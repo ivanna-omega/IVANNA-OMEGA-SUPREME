@@ -317,9 +317,22 @@ def main() -> int:
             raise AssertionError("native lifecycle regression test is not in the test runner")
         if "testConcurrentControlThreadLifecycle();" not in lifecycle_test:
             raise AssertionError("concurrent start/stop lifecycle regression test is not in the test runner")
-        sound_screen = read("app/src/main/java/com/ivanna/omega/ui/SoundScreen.kt")
-        hrtf_toggle = sound_screen.find('requestRouteFeatures(en, routeAdaptiveEnabled)')
-        if hrtf_toggle < 0:
+        # El toggle HRTF vivo es OemViewModel.setHrtfEnabled (SoundScreen se
+        # borro en la Fase 2 de la refactorizacion de la UI, 2.5.497, junto
+        # con su requestRouteFeatures). El invariante es el mismo: el toggle
+        # no puede republicar adaptive=true mientras el modo manual esta
+        # activo. La via viva usa queueSystemWideHrtfEnabled (actualizacion
+        # parcial: preserva el bit de adaptive) y nunca llama a
+        # setAudioFeatures (el republicado completo que lleva adaptive).
+        oem_vm = read("app/src/main/java/com/ivanna/omega/ui/oem/OemViewModel.kt")
+        hrtf_start = oem_vm.find("fun setHrtfEnabled(en: Boolean)")
+        if hrtf_start < 0:
+            raise AssertionError("HRTF toggle (OemViewModel.setHrtfEnabled) is missing")
+        hrtf_end = oem_vm.find("\n    fun ", hrtf_start + 1)
+        hrtf_block = oem_vm[hrtf_start:hrtf_end if hrtf_end > 0 else hrtf_start + 1200]
+        if "queueSystemWideHrtfEnabled" not in hrtf_block:
+            raise AssertionError("HRTF toggle does not use the partial update that preserves the adaptive bit")
+        if "setAudioFeatures(" in hrtf_block:
             raise AssertionError("HRTF toggle can republish adaptive=true while manual mode is active")
 
         # Voice inference provenance/race: a late synchronous model call may
