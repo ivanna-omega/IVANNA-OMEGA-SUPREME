@@ -693,7 +693,7 @@ TEST(FusedChain, TOmegaDspUs) {
 // ── GEMELO ACÚSTICO + CALIBRACIÓN — CALL SITE (2026-11-21/22) ──────────────
 // El call site vive en FusedChain::pushEffectiveControls ->
 // refreshTwinCalibration: en SPEAKERS aplica la estimación calibrada del
-// gemelo (escala 0.75, confianza honesta, nota de voz) a la conservación,
+// gemelo (escala 0.80, confianza honesta, medida Farina app) a la conservación,
 // que es el camino vivo que ya consume esa escala en el hilo de audio; en
 // HEADPHONES deja la escala en 1.0 (sin cambio). La conservación está
 // encendida (amount 1.0) en estos tests para que la escala sea
@@ -722,20 +722,20 @@ TEST(FusedChainTwinCallSite, SpeakersAppliesCalibratedTwin) {
     chain.setControls(speakersControls());
     std::vector<double> l = tone(4800), r = tone(4800);
     chain.process(l.data(), r.data(), 4800);
-    // La escala calibrada (0.75, nota de voz) llega a la conservación en vivo.
-    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.75, 1e-6);
+    // La escala calibrada (0.80, medida Farina app) llega a la conservación en vivo.
+    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.80, 1e-6);
     EXPECT_TRUE(chain.telemetry().twinCalibrationApplied);
-    EXPECT_NEAR(chain.telemetry().twinCalibrationConfidence, 0.75f, 1e-6f);
+    EXPECT_NEAR(chain.telemetry().twinCalibrationConfidence, 0.80f, 1e-6f);
     const auto& est = chain.twinEstimate();
     EXPECT_TRUE(est.valid);
     EXPECT_TRUE(est.calibrationApplied);
-    EXPECT_NEAR(est.calibrationConfidence, 0.75, 1e-9);
-    EXPECT_NEAR(est.overallConfidence, 0.75, 1e-9);
-    EXPECT_NEAR(est.overallInterventionScale, 0.75, 1e-9);
-    // La respuesta de calibración llega: 63 Hz -6.22 dB, 125 Hz +1.17 dB
-    // (medidos desde la nota de voz, no el estimado -3.24/+1.97).
-    EXPECT_NEAR(est.calibratedResponseDb[0], -6.22, 0.01);
-    EXPECT_NEAR(est.calibratedResponseDb[1], 1.17, 0.01);
+    EXPECT_NEAR(est.calibrationConfidence, 0.80, 1e-9);
+    EXPECT_NEAR(est.overallConfidence, 0.80, 1e-9);
+    EXPECT_NEAR(est.overallInterventionScale, 0.80, 1e-9);
+    // La respuesta de calibración llega: 63 Hz -1.90 dB, 125 Hz -0.76 dB
+    // (medidos desde el barrido Farina de la app, no la nota de voz).
+    EXPECT_NEAR(est.calibratedResponseDb[0], -1.90, 0.01);
+    EXPECT_NEAR(est.calibratedResponseDb[1], -0.76, 0.01);
     EXPECT_FALSE(est.satellitesActive);  // surround OFF: satélite inactivo
     // La salida sigue siendo finita (la calibración no rompe el audio).
     for (std::size_t i = 0; i < l.size(); ++i) {
@@ -770,7 +770,7 @@ TEST(FusedChainTwinCallSite, InvalidCalibrationFallsBackToUncalibrated) {
     std::vector<double> l = tone(4800), r = tone(4800);
     chain.process(l.data(), r.data(), 4800);
     // Fallback al estimado SIN calibrar: la confianza es la del gemelo
-    // sin valores derivados (~0.46), NUNCA el 0.926 inflado ni el 0.75.
+    // sin valores derivados (~0.46), NUNCA el 0.926 inflado ni el 0.80.
     const double expected =
         AcousticTwin::estimate(AcousticTwinParams::esseGenezi())
             .overallInterventionScale;
@@ -788,7 +788,7 @@ TEST(FusedChainTwinCallSite, ModeSwitchBackToHeadphonesResetsScale) {
     chain.setControls(speakersControls());
     std::vector<double> l = tone(4800), r = tone(4800);
     chain.process(l.data(), r.data(), 4800);
-    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.75, 1e-6);
+    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.80, 1e-6);
     // Cambio a audífonos: la escala vuelve a 1.0 (la calibración del
     // Genezi no debe quedarse escalando la conservación en audífonos).
     chain.setControls(headphonesControls());
@@ -829,10 +829,10 @@ TEST(FusedChainTwinCallSite, ResetForcesRefresh) {
     chain.setControls(speakersControls());
     std::vector<double> l = tone(4800), r = tone(4800);
     chain.process(l.data(), r.data(), 4800);
-    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.75, 1e-6);
+    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.80, 1e-6);
     chain.reset();
     chain.process(l.data(), r.data(), 4800);
-    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.75, 1e-6);
+    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.80, 1e-6);
     EXPECT_TRUE(chain.telemetry().twinCalibrationApplied);
 }
 
@@ -840,9 +840,9 @@ TEST(FusedChainTwinCallSite, ResetForcesRefresh) {
 // Con la calibración aplicada (SPEAKERS, válida), el gemelo CONTROLA
 // la conservación: si el usuario no fijó amount ni techo, se usan los
 // defaults del gemelo (amount 0.5, techo 0.8). Sin el amount la escala
-// 0.75 no haría nada (0 × 0.75 = 0); sin el techo el solucionador nunca
+// 0.80 no haría nada (0 × 0.80 = 0); sin el techo el solucionador nunca
 // constriñe (ganancia siempre 1.0) y el control sería un placebo.
-// Efectivo: 0.5 × 0.75 = 0.375. El amount del usuario (> 0) y un techo
+// Efectivo: 0.5 × 0.80 = 0.40. El amount del usuario (> 0) y un techo
 // fijado por el usuario (< 1.0) siempre mandan. En audífonos y con
 // calibración inválida no hay control (fail-closed).
 namespace {
@@ -890,17 +890,17 @@ TEST(FusedChainTwinControl, SpeakersAppliesTwinDefaults) {
     std::vector<double> l = tone(4800), r = tone(4800);
     chain.process(l.data(), r.data(), 4800);
     // El gemelo pone sus defaults: amount 0.5 y techo 0.8 (el usuario
-    // no fijó ninguno). La escala es la confianza honesta 0.75, así que
-    // el amount efectivo es 0.5 × 0.75 = 0.375 > 0: la conservación está
+    // no fijó ninguno). La escala es la confianza honesta 0.80, así que
+    // el amount efectivo es 0.5 × 0.80 = 0.40 > 0: la conservación está
     // ACTIVA y el gemelo la modula.
     EXPECT_FLOAT_EQ(chain.conservation().config().amount,
                     FusedChain::kTwinCalibratedDefaultConservationAmount);
     EXPECT_FLOAT_EQ(chain.conservation().config().energyCap,
                     FusedChain::kTwinCalibratedDefaultConservationEnergyCap);
     EXPECT_TRUE(chain.conservation().isActive());
-    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.75, 1e-6);
+    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.80, 1e-6);
     EXPECT_TRUE(chain.telemetry().twinCalibrationApplied);
-    EXPECT_NEAR(chain.telemetry().twinCalibrationConfidence, 0.75f, 1e-6f);
+    EXPECT_NEAR(chain.telemetry().twinCalibrationConfidence, 0.80f, 1e-6f);
     for (std::size_t i = 0; i < l.size(); ++i) {
         ASSERT_TRUE(std::isfinite(l[i]) && std::isfinite(r[i]));
     }
@@ -910,7 +910,7 @@ TEST(FusedChainTwinControl, SpeakersActsOnHotSignal) {
     using namespace ivanna::fused::acoustic_twin;
     // Tono caliente a 1 kHz, solo un toque de EQ grave en bocinas: la
     // banda de 1 kHz supera el techo 0.8 y la conservación (efectivo
-    // 0.375) la recorta. Se compara contra una cadena idéntica con
+    // 0.40) la recorta. Se compara contra una cadena idéntica con
     // calibración inválida (sin control del gemelo: conservación en
     // bypass), para aislar el efecto del gemelo. APEX apagado para medir
     // la conservación sola.
@@ -958,7 +958,7 @@ TEST(FusedChainTwinControl, UserAmountWins) {
     // El techo sí lo pone el gemelo (el usuario lo dejó en 1.0).
     EXPECT_FLOAT_EQ(chain.conservation().config().energyCap,
                     FusedChain::kTwinCalibratedDefaultConservationEnergyCap);
-    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.75, 1e-6);
+    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.80, 1e-6);
     EXPECT_TRUE(chain.telemetry().twinCalibrationApplied);
 }
 
@@ -975,7 +975,7 @@ TEST(FusedChainTwinControl, UserCapWins) {
     EXPECT_FLOAT_EQ(chain.conservation().config().amount,
                     FusedChain::kTwinCalibratedDefaultConservationAmount);
     EXPECT_FLOAT_EQ(chain.conservation().config().energyCap, 0.5f);
-    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.75, 1e-6);
+    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.80, 1e-6);
     EXPECT_TRUE(chain.telemetry().twinCalibrationApplied);
 }
 
@@ -992,7 +992,7 @@ TEST(FusedChainTwinControl, InvalidCalibrationNoControl) {
     chain.process(l.data(), r.data(), 4800);
     // Calibración inválida: no se aplican los defaults del gemelo y la
     // conservación queda apagada (fail-closed). La escala es la del
-    // estimado sin calibrar (~0.46), no el 0.75.
+    // estimado sin calibrar (~0.46), no el 0.80.
     EXPECT_FLOAT_EQ(chain.conservation().config().amount, 0.0f);
     EXPECT_FLOAT_EQ(chain.conservation().config().energyCap, 1.0f);
     EXPECT_FALSE(chain.conservation().isActive());
@@ -1023,8 +1023,8 @@ TEST(FusedChainTwinControl, NeutralSpeakersNoControl) {
     EXPECT_FLOAT_EQ(chain.conservation().config().amount, 0.0f);
     EXPECT_FLOAT_EQ(chain.conservation().config().energyCap, 1.0f);
     EXPECT_FALSE(chain.conservation().isActive());
-    // La escala sí se alimenta (0.75), pero sin amount no actúa.
-    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.75, 1e-6);
+    // La escala sí se alimenta (0.80), pero sin amount no actúa.
+    EXPECT_NEAR(chain.conservation().twinInterventionScale(), 0.80, 1e-6);
     EXPECT_TRUE(chain.telemetry().twinCalibrationApplied);
 }
 

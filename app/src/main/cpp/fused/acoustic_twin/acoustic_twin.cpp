@@ -197,6 +197,57 @@ TwinCalibration TwinCalibration::geneziPz1dEstimated() noexcept {
     return c;
 }
 
+TwinCalibration TwinCalibration::geneziPz1dMeasured() noexcept {
+    // Respuesta en magnitud MEDIDA desde el barrido Farina de la app
+    // (2026-11-22 05:54 CST): ESS limpio 20 Hz-20 kHz capturado por
+    // GeneziSweepRecorder (WAV 48 kHz, sin compresión). Método: RMS
+    // por ventana de 0.25 s siguiendo la frecuencia del ESS
+    // (exponencial 20 Hz -> 20 kHz en 10 s), normalizado por el RMS
+    // del ESS fuente en cada ventana, dos barridos independientes
+    // (lo/hi) promediados. Lo y hi coinciden dentro de ~1 dB en
+    // 125 Hz-2 kHz, así que la medida es coherente.
+    //   63 Hz -1.90 | 125 Hz -0.76 | 250 Hz -3.71 | 500 Hz -2.99 |
+    //   1000 Hz 0.0 | 2000 Hz -10.51 | 4000 Hz -17.05 | 8000 Hz -7.00
+    // 16 kHz: del ESTIMADO (0.0 dB). El barrido mide −30.7 dB a
+    // 16 kHz, pero eso es el recorte del micrófono del teléfono,
+    // NO el Genezi (su super-tweeter llega a 24 kHz). Usar −30 dB
+    // como respuesta del Genezi sería falso.
+    // La caída a 2–4 kHz (−10.5/−17 dB) es real en la grabación
+    // (lo y hi la muestran igual), pero puede ser el cruce del
+    // Genezi o un nulo por la posición del micrófono; no se puede
+    // asegurar que sea propiedad del Genezi sin medir en otra
+    // posición. Se usa el valor medido (es el mejor dato) y la
+    // confianza de agudos (0.60) refleja la duda.
+    // Potencia (135 W), sensibilidad (88 dB) y RT60 (0.34 s) siguen
+    // del estimado: el barrido no los mide (la deconvolución Farina
+    // es inestable con estos datos: RT60 2.7–6.6 s, absurdo para
+    // 70 m³; el pico directo salta con la alineación). Por eso la
+    // confianza honesta es 0.80, no 0.90+: la respuesta 63 Hz-8 kHz
+    // ya es medida en WAV limpio (mejora real sobre la nota de voz
+    // 0.75, que era AAC), pero falta RT60, potencia, sensibilidad
+    // y 16 kHz medidos.
+    // Fuente: goals/majestuosidad-total-perceptual-de-ivanna/
+    //   calibration_p3/sweep_2026-11-22_0554/INFORME_BARRIDO_2026-11-22_0554.md
+    TwinCalibration c;
+    c.responseDb = {-1.90, -0.76, -3.71, -2.99, 0.0, -10.51, -17.05, -7.00, 0.0};
+    c.responseKnown = true;
+    c.honestConfidence = 0.80;
+    c.directPathConfidence = 0.85;
+    c.bassConfidence = 0.85;   // medido en WAV limpio, lo/hi a ~2 dB
+    c.midConfidence = 0.80;    // medido (250 Hz-1 kHz a ~1 dB; 2 kHz con duda)
+    c.trebleConfidence = 0.60; // 4 kHz con duda de posición; 16 kHz no medido
+    c.roomConfidence = 0.70;   // RT60 no medido de forma fiable
+    c.isEstimated = false;     // la respuesta principal es MEDIDA
+    c.satelliteKnown = true;
+    c.satelliteF3Hz = 157.5;
+    c.satelliteF3HighHz = 16000.0;
+    c.satelliteSensitivityDb = 84.0;
+    c.satelliteResponseDb = {-31.84, -8.66, -0.11, 0.0, 0.0,
+                             0.0, -0.02, -0.26, -3.01};
+    c.valid = c.isValid();
+    return c;
+}
+
 TwinCalibration TwinCalibration::geneziPz1dVoiceNote() noexcept {
     // Respuesta en magnitud MEDIDA desde la nota de voz de Esse
     // (2026-11-22 01:0x CST): 3 barridos ESS grabados con el grabador

@@ -504,6 +504,88 @@ int main() {
         check(estimatesEqual(e, e2), "calibrada (nota de voz) determinista");
     }
 
+    // ── 10. Calibración MEDIDA desde el barrido Farina de la app ──────
+    // (2026-11-22 05:54 CST, ESS limpio WAV 48 kHz)
+    std::printf("[calibracion medida farina app]\n");
+    {
+        // Respuesta en magnitud medida en WAV limpio (2 barridos ESS,
+        // lo/hi promediados). Graves/medios/agudos hasta 8 kHz MEDIDOS;
+        // 16 kHz del estimado (el micrófono recorta ahí).
+        const TwinCalibration cal = TwinCalibration::geneziPz1dMeasured();
+        check(cal.valid, "calibracion medida valida");
+        check(!cal.isEstimated, "calibracion marcada como MEDIDA (no estimada)");
+        check(cal.responseKnown, "respuesta por banda presente");
+        check(near(cal.honestConfidence, 0.80, 0.001),
+              "confianza honesta global 0.80");
+        check(near(cal.directPathConfidence, 0.85, 0.001), "directo 0.85");
+        check(near(cal.bassConfidence, 0.85, 0.001), "graves 0.85 (medidos)");
+        check(near(cal.midConfidence, 0.80, 0.001), "medios 0.80 (medidos)");
+        check(near(cal.trebleConfidence, 0.60, 0.001),
+              "agudos 0.60 (4 kHz con duda, 16 kHz no medido)");
+        check(near(cal.roomConfidence, 0.70, 0.001), "sala 0.70");
+        // Respuesta medida (barrido Farina app, relativa a 1 kHz).
+        check(near(cal.responseDb[0], -1.90, 0.01), "respuesta 63 Hz -1.90 dB");
+        check(near(cal.responseDb[1], -0.76, 0.01), "respuesta 125 Hz -0.76 dB");
+        check(near(cal.responseDb[2], -3.71, 0.01), "respuesta 250 Hz -3.71 dB");
+        check(near(cal.responseDb[3], -2.99, 0.01), "respuesta 500 Hz -2.99 dB");
+        check(near(cal.responseDb[4], 0.0, 0.001), "respuesta 1 kHz 0 dB");
+        check(near(cal.responseDb[5], -10.51, 0.01), "respuesta 2 kHz -10.51 dB");
+        check(near(cal.responseDb[6], -17.05, 0.01), "respuesta 4 kHz -17.05 dB");
+        check(near(cal.responseDb[7], -7.00, 0.01), "respuesta 8 kHz -7.00 dB");
+        // 16 kHz del estimado (0.0 dB), NO del barrido (el micrófono
+        // recorta ahí: −30 dB medido es el micrófono, no el Genezi).
+        check(near(cal.responseDb[8], 0.0, 0.001),
+              "respuesta 16 kHz 0 dB (estimado, no medido)");
+        // Mejor que la nota de voz (0.80 > 0.75) y que el estimado.
+        const TwinCalibration vn = TwinCalibration::geneziPz1dVoiceNote();
+        const TwinCalibration est = TwinCalibration::geneziPz1dEstimated();
+        check(cal.honestConfidence > vn.honestConfidence,
+              "medida 0.80 > nota de voz 0.75");
+        check(cal.honestConfidence > est.honestConfidence,
+              "medida 0.80 > estimado 0.70");
+        // La respuesta medida difiere de la nota de voz en 2-4 kHz
+        // (la nota de voz, AAC, no veía la caída).
+        check(cal.responseDb[5] < vn.responseDb[5],
+              "2 kHz medido (-10.51) mas bajo que nota de voz (-1.72)");
+        check(cal.responseDb[6] < vn.responseDb[6],
+              "4 kHz medido (-17.05) mas bajo que nota de voz (0.0)");
+
+        // Aplicar la calibración al preset calibrado.
+        const AcousticTwinParams p =
+            AcousticTwinParams::esseGeneziCalibrated();
+        const AcousticTwinEstimate e =
+            AcousticTwin::estimateCalibrated(p, cal);
+        check(e.valid, "estimacion calibrada (medida) valida");
+        check(e.calibrationApplied, "calibracion medida aplicada");
+        check(near(e.calibrationConfidence, 0.80, 0.001),
+              "confianza de calibracion 0.80 (honesta)");
+        check(near(e.overallConfidence, 0.80, 0.001),
+              "confianza global 0.80, NO 0.926 de la formula");
+        check(near(e.overallInterventionScale, 0.80, 0.001),
+              "interventionScale == confianza (0.80)");
+        // Confianza por banda: graves 0.85, medios 0.80, agudos 0.60.
+        check(near(e.band[0].confidence, 0.85, 0.001), "banda 63 Hz: 0.85");
+        check(near(e.band[1].confidence, 0.85, 0.001), "banda 125 Hz: 0.85");
+        check(near(e.band[4].confidence, 0.80, 0.001), "banda 1 kHz: 0.80");
+        check(near(e.band[8].confidence, 0.60, 0.001), "banda 16 kHz: 0.60");
+        // Ganancia por banda: anclada a 1 kHz (-6.35 dB) + respuesta.
+        check(near(e.band[4].gainDb, -6.35, 0.5),
+              "ganancia 1 kHz ~-6.35 dB (ancla, sin cambio)");
+        check(near(e.band[0].gainDb, -8.25, 0.5),
+              "ganancia 63 Hz ~-8.25 dB (-6.35 - 1.90)");
+        check(near(e.band[1].gainDb, -7.11, 0.5),
+              "ganancia 125 Hz ~-7.11 dB (-6.35 - 0.76)");
+        check(near(e.band[6].gainDb, -23.40, 0.5),
+              "ganancia 4 kHz ~-23.40 dB (-6.35 - 17.05)");
+        check(near(e.calibratedResponseDb[0], -1.90, 0.01),
+              "respuesta calibrada 63 Hz guardada");
+        check(allFiniteAndInRange(e), "salida calibrada finita y en rango");
+        // Determinismo.
+        const AcousticTwinEstimate e2 =
+            AcousticTwin::estimateCalibrated(p, cal);
+        check(estimatesEqual(e, e2), "calibrada (medida) determinista");
+    }
+
     std::printf("== %d checks, %d FALLARON ==\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

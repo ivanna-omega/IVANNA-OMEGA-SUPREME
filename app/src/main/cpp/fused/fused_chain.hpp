@@ -231,10 +231,11 @@ public:
 
     // ── GEMELO ACÚSTICO + CALIBRACIÓN — CALL SITE (2026-11-21/22) ────────
     // La calibración del Genezi vive embebida en el gemelo. Desde la
-    // 2026-11-22 la de por defecto es la MEDIDA desde la nota de voz de
-    // Esse (TwinCalibration::geneziPz1dVoiceNote(), confianza honesta
-    // 0.75); la P3 estimada (geneziPz1dEstimated(), 0.70) queda como
-    // respaldo documentado. FusedChain la consulta en runtime
+    // 2026-11-22 la de por defecto es la MEDIDA desde el barrido Farina
+    // de la app (TwinCalibration::geneziPz1dMeasured(), confianza
+    // honesta 0.80); la nota de voz (geneziPz1dVoiceNote(), 0.75) y la
+    // P3 estimada (geneziPz1dEstimated(), 0.70) quedan como respaldo
+    // documentado. FusedChain la consulta en runtime
     // (refreshTwinCalibration, en pushEffectiveControls, por bloque y
     // solo cuando cambia el modo o la calibración) y alimenta su
     // interventionScale a la conservación (applyTwinToConservation), que
@@ -245,7 +246,7 @@ public:
     //
     // setTwinCalibration: alimenta una calibración distinta (p. ej. una
     // MEDIDA futura: la app carga el JSON en Kotlin y puebla el struct).
-    // Sin llamar, se usa la de la nota de voz del Genezi. Llamar antes de
+    // Sin llamar, se usa la medida en WAV limpio del Genezi. Llamar antes de
     // process() o con la cadena parada (mismo patrón que setControls:
     // el struct se escribe en el hilo de UI y lo lee el de audio).
     // Una calibración inválida NO rompe nada: el refresh cae al estimado
@@ -265,7 +266,7 @@ public:
     // (la ganancia es siempre 1.0: solo baja si el techo < energía
     // medida) y el control sería un placebo. El amount del usuario
     // (> 0) y un techo fijado por el usuario (< 1.0) siempre mandan.
-    // Efectivo con la nota de voz (2026-11-22): 0.5 × 0.75 = 0.375.
+    // Efectivo con la medida en WAV limpio (2026-11-22): 0.5 × 0.80 = 0.40.
     // El techo 0.8 solo recorta bandas por encima del 80% de energía
     // (exceso genuino); el recorte máximo a fondo de escala es ~3.7%
     // (no recorta de más).
@@ -283,7 +284,7 @@ private:
     // cambia el modo o la calibración (la estimación es función pura de
     // parámetros estáticos; por bloque sería trabajo inútil).
     //   SPEAKERS: estimateCalibrated(esseGeneziCalibrated(),
-    //     geneziPz1dVoiceNote()) -> escala 0.75 (confianza honesta).
+    //     geneziPz1dMeasured()) -> escala 0.80 (confianza honesta).
     //     Calibración inválida -> estimate(esseGenezi()) sin calibrar
     //     (~0.46): la fórmula NO ve los valores derivados, así que no
     //     infla la confianza (eso daría 0.926 y sería mentir).

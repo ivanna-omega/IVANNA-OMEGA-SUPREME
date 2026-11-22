@@ -194,6 +194,25 @@ struct TwinCalibration {
     // Fuente: goals/.../calibration_p3/voicenote_2026-11-22/
     //   respuesta_rms_voicenote.json, INFORME_VOICENOTE_2026-11-22.md
     static TwinCalibration geneziPz1dVoiceNote() noexcept;
+    // Calibración del Genezi con la respuesta en magnitud MEDIDA desde
+    // el barrido Farina de la app (2026-11-22 05:54 CST, ESS limpio
+    // 20 Hz-20 kHz capturado por GeneziSweepRecorder, WAV 48 kHz sin
+    // compresión). Método: RMS por ventana de 0.25 s siguiendo la
+    // frecuencia del ESS, normalizado por el RMS del ESS fuente, dos
+    // barridos independientes (lo/hi) promediados; coinciden dentro de
+    // ~1 dB en 125 Hz-2 kHz. Respuesta 63 Hz-8 kHz MEDIDA; 16 kHz del
+    // ESTIMADO (0.0 dB: el micrófono del teléfono recorta ahí, −30 dB
+    // medido es el micrófono, no el Genezi). La caída a 2–4 kHz
+    // (−10.5/−17 dB) es real en la grabación pero puede ser el cruce
+    // del Genezi o un nulo por posición del micrófono; la confianza
+    // de agudos (0.60) lo refleja. Potencia, sensibilidad y RT60
+    // siguen sin medirse (derivan del estimado). Confianza honesta
+    // 0.80: medición completa en WAV (mejor que la nota de voz 0.75,
+    // que era AAC), pero falta RT60, potencia, sensibilidad y 16 kHz.
+    // isEstimated=false porque la respuesta principal es medida.
+    // Fuente: goals/.../calibration_p3/sweep_2026-11-22_0554/
+    //   INFORME_BARRIDO_2026-11-22_0554.md
+    static TwinCalibration geneziPz1dMeasured() noexcept;
 };
 
 // Estimación por banda. Todo es un ESTIMADO (modelo), no una medición.

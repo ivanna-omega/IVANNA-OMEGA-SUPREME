@@ -422,19 +422,20 @@ void FusedChain::refreshTwinCalibration(OmegaOutputMode mode) noexcept {
     twinCalReady_ = true;
 
     if (mode == OmegaOutputMode::SPEAKERS) {
-        // Trayecto Genezi: calibración con la respuesta MEDIDA desde la
-        // nota de voz de Esse (2026-11-22, TwinCalibration::
-        // geneziPz1dVoiceNote(), confianza honesta 0.75), o la
+        // Trayecto Genezi: calibración con la respuesta MEDIDA desde el
+        // barrido Farina de la app (2026-11-22 05:54, TwinCalibration::
+        // geneziPz1dMeasured(), confianza honesta 0.80), o la
         // alimentada por la app. Calibración inválida -> estimado SIN
         // calibrar (~0.46) con el preset sin valores derivados, para
         // que la fórmula no infle la confianza a 0.926.
-        // La P3 estimada (geneziPz1dEstimated(), 0.70) queda como
-        // respaldo documentado; la de la nota de voz manda porque su
-        // respuesta en graves/medios es MEDIDA, no derivada.
+        // La P3 estimada (geneziPz1dEstimated(), 0.70) y la nota de voz
+        // (geneziPz1dVoiceNote(), 0.75) quedan como respaldo
+        // documentado; la medida en WAV limpio manda porque su
+        // respuesta 63 Hz-8 kHz es MEDIDA en limpio, no AAC.
         const acoustic_twin::TwinCalibration cal =
             twinCalibrationHasOverride_.load(std::memory_order_acquire)
                 ? twinCalibrationOverride_
-                : acoustic_twin::TwinCalibration::geneziPz1dVoiceNote();
+                : acoustic_twin::TwinCalibration::geneziPz1dMeasured();
         acoustic_twin::AcousticTwinEstimate est;
         if (cal.isValid()) {
             est = acoustic_twin::AcousticTwin::estimateCalibrated(
