@@ -14,6 +14,14 @@ package com.ivanna.omega.ui
  * usando sus propios rangos. Unificar los rangos divergentes es trabajo de
  * la Fase 3 de la refactorización, no de este archivo.
  *
+ * ACTUALIZACIÓN Fase 2 (2026-11-22): la unificación YA está hecha — todas
+ * las pantallas usan estos rangos como fuente única (FusedOperatorsScreen,
+ * IvannaControlPanel, AdaptiveEngineScreen). El clamp fusionado de EQ
+ * (FusedControls) también se abrió a ±18 dB para que el slider no se
+ * devolviera a ±12. Lo que NO se unificó: el alpha legacy del DSP nativo
+ * (umbral = −24 + 24·alpha, Compressor.cpp) solo cubre −24…0 dB; por debajo
+ * de −24 dB el dB completo lo lleva la cadena fusionada.
+ *
  * Divergencias conocidas (verificadas en el código vivo, inventario §1.6):
  *  - EQ Graves/Medios/Agudos: ±18 dB aquí; ±12 dB en FusedOperatorsScreen
  *    (ARMONÍA) y en IvannaControlPanel. Presencia: ±12 dB en ambas.

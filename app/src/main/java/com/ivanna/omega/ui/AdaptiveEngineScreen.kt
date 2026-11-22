@@ -363,7 +363,7 @@ internal fun AdaptiveEngineScreen(
                 AuroraSlider(
                     label = "Threshold (dB)",
                     value = audioState.compressorThreshold,
-                    range = -40f..0f,
+                    range = CanonicalRanges.compressorThresholdDb,
                     displayValue = { "%.0f dB".format(it) },
                     onValueChange = { v ->
                         AudioStateManager.updateState { it.copy(compressorThreshold = v) }
@@ -373,7 +373,7 @@ internal fun AdaptiveEngineScreen(
                 AuroraSlider(
                     label = "Ratio",
                     value = audioState.compressorRatio,
-                    range = 1f..10f,
+                    range = CanonicalRanges.compressorRatio,
                     displayValue = { "%.1f:1".format(it) },
                     onValueChange = { v ->
                         AudioStateManager.updateState { it.copy(compressorRatio = v) }
@@ -383,7 +383,7 @@ internal fun AdaptiveEngineScreen(
                 AuroraSlider(
                     label = "Attack (ms)",
                     value = audioState.compressorAttack,
-                    range = 1f..100f,
+                    range = CanonicalRanges.compressorAttackMs,
                     displayValue = { "%.0f ms".format(it) },
                     onValueChange = { v ->
                         AudioStateManager.updateState { it.copy(compressorAttack = v) }
@@ -393,7 +393,7 @@ internal fun AdaptiveEngineScreen(
                 AuroraSlider(
                     label = "Release (ms)",
                     value = audioState.compressorRelease,
-                    range = 10f..500f,
+                    range = CanonicalRanges.compressorReleaseMs,
                     displayValue = { "%.0f ms".format(it) },
                     onValueChange = { v ->
                         AudioStateManager.updateState { it.copy(compressorRelease = v) }
@@ -408,7 +408,7 @@ internal fun AdaptiveEngineScreen(
                 AuroraSlider(
                     label = "Graves (dB)",
                     value = audioState.eqBass,
-                    range = -12f..12f,
+                    range = CanonicalRanges.eqBandDb,
                     displayValue = { "%+.1f dB".format(it) },
                     onValueChange = { v ->
                         AudioStateManager.updateState { it.copy(eqBass = v) }
@@ -418,7 +418,7 @@ internal fun AdaptiveEngineScreen(
                 AuroraSlider(
                     label = "Medios (dB)",
                     value = audioState.eqMid,
-                    range = -12f..12f,
+                    range = CanonicalRanges.eqBandDb,
                     displayValue = { "%+.1f dB".format(it) },
                     onValueChange = { v ->
                         AudioStateManager.updateState { it.copy(eqMid = v) }
@@ -428,7 +428,7 @@ internal fun AdaptiveEngineScreen(
                 AuroraSlider(
                     label = "Agudos (dB)",
                     value = audioState.eqTreble,
-                    range = -12f..12f,
+                    range = CanonicalRanges.eqBandDb,
                     displayValue = { "%+.1f dB".format(it) },
                     onValueChange = { v ->
                         AudioStateManager.updateState { it.copy(eqTreble = v) }

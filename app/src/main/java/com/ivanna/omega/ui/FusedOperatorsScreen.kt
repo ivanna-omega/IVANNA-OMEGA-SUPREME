@@ -514,25 +514,25 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                         spec = FusedControlSpecs.tonalTrim,
                     ) { update(controls.copy(tonal = t.copy(trimDb = it))) }
                     FusedSliderRow(
-                        label = "Graves (dB)", value = t.lowDb, range = -12f..12f,
+                        label = "Graves (dB)", value = t.lowDb, range = CanonicalRanges.eqBandDb,
                         format = { "${"%+.1f".format(it)} dB" },
-                        hint = "Graves −12..+12 dB",
+                        hint = "Graves −18..+18 dB",
                         spec = FusedControlSpecs.tonalEq,
                     ) { update(controls.copy(tonal = t.copy(lowDb = it))) }
                     FusedSliderRow(
-                        label = "Medios (dB)", value = t.midDb, range = -12f..12f,
+                        label = "Medios (dB)", value = t.midDb, range = CanonicalRanges.eqBandDb,
                         format = { "${"%+.1f".format(it)} dB" },
-                        hint = "Medios −12..+12 dB",
+                        hint = "Medios −18..+18 dB",
                         spec = FusedControlSpecs.tonalEq,
                     ) { update(controls.copy(tonal = t.copy(midDb = it))) }
                     FusedSliderRow(
-                        label = "Agudos (dB)", value = t.highDb, range = -12f..12f,
+                        label = "Agudos (dB)", value = t.highDb, range = CanonicalRanges.eqBandDb,
                         format = { "${"%+.1f".format(it)} dB" },
-                        hint = "Agudos −12..+12 dB",
+                        hint = "Agudos −18..+18 dB",
                         spec = FusedControlSpecs.tonalEq,
                     ) { update(controls.copy(tonal = t.copy(highDb = it))) }
                     FusedSliderRow(
-                        label = "Presencia (dB)", value = t.presenceDb, range = -12f..12f,
+                        label = "Presencia (dB)", value = t.presenceDb, range = CanonicalRanges.eqPresenceDb,
                         format = { "${"%+.1f".format(it)} dB" },
                         hint = "Presencia 8–12 kHz −12..+12 dB",
                         spec = FusedControlSpecs.tonalEq,
@@ -568,13 +568,13 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                         spec = FusedControlSpecs.dynSafety,
                     ) { update(controls.copy(dynamics = d.copy(safety = it))) }
                     FusedSliderRow(
-                        label = "Umbral compresor (dB)", value = d.compThresholdDb, range = -60f..0f,
+                        label = "Umbral compresor (dB)", value = d.compThresholdDb, range = CanonicalRanges.compressorThresholdDb,
                         format = { "%.0f dB".format(it) },
                         hint = "Umbral −60..0 dB",
                         spec = FusedControlSpecs.dynComp,
                     ) { update(controls.copy(dynamics = d.copy(compThresholdDb = it))) }
                     FusedSliderRow(
-                        label = "Ratio compresor", value = d.compRatio, range = 1f..20f,
+                        label = "Ratio compresor", value = d.compRatio, range = CanonicalRanges.compressorRatio,
                         format = { "%.1f:1".format(it) },
                         hint = "Ratio 1..20 (1 = sin compresión)",
                         spec = FusedControlSpecs.dynComp,

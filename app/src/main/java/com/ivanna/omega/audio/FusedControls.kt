@@ -240,9 +240,9 @@ data class TransducerControls(
 data class TonalControls(
     val curve: FusedTonalCurve = FusedTonalCurve.HARMAN, // 0 plana, 1 Harman 2018, 2 élite (insignia).
     val trimDb: Float = 0.0f,     // trim -6..+6 dB (neto 0.0 dB por Matched-LUFS).
-    val lowDb: Float = 0.0f,      // graves -12..+12 dB.
-    val midDb: Float = 0.0f,      // medios -12..+12 dB.
-    val highDb: Float = 0.0f,     // agudos -12..+12 dB.
+    val lowDb: Float = 0.0f,      // graves ±18 dB (canónico, CanonicalRanges.eqBandDb).
+    val midDb: Float = 0.0f,      // medios ±18 dB (canónico, CanonicalRanges.eqBandDb).
+    val highDb: Float = 0.0f,     // agudos ±18 dB (canónico, CanonicalRanges.eqBandDb).
     // v2.5.473 (§2.2 #38): presencia 8–12 kHz. Antes no existía como campo
     // fusionado (solo vivía en DSPState.presence); ahora viaja al daemon
     // vía buildFusedPerceptualFields ("holosEqPresence") y se persiste.
@@ -251,9 +251,9 @@ data class TonalControls(
 ) {
     fun clamp(): TonalControls = copy(
         trimDb = clampf(trimDb, -6.0f, 6.0f),
-        lowDb = clampf(lowDb, -12.0f, 12.0f),
-        midDb = clampf(midDb, -12.0f, 12.0f),
-        highDb = clampf(highDb, -12.0f, 12.0f),
+        lowDb = clampf(lowDb, -18.0f, 18.0f),
+        midDb = clampf(midDb, -18.0f, 18.0f),
+        highDb = clampf(highDb, -18.0f, 18.0f),
         presenceDb = clampf(presenceDb, -12.0f, 12.0f),
     )
 

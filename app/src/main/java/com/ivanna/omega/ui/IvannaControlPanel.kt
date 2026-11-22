@@ -250,6 +250,13 @@ fun IvannaControlPanel(
     initialOmegaMode: Int = 2,
     initialCompThreshold: Float = 0.35f,
     initialCompRatio: Float = 0.08f,
+    // Umbral/ratio del compresor EN dB (canónico, CanonicalRanges). Por
+    // defecto derivan del alpha/beta normalizado legacy con el mapeo
+    // histórico del motor (umbral = −24 + 24·alpha; ratio = 1 + 19·beta),
+    // así el valor guardado no cambia: solo cambia el rango del control.
+    // El llamador (ControlTabScreen) pasa el dB fusionado guardado.
+    initialCompThresholdDb: Float = -24f + initialCompThreshold * 24f,
+    initialCompRatioValue: Float = 1f + initialCompRatio * 19f,
     initialNhoHarmonic: Float = 0.28f,
     initialSpatialAngle: Float = 0.5f,
     initialSpatialWidth: Float = 0.68f,
@@ -649,8 +656,8 @@ fun IvannaControlPanel(
     var selectedPreset by remember { mutableStateOf(initialPreset) }
     var autoMode by remember { mutableStateOf(initialAutoMode) }
     var omegaMode by remember { mutableIntStateOf(savedState.omegaMode) }
-    var compThreshold by remember { mutableFloatStateOf(initialCompThreshold) }
-    var compRatio by remember { mutableFloatStateOf(initialCompRatio) }
+    var compThresholdDb by remember { mutableFloatStateOf(initialCompThresholdDb) }
+    var compRatioValue by remember { mutableFloatStateOf(initialCompRatioValue) }
     var nhoHarmonic by remember { mutableFloatStateOf(savedState.nhoHarmonic) }
     var spatialAngle by remember { mutableFloatStateOf(savedState.spatialAngle) }
     var spatialWidth by remember { mutableFloatStateOf(savedState.spatialWidth) }
@@ -1056,10 +1063,10 @@ fun IvannaControlPanel(
 
         GlassCard(title = "DSP CORE", accent = AuroraCyan, subtitle = "EQ · Exciter · Widener · Gain") {
             AuroraSlider("EXCITER", exciter, 0f..1f, unit = "×", spec = FusedControlSpecs.dynExciter) { exciter = it; onExciterChange(it) }
-            AuroraSlider("GRAVES", tonalLow, -12f..12f, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalLow = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
-            AuroraSlider("MEDIOS", tonalMid, -12f..12f, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalMid = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
-            AuroraSlider("AGUDOS", tonalHigh, -12f..12f, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalHigh = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
-            AuroraSlider("PRESENCIA", tonalPresence, -12f..12f, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalPresence = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
+            AuroraSlider("GRAVES", tonalLow, CanonicalRanges.eqBandDb, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalLow = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
+            AuroraSlider("MEDIOS", tonalMid, CanonicalRanges.eqBandDb, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalMid = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
+            AuroraSlider("AGUDOS", tonalHigh, CanonicalRanges.eqBandDb, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalHigh = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
+            AuroraSlider("PRESENCIA", tonalPresence, CanonicalRanges.eqPresenceDb, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalPresence = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
             AuroraSlider("TRIM · CIERRE LUFS", tonalTrim, -6f..6f, unit = "dB", spec = FusedControlSpecs.tonalTrim) { tonalTrim = it; onTonalTrimChange(it) }
             AuroraSlider("STEREO WIDTH", width, 0f..1.5f, unit = "γ", spec = FusedControlSpecs.dynWidth) { width = it; onWidthChange(it) }
             // MEZCLA CAPTURA (v2.5.412): cuánto del procesado se reinyecta
@@ -1085,13 +1092,16 @@ fun IvannaControlPanel(
         }
 
         GlassCard(title = "COMPRESOR", accent = AmberSignal, subtitle = "g_comp · dinámica lock-free") {
-            AuroraSlider("THRESHOLD", compThreshold, 0f..1f, spec = FusedControlSpecs.dynComp,
-                displayValue = { "%.1f dB".format(-24f + it * 24f) }) {
-                compThreshold = it; onCompThresholdChange(it)
+            // Compresor en dB canónicos (−60…0 dB, ratio 1…20): el valor
+            // guardado (dB fusionado) no cambia, solo el rango del control.
+            // El alpha/beta normalizado legacy se deriva en el llamador.
+            AuroraSlider("THRESHOLD", compThresholdDb, CanonicalRanges.compressorThresholdDb, spec = FusedControlSpecs.dynComp,
+                displayValue = { "%.1f dB".format(it) }) {
+                compThresholdDb = it; onCompThresholdChange(it)
             }
-            AuroraSlider("RATIO", compRatio, 0f..1f, spec = FusedControlSpecs.dynComp,
-                displayValue = { "%.1f:1".format(1f + it * 19f) }) {
-                compRatio = it; onCompRatioChange(it)
+            AuroraSlider("RATIO", compRatioValue, CanonicalRanges.compressorRatio, spec = FusedControlSpecs.dynComp,
+                displayValue = { "%.1f:1".format(it) }) {
+                compRatioValue = it; onCompRatioChange(it)
             }
         }
 

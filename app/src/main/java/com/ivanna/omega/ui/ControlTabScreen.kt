@@ -290,6 +290,10 @@ fun ControlTabScreen(
         initialWidth         = dsp.value.stereoWidth,
         initialCompThreshold = dsp.value.alpha,
         initialCompRatio     = dsp.value.beta,
+        // El panel muestra el compresor en dB canónicos: el valor que
+        // manda es el dB fusionado guardado (no el alpha legacy).
+        initialCompThresholdDb = fusedControls.dynamics.compThresholdDb,
+        initialCompRatioValue = fusedControls.dynamics.compRatio,
         initialAuxFieldEnabled = paramStore.isAuxFieldEnabled(),
         roomGains = roomGains,
         roomEnabled = roomEnabled,
@@ -360,13 +364,17 @@ fun ControlTabScreen(
             dsp.value = dsp.value.copy(stereoWidth = v); dsp.value.pushToNative()
             pushFused(fusedControls.copy(dynamics = fusedControls.dynamics.copy(width = v)))
         },
+        // v: umbral en dB canónicos (−60…0). El alpha legacy del DSP
+        // nativo solo cubre −24…0 dB (Compressor.cpp: umbral = −24 + 24·alpha):
+        // por debajo de −24 dB el alpha se queda en su piso (0) y el dB
+        // completo lo lleva la cadena fusionada.
         onCompThresholdChange = { v ->
-            dsp.value = dsp.value.copy(alpha = v); dsp.value.pushToNative()
-            pushFused(fusedControls.copy(dynamics = fusedControls.dynamics.copy(compThresholdDb = -24f + v * 24f)))
+            dsp.value = dsp.value.copy(alpha = ((v + 24f) / 24f).coerceIn(0f, 1f)); dsp.value.pushToNative()
+            pushFused(fusedControls.copy(dynamics = fusedControls.dynamics.copy(compThresholdDb = v)))
         },
         onCompRatioChange = { v ->
-            dsp.value = dsp.value.copy(beta = v); dsp.value.pushToNative()
-            pushFused(fusedControls.copy(dynamics = fusedControls.dynamics.copy(compRatio = 1f + v * 19f)))
+            dsp.value = dsp.value.copy(beta = ((v - 1f) / 19f).coerceIn(0f, 1f)); dsp.value.pushToNative()
+            pushFused(fusedControls.copy(dynamics = fusedControls.dynamics.copy(compRatio = v)))
         },
         onTonalEqChange = { low, mid, high, presence ->
             dsp.value = dsp.value.copy(low = low, mid = mid, high = high, presence = presence)
