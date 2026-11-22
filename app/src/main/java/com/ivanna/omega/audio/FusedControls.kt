@@ -662,6 +662,28 @@ object FusedControlsBridge {
      */
     fun buildFusedPerceptualFields(c: FusedControls): Map<String, Float> {
         val clamped = c.clamp()
+        // ── CONTROL DEL GEMELO (orden de Esse, 2026-11-21; caza 2026-11-22) ──
+        // La FusedChain (C++, sección 8 de pushEffectiveControls) ya aplica
+        // estos mismos defaults cuando la calibración P3 está aplicada
+        // (SPEAKERS, válida) y el usuario no fijó amount ni techo: amount
+        // 0.5 / techo 0.8 (kTwinCalibratedDefaultConservation*). PERO el
+        // snapshot solo guarda lo que la app EMPUJA, y la app empujaba el
+        // amount crudo de la pref (0.0), así que el snapshot marcaba
+        // consv=0.0 aunque el gemelo SÍ actuaba dentro de la FusedChain
+        // (el 0.0 es la entrada, no el valor efectivo). Eso hacía imposible
+        // verificar que el gemelo actúa. Por eso el push aplica aquí los
+        // mismos defaults del gemelo: el snapshot muestra consv=0.5 y el
+        // efecto recibe 0.5 (lo mismo que la FusedChain pondría sola), así
+        // que el audio NO cambia — solo se vuelve VISIBLE y verificable.
+        // El amount del usuario (> 0) y un techo fijado (< 1.0) mandan.
+        // En audífonos no se aplica (la calibración del Genezi no aplica).
+        val twinSpeakers = clamped.spatial.mode == FusedSpatialMode.SPEAKERS
+        val twinConsvAmount =
+            if (twinSpeakers && clamped.conservation.amount <= 0f) 0.5f
+            else clamped.conservation.amount
+        val twinConsvEnergyCap =
+            if (twinSpeakers && clamped.conservation.energyCap >= 1f) 0.8f
+            else clamped.conservation.energyCap
         return mapOf(
             // ORBE·Ω (espacial). orbeSpread = ancho espacial (0..2 → 0..1.5).
             "orbeAmount" to clamped.spatial.amount,
@@ -707,8 +729,11 @@ object FusedControlsBridge {
             // setConservationParams → atomics → syncFusedControlsFromAtomics.
             // amount 0 = apagado (bypass bit-exacto). NO gateado en bocinas:
             // es un guarda de energía, válido en ambos modos.
-            "consvAmount" to clamped.conservation.amount,
-            "consvEnergyCap" to clamped.conservation.energyCap,
+            // (Gemelo: amount/techo con defaults del gemelo en SPEAKERS —
+            // ver arriba. La escala de confianza 0.80 la aplica la
+            // FusedChain vía twinInterventionScale; el efectivo es 0.5×0.80.)
+            "consvAmount" to twinConsvAmount,
+            "consvEnergyCap" to twinConsvEnergyCap,
             "consvPhaseCoherence" to clamped.conservation.phaseCoherence,
             "consvInertia" to clamped.conservation.inertia,
         )

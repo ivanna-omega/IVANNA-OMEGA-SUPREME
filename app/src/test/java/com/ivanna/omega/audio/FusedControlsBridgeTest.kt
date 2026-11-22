@@ -208,4 +208,32 @@ class FusedControlsBridgeTest {
         assertEquals(0.5f, fields["consvPhaseCoherence"]!!, 0.0f)
         assertEquals(0.82f, fields["consvInertia"]!!, 0.0f)
     }
+
+    @Test
+    fun `gemelo en SPEAKERS empuja defaults de conservacion cuando no estan fijados`() {
+        // Caza 2026-11-22: el snapshot marcaba consv=0.0 aunque el gemelo
+        // SÍ actuaba dentro de la FusedChain (el 0.0 es la entrada, no el
+        // efectivo). El push aplica aquí los mismos defaults del gemelo
+        // (FusedChain §8: amount 0.5 / techo 0.8) para que el snapshot lo
+        // muestre y se pueda verificar. En audífonos no aplica.
+        val sp = FusedControlsBridge.buildFusedPerceptualFields(
+            FusedControls().copy(spatial = SpatialControls(mode = FusedSpatialMode.SPEAKERS))
+        )
+        assertEquals(0.5f, sp["consvAmount"]!!, 0.0f)
+        assertEquals(0.8f, sp["consvEnergyCap"]!!, 0.0f)
+        val hp = FusedControlsBridge.buildFusedPerceptualFields(
+            FusedControls().copy(spatial = SpatialControls(mode = FusedSpatialMode.HEADPHONES))
+        )
+        assertEquals(0.0f, hp["consvAmount"]!!, 0.0f)
+        assertEquals(1.0f, hp["consvEnergyCap"]!!, 0.0f)
+        // El amount del usuario (> 0) y un techo fijado (< 1.0) mandan.
+        val user = FusedControlsBridge.buildFusedPerceptualFields(
+            FusedControls().copy(
+                spatial = SpatialControls(mode = FusedSpatialMode.SPEAKERS),
+                conservation = ConservationControls(amount = 0.6f, energyCap = 0.4f),
+            )
+        )
+        assertEquals(0.6f, user["consvAmount"]!!, 0.0f)
+        assertEquals(0.4f, user["consvEnergyCap"]!!, 0.0f)
+    }
 }
