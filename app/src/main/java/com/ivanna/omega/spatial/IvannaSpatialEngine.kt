@@ -1,0 +1,347 @@
+package com.ivanna.omega.spatial
+
+import kotlin.math.*
+import com.ivanna.omega.core.IvannaNativeLib
+import com.ivanna.omega.magisk.MagiskBridge
+
+class IvannaSpatialEngine private constructor() {
+
+    companion object {
+        val shared: IvannaSpatialEngine = IvannaSpatialEngine()
+
+        /** Separate delay/history state for Ivanna-owned playback streams. */
+        internal fun createIsolated(): IvannaSpatialEngine = IvannaSpatialEngine()
+
+        @Volatile var enabled: Boolean = true
+        val reducedComplexity: Boolean
+            get() = shared.reducedComplexity
+        val distanceMeters: Float
+            get() = shared.distance
+        val reflectionDelayMs: Float
+            get() = shared.earlyReflectionTimes[0] * shared.distance
+        val reflectionGain: Float
+            get() = shared.earlyReflectionGains[0] / sqrt(shared.distance.coerceAtLeast(0.5f))
+
+        fun setAzimuth(rad: Float) {
+            if (!rad.isFinite()) return
+            shared.azimuthRad = rad.coerceIn(-Math.PI.toFloat(), Math.PI.toFloat())
+            publishHeadPoseToSystemWide()
+            // Apply to the production object renderer too; legacy Kotlin state alone
+            // is not enough when PlaybackCaptureService is using native HRTF.
+            runCatching {
+                IvannaSpatialManager.setScenePose(
+                    shared.azimuthRad, shared.elevationRad, shared.distance
+                )
+            }
+        }
+        private fun publishHeadPoseToSystemWide() {
+            val yaw = shared.azimuthRad
+            val pitch = shared.elevationRad
+            if (!yaw.isFinite() || !pitch.isFinite()) return
+            // Socket IPC se invoca desde controles de app, nunca desde el callback de audio.
+            runCatching {
+                MagiskBridge.sendCommand("""{"action":"SET_HEAD_POSE","yawRad":$yaw,"pitchRad":$pitch}""")
+            }
+        }
+        // v2.5.471 (F2, parte segura): envío throttled de la pose al daemon
+        // (Ruta B) desde el sensor. El sensor corre a ~100 Hz; mandar un
+        // comando de socket por evento saturaría el IPC. Se envía solo cuando
+        // el yaw cambió >0.5° desde el último envío Y pasaron ≥50 ms. El
+        // daemon solo aplica la pose cuando headTracking está activo, así que
+        // enviarla siempre es seguro (el flag la puerta).
+        @Volatile private var lastPoseSentYawRad: Float = Float.NaN
+        @Volatile private var lastPoseSentMs: Long = 0L
+        private fun publishHeadPoseThrottled() {
+            val yaw = shared.azimuthRad
+            if (!yaw.isFinite()) return
+            val now = android.os.SystemClock.elapsedRealtime()
+            val lastYaw = lastPoseSentYawRad
+            val yawChanged = lastYaw.isNaN() || kotlin.math.abs(yaw - lastYaw) > 0.0087f
+            if (!yawChanged) return
+            if (now - lastPoseSentMs < 50L) return
+            lastPoseSentYawRad = yaw
+            lastPoseSentMs = now
+            publishHeadPoseToSystemWide()
+        }
+        fun setWidth(v: Float) { shared.widthFactor = v.coerceIn(0f, 1.5f) }
+        fun setDistance(v: Float) {
+            val d = v.coerceIn(0.5f, 2.0f)
+            shared.distance = d
+            runCatching {
+                IvannaSpatialManager.setScenePose(
+                    shared.azimuthRad, shared.elevationRad, shared.distance
+                )
+            }
+            if (IvannaNativeLib.isLoaded) {
+                val distScale = 1f / sqrt(d)
+                for (i in shared.earlyReflectionTimes.indices) {
+                    runCatching {
+                        IvannaNativeLib.nativeSetReflectionDelay(i, shared.earlyReflectionTimes[i] * d)
+                        IvannaNativeLib.nativeSetReflectionGain(i, shared.earlyReflectionGains[i] * distScale)
+                    }
+                }
+            }
+        }
+        fun setReducedComplexity(reduced: Boolean) {
+            shared.reducedComplexity = reduced
+        }
+
+        // FIX: elevación existía en UI (slider binauralElevation) y en prefs
+        // pero no tenía ninguna función en el motor espacial ni llamada nativa.
+        // Se modela como pitch del head-tracker: ±45° → nativeSetSpatialParams
+        // con JSON {elevation_rad: v} que el motor HRTF ya acepta.
+        fun setElevation(rad: Float) {
+            shared.elevationRad = rad.coerceIn(-Math.PI.toFloat() / 4f, Math.PI.toFloat() / 4f)
+            publishHeadPoseToSystemWide()
+            if (IvannaNativeLib.isLoaded) runCatching {
+                IvannaNativeLib.nativeSetSpatialParams(
+                    """{"azimuth_rad":${shared.azimuthRad},"elevation_rad":${shared.elevationRad}}"""
+                )
+            }
+            // The object renderer receives the same source pose; setScenePose
+            // reports success only after the native stem coordinates read back.
+            runCatching {
+                IvannaSpatialManager.setScenePose(
+                    shared.azimuthRad, shared.elevationRad, shared.distance
+                )
+            }
+        }
+
+        /**
+         * Cablea el HeadTracker al motor nativo.
+         * onOrientationChanged → nativeSetSpatialAngleRad (yaw) en el hilo
+         * del sensor — zero-Compose, latencia mínima (~10 ms).
+         */
+        fun setHeadTracker(tracker: IvannaHeadTracker) =
+            shared.attachHeadTracker(tracker)
+    }
+
+    @Volatile private var sampleRate = 44100
+    private val maxBlockSize = 4096
+    @Volatile private var maxItdSamples = (0.0015f * sampleRate).toInt()
+    @Volatile private var crossfeedDelaySamples = (0.001f * sampleRate).toInt().coerceAtLeast(1)
+    internal val configuredSampleRateHz: Int get() = sampleRate
+    internal val itdDelayCapacitySamples: Int get() = maxItdSamples
+    internal val crossfeedDelayCapacitySamples: Int get() = crossfeedDelaySamples
+    private val earlyReflectionTimes = intArrayOf(7, 13, 17, 23)
+    private val earlyReflectionGains = floatArrayOf(0.3f, 0.2f, 0.15f, 0.1f)
+
+    @Volatile var azimuthRad: Float = 0f
+    @Volatile var elevationRad: Float = 0f
+    @Volatile var widthFactor: Float = 1.0f
+    @Volatile var distance: Float = 1.0f
+    @Volatile var reducedComplexity: Boolean = false
+
+    private var fadeGain = 1.0f
+    private var targetEnabled = true
+    private val fadeSpeed = 0.01f
+
+    private var delayedL = FloatArray(maxItdSamples)
+    private var delayedR = FloatArray(maxItdSamples)
+    private var earlyReflectionBuffers = Array(4) { FloatArray(maxBlockSize) }
+    private var crossfeedBufferL = FloatArray(crossfeedDelaySamples)
+    private var crossfeedBufferR = FloatArray(crossfeedDelaySamples)
+
+    private var itdWriteIndex = 0
+    private var crossfeedWriteIndex = 0
+    private var earlyWriteIndices = IntArray(4)
+    private var modPhase = 0f
+    private var erLowpassState = FloatArray(4)
+
+    fun attachHeadTracker(tracker: IvannaHeadTracker) {
+        tracker.onOrientationChanged = { pitch, yaw, roll ->
+            if (IvannaNativeLib.isLoaded)
+                IvannaNativeLib.nativeSetSpatialAngleRad(yaw)
+            azimuthRad = yaw
+            elevationRad = pitch
+            // v2.5.471 (F2, parte segura): publicar la pose al daemon (Ruta B,
+            // SET_HEAD_POSE) con throttle. Antes solo llegaba al cambiar el
+            // azimut a mano; el sensor nunca alimentaba la Ruta B.
+            publishHeadPoseThrottled()
+        }
+    }
+
+    fun init(modelPath: String? = null) { reset() }
+
+    /** Recalculate time-domain delay lines for the selected output sample clock. */
+    @Synchronized
+    fun configureSampleRate(rateHz: Int) {
+        if (rateHz !in 8_000..192_000 || rateHz == sampleRate) return
+        sampleRate = rateHz
+        maxItdSamples = (0.0015f * rateHz).toInt().coerceAtLeast(1)
+        crossfeedDelaySamples = (0.001f * rateHz).toInt().coerceAtLeast(1)
+        delayedL = FloatArray(maxItdSamples)
+        delayedR = FloatArray(maxItdSamples)
+        crossfeedBufferL = FloatArray(crossfeedDelaySamples)
+        crossfeedBufferR = FloatArray(crossfeedDelaySamples)
+        reset()
+    }
+
+    fun reset() {
+        delayedL.fill(0f); delayedR.fill(0f)
+        crossfeedBufferL.fill(0f); crossfeedBufferR.fill(0f)
+        earlyReflectionBuffers.forEach { it.fill(0f) }
+        earlyWriteIndices.fill(0)
+        erLowpassState.fill(0f)
+        modPhase = 0f
+        itdWriteIndex = 0; crossfeedWriteIndex = 0
+        fadeGain = 1.0f; targetEnabled = true
+        normGain = 1.0f
+    }
+
+    fun release() { reset() }
+
+    /** Estado de la normalización constant-power (suavizado entre bloques). */
+    private var normGain = 1.0f
+
+    /**
+     * FIX (ruta de volumen): la cadena espacial alteraba el nivel percibido.
+     *   1. ILD usaba sqrt((1±cos az)/2) con clamp a 0.3 — en azimut 0 daba
+     *      L=1.0 / R=0.3 (desbalance + caída de nivel) en vez de centro unitario.
+     *   2. El ancho M/S (mid + side*w) sumaba energía al subir w.
+     *   3. Las reflexiones tempranas se SUMABAN a la señal directa con ganancia
+     *      ~0.5 → copia retardada audible = el eco al subir la intensidad.
+     *   4. focusGain se calculaba y no se usaba.
+     * Ahora: paneo constant-power unitario en el centro, ancho normalizado en
+     * energía, reflexiones/crossfeed en mezcla wet/dry (no aditivas) y
+     * normalización final constant-power contra el nivel de entrada. IVANNA
+     * solo cambia la POSICIÓN espacial; el volumen es de Android/AudioManager.
+     */
+    fun processStereoInput(
+        inL: FloatArray, inR: FloatArray,
+        outL: FloatArray, outR: FloatArray,
+        numFrames: Int
+    ) {
+        val desired = IvannaSpatialEngine.enabled
+        if (desired != targetEnabled) targetEnabled = desired
+        if (targetEnabled && fadeGain < 1f) fadeGain = (fadeGain + fadeSpeed).coerceAtMost(1f)
+        else if (!targetEnabled && fadeGain > 0f) fadeGain = (fadeGain - fadeSpeed).coerceAtLeast(0f)
+
+        if (fadeGain <= 0f) {
+            System.arraycopy(inL, 0, outL, 0, numFrames)
+            System.arraycopy(inR, 0, outR, 0, numFrames)
+            return
+        }
+
+        val n = minOf(numFrames, maxBlockSize)
+        // Cola sin procesar si el bloque excede el buffer máximo (antes la
+        // condición `numFrames < n` era inalcanzable y dejaba basura en la cola).
+        if (n < numFrames) {
+            System.arraycopy(inL, n, outL, n, numFrames - n)
+            System.arraycopy(inR, n, outR, n, numFrames - n)
+        }
+
+        val azimuth = azimuthRad
+        val width = widthFactor.coerceIn(0f, 1.5f)
+        val dist = distance
+        val itdMax = maxItdSamples
+        val sinAzimuth = sin(azimuth)
+
+        // Paneo constant-power: pan = sin(az) ∈ [-1,1]; en el centro ambos
+        // canales quedan exactamente a 1.0 (0 dB) — sin caída de nivel.
+        val pan = sinAzimuth.coerceIn(-1f, 1f)
+        val theta = (PI.toFloat() / 4f) * (1f + pan)
+        val ildL = (sqrt(2f) * cos(theta)).coerceIn(0.25f, 1.42f)
+        val ildR = (sqrt(2f) * sin(theta)).coerceIn(0.25f, 1.42f)
+
+        // Ancho normalizado en energía: w = 1 → 1.0 (neutro).
+        val widthNorm = sqrt(2f / (1f + width * width))
+        // Reflexiones tempranas + crossfeed como mezcla wet/dry acotada.
+        val erWet = 0.12f
+        val distGain = 1f / sqrt(dist)
+
+        var dryPow = 0.0
+        var wetPow = 0.0
+
+        for (i in 0 until n) {
+            val writePos = itdWriteIndex
+            delayedL[writePos] = inL[i] * ildL
+            delayedR[writePos] = inR[i] * ildR
+
+            val itdSamplesF = sinAzimuth * (itdMax - 3).coerceAtLeast(1).toFloat()
+            val delayLf = (-itdSamplesF).coerceIn(0f, (itdMax - 2).toFloat())
+            val delayRf = (itdSamplesF).coerceIn(0f, (itdMax - 2).toFloat())
+
+            val dL0 = delayLf.toInt()
+            val fracL = delayLf - dL0
+            val idxL0 = (writePos - dL0 + itdMax) % itdMax
+            val idxL1 = (writePos - dL0 - 1 + itdMax) % itdMax
+            val delayedSampleL = delayedL[idxL0] * (1f - fracL) + delayedL[idxL1] * fracL
+
+            val dR0 = delayRf.toInt()
+            val fracR = delayRf - dR0
+            val idxR0 = (writePos - dR0 + itdMax) % itdMax
+            val idxR1 = (writePos - dR0 - 1 + itdMax) % itdMax
+            val delayedSampleR = delayedR[idxR0] * (1f - fracR) + delayedR[idxR1] * fracR
+
+            itdWriteIndex = (writePos + 1) % itdMax
+
+            dryPow += (inL[i] * inL[i] + inR[i] * inR[i]).toDouble()
+
+            var sampleL = delayedSampleL
+            var sampleR = delayedSampleR
+
+            val mid = (sampleL + sampleR) * 0.5f
+            val side = (sampleL - sampleR) * 0.5f
+            sampleL = (mid + side * width) * widthNorm
+            sampleR = (mid - side * width) * widthNorm
+
+            var er = 0f
+            val numTaps = if (reducedComplexity) 2 else 4
+            val tapNorm = if (reducedComplexity) 0.5f else 0.25f
+            for (j in 0 until numTaps) {
+                val delaySamples = ((earlyReflectionTimes[j] * sampleRate / 1000f).toInt()).coerceIn(1, maxBlockSize - 1)
+                val readIdx = (earlyWriteIndices[j] - delaySamples + maxBlockSize) % maxBlockSize
+                var reflected = earlyReflectionBuffers[j][readIdx] * earlyReflectionGains[j]
+                erLowpassState[j] += 0.3f * (reflected - erLowpassState[j])
+                reflected = erLowpassState[j]
+                er += reflected
+            }
+            er *= tapNorm  // normaliza la suma según la cantidad de taps activos
+
+            val xfeedFactor = 0.15f / dist
+            val xfeedReadIdx = crossfeedWriteIndex % crossfeedDelaySamples
+            val crossL = crossfeedBufferR[xfeedReadIdx] * xfeedFactor
+            val crossR = crossfeedBufferL[xfeedReadIdx] * xfeedFactor
+
+            // Mezcla wet/dry acotada: reflexiones y crossfeed NO añaden energía
+            // sobre la señal directa (fuente real del eco reportado).
+            var outSampleL = (sampleL * (1f - erWet) + (er + crossL) * erWet) * distGain
+            var outSampleR = (sampleR * (1f - erWet) + (er + crossR) * erWet) * distGain
+
+            outSampleL = outSampleL * fadeGain + inL[i] * (1f - fadeGain)
+            outSampleR = outSampleR * fadeGain + inR[i] * (1f - fadeGain)
+
+            wetPow += (outSampleL * outSampleL + outSampleR * outSampleR).toDouble()
+
+            outL[i] = outSampleL
+            outR[i] = outSampleR
+
+            val erFeed = (sampleL + sampleR) * 0.5f
+            for (j in 0 until numTaps) {
+                earlyReflectionBuffers[j][earlyWriteIndices[j]] = erFeed
+                earlyWriteIndices[j] = (earlyWriteIndices[j] + 1) % maxBlockSize
+            }
+            crossfeedBufferL[crossfeedWriteIndex] = sampleL
+            crossfeedBufferR[crossfeedWriteIndex] = sampleR
+            crossfeedWriteIndex = (crossfeedWriteIndex + 1) % crossfeedDelaySamples
+        }
+
+        // Normalización constant-power con rampa lineal muestra a muestra
+        // para eliminar saltos escalón de ganancia en fronteras de bloque.
+        val prevNormGain = normGain
+        if (dryPow > 1e-9 && wetPow > 1e-9) {
+            val target = sqrt(dryPow / wetPow).toFloat().coerceIn(0.65f, 1.35f)
+            normGain += 0.15f * (target - normGain)
+        } else {
+            normGain += 0.15f * (1f - normGain)
+        }
+        val gainStep = if (n > 0) (normGain - prevNormGain) / n.toFloat() else 0f
+        var g = prevNormGain
+        for (i in 0 until n) {
+            g += gainStep
+            outL[i] = (outL[i] * g).coerceIn(-0.98f, 0.98f)
+            outR[i] = (outR[i] * g).coerceIn(-0.98f, 0.98f)
+        }
+    }
+}

@@ -1,0 +1,222 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- SAFMUS Camera2 adapter: permission is declared for explicit foreground camera features only.
+         SAFMUS never opens the camera or prompts for access automatically. -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-feature android:name="android.hardware.camera.any" android:required="false"/>
+    <!-- ARCore (captura espacial): "optional" = la app se instala y funciona en
+         teléfonos sin ARCore; solo la pantalla de captura se degrada con aviso. -->
+    <uses-feature android:name="android.hardware.camera.ar" android:required="false"/>
+
+    <!-- Audio permissions -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- MÚSICA LOCAL (v2.5.447): leer los audios de Download y Música para
+         listarlos y reproducirlos por el BridgePlayer. Android 13+ usa
+         READ_MEDIA_AUDIO; en versiones anteriores READ_EXTERNAL_STORAGE. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <!-- v2.5.375 (Ruta B): MODIFY_AUDIO_ROUTING (signature|privileged) — sin
+         ella, AudioManager.getActivePlaybackConfigurations() devuelve copias
+         anonimizadas (sessionId=-1) y el sondeo por reflexión no puede
+         descubrir sesiones de terceros. Declararla NO la concede a una app
+         normal; es el requisito para que el sondeo devuelva IDs reales si
+         IVANNA se instala como app privilegiada (/system/priv-app) vía el
+         módulo Magisk. Sin privilegio, el fallback es el omega global
+         (sesión 0), que no necesita el sessionId. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_ROUTING"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- FIX (Bluetooth a grado magistral): BLUETOOTH_CONNECT es requerido
+         desde API 31 para BluetoothA2dp.getCodecStatus() — sin esto, la
+         detección real de códec (SBC/AAC/aptX/LDAC) lanza SecurityException
+         y el sistema se degrada al hack vendor-specific existente
+         (bt_codec_bitrate), que sigue funcionando sin este permiso. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <!-- Revisor de actualizaciones (v2.5.444): instalar la APK descargada
+         con el instalador del sistema (un toque del usuario; sin
+         instalación silenciosa). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- Voz en la nube (IvannaCloudTts) y agente Gemini necesitan salir a internet -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <!-- Wi-Fi scan results are location-sensitive on Android; request at runtime only when the user starts a scan. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+
+    <!-- Módulo Magisk: leer metadata de sesiones de audio activas (Spotify, Tidal, etc.) -->
+    <uses-permission android:name="android.permission.MEDIA_CONTENT_CONTROL"/>
+    <!-- Estadísticas de uso de apps para detectar qué app produce audio -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions"/>
+    <!-- Vibración para feedback en cambio de preset desde el módulo -->
+    <uses-permission android:name="android.permission.VIBRATE"/>
+
+    <!-- FIX (entrada tipo C / ruta libre DAC): sin este uses-feature la app ni
+         siquiera se lista como compatible con accesorios USB y el sistema no
+         le entrega ACTION_USB_DEVICE_ATTACHED cuando el usuario conecta el DAC
+         DESPUES de arrancar la app. required=false porque la app tambien debe
+         instalarse y funcionar (con fallback AudioTrack) en telefonos sin
+         host USB — la ruta directa se degrada con aviso, no con exclusion. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
+
+    <!-- Red: cambio de estado de red/WiFi para conectividad -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+
+    <application
+        android:name=".core.IVANNAApplication"
+        android:allowBackup="false"
+        android:label="IVANNA-OMEGA"
+        android:supportsRtl="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.IvannaOmega"
+        android:networkSecurityConfig="@xml/network_security_config"
+>
+        <!-- FIX 3 (v2.5.465 — app murió 2026-11-18 05:37:37): attribution tag
+             de la ruta de captura (AppOps). La captura por MediaProjection
+             (PlaybackCaptureService + SystemAudioCapture) y el wake lock de
+             captura atribuyen sus operaciones a este tag (vía
+             Context.createAttributionContext("playback_capture")). Android 12+
+             exige que todo tag usado esté declarado aquí; con targetSdk 35 un
+             tag no declarado convierte la llamada AppOps en SecurityException
+             (SECURITY_EXCEPTION_ON_INVALID_ATTRIBUTION_TAG_CHANGE, habilitado
+             a partir de targetSdk R) y mata el proceso, y las ops
+             RECORD_AUDIO_OUTPUT / WAKE_LOCK no arrancan ("Operation not
+             started").
+             FIX CI 465 (2026-11-18): AAPT (AGP 8.5.2, compileSdk 35) rechaza
+             el elemento <attribution> ("unexpected element <attribution>
+             found in <manifest><application>") y el Build APK fallaba, así
+             que el elemento se QUITA del manifiesto. La red de seguridad es
+             el runCatching alrededor de cada createAttributionContext() en
+             PlaybackCaptureService.kt y SystemAudioCapture.kt: si el tag no
+             está declarado, la llamada cae al contexto base sin matar el
+             proceso (la captura sigue; el tag solo alimenta el panel de
+             privacidad). Si AAPT lo acepta en un AGP futuro, se puede
+             redeclarar aquí. -->
+        <!-- (elemento <attribution> retirado por el fix CI 465; ver comentario) -->
+
+        <!-- FIX (ARCore): sin este meta-data, ArCoreApk.requestInstall() y Session()
+             lanzan «Application manifest must contain meta-data com.google.ar.core»
+             y la pantalla CAPTURA ESPACIAL queda inutilizable (botones deshabilitados).
+             Lo exige el SDK en el manifiesto de la APP, no basta con la dependencia.
+             scripts/check_arcore_manifest.py impide que vuelva a faltar. -->
+        <meta-data android:name="com.google.ar.core" android:value="optional"/>
+        <!-- FIX (APK corrupto): extractNativeLibs=false instruye al package manager
+             a mapear las .so directamente desde el APK sin extraerlas a disco.
+             Requiere que las .so estén sin comprimir en el APK (useLegacyPackaging=false
+             en build.gradle.kts). Sin este atributo, el comportamiento depende de la
+             versión del OS: API 23-27 extraía siempre; API 28+ respeta el flag del APK
+             pero si las .so van sin comprimir Y extractNativeLibs no está declarado,
+             algunos OEM (Motorola/Qualcomm) vuelven al modo extracción y producen
+             el APK corrupto visto en campo. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <activity android:name=".fotoholo.RoomArCaptureActivity" android:exported="false" android:screenOrientation="fullSensor" android:label="Captura espacial AR" />
+
+        <!-- Playback capture service (MediaProjection) -->
+        <service
+            android:name=".audio.PlaybackCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection"/>
+
+        <!-- Bridge playback service (v2.5.438): mantiene el proceso en
+             primer plano mientras suena el BridgePlayer (Tidal/locales),
+             para que Android no estrangule el hilo de audio al cambiar
+             a otra app (tronido-metralleta). No posee el reproductor. -->
+        <service
+            android:name=".audio.BridgePlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"/>
+
+        <!-- FIX: Receptor de sesiones de audio globales (Global Effect Manager) -->
+        <!-- Permite capturar el broadcast de Android cuando cualquier app abre audio -->
+        <receiver
+            android:name=".audio.AudioSessionReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.media.action.OPEN_AUDIO_EFFECT_CONTROL_SESSION"/>
+                <action android:name="android.media.action.CLOSE_AUDIO_EFFECT_CONTROL_SESSION"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- FIX (persistencia): el manifest pedia RECEIVE_BOOT_COMPLETED pero
+             no habia receiver para ese broadcast: el permiso no hacia nada y
+             los ajustes del usuario no volvian tras reiniciar. -->
+        <!-- LOCKED_BOOT_COMPLETED NO se declara a proposito: con
+             directBootAware="false" (correcto — el restore lee prefs del
+             almacenamiento cifrado por credencial, inaccesible antes del
+             primer desbloqueo) el sistema nunca lo entregaria; el codigo
+             del receiver lo escucha defensivamente pero desde el manifest
+             seria un action muerto. La restauracion ocurre en
+             BOOT_COMPLETED, cuando las prefs ya son legibles. -->
+        <receiver
+            android:name=".audio.BootRestoreReceiver"
+            android:exported="false"
+            android:directBootAware="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+            </intent-filter>
+        </receiver>
+
+        <!-- FIX (entrada tipo C): receiver de hotplug USB para el path DAC
+             directo. Solo escucha ATTACHED (DETACHED no se entrega a receivers
+             de manifest desde API 12+; la desconexion se cubre con el receiver
+             dinamico de UsbAudioProManager). El meta-data device_filter limita
+             el disparo a dispositivos de clase AUDIO (UAC1/UAC2) para no
+             despertar la app con cualquier pendrive o raton. -->
+        <receiver
+            android:name=".audio.UsbDacAttachReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/usb_audio_device_filter"/>
+        </receiver>
+
+        <!-- FIX (sub-entorno desconectado): CognitiveDashboardActivity existia
+             como ComponentActivity completa pero no estaba en el manifest ni la
+             lanzaba nadie -> pantalla inalcanzable. Se registra como actividad
+             interna (exported=false) para poder abrirla desde la app. -->
+        <activity
+            android:name=".ui.CognitiveDashboardActivity"
+            android:exported="false"
+            android:label="IVANNA Cognitive"/>
+
+        <!-- Revisor de actualizaciones (v2.5.444): el instalador del sistema
+             lee la APK descargada (cacheDir/updates/) por FileProvider.
+             Solo ese directorio se expone (ver res/xml/update_file_paths.xml). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_file_paths"/>
+        </provider>
+
+    </application>
+
+</manifest>

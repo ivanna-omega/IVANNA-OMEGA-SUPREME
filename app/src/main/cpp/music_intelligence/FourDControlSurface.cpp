@@ -1,0 +1,339 @@
+// FourDControlSurface.cpp — implementación de la superficie global de la Cadena 4D
+// (c) 2026 Luis Uriel Pimentel Pérez — GORE TNS. All rights reserved.
+#include "FourDControlSurface.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <limits>
+#include <cmath>
+#include <memory>
+#include <mutex>
+#include <thread>
+
+namespace ivanna { namespace fourd {
+
+namespace {
+
+// Chunk fijo: el mismo tamaño que usa el motor IME (ImeBridge kChunk=512) y holgadamente
+// por debajo del maxBlock de arranque (480). Búferes en pila -> cero malloc en audio.
+constexpr int kChunk = kAnalysisChunk;
+
+std::mutex   g_initMutex;
+std::unique_ptr<ivanna::ime::FourDExcitationChain> g_chain;
+std::atomic<bool>  g_ready{false};
+std::atomic<bool>  g_enabled{false};
+std::atomic<bool>  g_hapticsOn{false};
+std::atomic<bool>  g_xtcOn{false};
+std::atomic<bool>  g_arcOn{false};
+// Geometría de sala del cancelador de la cadena 4D (NaN = nunca fijada: conserva el valor por defecto).
+std::atomic<float> g_xtcSpan{std::numeric_limits<float>::quiet_NaN()};
+std::atomic<float> g_xtcDist{std::numeric_limits<float>::quiet_NaN()};
+std::atomic<float> g_xtcOffset{0.0f};
+std::atomic<float> g_arcDepth{0.0f};
+// Controles continuos: NaN / -1 = "nunca fijado" (la cadena conserva su valor por defecto).
+// Se guardan aquí para que lo restaurado al arrancar (antes de que exista la cadena) no se pierda.
+std::atomic<float> g_leadMs{std::numeric_limits<float>::quiet_NaN()};
+std::atomic<float> g_depth{std::numeric_limits<float>::quiet_NaN()};
+std::atomic<float> g_hapticScale{std::numeric_limits<float>::quiet_NaN()};
+std::atomic<float> g_dosCal{std::numeric_limits<float>::quiet_NaN()};
+std::atomic<int>   g_dosMode{-1};
+std::atomic<float> g_sr{48000.0f};
+std::atomic<int>   g_maxBlock{480};
+
+// Exclusión mutua NO bloqueante para el camino de audio: si otro hilo está dentro (p. ej. dos
+// rutas JNI vivas a la vez), ese bloque se omite en lugar de esperar ni de correr en paralelo
+// sobre el mismo estado. Los hilos NO de audio (init/shutdown) sí esperan (spin + yield).
+// analysis: extractor, conductor, dosímetro, háptica, escena. output: cancelador de diafonía.
+std::atomic_flag g_analysisBusy = ATOMIC_FLAG_INIT;
+std::atomic_flag g_outputBusy   = ATOMIC_FLAG_INIT;
+
+struct TryGuard {
+    std::atomic_flag& f;
+    bool ok;
+    explicit TryGuard(std::atomic_flag& x) noexcept
+        : f(x), ok(!x.test_and_set(std::memory_order_acquire)) {}
+    ~TryGuard() { if (ok) f.clear(std::memory_order_release); }
+    TryGuard(const TryGuard&) = delete;
+    TryGuard& operator=(const TryGuard&) = delete;
+};
+
+struct SpinBoth {
+    SpinBoth() noexcept {
+        while (g_analysisBusy.test_and_set(std::memory_order_acquire)) std::this_thread::yield();
+        while (g_outputBusy.test_and_set(std::memory_order_acquire))   std::this_thread::yield();
+    }
+    ~SpinBoth() {
+        g_outputBusy.clear(std::memory_order_release);
+        g_analysisBusy.clear(std::memory_order_release);
+    }
+    SpinBoth(const SpinBoth&) = delete;
+    SpinBoth& operator=(const SpinBoth&) = delete;
+};
+
+// Base de escena AJENA (la del StyleBlender) y número de la última escena PROPIA publicada.
+// Solo se tocan bajo g_analysisBusy.
+ivanna::ime::SceneApply g_baseScene{};
+uint32_t g_ownSeq = 0;
+bool     g_haveBase = false;
+
+// Un bloque con NaN/Inf envenenaría el extractor (estado con memoria) y todas las magnitudes
+// derivadas; se descarta ese bloque en la entrada. La suma es una sola pasada barata.
+inline bool blockFinite(const float* x, int n) noexcept {
+    float acc = 0.0f;
+    for (int i = 0; i < n; ++i) acc += x[i];
+    return std::isfinite(acc);
+}
+
+inline bool active() noexcept {
+    return g_ready.load(std::memory_order_acquire) && g_chain != nullptr;
+}
+
+inline ivanna::ime::FourDExcitationChain* chain() noexcept { return g_chain.get(); }
+
+void reapplyControls() noexcept {
+    auto* c = chain();
+    if (!c) return;
+    c->setEnabled(g_enabled.load(std::memory_order_relaxed));
+    c->setHapticsEnabled(g_hapticsOn.load(std::memory_order_relaxed));
+    c->setCrosstalkEnabled(g_xtcOn.load(std::memory_order_relaxed));
+    {
+        const float sp = g_xtcSpan.load(std::memory_order_relaxed), di = g_xtcDist.load(std::memory_order_relaxed);
+        if (std::isfinite(sp) && std::isfinite(di)) {
+            auto g = c->crosstalk().geometry();
+            g.spanMeters = sp; g.distanceMeters = di; g.listenerOffsetM = g_xtcOffset.load(std::memory_order_relaxed);
+            c->setSpeakerGeometry(g);
+        }
+    }
+    c->setArcDepth(g_arcDepth.load(std::memory_order_relaxed));
+    { const float v = g_leadMs.load(std::memory_order_relaxed);      if (std::isfinite(v)) c->setLeadMs(v); }
+    { const float v = g_depth.load(std::memory_order_relaxed);       if (std::isfinite(v)) c->setDepth(v); }
+    { const float v = g_hapticScale.load(std::memory_order_relaxed); if (std::isfinite(v)) c->setHapticScale(v); }
+    { const float v = g_dosCal.load(std::memory_order_relaxed);      if (std::isfinite(v)) c->setDosimeterCalibration(v); }
+    { const int m = g_dosMode.load(std::memory_order_relaxed);       if (m >= 0) c->setDosimeterMode(m); }
+    c->setArcEnabled(g_arcOn.load(std::memory_order_relaxed));
+}
+
+} // namespace
+
+// ── Ciclo de vida ────────────────────────────────────────────────────────────
+void ensureInit(float sampleRate, int maxBlock) noexcept {
+    const float sr = (sampleRate > 8000.0f && std::isfinite(sampleRate)) ? sampleRate : 48000.0f;
+    const int   mb = (maxBlock > 0) ? maxBlock : 480;
+    std::lock_guard<std::mutex> g(g_initMutex);
+    SpinBoth spin;   // el audio no puede estar dentro de la cadena mientras se re-prepara
+    if (g_ready.load(std::memory_order_acquire) && g_chain) {
+        // Re-preparar solo si cambian las condiciones (cambio de ruta / sample rate).
+        if (g_sr.load(std::memory_order_relaxed) == sr &&
+            g_maxBlock.load(std::memory_order_relaxed) == mb) {
+            return;
+        }
+    }
+    if (!g_chain) g_chain = std::make_unique<ivanna::ime::FourDExcitationChain>();
+    g_chain->prepare(sr, mb);
+    g_sr.store(sr, std::memory_order_relaxed);
+    g_maxBlock.store(mb, std::memory_order_relaxed);
+    g_haveBase = false;
+    g_ownSeq = 0;
+    g_ready.store(true, std::memory_order_release);
+    reapplyControls();
+}
+
+bool isInitialized() noexcept { return active(); }
+
+void shutdown() noexcept {
+    std::lock_guard<std::mutex> g(g_initMutex);
+    SpinBoth spin;   // espera a que el audio salga antes de liberar la cadena
+    g_ready.store(false, std::memory_order_release);
+    g_chain.reset();
+    g_haveBase = false;
+    g_ownSeq = 0;
+}
+
+// ── Interruptor maestro y sub-controles ──────────────────────────────────────
+void setEnabled(bool on) noexcept {
+    g_enabled.store(on, std::memory_order_relaxed);
+    if (active()) chain()->setEnabled(on);
+}
+bool enabled() noexcept { return g_enabled.load(std::memory_order_relaxed); }
+
+void setHapticsEnabled(bool on) noexcept {
+    g_hapticsOn.store(on, std::memory_order_relaxed);
+    if (active()) chain()->setHapticsEnabled(on);
+}
+void setHapticScale(float s) noexcept              { if (!std::isfinite(s)) return; g_hapticScale.store(s, std::memory_order_relaxed); if (active()) chain()->setHapticScale(s); }
+void setOutputLatencyMs(float ms) noexcept {
+    if (!std::isfinite(ms)) return;
+    const float applied = ms < 0.0f ? 0.0f : ms;      // el motor no acepta negativos
+    appliedOutputLatencyMsRef().store(applied, std::memory_order_relaxed);
+    if (active()) chain()->setOutputLatencyMs(applied);
+}
+void setLeadMs(float ms) noexcept                  { if (!std::isfinite(ms)) return; g_leadMs.store(ms, std::memory_order_relaxed); if (active()) chain()->setLeadMs(ms); }
+void setDepth(float d) noexcept                    { if (!std::isfinite(d)) return; g_depth.store(d, std::memory_order_relaxed); if (active()) chain()->setDepth(d); }
+void setArcEnabled(bool on) noexcept {
+    g_arcOn.store(on, std::memory_order_relaxed);
+    if (active()) chain()->setArcEnabled(on);
+}
+void setArcDepth(float d) noexcept {
+    g_arcDepth.store(std::isfinite(d) ? std::min(1.0f, std::max(0.0f, d)) : 0.0f, std::memory_order_relaxed);
+    if (active()) chain()->setArcDepth(g_arcDepth.load(std::memory_order_relaxed));
+}
+void setDosimeterMode(int mode) noexcept           { if (mode < 0 || mode > 2) return; g_dosMode.store(mode, std::memory_order_relaxed); if (active()) chain()->setDosimeterMode(mode); }
+void setDosimeterCalibration(float dbfs) noexcept  { if (!std::isfinite(dbfs)) return; g_dosCal.store(dbfs, std::memory_order_relaxed); if (active()) chain()->setDosimeterCalibration(dbfs); }
+void setCrosstalkEnabled(bool on) noexcept {
+    g_xtcOn.store(on, std::memory_order_relaxed);
+    if (active()) chain()->setCrosstalkEnabled(on);
+}
+void setSpeakerGeometry(const ivanna::spatial::CrosstalkCanceller::Geometry& g) noexcept {
+    // Se guarda para sobrevivir a que la cadena aun no exista; si nada cambio no se recalcula (se llama por bloque).
+    const bool same = g_xtcSpan.load(std::memory_order_relaxed) == g.spanMeters &&
+                      g_xtcDist.load(std::memory_order_relaxed) == g.distanceMeters &&
+                      g_xtcOffset.load(std::memory_order_relaxed) == g.listenerOffsetM;
+    g_xtcSpan.store(g.spanMeters, std::memory_order_relaxed);
+    g_xtcDist.store(g.distanceMeters, std::memory_order_relaxed);
+    g_xtcOffset.store(g.listenerOffsetM, std::memory_order_relaxed);
+    if (!same && active()) chain()->setSpeakerGeometry(g);
+}
+
+// ── Alimentación ─────────────────────────────────────────────────────────────
+void feedPlanar(const float* L, const float* R, int frames) noexcept {
+    if (!L || frames <= 0) return;
+    TryGuard tg(g_analysisBusy);
+    if (!tg.ok) return;
+    if (!active() || !g_enabled.load(std::memory_order_relaxed)) return;
+    auto* c = chain();
+    const float* rr = R ? R : L;
+    int done = 0;
+    while (done < frames) {
+        const int n = std::min(kChunk, frames - done);
+        if (blockFinite(L + done, n) && blockFinite(rr + done, n)) c->analyze(L + done, rr + done, n);
+        done += n;
+    }
+}
+
+void feedInterleaved(const float* interleaved, int frames, int channels) noexcept {
+    if (!interleaved || frames <= 0 || channels <= 0) return;
+    TryGuard tg(g_analysisBusy);
+    if (!tg.ok) return;
+    if (!active() || !g_enabled.load(std::memory_order_relaxed)) return;
+    auto* c = chain();
+    float l[kChunk], r[kChunk];
+    int done = 0;
+    while (done < frames) {
+        const int n = std::min(kChunk, frames - done);
+        const float* p = interleaved + static_cast<size_t>(done) * channels;
+        if (channels == 1) {
+            for (int i = 0; i < n; ++i) { l[i] = r[i] = p[i]; }
+        } else {
+            for (int i = 0; i < n; ++i) { l[i] = p[i * channels]; r[i] = p[i * channels + 1]; }
+        }
+        if (blockFinite(l, n) && blockFinite(r, n)) c->analyze(l, r, n);
+        done += n;
+    }
+}
+
+// ── Etapa de salida ──────────────────────────────────────────────────────────
+void applyOutputPlanar(float* L, float* R, int frames) noexcept {
+    if (!L || !R || frames <= 0) return;
+    TryGuard tg(g_outputBusy);
+    if (!tg.ok) return;
+    if (!active() || !g_xtcOn.load(std::memory_order_relaxed)) return;
+    auto* c = chain();
+    int done = 0;
+    while (done < frames) {
+        const int n = std::min(kChunk, frames - done);
+        c->applyOutputStage(L + done, R + done, n);
+        done += n;
+    }
+}
+
+void meterOutputPlanar(const float* L, const float* R, int frames) noexcept {
+    if (!L || frames <= 0) return;
+    TryGuard tg(g_analysisBusy);
+    if (!tg.ok) return;
+    if (!active() || !g_enabled.load(std::memory_order_relaxed)) return;
+    auto* c = chain();
+    const float* rr = R ? R : L;
+    int done = 0;
+    while (done < frames) {
+        const int n = std::min(kChunk, frames - done);
+        if (blockFinite(L + done, n) && blockFinite(rr + done, n)) c->meterOutput(L + done, rr + done, n);
+        done += n;
+    }
+}
+
+void applyOutputInterleaved(float* interleaved, int frames, int channels) noexcept {
+    if (!interleaved || frames <= 0 || channels <= 0) return;
+    TryGuard tg(g_outputBusy);
+    if (!tg.ok) return;
+    if (!active() || !g_xtcOn.load(std::memory_order_relaxed)) return;
+    auto* c = chain();
+    float l[kChunk], r[kChunk];
+    int done = 0;
+    while (done < frames) {
+        const int n = std::min(kChunk, frames - done);
+        float* p = interleaved + static_cast<size_t>(done) * channels;
+        if (channels == 1) {
+            for (int i = 0; i < n; ++i) { l[i] = r[i] = p[i]; }
+            c->applyOutputStage(l, r, n);
+            for (int i = 0; i < n; ++i) { p[i] = l[i]; }
+        } else {
+            for (int i = 0; i < n; ++i) { l[i] = p[i * channels]; r[i] = p[i * channels + 1]; }
+            c->applyOutputStage(l, r, n);
+            for (int i = 0; i < n; ++i) { p[i * channels] = l[i]; p[i * channels + 1] = r[i]; }
+        }
+        done += n;
+    }
+}
+
+// ── Lazo de escena ───────────────────────────────────────────────────────────
+void publishAnticipatedScene() noexcept {
+    TryGuard tg(g_analysisBusy);
+    if (!tg.ok) return;
+    if (!active() || !g_enabled.load(std::memory_order_relaxed)) return;
+    auto& bus = ivanna::ime::SceneTargetBus::instance();
+    // DEFECTO CORREGIDO: antes la base era siempre peekLatest(), y tras la primera publicación
+    // eso es la escena YA modulada por esta cadena -> se volvía a modular cada bloque y la
+    // apertura se acumulaba hasta saturar. Ahora solo una escena con número distinto del de
+    // nuestra última publicación se toma como base nueva; si no, se reutiliza la última base ajena.
+    const ivanna::ime::SceneApply cur = bus.peekLatest();
+    if (!g_haveBase || cur.seq != g_ownSeq) {
+        g_baseScene = cur;
+        g_haveBase = true;
+    }
+    chain()->publishScene(g_baseScene);
+    g_ownSeq = bus.peekLatest().seq;
+}
+
+// ── Estado ───────────────────────────────────────────────────────────────────
+ivanna::ime::FourDStatus status() noexcept {
+    ivanna::ime::FourDStatus st = active() ? chain()->status() : ivanna::ime::FourDStatus{};
+    // FIX (4D toggle, 2026-11-09): reportar el flag guardado g_enabled aunque la
+    // cadena aún no esté activa (DSP sin inicializar). Antes, con active()==false
+    // el status devolvía FourDStatus{} con enabled=false, así que la UI leía
+    // enabled=false cada 400 ms y el switch se apagaba solo aunque el usuario
+    // lo hubiera encendido (setEnabled sí guarda g_enabled; reapplyControls lo
+    // aplica a la cadena cuando el DSP se inicializa). La telemetría (anticipación,
+    // confianza, etc.) sigue en 0 sin audio, que es lo correcto.
+    st.enabled = g_enabled.load(std::memory_order_relaxed);
+    st.outputLatencyMs = appliedOutputLatencyMsRef().load(std::memory_order_relaxed);
+    return st;
+}
+
+float arcImpact() noexcept {
+    if (!active()) return 0.0f;
+    const float v = chain()->arc().impact;
+    return std::isfinite(v) ? (v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v)) : 0.0f;
+}
+
+float arcTension() noexcept {
+    if (!active()) return 0.0f;
+    const float v = chain()->arc().tension;
+    return std::isfinite(v) ? (v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v)) : 0.0f;
+}
+
+uint32_t publishedScenes() noexcept {
+    if (!active()) return 0u;
+    return chain()->status().publishedScenes;
+}
+
+}} // namespace ivanna::fourd

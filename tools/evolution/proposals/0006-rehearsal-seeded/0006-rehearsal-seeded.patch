@@ -1,0 +1,22 @@
+diff --git a/tools/evolution/rehearsal_seed.py b/tools/evolution/rehearsal_seed.py
+--- a/tools/evolution/rehearsal_seed.py
++++ b/tools/evolution/rehearsal_seed.py
+@@ -14,3 +14,15 @@
+-def clamp_amount(x: float) -> float:
+-    """Cantidad DSP 0..1. BUG SEMBRADO: devuelve x sin clampear."""
+-    return x
++def clamp_amount(x: float) -> float:
++    """Clamp a DSP amount to the inclusive range [0, 1].
++
++    The original implementation returned the input value unchanged,
++    which violated the contract that the function should constrain
++    values to the DSP‑valid interval. This refined implementation
++    ensures that any value below 0.0 is raised to 0.0 and any value
++    above 1.0 is lowered to 1.0, while values already within the range
++    are returned unchanged.
++    """
++    if x < 0.0:
++        return 0.0
++    if x > 1.0:
++        return 1.0
++    return x

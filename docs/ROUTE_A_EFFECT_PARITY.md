@@ -1,0 +1,66 @@
+# Paridad de efectos: Ruta A (captura de reproducción) frente a Ruta B (efecto del sistema)
+
+Estado: **auditoría por lectura de código y búsquedas en el repo (2026-11-04), sin ejecutar nada en dispositivo.**
+Un nombre parecido no prueba un comportamiento igual: cada fila "equivalente" es una correspondencia por lectura, no una medición.
+
+## Premisa del propietario
+
+La captura de reproducción (Ruta A: `PlaybackCaptureService` → motor nativo de la app → `AudioTrack` propio) intercepta ahora el audio. Se pidió que los efectos del producto se apliquen por esa ruta.
+
+## Hallazgo estructural
+
+`IvannaFusionCore.cpp` (clase `IvannaFusionEngine`) se compila **solo** dentro de `libomega_effect.so` (unity-build en `omega_effect.cpp`, Ruta B). La app (`libivanna_omega.so`) no lo enlaza: Ruta A arma su cadena con otras piezas. Los efectos de ese motor no corren en Ruta A salvo que tengan un equivalente propio.
+
+## Mapa por etapa
+
+| Efecto | Ruta B | Ruta A | Estado |
+|---|---|---|---|
+| Coclear activo inverso | `ctx->cochlearEngine` | `g_cochlearEngine` | mismo módulo |
+| Pipeline unificado declarativo | `unifiedPipeline` | `g_unifiedPipeline` | mismo módulo |
+| 5 ejes supremos | `supremeLattice/Cvnn/SnnHoa/Pinna/MsoFarrow` | `pipe.warpedLatticeInverter/transharmonicSynth/snnNmfHoaUpmixer/pinnaManifoldInterpolator/shmMsoArbitrator` | mismas clases con distinto nombre; Ruta A activa por `pipe`, Ruta B por bits `OMEGA_FLAG_SUPREME_*` |
+| Reconstrucción de realidad | `AcousticRealityOrchestrator` | ídem | compartido |
+| Volterra H2, anti-Dolby, RIR, punch, limitador, guardas | sí | sí | compartidos (con guardas propias en Ruta A: `s_routeAGuard`) |
+| Cadena 4D (arco, diafonía, dosímetro) | `fourd::*` | `fourd::*` | **mismo módulo**; la geometría de sala del cancelador solo llegaba a Ruta B (corregido en v2.5.346) |
+| WFS | `IvannaFusionEngine::m_wfs` | `RouteAWfsEngine` | equivalente propio |
+| NPE neuromórfico | `m_npe` (`NpeStereoCore`) | `routeAApplyNpe` antes del punch (v2.5.349) | **movido a Ruta A**: mismo núcleo, estado por `PiLstmBridge`; sin medir en dispositivo |
+| Upmix / M/S / campo AUX / campo temporal / corrección de sala | dentro de `IvannaFusionEngine` | globales y `g_upmix`, `g_widener` en el JNI | equivalentes propios, no verificados al mismo nivel |
+| Adaptativo | `ctx->adaptive` (ADE) | ADE en la app (worker Kotlin) | equivalente propio |
+| **EvolutionaryEQ** (FIR de 512 bandas) | `m_evoEq->processNEON` | `routeAApplyEvoEq` tras `g_eq` (v2.5.348) | **movido a Ruta A**: misma clase, calibración en hilo propio, toggle en la UI; sin medir en dispositivo |
+| **Escena binaural HRTF** | `m_hrtf->processBinauralScene` (`HrtfManager`) | `PDEngine::hrtf` (`HRTFConvolver`) | HRTF real en ambas rutas, motores/datasets/controles distintos; equivalencia perceptual no demostrada. No duplicar el motor en Ruta A |
+| **GoldenEar GAN** | `applyGoldenEarGAN` | casi ausente (1 mención) | solo Ruta B |
+| **`AdaptiveEngineV2`** | analiza centroide, tonalidad, percusividad y reverb; corrige umbral y razón del compresor y una ganancia que solo atenúa (≤ 1.0, ISO 226 a 1 kHz) | no existe; esos mismos actuadores (compresor, ganancia objetivo, reducción del excitador) los mueven el ADE y los controles del usuario | **no se porta por ahora**: sería un segundo controlador sobre los mismos actuadores (Ruta B ya necesita un `max()` y un producto para arbitrarlos), con efecto acotado a dinámica y atenuación |
+| **Atlas (reconstrucción de escena, dereverb estadístico, ER físico, shaper)** | los bits `OMEGA_FLAG_ATLAS_*` del snapshot se copian a `SceneTargetBus` | el mismo `SceneTargetBus` se controla desde `ivanna_ime_jni.cpp` | **el efecto sí existe en Ruta A**. Corrección: una versión anterior de este documento lo marcaba como solo-B por contar las menciones de los bits, no las del módulo. Solo los bits del snapshot son de Ruta B |
+| **Offload FastRPC** (`IvannaFastRpcClient`) | sí (hardware/root) | — | no trasladable: requiere el DSP del dispositivo |
+| Acciones del daemon sin espejo local (`SET_INTENSITY`, `SET_HARMONIC_GAIN`, `SEND_PERCEPTUAL_STATE`, `SET_PINNA_METRICS`, `SET_ROUTE_PROFILE`, `SET_ADAPTIVE_STATE`, `SET_PF_PARAMS`, `PUSH_YAMNET_SCORES`) | sí | según `docs/ROOT_VS_NOROOT_CAPABILITIES.md` | sin cambio |
+
+## Por qué esta versión no mueve efectos de B a A
+
+- Llevar `IvannaFusionEngine` completo a Ruta A **duplicaría etapas** que Ruta A ya tiene con otro nombre (WFS, upmix, M/S, compresor, EQ) y cambiaría el sonido sin que nadie lo pueda comprobar aquí.
+- El historial del repo (`AGENT_CLAIMS.md`) documenta que un cambio de rutas sin prueba en dispositivo hizo desaparecer el efecto y dejó a la app pidiendo el permiso de captura en bucle.
+- Cada traslado necesita su correspondencia de parámetros (escala y unidad), prueba de identidad cuando está apagado y una escucha o medición real.
+
+## Qué sí cambia en v2.5.346
+
+La geometría de sala del cancelador de diafonía (transaural) ahora también llega a Ruta A. En v2.5.343 solo se aplicó dentro de `omega_effect.cpp`; el cancelador de Ruta A, que es el de la cadena 4D, seguía con la geometría de escritorio (0.90 m de separación, 0.85 m de distancia) en vez de la sala 3.83 × 2.83 × 7.00 m. Se deriva de FL/FR del layout del WFS de Ruta A, con la misma función que Ruta B (`RoomGeometryConfig::crosstalkPlacement`).
+
+Verificado: prueba estructural (`tests/test_magistral_defaults.py`) y el helper compila aislado. **No** se compiló la biblioteca JNI completa (necesita NDK) ni se probó en el dispositivo.
+
+## Siguiente trabajo (en orden de menor riesgo)
+
+1. Decidir con el propietario cuáles de los efectos "solo Ruta B" usa de verdad.
+2. Por cada uno: correspondencia de parámetros, identidad bit-exacta apagado, prueba host y escucha en el dispositivo.
+3. Marcar en la UI los controles que no llegan a Ruta A.
+
+## Actualización v2.5.350
+
+- **Interruptor del EQ evolutivo:** se pintaba con `nativeIsEvolutionaryEqActive()`, que es `false` mientras la calibración corre en su hilo (unos segundos tras arrancar): mostraba "apagado" estando encendido. Y la elección no se guardaba: apagarlo se perdía al reiniciar la app, porque el nativo arranca en ON. Ahora la elección se persiste (`EvolutionaryEqPrefs`) y se reaplica en `PersistedStateRestorer`.
+- **Qué hace el EQ evolutivo — MEDIDO en host (2026-11-05):** se calibró `EvolutionaryEQ` (mismo código que Ruta A y Ruta B) y se calculó la respuesta en frecuencia de su respuesta al impulso a 48 kHz: **−0.38 dB a 60 Hz, −0.30 dB a 250 Hz, −0.02 dB a 800 Hz, +0.06 dB a 3.7 kHz, +0.24 dB a 6.9 kHz y a 13 kHz, 0.00 dB a 16 kHz, +0.02 dB a 20 kHz**; DC −0.39 dB; L y R idénticos; **pico de la respuesta al impulso en la muestra 127 (retardo 2.65 ms)**. Es decir, aunque el módulo declara una curva objetivo de "perfil de presencia" (−2 dB a ≈ 460 Hz hasta +3 dB a ≈ 13 kHz), el filtro que realmente sale de la calibración (regularizador de suavidad, tope de pico y normalización a ≤ 0 dB) se queda en **±0.4 dB**: un cambio de timbre prácticamente inaudible. **El efecto práctico de portarlo a Ruta A es añadir 2.65 ms de retardo y ≈ 25 M MAC/s por ≤ 0.4 dB.** No es un efecto de gran impacto; está en Ruta A por paridad. Si se busca el máximo impacto, el esfuerzo rinde más en otras etapas. (El reinyector de Ruta A estima el retardo del DSP; no se ha comprobado con este filtro activo.) La curva objetivo está definida en frecuencia normalizada: a 44.1 kHz bajaría un 8 %.
+- **Sin portar, a propósito:** `AdaptiveEngineV2` (ver tabla), la escena binaural de `HrtfManager` (por altavoces se apaga en modo AUX) y GoldenEar GAN (un segundo armónico a ≈ −18 dB × el deslizador, con equivalentes en el excitador y Volterra de Ruta A). El offload FastRPC no es trasladable.
+
+
+## Actualización v2.5.353 — HRTF de Ruta A y tiempo real
+
+- La escena binaural de Ruta A ya estaba implementada: `PDEngine::hrtf` procesa mediante `HRTFConvolver`; la activación llega por `nativeSetHRTFEnabled`. La fila de paridad deja de presentarla como capacidad ausente.
+- La existencia de HRTF en ambas rutas **no demuestra equivalencia**: `HrtfManager` y `HRTFConvolver` son motores distintos. Dataset, pose, filtros, latencia, mezcla y respuesta perceptual deben medirse antes de afirmar paridad.
+- El scratch HRTF de Ruta A pasa a almacenamiento fijo de 2048 frames (máximo contractual de la cadena JNI), evitando `std::vector::resize` en el callback. Un bloque superior al contrato omite HRTF y la mezcla retorna suavemente a Spatial.
+- `test_rt_no_alloc` incorpora PDEngine/HRTF en la prueba de cero asignaciones de Ruta A, con movimiento de azimut durante 10 000 bloques. El gate debe pasar en CI; no se afirma ausencia de glitches en el Moto G85.

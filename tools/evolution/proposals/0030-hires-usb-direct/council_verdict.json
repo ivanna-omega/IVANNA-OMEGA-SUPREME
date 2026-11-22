@@ -1,0 +1,20 @@
+{
+  "finding": "Puerta Hi-Fi USB: el BridgePlayer abre PCM_FLOAT al mezclador (16-bit/48k) aunque el DAC USB sea 24-bit; la vía direct_pcm + PCM_24_BIT_PACKED no existe en la app",
+  "approved": false,
+  "patch": null,
+  "rounds": [
+    {
+      "round": 1,
+      "proposer": "solución inventada",
+      "implementer": "sin diff utilizable (5 intentos)",
+      "reviewer": null
+    }
+  ],
+  "detector": {
+    "real": true,
+    "text": "REAL\n\n`IvannaBridgePlayer.kt` solo expone `OutputRoute(sampleRate, preferredDevice)` y en `selectOutputRoute()` prioriza USB por tasa anunciada, pero no hay ningún camino `direct`, ni `encoding`, ni consulta a `getDirectProfiles()` en el fragmento mostrado. La evidencia también dice que el `AudioTrack.Builder` usa `ENCODING_PCM_FLOAT` y escribe al mezclador, así que la ruta directa 24-bit no existe en este código.\n\nCausa raíz: el bridge siempre abre `AudioTrack` flotante hacia la ruta de mezcla; no hay probe de perfiles directos ni fallback a PCM_24_BIT_PACKED."
+  },
+  "reviewer": null,
+  "arbiter": null,
+  "reason": "ronda 1: el implementer no devolvió un diff utilizable en 5 intentos"
+}

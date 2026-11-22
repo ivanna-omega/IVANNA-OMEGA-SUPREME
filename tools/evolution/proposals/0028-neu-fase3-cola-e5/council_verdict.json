@@ -1,0 +1,31 @@
+{
+  "finding": "NEU·Ω incompleto: la cola difusa (T) no está en la matriz espectral (Fase 3 pendiente) — la cadena hace DOS pares FFT/IFFT donde bastaría UNO",
+  "approved": false,
+  "patch": null,
+  "rounds": [
+    {
+      "round": 1,
+      "proposer": "solución inventada",
+      "implementer": "diff redactado",
+      "reviewer": {
+        "round": 1,
+        "approved": false,
+        "text": "RECHAZADO\n\nENFOQUE: no hay parche real. El diff está vacío y no corrige nada de la causa raíz, ni mueve la cola a frecuencia, ni elimina el segundo par FFT/IFFT, ni añade el fallback fail-closed, ni incluye tests de EDC/coste/clics.\n\nExijo:\n- Implementación efectiva en `SpectralCore` para sumar la cola `T[k]` en frecuencia antes del único IFFT.\n- Desactivar el procesamiento de cola en `RirConvolver` solo cuando `NEU` esté activo, manteniendo la ruta actual cuando `NEU` esté OFF.\n- Fallback automático a cola en tiempo si la vía en frecuencia falla.\n- Tests host nuevos: EDC por banda ±1 dB, mismo T60, menor coste por hop, salida acotada/finita y sin clic al conmutar.\n- Diff limpio y aplicable sobre los archivos reales, sin APIs inventadas."
+      },
+      "reviewer2": null
+    },
+    {
+      "round": 2,
+      "proposer": "enfoque reinventado",
+      "implementer": "sin diff utilizable (5 intentos)",
+      "reviewer": null
+    }
+  ],
+  "detector": {
+    "real": false,
+    "text": "FALSO POSITIVO\n\n`SpectralCore.hpp` ya declara explícitamente `T = 0 (sin cola difusa)` y que en esta fase “este núcleo NO se conecta a la cadena en la Fase 1”; además `NeuCompiler.hpp` solo construye matrices `A_ORBE/A_HOLOS` para el núcleo espectral, no una cola RIR dentro del espectro. La cola en tiempo sigue existiendo en `RirConvolver.hpp` como camino separado, así que el hallazgo de “falta la cola en la matriz” no describe un bug del código mostrado, sino una fase de diseño no implementada todavía.\n\nCorrige el detector para que no marque como defecto real la ausencia de una optimización de fase posterior cuando el código documenta explícitamente que es intencional (`T=0`, núcleo no integrado, cola en tiempo separada). Añade un test del detector que confirme que comentarios/contratos de fase (“Fase 1”, “T=0”, “NO se conecta”) suprimen este tipo de hallazgo."
+  },
+  "reviewer": null,
+  "arbiter": null,
+  "reason": "ronda 2: el implementer no devolvió un diff utilizable en 5 intentos"
+}

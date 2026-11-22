@@ -1,0 +1,188 @@
+package com.ivanna.omega.audio
+
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.ceil
+import kotlin.math.sin
+
+/**
+ * Remuestreador estéreo intercalado L/R de sinc enventanada (Blackman-Harris),
+ * 64 taps, 1024 fases con interpolación lineal entre fases; ventana Blackman-Harris de cuatro términos.
+ *
+ * FIX (distorsión constante a cualquier volumen): la versión anterior repetía
+ * la muestra más cercana (vecino más próximo). Con 44.1/48 → 96 kHz eso crea
+ * imágenes espectrales y jitter de fase (patrón de repetición irregular en
+ * 44.1→96), y además descartaba la fracción de muestra en cada trozo
+ * ((frames*ratio).toInt()) reiniciando la fase = discontinuidad por trozo.
+ * Ahora el filtro es de banda limitada y conserva posición fraccionaria e
+ * historial entre llamadas: la salida es continua entre trozos.
+ *
+ * Latencia de grupo aproximada: HALF muestras de entrada (32). No es thread-safe: un hilo por instancia.
+ */
+class StereoAudioResampler(
+    private val targetRate: Int = 96000
+) {
+    private companion object {
+        const val TAPS = 64
+        const val HALF = TAPS / 2
+        const val PHASES = 1024
+    }
+
+    // Start at the output rate so setInputSampleRate(targetRate) is a correct no-op, while any other rate recalculates ratio and FIR cutoff.
+    private var inputRate = targetRate
+    private var step = 1.0           // muestras de entrada por muestra de salida
+    private var table = buildTable(1.0)
+
+    // Historial (TAPS frames) por canal y posición fraccionaria en coordenadas
+    // del bloque combinado [historial | entrada nueva].
+    private var histL = FloatArray(TAPS)
+    private var histR = FloatArray(TAPS)
+    private var pos = TAPS.toDouble()
+
+    // Reused per-instance workspaces: avoid allocating two channel buffers and
+    // a coefficient buffer for every decoder chunk. The instance remains
+    // single-threaded; output storage is still owned by the returned array.
+    private var workL = FloatArray(TAPS * 2)
+    private var workR = FloatArray(TAPS * 2)
+    private val coefficientScratch = FloatArray(TAPS)
+
+    private var clockCorrectionPpm = 0.0
+
+    fun setInputSampleRate(rate: Int) {
+        if (rate <= 0) return
+        if (rate != inputRate) {
+            inputRate = rate
+            clockCorrectionPpm = 0.0
+            val nominalStep = rate.toDouble() / targetRate.toDouble()
+            step = nominalStep
+            table = buildTable(if (nominalStep > 1.0) 1.0 / nominalStep else 1.0)
+            histL.fill(0f); histR.fill(0f)
+            pos = TAPS.toDouble()
+        }
+    }
+
+    /** Bounded ppm correction from paired output frame-position/timestamp samples. */
+    fun setClockCorrectionPpm(ppm: Double) {
+        // ±1000 ppm en paridad con el servo (v2.5.415; antes ±500) y con el
+        // clamp del ASRC nativo: el PLL ya no se queda sin autoridad.
+        clockCorrectionPpm = if (ppm.isFinite()) ppm.coerceIn(-1000.0, 1000.0) else 0.0
+        step = inputRate.toDouble() / targetRate.toDouble() /
+            (1.0 + clockCorrectionPpm * 1.0e-6)
+    }
+
+    // Keep the filter history current while unity-rate output is bit-transparent.
+    private fun rememberPassThrough(input: FloatArray) {
+        val frames = input.size / 2
+        if (frames >= TAPS) {
+            val start = (frames - TAPS) * 2
+            for (i in 0 until TAPS) {
+                histL[i] = input[start + i * 2]
+                histR[i] = input[start + i * 2 + 1]
+            }
+        } else if (frames > 0) {
+            System.arraycopy(histL, frames, histL, 0, TAPS - frames)
+            System.arraycopy(histR, frames, histR, 0, TAPS - frames)
+            for (i in 0 until frames) {
+                histL[TAPS - frames + i] = input[i * 2]
+                histR[TAPS - frames + i] = input[i * 2 + 1]
+            }
+        }
+        pos = TAPS.toDouble()
+    }
+
+    private fun buildTable(cutoffScale: Double): FloatArray {
+        // This sinc convention uses fc normalized to Nyquist: h(x)=sin(pi*fc*x)/(pi*x).
+        // Nyquist is therefore fc=1.0; 0.97 leaves a 3% transition band below Nyquist.
+        // cutoffScale tracks target/input ratio when downsampling (e.g. 0.5 at 96 kHz -> 48 kHz).
+        val fc = 0.97 * cutoffScale
+        val t = FloatArray((PHASES + 1) * TAPS)
+        for (p in 0..PHASES) {
+            val frac = p.toDouble() / PHASES
+            var sum = 0.0
+            val row = DoubleArray(TAPS)
+            for (k in 0 until TAPS) {
+                val x = (k - HALF + 1) - frac
+                val s = if (abs(x) < 1e-9) fc else sin(PI * fc * x) / (PI * x)
+                val u = x / HALF
+                val w = if (abs(u) >= 1.0) 0.0 else
+                    0.35875 + 0.48829 * cos(PI * u) + 0.14128 * cos(2 * PI * u) + 0.01168 * cos(3 * PI * u)
+                row[k] = s * w
+                sum += row[k]
+            }
+            // Ganancia DC unitaria en cada fase (sin modulación de nivel por fase).
+            for (k in 0 until TAPS) t[p * TAPS + k] = (row[k] / sum).toFloat()
+        }
+        return t
+    }
+
+    fun process(input: FloatArray): FloatArray {
+        // Stereo PCM is interleaved L/R. A trailing unmatched sample is not a
+        // complete frame: discard only that sample, never shift channel parity.
+        val completeInput = if (input.size % 2 == 0) input else input.copyOf(input.size - 1)
+        if (completeInput.isEmpty()) return FloatArray(0)
+
+        if (inputRate == targetRate && clockCorrectionPpm == 0.0 &&
+            completeInput.all { it.isFinite() }) {
+            rememberPassThrough(completeInput)
+            return completeInput
+        }
+        val n = completeInput.size / 2
+        if (n == 0) return FloatArray(0)
+
+        val total = TAPS + n
+        if (workL.size < total) {
+            val capacity = maxOf(total, workL.size * 2)
+            workL = FloatArray(capacity)
+            workR = FloatArray(capacity)
+        }
+        val l = workL
+        val r = workR
+        System.arraycopy(histL, 0, l, 0, TAPS)
+        System.arraycopy(histR, 0, r, 0, TAPS)
+        for (i in 0 until n) {
+            val left = completeInput[2 * i]
+            val right = completeInput[2 * i + 1]
+            // A corrupt decoder/DSP sample must not poison the FIR history.
+            l[TAPS + i] = if (left.isFinite()) left else 0f
+            r[TAPS + i] = if (right.isFinite()) right else 0f
+        }
+
+        // The loop emits one frame for each p < total - HALF. Allocate
+        // the exact upper bound instead of adding two spare frames and copying
+        // the result on every decoder chunk.
+        val available = total - HALF - pos
+        val maxOut = if (available > 0.0) ceil(available / step).toInt().coerceAtLeast(0) else 0
+        val out = FloatArray(maxOut * 2)
+        var o = 0
+        val coef = coefficientScratch
+        var p = pos
+        while (true) {
+            val ip = p.toInt()
+            if (ip + HALF > total - 1) break
+            val phaseF = (p - ip) * PHASES
+            val ph = phaseF.toInt()
+            val a = (phaseF - ph).toFloat()
+            val b0 = ph * TAPS
+            val b1 = (ph + 1) * TAPS
+            for (k in 0 until TAPS) coef[k] = table[b0 + k] * (1f - a) + table[b1 + k] * a
+            val start = ip - HALF + 1
+            var accL = 0f
+            var accR = 0f
+            for (k in 0 until TAPS) {
+                val c = coef[k]
+                accL += c * l[start + k]
+                accR += c * r[start + k]
+            }
+            if (o + 1 >= out.size) break
+            out[o++] = accL
+            out[o++] = accR
+            p += step
+        }
+
+        System.arraycopy(l, n, histL, 0, TAPS)
+        System.arraycopy(r, n, histR, 0, TAPS)
+        pos = p - n
+        return if (o == out.size) out else out.copyOf(o)
+    }
+}

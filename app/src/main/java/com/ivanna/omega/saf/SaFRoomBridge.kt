@@ -1,0 +1,123 @@
+package com.ivanna.omega.saf
+
+import com.ivanna.omega.core.IvannaNativeLib
+
+/**
+ * SaFRoomBridge — JNI Kotlin-side interface para SaFRoomOptimizer (C++).
+ *
+ * Resuelve el MAP cuadrático acotado de SAF-Room v2:
+ *   J(p) = 1/2 ||p - τ||² + λ/2 ||p - p₀||²
+ *   p* = clip((τ + λ p₀)/(1 + λ), p_min, p_max)
+ *   λ = λ₀ exp(0.15 RT60 + HRTF_mismatch_energy + 0.40 diffuseness)
+ *
+ * Esta solución es exacta para el objetivo cuadrático declarado; no afirma
+ * resolver términos perceptuales no convexos aún no cableados ni calibrados.
+ *
+ * Flujo de uso:
+ *   1. setTarget(floatArrayOf(...))     — fijar τ_t desde calibración HRTF
+ *   2. setRoomState(rt60, drr, mode)    — actualizar R_t (RoomSimulator)
+ *   3. setHrtfState(mismatch, conv)     — actualizar H_t (SaFOptimizer)
+ *   4. setSoundFieldState(diff, comp)   — actualizar S_t (SpatialEngine)
+ *   5. step()                           — resolver el MAP cuadrático acotado
+ *   6. getDiagnostics()                 — leer [estado, J*, λ, βᵀz, iter]
+ */
+object SaFRoomBridge {
+
+    private val loaded get() = IvannaNativeLib.isLoaded
+
+    // ── Fórmula principal ────────────────────────────────────────────────────
+
+    /**
+     * Resuelve el MAP cuadrático acotado en una evaluación directa.
+     * @return peso efectivo del target en el MAP [0,1]; 0f si la solución se rechaza o falla.
+     */
+    fun step(): Float =
+        if (loaded) runCatching { nativeSafrStep() }.getOrElse { 0f } else 0f
+
+    // ── Contexto de sala R_t ─────────────────────────────────────────────────
+    /**
+     * @param rt60     Tiempo de reverberación T60 [0, 5] s
+     * @param drr      Direct-to-reverb ratio [dB], típico [-10, +15]
+     * @param roomMode Energía de modos de sala (0=sin modos, 1=dominante)
+     */
+    fun setRoomState(rt60: Float, drr: Float, roomMode: Float = 0f) {
+        if (loaded) runCatching { nativeSafrSetRoom(rt60, drr, roomMode) }
+        runCatching { com.ivanna.omega.spatial.AdaptiveEnvironmentBridge.updateEnvironmentRT60(rt60) }
+    }
+
+    // ── Estado HRTF H_t ───────────────────────────────────────────────────────
+    /**
+     * @param mismatchEnergy  ‖q_t − τ_measured‖² normalizado [0, 1]
+     * @param convergenceRate EMA de ‖Δ_t‖ / ‖Δ_0‖ (0=convergido, 1=inicio)
+     */
+    fun setHrtfState(mismatchEnergy: Float, convergenceRate: Float = 0f) {
+        if (loaded) runCatching { nativeSafrSetHrtf(mismatchEnergy, convergenceRate) }
+    }
+
+    // ── Campo sonoro S_t ──────────────────────────────────────────────────────
+    /**
+     * @param diffuseness Difusividad del campo (0=onda plana, 1=difuso)
+     * @param complexity  Complejidad espectral normalizada [0, 1]
+     */
+    fun setSoundFieldState(diffuseness: Float, complexity: Float = 0f) {
+        if (loaded) runCatching { nativeSafrSetField(diffuseness, complexity) }
+    }
+
+    // ── Target τ_t ────────────────────────────────────────────────────────────
+    /**
+     * Fija el target de calibración perceptual (vector latente de 7D).
+     * Se obtiene de SaFOptimizer (calibración HRTF por direcciones).
+     */
+    fun setTarget(tau: FloatArray) {
+        if (loaded && tau.size >= 7)
+            runCatching { nativeSafrSetTarget(tau) }
+    }
+
+    // ── Lectura de estado ─────────────────────────────────────────────────────
+    /** p_t actual — vector latente HRTF/DSP (7D). */
+    fun getParams(): FloatArray =
+        if (loaded) runCatching { nativeSafrGetParams() }.getOrElse { FloatArray(7) }
+        else FloatArray(7)
+
+    /**
+     * Diagnósticos del último paso:
+     * [0] peso τ      — coeficiente exacto del target en el MAP; 0 si se rechaza
+     * [1] J*         — objetivo MAP cuadrático en la solución
+     * [2] λ_t        — fuerza del prior dependiente del contexto
+     * [3] βᵀz        — exponente contextual de λ_t
+     * [4] iteration  — contador de soluciones aceptadas
+     */
+    /** Null means JNI unavailable or the diagnostics call failed; zeros are not a success signal. */
+    fun getDiagnosticsOrNull(): FloatArray? =
+        if (loaded) runCatching { nativeSafrDiag() }.getOrNull() else null
+
+    /** Compatibility API for existing callers; telemetry should use getDiagnosticsOrNull(). */
+    fun getDiagnostics(): FloatArray = getDiagnosticsOrNull() ?: FloatArray(5)
+
+    fun reset() { if (loaded) runCatching { nativeSafrReset() } }
+
+    /**
+     * Actualiza el contexto de sala y aplica una solución MAP cerrada en un paso.
+     * [steps] se conserva por compatibilidad de API; el solver cuadrático no itera.
+     */
+    fun optimiseForCurrentRoom(
+        rt60: Float,
+        drr: Float,
+        @Suppress("UNUSED_PARAMETER") steps: Int = 24,
+        roomMode: Float = 0f
+    ): FloatArray {
+        setRoomState(rt60, drr, roomMode)
+        step()
+        return getParams()
+    }
+
+    // ── JNI ──────────────────────────────────────────────────────────────────
+    @JvmStatic private external fun nativeSafrStep(): Float
+    @JvmStatic private external fun nativeSafrSetRoom(rt60: Float, drr: Float, roomMode: Float)
+    @JvmStatic private external fun nativeSafrSetHrtf(mismatch: Float, convRate: Float)
+    @JvmStatic private external fun nativeSafrSetField(diffuseness: Float, complexity: Float)
+    @JvmStatic private external fun nativeSafrSetTarget(tau: FloatArray)
+    @JvmStatic private external fun nativeSafrGetParams(): FloatArray
+    @JvmStatic private external fun nativeSafrDiag(): FloatArray
+    @JvmStatic private external fun nativeSafrReset()
+}

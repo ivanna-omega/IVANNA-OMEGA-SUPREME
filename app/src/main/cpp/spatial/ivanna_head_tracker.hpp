@@ -1,0 +1,165 @@
+// ivanna_head_tracker.hpp
+// ============================================================================
+// IVANNA — Head Tracking 6DoF para Audio Holográfico
+// ============================================================================
+// © 2026 Luis Uriel Pimentel Pérez — GORE TNS. All rights reserved.
+//
+// [MAJESTY-6DoF-1.0] Rastreo de cabeza en tiempo real usando IMU del
+// dispositivo Android (Sensor.TYPE_ROTATION_VECTOR). Convierte la orientación
+// del dispositivo en una matriz de rotación 3D que se aplica a los coeficientes
+// HRTF en cada frame de audio.
+//
+// El sensor entrega ~100 Hz (una muestra cada ~10 ms); getPoseForAudioFrame()
+// devuelve la última pose coherente, SIN predicción al instante del frame
+// (la predicción vive en HeadTrackerFusion, que hoy no recibe datos de
+// ningún sensor: updateGyro/updateAccel/updateMagnetometer no tienen
+// llamador). No hay medición de latencia IMU→HRTF en el teléfono, así que
+// no se afirma ningún "<5 ms": la latencia real es sensor (~10 ms) +
+// JNI + bloque de audio.
+//
+// Dónde llega de verdad: IvannaHeadTracker (Kotlin) alimenta este
+// rastreador y el ObjectRenderer lo consume en renderBlock() — pero solo
+// en la ruta de reserva de PlaybackCaptureService (cuando el master
+// nativo NO está activo). Con el master nativo activo (cadena
+// ORBE→HOLOS→OMNI→Φ), ORBE/HOLOS no reciben pose y Omni lee un yaw sin
+// llamador Kotlin: el head tracking no mueve el campo en la cadena
+// principal.
+// ============================================================================
+#pragma once
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <mutex>
+
+namespace ivanna::spatial {
+
+struct alignas(16) Quaternion {
+    float x = 0.f, y = 0.f, z = 0.f, w = 1.f;
+
+    inline void fromRotationVector(const float rv[4]) noexcept {
+        // rv[0..2] = x,y,z; rv[3] = scalar (cos(theta/2))
+        x = rv[0]; y = rv[1]; z = rv[2]; w = rv[3];
+        normalize();
+    }
+
+    inline void normalize() noexcept {
+        float len = std::sqrt(x*x + y*y + z*z + w*w);
+        if (len > 1e-6f) { x /= len; y /= len; z /= len; w /= len; }
+    }
+
+    // Convierte quaternion a matriz de rotación 3x3 (column-major)
+    inline void toRotationMatrix(float out[9]) const noexcept {
+        const float xx = x*x, yy = y*y, zz = z*z;
+        const float xy = x*y, xz = x*z, yz = y*z;
+        const float wx = w*x, wy = w*y, wz = w*z;
+
+        out[0] = 1.f - 2.f*(yy + zz);  out[3] = 2.f*(xy - wz);       out[6] = 2.f*(xz + wy);
+        out[1] = 2.f*(xy + wz);        out[4] = 1.f - 2.f*(xx + zz); out[7] = 2.f*(yz - wx);
+        out[2] = 2.f*(xz - wy);        out[5] = 2.f*(yz + wx);       out[8] = 1.f - 2.f*(xx + yy);
+    }
+
+    // Yaw (rotación alrededor del eje Z, "arriba") extraído del quaternion,
+    // en grados. Convención Z-up consistente con kVirtualSpeakers (el anillo
+    // ecuatorial vive en el plano X-Y, los polos son ±Z).
+    inline float yawDegrees() const noexcept {
+        const float sinYawCosPitch = 2.f * (w*z + x*y);
+        const float cosYawCosPitch = 1.f - 2.f * (y*y + z*z);
+        return std::atan2(sinYawCosPitch, cosYawCosPitch) * 180.f / (float)M_PI;
+    }
+
+    // Pitch (rotación alrededor del eje Y) y roll (alrededor del eje X),
+    // en grados. Misma convención ZYX que yawDegrees(): yaw = atan2(
+    // 2(wz+xy), 1−2(y²+z²)), pitch = asin(2(wy−zx)), roll = atan2(
+    // 2(wx+yz), 1−2(x²+y²)). Los tres juntos son el SO(3) completo:
+    // yaw solo no basta para el parallax (cabeceo y ladeo mueven la
+    // elevación y el balance del campo). pitch se clamp a ±90° (asin).
+    inline float pitchDegrees() const noexcept {
+        const float v = std::clamp(2.f * (w*y - z*x), -1.0f, 1.0f);
+        return std::asin(v) * 180.f / (float)M_PI;
+    }
+    inline float rollDegrees() const noexcept {
+        const float sinRollCosPitch = 2.f * (w*x + y*z);
+        const float cosRollCosPitch = 1.f - 2.f * (x*x + y*y);
+        return std::atan2(sinRollCosPitch, cosRollCosPitch) * 180.f / (float)M_PI;
+    }
+
+    // Interpolación esférica (SLERP) para suavizar entre poses
+    static Quaternion slerp(const Quaternion& a, const Quaternion& b, float t) noexcept {
+        float dot = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+        Quaternion b2 = b;
+        if (dot < 0.f) { dot = -dot; b2.x = -b2.x; b2.y = -b2.y; b2.z = -b2.z; b2.w = -b2.w; }
+
+        if (dot > 0.9995f) {
+            Quaternion r;
+            r.x = a.x + t*(b2.x - a.x);
+            r.y = a.y + t*(b2.y - a.y);
+            r.z = a.z + t*(b2.z - a.z);
+            r.w = a.w + t*(b2.w - a.w);
+            r.normalize();
+            return r;
+        }
+
+        float theta0 = std::acos(dot);
+        float theta = theta0 * t;
+        float sinTheta = std::sin(theta);
+        float sinTheta0 = std::sin(theta0);
+        float s0 = std::cos(theta) - dot * sinTheta / sinTheta0;
+        float s1 = sinTheta / sinTheta0;
+
+        Quaternion r;
+        r.x = a.x*s0 + b2.x*s1;
+        r.y = a.y*s0 + b2.y*s1;
+        r.z = a.z*s0 + b2.z*s1;
+        r.w = a.w*s0 + b2.w*s1;
+        return r;
+    }
+};
+
+struct alignas(16) HeadPose {
+    Quaternion orientation;
+    float timestampMs = 0.f;
+    float confidence = 1.f;  // 0-1, basado en calidad del sensor
+};
+
+class HeadTracker {
+public:
+    // Llamado desde hilo de sensor (Java/Kotlin) a ~100Hz
+    void update(const float rotationVector[4], float timestampMs) noexcept;
+
+    // Coherent, bounded-cost read for the audio callback. It uses atomic fields
+    // and never takes the sensor/control mutex.
+    HeadPose getLatestPose() const noexcept;
+
+    // Compatibility entry point. The supplied frame time historically used a
+    // block-duration clock, while sensor timestamps use Android boot time.
+    // Until both clocks share a real origin, always return the latest coherent pose.
+    HeadPose getPoseForAudioFrame(float audioFrameTimeMs) const noexcept;
+
+    // Reset when the user pauses tracking or removes headphones.
+    void reset() noexcept;
+
+private:
+    mutable std::mutex writerMutex_;
+    std::atomic<uint32_t> latestPoseSequence_{0};
+    std::atomic<float> latestX_{0.f};
+    std::atomic<float> latestY_{0.f};
+    std::atomic<float> latestZ_{0.f};
+    std::atomic<float> latestW_{1.f};
+    std::atomic<float> latestTimestampMs_{0.f};
+    std::atomic<float> latestConfidence_{1.f};
+
+    // Legacy state kept for ABI/source compatibility; reads for the active
+    // renderer use the coherent atomic snapshot above.
+    HeadPose currentPoseSlots_[2]{};
+    std::atomic<uint32_t> activePoseSlot_{0};
+    HeadPose previousPose_{};
+    float lastTimestampMs_ = 0.f;
+
+    // Buffer circular de poses para interpolación de alta calidad
+    static constexpr int kPoseHistorySize = 8;
+    std::array<HeadPose, kPoseHistorySize> poseHistory_{};
+    std::atomic<int> historyWriteIdx_{0};
+};
+
+} // namespace ivanna::spatial

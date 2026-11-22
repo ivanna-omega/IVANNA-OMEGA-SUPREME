@@ -1,0 +1,18 @@
+{
+  "proposal": "0006-rehearsal-seeded",
+  "status": "already_applied",
+  "applied": false,
+  "dry_run": true,
+  "council": {
+    "approved": true,
+    "evidence": "COUNCIL.md: veredicto APROBADO"
+  },
+  "files": [
+    "tools/evolution/rehearsal_seed.py"
+  ],
+  "already_applied": {
+    "state": "moot",
+    "detail": "tools/evolution/rehearsal_seed.py: moot"
+  },
+  "reason": "el cambio ya está en el árbol (moot): tools/evolution/rehearsal_seed.py: moot"
+}

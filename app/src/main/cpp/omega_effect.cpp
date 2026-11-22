@@ -1,0 +1,3611 @@
+#include "IvannaAudioClassifier.hpp"
+#include <jni.h>
+#include <cstdio>  // fopen/fread (carga Genezi .ivk1, Ruta B, v2.5.369)
+#include <android/log.h>
+#include "thermal_governor.hpp"   // ThermalGovernor v2.3.0 — O(1) per RT block
+#include "IvannaFusionCore.cpp"
+#include "adaptive_engine_v2.hpp"
+#include "dsp/AdaptiveGainRamp.hpp"
+#include "spatial/RirConvolver.hpp"
+#include "spatial/RirDataset.hpp"
+#include "spatial/SofaSafRirMasterKnowledge.hpp"
+#include "spatial/SafmusLatentGuard.hpp"
+#include "spatial/HearingAdaptationEngine.hpp"
+#include "spatial/IvannaAudioPipeline.hpp"
+#include "spatial/HRTFDatabase.h"
+#include "music_intelligence/ImeBridge.hpp"
+#include "music_intelligence/FourDControlSurface.hpp"
+#include "spatial/RoomGeometryConfig.hpp"
+#include "anti_dolby.h"
+#include "neuromorphic/CochlearActiveInverseModel.hpp"
+#include "neuromorphic/volterra_h2_symmetric.hpp"
+#include "hexagon/ivanna_fastrpc_client.hpp"
+#include "supreme/WarpedLatticeTransducerInverter.hpp"
+#include "supreme/PhaseCoherentTransharmonicSynthesizer.hpp"
+#include "supreme/SnnNmfHoaUpmixer.hpp"
+#include "supreme/PinnaManifoldInterpolator.hpp"
+#include "supreme/ShmPipelineArbitrator.hpp"
+#include "include/omega_effect_evidence.h"   // evidencia medida HRTF/RIR/SAF por procesador
+#include "include/omega_effect_beacon.h"   // señal real "el efecto procesa" para la app (Ruta A/B)
+#include "include/omega_effect_no_effect.h" // v2.5.470: re-arme del auto-enable tras DISABLE espurio
+#include "include/audio_callback_clock.hpp" // reloj de cadencia software; nunca referencia de fase DAC
+#include "include/audio_hardware_clock.hpp" // estimador de frecuencia desde posiciones reales del driver
+#include "include/audio_hardware_clock_bridge.hpp" // IPC HAL -> callback; productor del HAL real
+#include "supreme/SupremeTransitionEnvelope.hpp"
+#include "supreme/SupremeAcousticStabilityGuard.hpp"
+#include "include/omega_wave_stages.hpp"
+#include "include/acoustic_unity_engine.hpp"
+#include "include/punch_engine.hpp"
+#include "include/master_output_stage.hpp"  // True-Peak 4x + TPDF + 64-bit (v2.5.461)
+#include <vector>
+#include "audio_effect_compat.h"
+#include "ivanna_asrc_bridge.h"  // ASRC del daemon (v2.5.439, magistral): puente al efecto, init lazy + fail-closed. Include dir en CMakeLists (magisk_module/engine/effect/).
+#include "include/omega_control_bus.h"
+#include "fused/new_physics_engine.hpp"  // FÍSICA NUEVA (Fase 2, v2.5.472): mismo motor que Ruta A
+#include "fused/np483_defaults.hpp"  // v2.5.483: órganos v3 despiertos con los mismos defaults que Ruta A
+#include <string.h>
+#include "security/ivanna_integrity.h"  // Anti-piratería v2.5.369: self-check de ruta de carga (Ruta B fail-closed).
+#include "security/ivanna_antitamper.h"  // Anti-piratería fase 2: anti-debug/anti-hook en Ruta B (fail-closed).
+#include <stdlib.h>
+#include <errno.h>
+#include <new>
+#include <atomic>
+#include <algorithm>   // AUDIT FIX #4: std::clamp / std::isfinite en SET_PARAM
+#include "include/SafetyLimiter.h"  // FIX distorsion: limiter de Ruta A reusado en Ruta B
+#include "include/rt_gain_slew.hpp"  // v2.5.386: slew del objetivo de ganancia adaptativa + tope 4:1 del compresor (bombeo 384/385)
+#include "include/rt_log_ring.hpp"  // v2.5.446: anillo lock-free de eventos RT — el hilo de audio ya no loguea (check_rt_safety 6 violaciones)
+#include "include/rt_band_meter.hpp"
+#include "include/fotoholo_bark_meter.hpp"
+#include <cmath>
+#include <mutex>
+#include <time.h>
+#include <condition_variable>
+#include <thread>
+
+// IvannaFusionCore = IvannaFusionEngine (alias en IvannaFusionCore.hpp).
+// using namespace evita cualificar con Ivanna:: en todo el archivo.
+using namespace Ivanna;
+
+#define LOG_TAG "IvannaOmegaEffect"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+// FIX (trazabilidad HRTF): sin este canal no habia forma de saber, en un
+// dispositivo real, si el motor estaba usando el dataset MEDIDO o habia
+// caido al sintetico — el fallback era completamente silencioso.
+#ifndef LOGW
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#endif
+// FIX (build arm64): los reintentos de arranque del hilo del motor adaptativo
+// (SET_CONFIG/ENABLE) reportan fallos con LOGE, que este archivo no definia.
+#ifndef LOGE
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#endif
+
+// ── AUDIT FIX #4 (plano de control) ──────────────────────────────────────────
+// EFFECT_CMD_SET_PARAM era un no-op: cualquier android.media.audiofx.
+// AudioEffect.setParameter() enviado por la app se descartaba en silencio.
+// El bus cross-process (OmegaControlBus, seqlock SHM) YA existía y YA está
+// enganchado a omega_process/omega_apply_snapshot — pero solo lo alimentaba
+// el daemon (command_server.publish). En un dispositivo sin root ni daemon,
+// el bus quedaba mudo y omega_process corría con los defaults del core.
+//
+// Este bloque cierra el ciclo SIN romper nada:
+//   1. El efecto conserva un reader del bus autoritativo del daemon cuando
+//      está disponible; nunca crea un segundo writer sobre ese SHM.
+//   2. Un writer independiente publica telemetría de salida en
+//      OMEGA_EFFECT_LOCAL_BUS_PATH, incluso con daemon activo.
+//   3. Cuando llega SET_PARAM, el efecto aplica directamente al DSP local y
+//      publica el snapshot en el canal de telemetría, sin alterar el control
+//      plane ni depender de un writer compartido con el daemon.
+//   3. IDs de parámetro: rango proprietary 0x00010000+, nunca colisiona
+//      con IDs AOSP reservados (0..0x00FFFFFF están reservados pero AOSP
+//      no reclama subrangos concretos para efectos custom con UUID propio).
+// ─────────────────────────────────────────────────────────────────────────────
+enum omega_effect_param_id : uint32_t {
+    OMEGA_PARAM_INTENSITY           = 0x00010001, // f32 [0..1]
+    OMEGA_PARAM_SPATIAL_WIDTH       = 0x00010002, // f32 [0..3]
+    OMEGA_PARAM_HARMONIC_GAIN       = 0x00010003, // f32 [0..2]
+    OMEGA_PARAM_COMPRESSOR_THRESHOLD= 0x00010004, // f32 (dB, <0)
+    OMEGA_PARAM_COMPRESSOR_AMOUNT   = 0x00010005, // f32 [0..1]
+    OMEGA_PARAM_LOUDNESS_TARGET     = 0x00010006, // f32 (LUFS)
+    OMEGA_PARAM_ANTI_DOLBY          = 0x00010007, // f32 [0..1]
+    OMEGA_PARAM_HIGH_CUT_HZ         = 0x00010008, // f32 (Hz)
+    OMEGA_PARAM_BASS_BOOST_DB       = 0x00010009, // f32 (dB)
+    OMEGA_PARAM_DIALOG_BOOST_DB     = 0x0001000A, // f32 (dB)
+    OMEGA_PARAM_WIDENER_MULT        = 0x0001000B, // f32 [0..2]
+    OMEGA_PARAM_ROUTE_MODE          = 0x0001000C, // i32 (RouteMode)
+    OMEGA_PARAM_MASTER_BYPASS       = 0x0001000D, // i32 (0/1)
+    OMEGA_PARAM_VOLTERRA_ON         = 0x0001000E, // i32 (0/1)
+    OMEGA_PARAM_FASTRPC_ON          = 0x0001000F, // i32 (0/1)
+    OMEGA_PARAM_ATI_ON              = 0x00010010, // i32 (0/1)
+};
+
+// Parseo AOSP effect_param_t: | u32 psize | u32 vsize | u8 param[psize] | pad4 | u8 value[vsize] |
+// Sin structs nuevos, sin depender de headers que no tengamos.
+static inline bool omega_param_read_id(const void* pCmdData, uint32_t cmdSize,
+                                       uint32_t& outId, uint32_t& outVsize,
+                                       const uint8_t*& outValPtr) noexcept {
+    if (!pCmdData) return false;
+    if (cmdSize < (uint32_t)(sizeof(uint32_t) * 3)) return false;
+    const uint8_t* p = static_cast<const uint8_t*>(pCmdData);
+    uint32_t psize, vsize;
+    memcpy(&psize, p + 0,             sizeof(uint32_t));
+    memcpy(&vsize, p + sizeof(uint32_t), sizeof(uint32_t));
+    if (psize != sizeof(uint32_t) || vsize == 0) return false;
+    const size_t hdr     = sizeof(uint32_t) * 2 + psize;
+    const size_t val_off = (hdr + 3u) & ~size_t(3u);
+    if (val_off + vsize > cmdSize) return false;
+    memcpy(&outId, p + sizeof(uint32_t) * 2, sizeof(uint32_t));
+    outVsize  = vsize;
+    outValPtr = p + val_off;
+    return true;
+}
+
+static inline bool omega_param_val_f32(const uint8_t* v, uint32_t vsize, float& out) noexcept {
+    if (vsize != sizeof(float)) return false;
+    memcpy(&out, v, sizeof(float));
+    return std::isfinite(out);
+}
+
+static inline bool omega_param_val_i32(const uint8_t* v, uint32_t vsize, int32_t& out) noexcept {
+    if (vsize != sizeof(int32_t)) return false;
+    memcpy(&out, v, sizeof(int32_t));
+    return true;
+}
+
+// EXPURGO (auditoría 2026-08-12): eliminados los 3 JNI fantasma
+//   nativeInitDSP / nativeSetSpatialWidthDirect / nativeSetHarmonicGain
+// y su singleton g_fusionCore.
+//
+// Por qué eran dead code:
+//   Este archivo compila a libomega_effect.so (módulo AudioFlinger cargado
+//   por audioserver vía dlopen, SIN máquina virtual ART). Los símbolos
+//   Java_com_ivanna_omega_core_IvannaNativeLib_* nunca pueden resolverse
+//   aquí — la app los llama contra libivanna_omega.so, donde YA existen
+//   las definiciones reales:
+//     - nativeInitDSP               → jni/ivanna_omega_jni.cpp:867
+//     - nativeSetSpatialWidthDirect → jni/ivanna_omega_jni.cpp:1171
+//     - nativeSetHarmonicGain       → jni/ivanna_omega_jni.cpp:1139
+//   El pipeline real usa IvannaFusionCore PER-INSTANCE (ctx->fusionCore,
+//   líneas 108/129/167/251/388) — nunca el global que estos JNI mantenían.
+//   Efecto: -31 líneas, tabla de símbolos de libomega_effect.so limpia.
+//   No se toca <jni.h> (otros símbolos del archivo lo pueden requerir).
+
+
+/* ════════════════════════════════════════════════════════════════════════════
+ *  IMPLEMENTACIÓN EFECTO AUDIOFLINGER (GlobalEffect / Magisk soundfx)
+ *  Punto de entrada obligatorio: símbolo "AELI"
+ *  (AUDIO_EFFECT_LIBRARY_INFO_SYM se expande a AELI vía audio_effect_compat.h)
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/* UUID propio del efecto IVANNA Omega */
+static const effect_uuid_t OMEGA_EFFECT_UUID = {
+    0x4956414e, 0x4e41, 0x4f4d, 0x4547, {0x41, 0x53, 0x55, 0x50, 0x52, 0x45}
+};
+
+static const effect_descriptor_t OMEGA_DESCRIPTOR = {
+    {0, 0, 0, 0, {0, 0, 0, 0, 0, 0}},   /* type: null (propósito general) */
+    {0x4956414e, 0x4e41, 0x4f4d, 0x4547, {0x41, 0x53, 0x55, 0x50, 0x52, 0x45}},
+    EFFECT_CONTROL_API_VERSION,
+    EFFECT_FLAG_TYPE_INSERT | EFFECT_FLAG_INSERT_ANY,
+    static_cast<uint16_t>(100),          /* cpuLoad: AOSP uint16_t */
+    static_cast<uint16_t>(16),           /* memoryUsage KB: AOSP uint16_t — v2.5.486: 128 -> 16 KB.
+        * Es solo una pista de presupuesto, no una asignación real (el efecto
+        * no reserva memoria por instancia en el APM). El presupuesto TOTAL
+        * del APM es 512 KB (MAX_EFFECTS_MEMORY): con 128 KB cabían 4
+        * instancias y el watchdog, al re-acoplar cada cambio de rola
+        * (Qobuz abre sesión nueva por rola), agotaba el presupuesto con
+        * ~12 instancias huérfanas y AudioFlinger rechazaba el acople
+        * ("memory limit exceeded", Error -3, 2026-11-20). Con 16 KB caben
+        * 32 instancias. 1024 KB hacía fallar SIEMPRE el registro con -38
+        * (INVALID_OPERATION); 16 KB es el mínimo sensato para un efecto
+        * insert con estado propio. */
+    "IVANNA Omega Effect",
+    "IVANNA OMEGA SUPREME"
+};
+
+/* Contexto por instancia. El PRIMER campo debe ser el puntero a la vtable.
+ *
+ * AUDIT FIX (session isolation): antes el estado DSP vivía en el global
+ * g_fusionCore compartido entre TODAS las sesiones de AudioFlinger. Dos
+ * pistas simultáneas (p.ej. música + navegación) pisaban el mismo estado
+ * interno (spatial renderer, HRTF, smoothers) -> glitches, saltos de
+ * ganancia y cross-talk entre sesiones. Se mueve el IvannaFusionCore a
+ * este contexto para que cada instancia tenga el suyo aislado.
+ *
+ * AUDIT FIX (realtime allocation): buffers L/R deinterleaved preasignados
+ * en el contexto (una vez, en SET_CONFIG) para evitar
+ * `static thread_local std::vector<float>::resize()` dentro del callback
+ * realtime de AudioFlinger. La rama de resize() de std::vector puede
+ * llamar a malloc bajo el hilo de audio -> jitter, XRun y en casos
+ * extremos deadlock si el allocator toca un mutex compartido.
+ *
+ * AUDIT FIX (control plane reconnect): campo lastAppliedGen guarda la
+ * última generation del OmegaControlBus (SHM) aplicada por esta instancia.
+ * Antes, omega_process ignoraba TOTALMENTE el snapshot publicado por el
+ * daemon (command_server publica pero el efecto no consumía): la UI
+ * movía sliders pero AudioFlinger corría con los defaults inmutables.
+ * Ahora cada instancia lee readLatest() al principio del callback y
+ * aplica los parámetros a su ctx->fusionCore, restaurando el puente
+ * cross-process UI -> daemon -> audioserver.
+ */
+struct omega_effect_context_t {
+    const struct effect_interface_s *itfe;
+    effect_config_t config;
+    bool enabled;
+    // v2.5.382 — FIX DEFINITIVO Ruta B: EFFECT_CMD_ENABLE jamás llega al
+    // efecto nativo en este HAL (Qualcomm), aunque la app hace setEnabled(true).
+    // Sin ENABLE, ctx->enabled=false y omega_process() cae en passthrough
+    // silencioso para siempre (beacon 0). Para distinguir "nunca habilitado"
+    // de "deshabilitado explícitamente", se rastrea aquí: DISABLE lo pone en
+    // true, ENABLE lo pone en false. omega_process() auto-habilita solo si
+    // nunca se deshabilitó explícitamente (respeta un DISABLE real).
+    bool explicitlyDisabled = false;
+    // v2.5.470 — NO_EFFECT: frames de audio acumulados tras un DISABLE
+    // (re-arme del auto-enable). Lo escribe omega_process (audio) y lo
+    // resetea omega_command en DISABLE/ENABLE (control); ver
+    // include/omega_effect_no_effect.h.
+    uint64_t disabledFrames = 0;
+    IvannaFusionEngine* fusionCore; // AUDIT FIX: DSP per-instance (era global)
+                                    // AUDIT FIX (type mismatch): la clase base
+                                    // IvannaFusionCore solo expone processBlock/
+                                    // setParameter; los metodos que usa este
+                                    // archivo (initSpatial/processStereo/
+                                    // setSpatialWidth/...) viven en la derivada
+                                    // IvannaFusionEngine. La instancia ya se crea
+                                    // como new IvannaFusionEngine(sr) — el tipo
+                                    // del puntero debe coincidir.
+    // FIX (v2.5.396, 4to brick 2026-11-11): el FusionEngine NO se crea en
+    // omega_create_effect. Su constructor hace I/O de archivos (HRTF .ihr1,
+    // agent_memory.bin por mmap) y muchas alocaciones con `new` plano; si
+    // algo ahí falla en el proceso audioserver, std::terminate tumba el
+    // servicio, el teléfono se reinicia solo y no arranca (brick). La
+    // creación se difiere a omega_process() (lazy, un solo intento): si
+    // falla, el efecto queda en passthrough y audioserver sigue vivo.
+    bool fusionCoreInitAttempted = false; // lazy init ya intentado (1 vez)
+    // FÍSICA NUEVA (Fase 2, v2.5.472): mismo NewPhysicsEngine que Ruta A,
+    // instancia por-efecto. Creación LAZY en omega_process (misma regla
+    // anti-bootloop que fusionCore, v2.5.396): nunca en omega_create_effect,
+    // new (std::nothrow), un solo intento; si falla, passthrough y
+    // audioserver sigue vivo. ABI v14: el snapshot YA trae los 17 campos
+    // np_* y omega_apply_snapshot los reenvía a los atomics g_np_* (vía
+    // omega_forward_snapshot_new_physics); este helper los sincroniza al
+    // motor cada bloque con setControls(). Sin snapshot adoptado aún, los
+    // atomics conservan sus defaults (amount 0 = bypass bit-exacto).
+    ivanna::newphys::NewPhysicsEngine* newPhysicsEngine = nullptr;
+    bool newPhysicsInitAttempted = false; // lazy init ya intentado (1 vez)
+    // ── RIR sala — instanciados per-session, cargados lazy al primer SET_ROOM_RT60
+    Ivanna::RirConvolver* rirConvolver; // convolucionador overlap-save (null hasta 1er load)
+    Ivanna::RirDataset*   rirDataset;   // dataset de 200 salas (cargado una vez por proceso)
+    float* rtL;                     // AUDIT FIX: buffer L preasignado (realtime)
+    float* rtR;                     // AUDIT FIX: buffer R preasignado (realtime)
+    float* rtDryL;                  // FIX USB-C DAC in-place: copia dry L inmune a aliasing inBuf==outBuf
+    float* rtDryR;                  // FIX USB-C DAC in-place: copia dry R inmune a aliasing inBuf==outBuf
+    float* rtVolterraScratch;       // Scratch intercalado 2*OMEGA_RT_MAX_FRAMES para Volterra sin pisar outBuf
+    int    rtCapacity;              // frames que caben en rtL/rtR
+    uint32_t lastConfiguredSr;      // SR previa para detectar hotplug de DAC Tipo-C (48k <-> 96k/192k)
+    uint64_t lastAppliedGen;        // AUDIT FIX: seguimiento de la generation SHM
+    bool     ctrlBusOpen;           // AUDIT FIX: OmegaControlBus reader ready
+    uint64_t ctrlBusOpenAttemptMs = 0; // FIX 2.5.475: último intento de abrir el reader (reintento espaciado 1 s)
+    ivanna::adaptive::AdaptiveEngineV2* adaptiveEngine;
+    bool     adaptiveEnabled;       // snapshot-controlled per-session Route-B actuator gate
+    // FIX 1 (bofo Genezi, v2.5.465): puerta de salida vigente en el último
+    // snapshot adoptado (true = SPEAKERS/Genezi: cadena de audífonos
+    // neutralizada en el efecto). Se fija en los dos puntos de adopción
+    // del snapshot (omega_process y seed de attach); calloc lo deja en
+    // false (UNKNOWN = fail-closed, aplicar snapshot tal cual).
+    bool     routeBSpeakersGate = false;
+    uint64_t adaptiveApplyBlocks;   // audio-thread count of real AdaptiveEngineV2 blocks applied
+    bool     chunkedWarned;         // AUDIT FIX: log único cuando se procesa en chunks
+    bool     thermalSkipRIR;        // ThermalGovernor: saltar RIR en tier ≥ LIMITED
+    // FIX RT (auditoría 2026-09-24): Volterra H2 (neuromorphic/volterra_h2_symmetric)
+    // es O(K²) por muestra (K=64 => ~2080 coeficientes H2, bucle NEON en
+    // grupos de 4 por cada una) — coste comparable o mayor al de RIR, pero
+    // se integró (cc23618c) SIN gate térmico: corría siempre que estaba
+    // enabled, sin importar tier. Bajo carga (WFS+HRTF+HOA+RIR+Volterra a
+    // la vez) eso es "cálculo pesado no preparado" en el hilo de audio —
+    // exactamente el patrón que agota el budget del bloque y causa
+    // desface/underrun. Mismo patrón que thermalSkipRIR: no se destruye el
+    // engine (caro recrearlo), solo se salta el bloque.
+    bool     thermalSkipVolterra;
+    // FIX (micro-cortes / voces robotizadas): vigilante de plazo de CPU. El
+    // gobernador térmico solo mira temperatura; si la cadena completa tarda
+    // mas que la duracion del bloque (SoC cargado por Tidal/Amazon + UI) el
+    // HAL sufre XRun = micro-corte. cpuShed apaga las etapas pesadas (mismos
+    // bypass suaves que el tier termico) con histeresis. calloc => 0.
+    bool     cpuShed;
+    int      cpuOverCount;
+    int      cpuUnderCount;
+    // FIX (distorsion digital): limiter por instancia al final de la cadena
+    // (tras expansion M/S TinyML + RIR). calloc zero-init deja el puntero
+    // en nullptr; se instancia lazy en SET_CONFIG junto a los buffers RT.
+    ivanna::SafetyLimiter* safetyLimiter;
+    // Etapa final maestro 64-bit (True-Peak 4x + TPDF): estado por instancia,
+    // sin malloc/locks; se prepara en SET_CONFIG/create_effect con el sr real.
+    ivanna::master::MasterOutputStage masterOutputStage;
+    // Eje 6: adaptación auditiva (isófonas, sello del ear tip, presbicusia,
+    // fatiga) — antes solo vivía en IvannaAudioPipeline (Ruta de test,
+    // PerfAuditor) y nunca se llamaba desde el callback real de AudioFlinger.
+    // Cero latencia añadida (biquads de mínima fase) — seguro al final de
+    // la cadena de Ruta B, igual que en el pipeline de referencia.
+    ivanna::spatial::HearingAdaptationEngine* hearingEngine;
+    // FIX (tronido en cambio de clase TinyML): s_sideGainSmooth era thread_local
+    // estático — si AudioFlinger rota el thread entre callbacks, cada thread nuevo
+    // arrancaba en 1.0f → salto de ganancia → tronido. Ahora es miembro del
+    // contexto por-instancia: estado persistente entre callbacks sin importar qué
+    // thread ejecuta el callback. calloc lo inicializa a 0; la primera muestra
+    // hará EMA desde 0 hacia el target, pero al ser coef ≈ 0.9998 a 48kHz la
+    // rampa de 0→1 tarda ~50ms — imperceptible vs el salto duro de ±4 dB.
+    float sideGainSmooth;
+    // FIX (tronido/zipper por escalon de ganancia adaptativa): ganancia aplicada
+    // en el bloque anterior; 0 = sin inicializar (calloc) -> se trata como 1.0.
+    float adaptGainPrev;
+    // v2.5.386 — BOMBEO (384/385): el OBJETIVO de ganancia adaptativa
+    // (V2 + ADE) se recalculaba por bloque y se rampaba dentro del bloque
+    // hasta el nuevo objetivo: si el objetivo saltaba entre bloques, la
+    // ganancia formaba un diente de sierra a ritmo de bloque = bombeo.
+    // adaptGainTargetSmooth es el objetivo con pendiente limitada ENTRE
+    // bloques (máx 0.02/bloque); compThresholdSmooth/compRatioSmooth hacen
+    // lo mismo con el compresor arbitrado (ratio topado a 4:1, ver
+    // rt_gain_slew.hpp). 1.0/-20 dB/1.0 = neutros (sin adaptación).
+    float adaptGainTargetSmooth{1.0f};
+    float compThresholdSmooth{-20.0f};
+    float compRatioSmooth{1.0f};
+    AntiDolbyState* antiDolby;
+    // Supremacía Acústica: Volterra H2 & Hexagon cDSP FastRPC
+    ivanna::dsp::VolterraH2Symmetric* volterraEngine;
+    // FALLO 5 (VOLTERRA·Ω, Ruta B): bytes del paquete .ivk1 que cargó el
+    // motor legacy en EFFECT_CMD_INIT. El fusionCore se crea LAZY en
+    // omega_process (no existe en init), así que el paquete se guarda
+    // aquí y se aplica al transductor fusionado al crear el fusionCore
+    // (una sola vez, coste único). Vacío = ningún .ivk1 cargó en init.
+    std::vector<std::uint8_t> volterraPkg;
+    ivanna::dsp::IvannaFastRpcClient* fastRpcClient;
+    bool fastRpcAvailable;
+    // Eje Supremo Coclear: CochlearActiveInverseEngine
+    ivanna::neuromorphic::CochlearActiveInverseEngine* cochlearEngine;
+    float cochlearIntensity;
+    // 5 Ejes de Supremacía Cuántico-Neuromórfica (Ruta B per-instance)
+    ivanna::supreme::WarpedLatticeTransducerInverter*      supremeLattice;
+    ivanna::supreme::PhaseCoherentTransharmonicSynthesizer* supremeCvnn;
+    ivanna::supreme::SnnNmfHoaUpmixer*                     supremeSnnHoa;
+    ivanna::supreme::PinnaManifoldInterpolator*            supremePinna;
+    ivanna::supreme::SupremeMsoFarrowArbitrator*           supremeMsoFarrow;
+    float lastPinnaConcha;
+    float lastPinnaHelix;
+    float lastPinnaHead;
+    ivanna::supreme::SupremeTransitionEnvelope masterBypassEnv;
+    // AUDIT FIX #4 (plano de control): estado del writer local para
+    // dispositivos sin daemon. Solo se abre si el reader del daemon falló.
+    // Snapshot que se publica al recibir SET_PARAM: se conserva entre
+    // llamadas para no perder los valores ya recibidos.
+    std::atomic<bool>        localWriterOpen{false}; // writer de telemetría local, separado del reader de control
+    ivanna::OmegaDspSnapshot pendingSnap;
+    ivanna::PunchEngine punch;    // v2.5.41: impacto predictivo (amount desde snapshot.ext_flags)
+    float adaptWfsScale = 1.0f;   // v2.5.15: wfs_spread_scale del ADE
+    float adaptImmScale = 1.0f;   // v2.5.15: upmix_immersivity del ADE
+    // Salidas directas del AdaptiveDecisionEngine de esta instancia de
+    // AudioFlinger. Se aplican en el mismo consumidor PCM, no solo al snapshot.
+    float adaptiveDecisionTargetGain{1.0f}; // solo atenuación [0.5, 1.0]
+    float adaptiveDecisionCompAmount{0.0f}; // intensidad compresor [0,1]
+    float adaptiveDecisionExciterReduction{0.0f}; // reducción adicional, [0,1]
+    float lastVoiceProb = 0.0f;   // v2.5.15: probabilidad VOICE medida (clasificador) para el motor adaptativo
+    bool lastVoiceProbValid = false;
+    ivanna::supreme::SupremeAcousticStabilityGuard stabilityGuard;
+    ivanna::spatial::IvannaAudioPipeline* audioPipeline;
+    ivanna::unified::DeclarativeUnifiedPipeline* unifiedPipeline;
+    uint64_t supremeAxesApplyCount;
+    ivanna::experimental::AdaptiveDecisionEngine* adaptive;
+    uint64_t lastAdaptiveSeq;
+    ivanna::rt::RtBandMeter bandMeter;
+    ivanna::rt::FotoHoloBarkMeter fotoHoloBarkMeter;
+    float fotoHoloDelta{0.0f};
+    float fotoHoloAppliedDelta{0.0f};
+    ivanna::audio::CallbackClockMonitor* callbackClock; // solo diagnóstico de cadencia del callback
+    ivanna::audio::HardwareClockReader* hardwareClockReader; // snapshot publicado por HAL/PCM
+    ivanna::audio::HardwareClockTracker* hardwareClockTracker; // estima frecuencia física; no altera PCM
+};
+
+// Bus LOCAL exclusivo de TELEMETRÍA de Ruta B. No comparte archivo ni
+// instancia con effectControlBus(), que sigue siendo reader del snapshot
+// autoritativo del daemon (/data/adb/ivanna_omega/omega_control_snapshot).
+// El writer local es único por proceso audioserver; app/JNI lo abre como reader.
+// Publicar aquí no compite con command_server ni modifica el control plane.
+static constexpr const char* OMEGA_LOCAL_BUS_PATH =
+    ivanna::OMEGA_EFFECT_LOCAL_BUS_PATH;
+
+static ivanna::OmegaControlBus& omegaLocalTelemetryBus() noexcept {
+    static ivanna::OmegaControlBus bus;
+    return bus;
+}
+static std::mutex g_omegaLocalTelemetryInitMutex;
+static std::atomic<bool> g_omegaLocalTelemetryReady{false};
+static std::atomic_flag g_omegaLocalTelemetryPublishBusy = ATOMIC_FLAG_INIT;
+
+static bool omega_ensure_local_telemetry_bus() noexcept {
+    if (g_omegaLocalTelemetryReady.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lock(g_omegaLocalTelemetryInitMutex);
+    if (g_omegaLocalTelemetryReady.load(std::memory_order_relaxed)) return true;
+    if (!omegaLocalTelemetryBus().openWriter(OMEGA_LOCAL_BUS_PATH)) return false;
+    g_omegaLocalTelemetryReady.store(true, std::memory_order_release);
+    LOGI("OmegaControlBus telemetry writer ready at %s", OMEGA_LOCAL_BUS_PATH);
+    return true;
+}
+
+// RT-safe: escritor lógico único. Si dos sesiones coinciden, la segunda
+// descarta ese frame (no espera ni bloquea el callback).
+static bool omega_publish_local_telemetry(const ivanna::OmegaDspSnapshot& snap) noexcept {
+    if (!g_omegaLocalTelemetryReady.load(std::memory_order_acquire)) return false;
+    if (g_omegaLocalTelemetryPublishBusy.test_and_set(std::memory_order_acquire)) return false;
+    const bool ok = omegaLocalTelemetryBus().publish(snap);
+    g_omegaLocalTelemetryPublishBusy.clear(std::memory_order_release);
+    return ok;
+}
+
+static void omega_local_publish_or_apply(omega_effect_context_t* ctx) noexcept;
+
+// Capacidad máxima esperada por bloque. AudioFlinger normalmente pasa
+// bloques entre 128 y 2048 frames; se reserva un margen holgado para no
+// necesitar reasignar nunca en la ruta caliente.
+static constexpr int OMEGA_RT_MAX_FRAMES = 8192;
+
+// Neutraliza únicamente los campos de actuación adaptativa del snapshot.
+// comp_amount es el control manual de ratio y se conserva; target_gain y
+// exc_red son salidas adaptativas separadas y vuelven a neutral al pasar a OFF.
+// Los parámetros explícitos de compresor, EQ, HRTF y geometría permanecen intactos.
+static inline void omega_neutralize_adaptive_snapshot(ivanna::OmegaDspSnapshot& s) noexcept {
+    // comp_amount es también el ratio solicitado por el control manual
+    // OMEGA_PARAM_COMPRESSOR_AMOUNT. Solo se neutraliza la salida adaptativa
+    // separada (adaptiveDecisionCompAmount); nunca borrar la petición del usuario.
+    s.target_gain = 1.0f;
+    s.exc_red = 0.0f;
+}
+
+// FIX 1 (bofo Genezi, v2.5.465) — PUERTA GENEZI EN EL EFECTO.
+// El snapshot trae ORBE=1.0, HOLOS=0.5 aunque la puerta de la app diga
+// SPEAKERS (medido en vivo 2026-11-18); el efecto los aplicaba directo.
+// El modo de salida viaja en el snapshot (temporal_field bits 18..19,
+// OmegaOutputMode en omega_control_bus.h, puesto por la app). Con
+// SPEAKERS el efecto neutraliza la cadena de audífonos — ORBE/HOLOS/
+// upmix/RIR/EQ a 0, ensanchador M/S a 1.0 — SIN tocar el snapshot (el
+// SHM y ctx->pendingSnap conservan los valores originales del usuario) y
+// SIN apagar ORBE/HOLOS globalmente (audífonos los siguen recibiendo).
+// UNKNOWN (escritor antiguo, modo nunca publicado) = fail-closed: se
+// aplica el snapshot tal cual, nunca silencio. Φ, Volterra, HRTF, SAF,
+// compresor y corrección de sala NO los toca esta puerta: Φ/Volterra los
+// mantiene el perfil Genezi de la app a propósito (kernel medido para el
+// PZ1D), y el HRTF ya lo apaga la app (hrtfAllowed / setAudioFeatures).
+// Ganancia neta 0.0 dB: todo lo neutralizado va a su valor identidad
+// (amount 0 = bypass bit-exacto, EQ plano + phonDelta 0 → trim 1.0).
+static inline bool omega_output_is_speakers(const ivanna::OmegaDspSnapshot& s) noexcept {
+    return ivanna::omega_output_mode_decode(s.temporal_field) ==
+           ivanna::OmegaOutputMode::SPEAKERS;
+}
+
+// ── FÍSICA NUEVA (Fase 2, v2.5.472) — ABI v14: snapshot → atomics ─────────
+// Los atomics g_np_* tienen su bloque canónico de declaraciones extern en
+// la sección Ruta B más abajo, junto a omega_apply_new_physics; pero
+// omega_apply_snapshot está ANTES en este archivo y los necesita para
+// reenviar el snapshot. Repetir aquí su declaración extern es legal
+// (misma entidad, mismo tipo) y no mueve el bloque canónico. Definiciones
+// en new_physics_globals_effect.cpp (target omega_effect, proceso
+// audioserver); la app tiene las suyas en new_physics_controls_bridge.cpp.
+extern std::atomic<float>   g_np_amount;
+extern std::atomic<float>   g_np_lgn_mix;
+extern std::atomic<float>   g_np_bs_damp;
+extern std::atomic<float>   g_np_torso_mix;
+extern std::atomic<float>   g_np_head_radius_m;
+extern std::atomic<float>   g_np_az_deg;
+extern std::atomic<float>   g_np_el_deg;
+extern std::atomic<int32_t> g_np_eq_class;
+extern std::atomic<float>   g_np_omega_sig_mix;
+extern std::atomic<float>   g_np_boost_cap_db;
+extern std::atomic<float>   g_np_xtalk_mix;
+extern std::atomic<float>   g_np_sigma_dist_m;
+extern std::atomic<float>   g_np_spl_db;
+extern std::atomic<float>   g_np_air_mix;
+extern std::atomic<float>   g_np_volterra_mix;
+extern std::atomic<float>   g_np_free_energy_mix;
+extern std::atomic<int32_t> g_np_abx_mode;
+
+// ABI v14 (Física Nueva, Fase 2, v2.5.472): el snapshot es la fuente de
+// verdad de los 17 controles np_* en Ruta B. Esta función los reenvía del
+// snapshot a los atomics g_np_*; omega_apply_new_physics los sincroniza al
+// NewPhysicsEngine cada bloque vía setControls() — esa vía NO cambia, solo
+// su fuente (antes solo los defaults de los atomics, ahora el snapshot).
+// Fail-closed: se construye un NewPhysicsControls desde el snapshot y se
+// pasa por clamp() — NaN/Inf caen a sus defaults seguros (amount 0 =
+// bypass bit-exacto) y los fuera de rango se topan; un snapshot corrupto
+// jamás deja un valor roto en los atomics ni en el motor (setControls
+// vuelve a clampar dentro del motor). Stores relaxed: lock-free y RT-safe.
+// NO crea el motor: si aún no existe, los atomics guardan los valores y
+// omega_apply_new_physics los aplica al crearlo lazy en omega_process.
+// NO se aplica aquí la puerta Genezi (SPEAKERS): el modo de salida viaja
+// en np_eq_class (E4 = Genezi PZ1D) y la app gobierna np_amount por ruta;
+// el efecto no reinterpreta el snapshot. Solo se llama con ruta
+// SYSTEM_WIDE (tras el early-return IN_PROCESS de omega_apply_snapshot):
+// en IN_PROCESS el snapshot no manda.
+static inline void omega_forward_snapshot_new_physics(
+    const ivanna::OmegaDspSnapshot& s) noexcept {
+    ivanna::newphys::NewPhysicsControls c;
+    c.amount            = s.np_amount;
+    c.lgnPinnaMix       = s.np_lgn_mix;
+    c.brightSpotDamp    = s.np_bs_damp;
+    c.torsoEchoMix      = s.np_torso_mix;
+    c.headRadiusM       = s.np_head_radius_m;
+    c.azimuthDeg        = s.np_az_deg;
+    c.elevationDeg      = s.np_el_deg;
+    c.eqClass           = static_cast<ivanna::newphys::EquipmentClass>(s.np_eq_class);
+    c.omegaSignatureMix = s.np_omega_sig_mix;
+    c.boostCapDb        = s.np_boost_cap_db;
+    c.crosstalkCompMix  = s.np_xtalk_mix;
+    c.sigmaDistanceM    = s.np_sigma_dist_m;
+    c.splEstimateDb     = s.np_spl_db;
+    c.airCompMix        = s.np_air_mix;
+    c.volterraMix       = s.np_volterra_mix;
+    c.freeEnergyMix     = s.np_free_energy_mix;
+    c.abxOverrideMode   = s.np_abx_mode;
+    c.clamp();
+    g_np_amount.store(c.amount, std::memory_order_relaxed);
+    g_np_lgn_mix.store(c.lgnPinnaMix, std::memory_order_relaxed);
+    g_np_bs_damp.store(c.brightSpotDamp, std::memory_order_relaxed);
+    g_np_torso_mix.store(c.torsoEchoMix, std::memory_order_relaxed);
+    g_np_head_radius_m.store(c.headRadiusM, std::memory_order_relaxed);
+    g_np_az_deg.store(c.azimuthDeg, std::memory_order_relaxed);
+    g_np_el_deg.store(c.elevationDeg, std::memory_order_relaxed);
+    g_np_eq_class.store(static_cast<int32_t>(c.eqClass), std::memory_order_relaxed);
+    g_np_omega_sig_mix.store(c.omegaSignatureMix, std::memory_order_relaxed);
+    g_np_boost_cap_db.store(c.boostCapDb, std::memory_order_relaxed);
+    g_np_xtalk_mix.store(c.crosstalkCompMix, std::memory_order_relaxed);
+    g_np_sigma_dist_m.store(c.sigmaDistanceM, std::memory_order_relaxed);
+    g_np_spl_db.store(c.splEstimateDb, std::memory_order_relaxed);
+    g_np_air_mix.store(c.airCompMix, std::memory_order_relaxed);
+    g_np_volterra_mix.store(c.volterraMix, std::memory_order_relaxed);
+    g_np_free_energy_mix.store(c.freeEnergyMix, std::memory_order_relaxed);
+    g_np_abx_mode.store(c.abxOverrideMode, std::memory_order_relaxed);
+}
+
+// AUDIT FIX (control plane reconnect): aplica un OmegaDspSnapshot recibido
+// vía SHM al IvannaFusionCore local. Se llama fuera del hot-path (una vez
+// por generation nueva). No hace malloc, no bloquea, no logea en cada
+// llamada. Los parámetros que el core actual no expone (EQ, dialónboost,
+// SAF, etc.) se ignoran hasta que se añadan setters en fases posteriores
+// — lo que importa aquí es que los sliders visibles de la UI (spatial
+// width, harmonic gain, compresor) SI lleguen al audio real.
+static inline void omega_apply_snapshot(IvannaFusionEngine* fc,
+                                        AntiDolbyState* ad,
+                                        const ivanna::OmegaDspSnapshot& s) noexcept {
+    if (!fc) return;
+    if (ad && std::isfinite(s.anti_dolby)) {
+        ad->setAntiDolbyIntensity(s.anti_dolby);
+    }
+    // El route arbiter marca quién aplica DSP. Si no somos SYSTEM_WIDE,
+    // ni intensity ni el resto tocan; el efecto queda enabled pero pasa.
+    // FIX (eco/desfase con sliders altos): cuando el daemon system-wide está activo,
+    // la app NO debe procesar localmente — el audio ya pasa por el daemon global.
+    // Procesar dos veces causa eco (delay doble) y desfase (filtros IIR duplicados).
+    if (static_cast<ivanna::RouteMode>(s.active_route) == ivanna::RouteMode::IN_PROCESS) {
+        return;
+    }
+    // ── Master Acoustic Orchestrator: Jerarquía Espacial (HRTF > WFS > RIR > M/S) ──
+    // Intelligent Upmixing (HOA)
+    // FIX 1 (bofo Genezi): con SPEAKERS el upmix (cadena de audífonos) va
+    // a 0; el snapshot conserva sus valores para cuando vuelvan audífonos.
+    const bool speakersGate = omega_output_is_speakers(s);
+    // FUSIÓN MAGISTRAL (Ruta B): el modo de salida llega a la cadena
+    // fusionada — el Espacial (ORBE·Ω) aplica su propia puerta Genezi
+    // (SPEAKERS → ORBE 0, HRTF 0, XTC+AuxField activos). UNKNOWN se clampa
+    // a HEADPHONES en FusedControls (fail-closed, nunca silencio).
+    fc->setFusedOutputMode(ivanna::omega_output_mode_decode(s.temporal_field));
+    const bool upmixOn = (s.upmixing_enabled != 0) && !speakersGate;
+    fc->setUpmixingEnabled(upmixOn);
+    if (std::isfinite(s.upmixing_immersivity)) {
+        fc->setImmersivity(speakersGate ? 0.f : s.upmixing_immersivity);
+    }
+    // Wave Field Synthesis con modulación acústica de AntiDolby
+    const bool wfsOn = (s.wfs_enabled != 0);
+    fc->setWfsEnabled(wfsOn);
+    if (std::isfinite(s.wfs_spread)) {
+        float spread = s.wfs_spread;
+        if (ad) spread *= ad->currentSpreadMultiplier();
+        fc->setWfsSpread(spread);
+    }
+    fc->setWfsSpeakerLayout(s.wfs_speaker_x, s.wfs_speaker_y, s.wfs_speaker_z);
+
+    // Route-B HRTF actuator gate: the core performs a smooth wet/dry transition.
+    fc->setHrtfEnabled((s.temporal_field & ivanna::OMEGA_EFFECT_HRTF_ENABLED_BIT) != 0u);
+    // ABI v8: aplicar la pose HRTF solo cuando una nueva generación llega al callback.
+    if (std::isfinite(s.head_yaw_rad) && std::isfinite(s.head_pitch_rad)) {
+        fc->updateHeadPose(std::clamp(s.head_yaw_rad, -3.14159265f, 3.14159265f),
+                           std::clamp(s.head_pitch_rad, -0.78539816f, 0.78539816f), 0.0f);
+    }
+
+    // ORBE — Binaural Esférico de Campo Cercano (ABI v9): los parámetros llegan
+    // por el snapshot desde la app (CONTROL / PersistedStateRestorer) y se
+    // aplican al FusionCore de esta instancia. amount 0 = apagado (el snapshot
+    // trae 1.0 desde la app por defecto; 0 solo si el usuario lo apaga).
+    // FIX 1 (bofo Genezi): con SPEAKERS el amount efectivo es 0 aunque el
+    // snapshot traiga 1.0; el snapshot NO se reescribe.
+    // Se clampean defensivamente: un snapshot corrupto no debe mover el motor.
+    if (std::isfinite(s.orbe_amount) && std::isfinite(s.orbe_distance_m) &&
+        std::isfinite(s.orbe_spread) && std::isfinite(s.orbe_proximity_db) &&
+        std::isfinite(s.orbe_diffuse)) {
+        fc->setOrbeParams(speakersGate ? 0.f : std::clamp(s.orbe_amount, 0.f, 1.f),
+                          std::clamp(s.orbe_distance_m, 0.15f, 2.0f),
+                          // v2.5.386 — SOBRE 380: orbe_spread topado a 1.0.
+                          // La 384 lo subió a 1.2 y ese valor quedó persistido;
+                          // el efecto lo rechaza aunque llegue un snapshot
+                          // viejo o corrupto (defensa en profundidad).
+                          std::clamp(s.orbe_spread, 0.f, 1.0f),
+                          std::clamp(s.orbe_proximity_db, 0.f, 6.f),
+                          std::clamp(s.orbe_diffuse, 0.f, 1.f),
+                          s.orbe_head_tracking != 0u);
+    }
+    const bool orbeOn = fc->isOrbeEnabled();
+    // HOLOS — Operador Único de Campo Acústico (ABI v10): los parámetros
+    // llegan por el snapshot desde la app (CONTROL / PersistedStateRestorer)
+    // y se aplican al FusionCore de esta instancia. amount 0 = apagado
+    // (el snapshot trae 0.5, harmonics 0 desde la app por defecto). Se clampean defensivamente: un snapshot corrupto no debe
+    // mover el motor. El EQ estático de Γ va plano por defecto (no-op).
+    // FIX 1 (bofo Genezi): con SPEAKERS amount 0 + EQ Γ a 0 aunque el
+    // snapshot traiga 0.5; el snapshot NO se reescribe.
+    if (std::isfinite(s.holos_amount) && std::isfinite(s.holos_distance_m) &&
+        std::isfinite(s.holos_spread) && std::isfinite(s.holos_proximity_db) &&
+        std::isfinite(s.holos_diffuse) && std::isfinite(s.holos_harmonics) &&
+        std::isfinite(s.holos_warmth) && std::isfinite(s.holos_dynamics) &&
+        std::isfinite(s.holos_width) && std::isfinite(s.holos_gamma) &&
+        std::isfinite(s.holos_room_rt60)) {
+        // v2.5.386 — SOBRE 380: holos_amount topado a 0.5, holos_width a 1.0
+        // y holos_diffuse a 0.5. La 384 los subió a 0.75/1.25/0.65 y esos
+        // valores quedaron persistidos; el efecto los rechaza aunque llegue
+        // un snapshot viejo o corrupto (defensa en profundidad).
+        fc->setHolosParams(speakersGate ? 0.f : std::clamp(s.holos_amount, 0.f, 0.5f),
+                           std::clamp(s.holos_distance_m, 0.15f, 2.0f),
+                           std::clamp(s.holos_spread, 0.f, 1.5f),
+                           std::clamp(s.holos_proximity_db, 0.f, 6.f),
+                           std::clamp(s.holos_diffuse, 0.f, 0.5f),
+                           std::clamp(s.holos_harmonics, 0.f, 1.f),
+                           std::clamp(s.holos_warmth, 0.f, 1.f),
+                           std::clamp(s.holos_dynamics, 0.f, 1.f),
+                           std::clamp(s.holos_width, 0.f, 1.0f),
+                           std::clamp(s.holos_gamma, 0.5f, 1.f),
+                           std::clamp(s.holos_room_rt60, 0.18f, 1.8f),
+                           s.holos_head_tracking != 0u,
+                           (s.holos_band_count == 12u) ? 12 : 24);
+        if (std::isfinite(s.holos_eq_low) && std::isfinite(s.holos_eq_mid) &&
+            std::isfinite(s.holos_eq_high) && std::isfinite(s.holos_eq_presence) &&
+            std::isfinite(s.holos_eq_tilt_db) && std::isfinite(s.holos_eq_freq)) {
+            if (speakersGate) {
+                fc->setHolosEq(0.f, 0.f, 0.f, 0.f, 0.f, 1000.f);
+            } else {
+                fc->setHolosEq(std::clamp(s.holos_eq_low, -12.f, 12.f),
+                               std::clamp(s.holos_eq_mid, -12.f, 12.f),
+                               std::clamp(s.holos_eq_high, -12.f, 12.f),
+                               std::clamp(s.holos_eq_presence, -12.f, 12.f),
+                               std::clamp(s.holos_eq_tilt_db, -12.f, 12.f),
+                               std::clamp(s.holos_eq_freq, 20.f, 20000.f));
+            }
+        }
+    }
+    const bool holosOn = fc->isHolosEnabled();
+    // CONSERVACIÓN PERCEPTUAL — Árbitro de campo (ABI v17, 2026-11-21):
+    // los parámetros llegan por el snapshot desde la app y se aplican al
+    // FusionCore de esta instancia. amount 0 = apagado (bypass bit-exacto).
+    // SIN puerta de bocinas (a diferencia de ORBE/HOLOS): la conservación
+    // es un guarda de energía (solo reduce, nunca crea), válida en ambos
+    // modos. Se clampean defensivamente: un snapshot corrupto no debe
+    // mover el motor.
+    if (std::isfinite(s.consv_amount) && std::isfinite(s.consv_energy_cap) &&
+        std::isfinite(s.consv_phase_coherence) && std::isfinite(s.consv_inertia)) {
+        fc->setConservationParams(std::clamp(s.consv_amount, 0.f, 1.f),
+                                  std::clamp(s.consv_energy_cap, 0.f, 1.f),
+                                  std::clamp(s.consv_phase_coherence, 0.f, 1.f),
+                                  std::clamp(s.consv_inertia, 0.f, 0.99f));
+    }
+    // Spatial width: si HOA, WFS, ORBE u HOLOS están activos, el ensanchador M/S se
+    // neutraliza para no alterar la física del frente de onda ni introducir
+    // filtro de peine.
+    // FIX 1: con SPEAKERS orbeOn/holosOn son false (amount 0 por la puerta);
+    // sin este término el widener M/S del snapshot (1.55x) se reactivaría
+    // justo al neutralizar ORBE/HOLOS. La puerta lo mantiene en 1.0.
+    if (upmixOn || wfsOn || orbeOn || holosOn || speakersGate) {
+        fc->setSpatialWidth(1.0f);
+    } else if (std::isfinite(s.spatial_width) && s.spatial_width >= 0.f) {
+        fc->setSpatialWidth(s.spatial_width);
+    }
+
+    // ── Φ — HyperState (ABI v13, 0038+0040): paridad Ruta B ───────────────
+    // El operador Φ llega por el snapshot desde la app (setHyperAmount
+    // escribe los globales g_hyper_* que gobiernan el proceso). amount 0 =
+    // apagado (bypass bit-exacto). Sin esto, Ruta B nunca inyectaba Φ
+    // aunque la directiva lo tiene ACTIVO desde 2026-11-08.
+    if (std::isfinite(s.hyper_amount)) {
+        fc->setHyperAmount(std::clamp(s.hyper_amount, 0.f, 1.f),
+                           static_cast<int>(std::clamp(s.hyper_preset, 0, 2)),
+                           s.hyper_xtc_enabled != 0u);
+    }
+
+    // ── FÍSICA NUEVA (ABI v14, Fase 2, v2.5.472) ──────────────────────────
+    // Los 17 controles np_* llegan por el snapshot desde la app/daemon y
+    // se reenvían a los atomics g_np_*; omega_apply_new_physics los
+    // sincroniza al NewPhysicsEngine cada bloque (vía setControls, que
+    // vuelve a clampar). El snapshot manda en Ruta B; sin snapshot
+    // adoptado aún, los atomics conservan sus defaults (amount 0 =
+    // bypass bit-exacto). Va tras el early-return IN_PROCESS: en
+    // IN_PROCESS el snapshot no manda.
+    omega_forward_snapshot_new_physics(s);
+
+    // ── Master Acoustic Orchestrator: Jerarquía Armónica (GoldenEarGAN > Volterra > Exciter) ──
+    // Harmonic gain (slider UI "Ganancia armónica" / GoldenEarGAN)
+    if (std::isfinite(s.harmonic_gain) && s.harmonic_gain >= 0.f) {
+        fc->setHarmonicGain(s.harmonic_gain);
+    }
+    // Compresor (threshold / ratio)
+    if (std::isfinite(s.compressor) && s.compressor < 0.f) {
+        const float ratio = 1.0f + 7.0f * std::clamp(s.comp_amount, 0.f, 1.f);
+        fc->setCompressorParams(s.compressor, ratio);
+    }
+    if (std::isfinite(s.intensity) && s.intensity > 0.f) {
+        fc->setIntensity(s.intensity);
+    }
+    const float widMult = (upmixOn || wfsOn || orbeOn || holosOn || speakersGate) ? 1.0f : (std::isfinite(s.widener_mult) && s.widener_mult > 0.f ? s.widener_mult : 1.0f);
+    fc->setRouteProfile(s.bass_boost_db, s.dialog_boost_db, widMult);
+    // FIX 1 (bofo Genezi): con SPEAKERS el EQ 10 bandas va plano y el
+    // phonDelta a 0 (listen==ref → trim 1.0, 0.0 dB netos; ver setEqGains).
+    // El snapshot conserva sus ganancias para cuando vuelvan audífonos.
+    if (speakersGate) {
+        static constexpr float kZeroEq[ivanna::OMEGA_CTRL_EQ_BANDS] = {};
+        fc->setEqGains(kZeroEq, ivanna::OMEGA_CTRL_EQ_BANDS, s.ref_phon, s.ref_phon);
+    } else {
+        fc->setEqGains(s.eq_gains, ivanna::OMEGA_CTRL_EQ_BANDS, s.listen_phon, s.ref_phon);
+    }
+    // ── Cable SAF → Ruta B — vector latente q[7] → motor HRTF ──────────────
+    // FIX: ABI v2 añade saf_q[7] + saf_q_valid al snapshot. Cuando el daemon
+    // publica un SET_SAF_STATE con el vector latente, saf_q_valid=1 y los
+    // valores llegan hasta aquí. setSafLatentParams() propaga q[] a
+    // HrtfManager::setSafLatentQ() que modula:
+    //   q[0] → curvatura Riemanniana (personalización espacial del HRTF)
+    //   q[1] → sesgo de azimut fino ±10°
+    //   q[2..6] → morph de dataset (reservado)
+    // El comentario anterior ("q[7] no cabe sin cambio de ABI") ya no aplica —
+    // la ABI fue extendida (saf_q[7] en omega_control_bus.h, OMEGA_CTRL_SAF_Q).
+    if (s.saf_q_valid == 1u && ivanna::safmus::isFiniteLatent(s.saf_q)) {
+        fc->setSafLatentParams(s.saf_q);
+    }
+    // ── Distancia de la escena → motor HRTF de la Ruta B ─────────────────────────────────────────────────────
+    // Azimut/elevación ya llegan por head_yaw/pitch_rad (updateHeadPose). La distancia viaja en npe_ctl bits 16..31;
+    // 0 = no publicada: no se toca el nivel (identidad con escritores antiguos). setSceneDistance() es idempotente.
+    {
+        const float d = ivanna::omega_scene_distance_decode(s.npe_ctl);
+        if (d > 0.f) fc->setSceneDistance(d);
+    }
+    // Aplicar saf_gain como modulación de harmonic_gain (compatibilidad con
+    // clientes que solo envían escalares SAF sin vector q[7]).
+    if (std::isfinite(s.saf_gain) && s.saf_gain > 0.f) {
+        const float safGain  = std::clamp(s.saf_gain, 0.5f, 2.0f);
+        const float safDelta = std::isfinite(s.saf_delta_energy)
+                                 ? std::clamp(s.saf_delta_energy, -1.f, 1.f)
+                                 : 0.f;
+        const float base = (std::isfinite(s.harmonic_gain) && s.harmonic_gain >= 0.f)
+                             ? s.harmonic_gain : 1.0f;
+        const float mod  = safGain * (1.0f - 0.15f * safDelta);
+        fc->setHarmonicGain(std::clamp(base * mod, 0.f, 2.0f));
+    }
+    // Volterra se gobierna en el consumidor PCM, donde puede consultar la cola
+    // real de GoldenEar y reclamar el slot de la misma generación de bloque.
+    // No usar aquí setVolterraEnabled(): esa bandera no gobierna ctx->volterraEngine.
+    fc->setFastRpcEnabled((s.flags & ivanna::OMEGA_FLAG_FASTRPC_ON) != 0);
+    fc->setAtiEnabled((s.flags & ivanna::OMEGA_FLAG_ATI_ON) != 0);
+    // Modo AUX/altavoces (bits 25..31 del snapshot: activo + crossover + coherencia).
+    {
+        bool auxOn = false; float auxXo = 120.f, auxCoh = 1.f;
+        ivanna::omega_aux_field_decode(s.flags, auxOn, auxXo, auxCoh);
+        fc->setAuxField(auxOn, auxXo, auxCoh);
+    }
+    // 4D: dinamica espacial temporal (campo temporal_field del snapshot).
+    {
+        bool tOn = false, tAuto = false; float tAmt = 0.6f;
+        ivanna::omega_temporal_field_decode(s.temporal_field, tOn, tAmt, tAuto);
+        fc->setTemporalField(tOn, tAmt, tAuto);
+    }
+    // Corrección acústica de sala medida (snapshot v6: room_corr_db[10]).
+    fc->setRoomCorrection(s.room_corr_db);
+    // Motor NPE neuromórfico (snapshot v7). La ganancia armónica es la misma que ya usan los demás motores.
+    fc->setCrosstalk((s.temporal_field & ivanna::OMEGA_TEMPORAL_FIELD_XTC_BIT) != 0u);   // diafonía (altavoces)
+    {
+        bool npeOn = false; float npeMasterDb = 0.f;
+        ivanna::omega_npe_ctl_decode(s.npe_ctl, npeOn, npeMasterDb);
+        fc->setNpe(npeOn, s.harmonic_gain, s.npe_lateral_inhib, s.npe_ohc_compression, npeMasterDb);
+    }
+}
+
+// Route B FotoHolo: apply the previous real-PCM Bark frame to the current
+// spatial owner. Called once per AudioFlinger callback, outside the analyzer loop.
+// The observer itself is read-only; this function only adjusts the selected actuator.
+static inline void omega_apply_fotoholo_modulation(omega_effect_context_t* ctx,
+                                                   IvannaFusionEngine* fc,
+                                                   AntiDolbyState* ad,
+                                                   int frames) noexcept {
+    if (!ctx || !fc || ctx->lastAppliedGen == 0u) return;
+    const auto& s = ctx->pendingSnap;
+    if (static_cast<ivanna::RouteMode>(s.active_route) == ivanna::RouteMode::IN_PROCESS) {
+        ctx->fotoHoloDelta = 0.0f;
+        ctx->fotoHoloAppliedDelta = 0.0f;
+        return;
+    }
+    bool enabled = false;
+    float intensity = 0.0f;
+    ivanna::omega_fotoholo_decode(s.temporal_field, enabled, intensity);
+    const float targetDelta = enabled && std::isfinite(ctx->fotoHoloDelta)
+        ? std::clamp(ctx->fotoHoloDelta, -0.25f, 0.25f) : 0.0f;
+    const uint32_t sr = ctx->lastConfiguredSr >= 8000u ? ctx->lastConfiguredSr : 48000u;
+    // Match Route A's 0.01 per 50 ms slew, scaled to this callback duration.
+    const float maxStep = std::clamp(0.2f * static_cast<float>(std::max(frames, 0)) /
+                                    static_cast<float>(sr), 0.00001f, 0.01f);
+    const float delta = ctx->fotoHoloAppliedDelta +
+        std::clamp(targetDelta - ctx->fotoHoloAppliedDelta, -maxStep, maxStep);
+    ctx->fotoHoloAppliedDelta = delta;
+    // Match omega_apply_snapshot / ControlPlaneEvidence priority exactly: WFS > HOA > M/S.
+    if (s.wfs_enabled != 0u) {
+        float base = std::isfinite(s.wfs_spread) ? std::clamp(s.wfs_spread, 0.0f, 2.0f) : 1.0f;
+        if (ad) base *= std::clamp(ad->currentSpreadMultiplier(), 0.0f, 2.0f);
+        fc->setWfsSpread(std::clamp(base + delta * 0.5f, 0.0f, 2.0f));
+    } else if (s.upmixing_enabled != 0u) {
+        const float base = std::isfinite(s.upmixing_immersivity)
+            ? std::clamp(s.upmixing_immersivity, 0.0f, 1.0f) : 0.0f;
+        fc->setImmersivity(std::clamp(base + delta * 0.25f, 0.0f, 1.0f));
+    } else {
+        // FIX 1 (bofo Genezi): con SPEAKERS la base del ensanchador es 1.0
+        // (el snapshot trae 1.55x); sin esto FotoHolo modularía el ancho
+        // M/S sobre bocinas aunque omega_apply_snapshot lo fije en 1.0.
+        const float base = ctx->routeBSpeakersGate
+            ? 1.0f
+            : (std::isfinite(s.spatial_width)
+                   ? std::clamp(s.spatial_width, 0.0f, 1.5f) : 1.0f);
+        const float ceiling = std::max(1.2f, base);
+        fc->setSpatialWidth(std::clamp(base + delta, 0.0f, ceiling));
+    }
+    (void)intensity; // Intensity is applied by the Route B meter when it computes fotoHoloDelta.
+}
+
+static inline void omega_apply_supreme_axes(omega_effect_context_t* ctx,
+                                            const ivanna::OmegaDspSnapshot& s) noexcept {
+    if (!ctx) return;
+    ctx->supremeAxesApplyCount += 1u;
+    if (static_cast<ivanna::RouteMode>(s.active_route) == ivanna::RouteMode::IN_PROCESS) {
+        return;
+    }
+    // FIX 1 (bofo Genezi): con SPEAKERS la sala del snapshot no se aplica
+    // (RT60/wet efectivos 0 → archetype 0, roomEngine inactivo). Scope de
+    // función: los usan el bloque supremeLattice Y el de audioPipeline.
+    const bool speakersGate = omega_output_is_speakers(s);
+    const float roomRt60Eff = speakersGate ? 0.f : s.room_rt60_s;
+    const float roomWetEff = speakersGate ? 0.f : s.room_wet;
+    if (ctx->supremeLattice) {
+        ctx->supremeLattice->setEnabled((s.flags & ivanna::OMEGA_FLAG_SUPREME_LATTICE_ON) != 0);
+        ctx->supremeLattice->setMicroChirpEnabled((s.flags & ivanna::OMEGA_FLAG_SUPREME_MICROCHIRP_ON) != 0);
+        if (std::isfinite(s.supreme_lattice_bl_drive))
+            ctx->supremeLattice->setBlCompensationDrive(s.supreme_lattice_bl_drive);
+        if (std::isfinite(s.supreme_lattice_lambda))
+            ctx->supremeLattice->setWarpingLambda(s.supreme_lattice_lambda);
+        const int routeArch = (roomRt60Eff > 0.52f) ? 2 : ((roomRt60Eff > 0.01f && roomRt60Eff < 0.31f) ? 1 : 0);
+        ctx->supremeLattice->setRouteArchetype(routeArch);
+        if (ctx->rirConvolver) {
+            ctx->rirConvolver->setTrueStereoCrossGain(0.20f);
+            // RIR wet-tail crossmix is not a calibrated speaker-to-ear inverse; keep it off.
+            // The route-gated FourD CrosstalkCanceller is the only runtime XTC stage.
+            ctx->rirConvolver->setTransauralXtcStrength(0.0f);
+        }
+    }
+    if (ctx->supremeCvnn) {
+        ctx->supremeCvnn->setEnabled((s.flags & ivanna::OMEGA_FLAG_SUPREME_CVNN_ON) != 0);
+        if (std::isfinite(s.supreme_cvnn_harmonic_gain))
+            ctx->supremeCvnn->setHarmonicGain(s.supreme_cvnn_harmonic_gain);
+        if (std::isfinite(s.supreme_cvnn_imd_cancel))
+            ctx->supremeCvnn->setImdCancelStrength(s.supreme_cvnn_imd_cancel);
+        if (std::isfinite(s.supreme_cvnn_tape_drive))
+            ctx->supremeCvnn->setAnalogTapeDrive(s.supreme_cvnn_tape_drive);
+    }
+    if (ctx->supremeSnnHoa) {
+        ctx->supremeSnnHoa->setEnabled((s.flags & ivanna::OMEGA_FLAG_SUPREME_SNN_HOA_ON) != 0);
+        if (std::isfinite(s.supreme_snn_immersivity))
+            ctx->supremeSnnHoa->setImmersivity(s.supreme_snn_immersivity);
+        if (std::isfinite(s.supreme_snn_spike_threshold))
+            ctx->supremeSnnHoa->setSnnThreshold(s.supreme_snn_spike_threshold);
+    }
+    if (ctx->supremePinna) {
+        ctx->supremePinna->setEnabled((s.flags & ivanna::OMEGA_FLAG_SUPREME_PINNA_ON) != 0);
+        if (std::isfinite(s.supreme_pinna_wet_mix))
+            ctx->supremePinna->setWetMix(s.supreme_pinna_wet_mix);
+        if (std::isfinite(s.supreme_pinna_concha_depth) &&
+            std::isfinite(s.supreme_pinna_helix_curl) &&
+            std::isfinite(s.supreme_pinna_head_width)) {
+            if (std::fabs(s.supreme_pinna_concha_depth - ctx->lastPinnaConcha) > 1.0e-4f ||
+                std::fabs(s.supreme_pinna_helix_curl   - ctx->lastPinnaHelix)  > 1.0e-4f ||
+                std::fabs(s.supreme_pinna_head_width   - ctx->lastPinnaHead)   > 1.0e-4f) {
+                ctx->lastPinnaConcha = s.supreme_pinna_concha_depth;
+                ctx->lastPinnaHelix  = s.supreme_pinna_helix_curl;
+                ctx->lastPinnaHead   = s.supreme_pinna_head_width;
+                const uint32_t srNow = (ctx->config.outputCfg.samplingRate != 0)
+                                     ? ctx->config.outputCfg.samplingRate : 48000u;
+                ctx->supremePinna->calibrateFromLatents(
+                    ctx->lastPinnaConcha, ctx->lastPinnaHelix, ctx->lastPinnaHead, (float)srNow);
+            }
+        }
+    }
+    if (ctx->supremeMsoFarrow) {
+        ctx->supremeMsoFarrow->setEnabled((s.flags & ivanna::OMEGA_FLAG_SUPREME_FARROW_MSO_ON) != 0);
+        ctx->supremeMsoFarrow->setEbpfBypassActive((s.flags & ivanna::OMEGA_FLAG_SUPREME_EBPF_BYPASS_ON) != 0);
+        if (std::isfinite(s.supreme_mso_itd_ns))
+            ctx->supremeMsoFarrow->setMsoItdNanoseconds(s.supreme_mso_itd_ns);
+    }
+    auto& realityOrch = ivanna::reality::AcousticRealityOrchestrator::instance();
+    const bool realityOn = (s.flags & ivanna::OMEGA_FLAG_REALITY_RECON_ON) != 0;
+    realityOrch.setEnabled(realityOn);
+    if (std::isfinite(s.intensity) && s.intensity > 0.0f) {
+        realityOrch.setRealityIntensity(s.intensity);
+    }
+    if (ctx->audioPipeline) {
+        ivanna::spatial::IvannaAudioPipeline::setActiveInstance(ctx->audioPipeline);
+        // Autoridad única coclear en Ruta B: ctx->cochlearEngine.
+        // El motor coclear interno de audioPipeline permanece desactivado en Ruta B.
+        ctx->audioPipeline->cochlearEngine().setEnabled(false);
+        ctx->audioPipeline->setRealityReconstructionEnabled(realityOn);
+        if (std::isfinite(s.intensity) && s.intensity > 0.0f) {
+            ctx->audioPipeline->realityOrchestrator().setRealityIntensity(s.intensity);
+        }
+        const float limitedWet = ivanna::spatial::RoomGeometryConfig::limitSyntheticReverbWetForRoomT60(
+            roomWetEff, roomRt60Eff);
+        const bool roomActive = (roomRt60Eff >= 0.01f && limitedWet > 0.001f);
+        ctx->audioPipeline->roomEngine().setEstimatedRoomT60(roomRt60Eff > 0.01f ? roomRt60Eff : 0.34f);
+        // §0.4: Si ctx->rirConvolver es la cola principal de Ruta B, roomEngine conserva
+        // únicamente la de-reverberación WPE (projectionWet=0) para evitar doble cola RIR.
+        ctx->audioPipeline->roomEngine().setProjectionWet(
+            (roomActive && !ctx->rirConvolver) ? std::clamp(limitedWet * 0.45f, 0.0f, 0.45f) : 0.0f);
+        ctx->audioPipeline->roomEngine().setInversionGain(
+            roomActive ? std::clamp(0.25f + 0.25f * roomRt60Eff, 0.15f, 0.65f) : 0.20f);
+        ctx->audioPipeline->physicalScene().setWallAbsorption(
+            roomActive ? std::clamp(1.0f / (1.0f + 1.8f * roomRt60Eff), 0.12f, 0.88f) : 0.30f);
+        if (std::isfinite(s.listen_phon) && s.listen_phon >= 30.0f) {
+            ctx->audioPipeline->hearingEngine().setListeningSpl(std::clamp(s.listen_phon, 40.0f, 100.0f));
+        }
+        auto& atlasBus = ivanna::ime::SceneTargetBus::instance();
+        atlasBus.setSceneReconstructionEnabled((s.flags & ivanna::OMEGA_FLAG_ATLAS_SCENE_OFF) == 0u);
+        atlasBus.setUseStatDereverb((s.flags & ivanna::OMEGA_FLAG_ATLAS_LEGACY_DEREVERB) == 0u);
+        atlasBus.setUsePhysicalEr((s.flags & ivanna::OMEGA_FLAG_ATLAS_LEGACY_ER) == 0u);
+        atlasBus.setShaperMode(((s.flags & ivanna::OMEGA_FLAG_ATLAS_LEGACY_SHAPER) == 0u) ? 1 : 0);
+        const int encodedStyle = static_cast<int>((s.flags & ivanna::OMEGA_FLAG_ATLAS_STYLE_MASK) >> ivanna::OMEGA_FLAG_ATLAS_STYLE_SHIFT);
+        atlasBus.setManualStyleOverride((encodedStyle > 0 && encodedStyle <= 12) ? (encodedStyle - 1) : -1);
+    }
+}
+
+// ── RIR dataset: inicialización fuera del hilo RT ───────────────────────────
+// FIX RT (auditoría 2026-08-25): este init (new + lectura de disco de 200
+// WAV) se hacía dentro de omega_apply_room, invocada desde omega_process —
+// el callback de audio del daemon. El primer frame con una sala activa
+// pagaba el coste de disco + malloc en el hilo RT -> XRun/glitch en el
+// arranque (mismo bug reparado en la ruta JNI por 12e3ea52, aquí seguía
+// vivo en la ruta daemon). Ahora se inicializa en EFFECT_CMD_SET_CONFIG
+// (hilo de control, no-RT) vía omega_rir_dataset_init(); el audio thread
+// solo hace acquire-load del puntero ya publicado.
+static std::atomic<Ivanna::RirDataset*> g_rirDataset{nullptr};
+
+// Llamar SOLO desde omega_command(EFFECT_CMD_SET_CONFIG) — hilo no-RT.
+// Idempotente: solo carga la primera vez que tiene éxito.
+static void omega_rir_dataset_init() noexcept {
+    if (g_rirDataset.load(std::memory_order_acquire) != nullptr) return;
+    Ivanna::RirDataset* ds = new (std::nothrow) Ivanna::RirDataset();
+    if (!ds) return;  // FIX (v2.5.373): nothrow — esta función es noexcept y un new que lanza tumbaría audioserver.
+    const char* base = "/data/adb/ivanna_omega/rir";
+    if (!ds->load(base)) {
+        LOGW("RirDataset: no se pudo cargar desde %s — sala desactivada", base);
+        delete ds;
+        return;
+    }
+    LOGI("RirDataset: %d salas cargadas desde %s", (int)ds->roomCount(), base);
+    // release-store: publica el dataset completamente construido al hilo RT
+    g_rirDataset.store(ds, std::memory_order_release);
+}
+
+// ── Worker de carga de IR (Ruta B) ─────────────────────────────────────────
+// FIX RT (2026-08-27): loadImpulseResponse() lee un WAV de disco y aloca
+// vectores — antes se llamaba dentro de omega_process (callback de audio)
+// en cada cambio de sala -> I/O + alloc en el hot path = XRun/tronido.
+// Ahora el hot path solo publica {ctx, roomIdx} y este hilo de control
+// hace disco + FFT, entregando vía RirConvolver::load() (thread-safe con
+// process() vía pending_ + crossfade). El mutex solo protege secciones
+// de microsegundos (registro + entrega); el disco corre sin él.
+static std::mutex              g_rirBMtx;
+static std::condition_variable g_rirBCv;
+static std::atomic<bool>       g_rirBStarted{false};
+static std::vector<omega_effect_context_t*> g_rirBLive;   // ctx vivos
+static omega_effect_context_t* g_rirBCtx = nullptr;       // petición pendiente
+static int32_t                 g_rirBIdx = -1;
+static float                   g_rirBSynthRt60 = -1.0f;
+static omega_effect_context_t* g_rirBRecoupleCtx = nullptr;  // SAF q cambio: re-hornear IR viva
+
+static bool omega_rir_ctx_alive_locked(omega_effect_context_t* ctx) {
+    for (auto* c : g_rirBLive) if (c == ctx) return true;
+    return false;
+}
+
+static void omega_rir_worker_loop() {
+    std::unique_lock<std::mutex> lk(g_rirBMtx);
+    while (true) {
+        g_rirBCv.wait(lk, [] { return g_rirBIdx >= 0 || g_rirBSynthRt60 > 0.0f || g_rirBRecoupleCtx != nullptr; });
+        if (g_rirBRecoupleCtx && g_rirBIdx < 0 && g_rirBSynthRt60 <= 0.0f) {
+            omega_effect_context_t* rctx = g_rirBRecoupleCtx;
+            g_rirBRecoupleCtx = nullptr;
+            // Re-hornea la IR cruda con el acoplamiento SAF vigente (fuera de RT, bajo mutex
+            // solo el registro; la FFT corre bajo el mismo porque load() es corto y no hay disco).
+            if (omega_rir_ctx_alive_locked(rctx) && rctx->rirConvolver && rctx->rirConvolver->couplingStale()) {
+                rctx->rirConvolver->relinkFromRaw();
+            }
+            continue;
+        }
+        omega_effect_context_t* ctx = g_rirBCtx;
+        const int32_t idx = g_rirBIdx;
+        const float synthRt60 = g_rirBSynthRt60;
+        g_rirBIdx = -1;
+        g_rirBSynthRt60 = -1.0f;
+        g_rirBCtx = nullptr;
+        if (!ctx) continue;
+
+        if (synthRt60 > 0.0f && idx < 0) {
+            if (!omega_rir_ctx_alive_locked(ctx) || !ctx->rirConvolver) continue;
+            const uint32_t srSession = (ctx->config.outputCfg.samplingRate != 0)
+                                     ? ctx->config.outputCfg.samplingRate : 48000u;
+            const float* q = (ctx->pendingSnap.saf_q_valid == 1u &&
+                              ivanna::safmus::isFiniteLatent(ctx->pendingSnap.saf_q))
+                ? ctx->pendingSnap.saf_q
+                : ivanna::master::kMasterSafGoldenQ;
+            ctx->rirConvolver->applySofaCoupling(q);
+            ctx->rirConvolver->synthesizeMasterStudioBrir(synthRt60, static_cast<int>(srSession));
+            continue;
+        }
+
+        if (idx < 0) continue;
+        Ivanna::RirDataset* ds = g_rirDataset.load(std::memory_order_acquire);
+        if (!ds) continue;
+        // Fase lenta SIN el mutex: disco + alloc (ds es proceso-global,
+        // inmutable tras su carga única en SET_CONFIG).
+        lk.unlock();
+        std::vector<float> irL, irR;
+        int sr = 0;
+        const bool ok = ds->loadImpulseResponse((size_t)idx, irL, irR, sr)
+                        && !irL.empty();
+        if (ok) {
+            // FIX (2026-08-29): resamplear la IR (16 kHz en disco) a la SR
+            // real de la sesión — sin esto la reverb sonaba comprimida 3×+
+            // y las reflexiones llegaban mal posicionadas (mismo fix Ruta A).
+            const uint32_t srSession = (ctx->config.outputCfg.samplingRate != 0)
+                                     ? ctx->config.outputCfg.samplingRate : 48000u;
+            Ivanna::RirDataset::resampleLinear(irL, sr, (int)srSession);
+            Ivanna::RirDataset::resampleLinear(irR, sr, (int)srSession);
+        }
+        lk.lock();
+        // Fase rápida CON el mutex: entregar solo si el ctx sigue vivo
+        // (release_effect des-registra bajo el mismo mutex -> sin UAF).
+        if (!omega_rir_ctx_alive_locked(ctx) || !ctx->rirConvolver) continue;
+        // FIX 1 (bofo Genezi): con SPEAKERS el worker no instala la IR
+        // (descarga; el wet por bloque ya es 0, esto evita trabajo inútil).
+        if (ctx->routeBSpeakersGate || ctx->pendingSnap.room_rt60_s < 0.01f || ctx->pendingSnap.room_wet <= 0.001f) {
+            ctx->rirConvolver->setWetDry(0.f);
+            ctx->rirConvolver->unload();
+            continue;
+        }
+        if (!ok) {
+            LOGW("RirDataset: sala idx=%d no se pudo cargar — bypass", (int)idx);
+            ctx->rirConvolver->setWetDry(0.f);
+            ctx->rirConvolver->unload();
+            continue;
+        }
+        int irLen = (int)irL.size();
+        if (irLen > Ivanna::RirConvolver::MAX_IR_TOTAL) irLen = Ivanna::RirConvolver::MAX_IR_TOTAL;
+        const float* q = (ctx->pendingSnap.saf_q_valid == 1u &&
+                          ivanna::safmus::isFiniteLatent(ctx->pendingSnap.saf_q))
+            ? ctx->pendingSnap.saf_q
+            : ivanna::master::kMasterSafGoldenQ;
+        const uint32_t srSession = (ctx->config.outputCfg.samplingRate != 0)
+                                 ? ctx->config.outputCfg.samplingRate : 48000u;
+        ctx->rirConvolver->setSampleRate(static_cast<int>(srSession));
+        ctx->rirConvolver->applySofaCoupling(q);
+        ctx->rirConvolver->load(irL.data(), irR.data(), irLen);
+        LOGI("RirConvolver: sala idx=%d sr=%dHz (%d muestras) + SOFA-SAF acoplada (worker, fuera de RT)",
+             (int)idx, sr, irLen);
+    }
+}
+
+// Llamable desde el hilo de audio: publicación breve bajo mutex (contención
+// ~cero — el worker solo lo retiene para registro/entrega, nunca para disco).
+static void omega_rir_post_load(omega_effect_context_t* ctx, size_t roomIdx) noexcept {
+    std::unique_lock<std::mutex> lk(g_rirBMtx, std::try_to_lock);
+    if (!lk.owns_lock()) return;
+    g_rirBCtx = ctx;
+    g_rirBIdx = (int32_t)roomIdx;
+    g_rirBSynthRt60 = -1.0f;
+    g_rirBCv.notify_one();
+}
+
+static void omega_rir_post_synth(omega_effect_context_t* ctx, float rt60S) noexcept {
+    std::unique_lock<std::mutex> lk(g_rirBMtx, std::try_to_lock);
+    if (!lk.owns_lock()) return;
+    g_rirBCtx = ctx;
+    g_rirBIdx = -1;
+    g_rirBSynthRt60 = rt60S;
+    g_rirBCv.notify_one();
+}
+
+// ── Cable RIR: aplica la sala seleccionada por SET_ROOM_RT60 ─────────────────
+// Llamada desde omega_process cuando el snapshot tiene un room_rt60_s nuevo.
+// Si rt60==0 → bypass. Si hay una sala cargada con ese RT60 → load() en el
+// RirConvolver (lock-free, el proceso() del próximo bloque la absorbe).
+static inline void omega_apply_room(omega_effect_context_t* ctx,
+                                    const ivanna::OmegaDspSnapshot& s) noexcept {
+    if (!ctx || !ctx->rirConvolver) return;
+
+    // FIX 1 (bofo Genezi): con SPEAKERS la RIR va a 0 (rt60/wet efectivos
+    // 0 → setWetDry(0) con rampa suave, sin corte duro). El snapshot
+    // conserva su sala para cuando vuelvan audífonos.
+    const float rt60 = omega_output_is_speakers(s) ? 0.f : s.room_rt60_s;
+    const float wet  = omega_output_is_speakers(s)
+        ? 0.f
+        : ivanna::spatial::RoomGeometryConfig::limitSyntheticReverbWetForRoomT60(
+              s.room_wet, rt60);
+
+    if (rt60 < 0.01f || wet <= 0.001f) {
+        // Zero-Pop: fijar wet=0 para que RirConvolver::process() haga rampa
+        // suave de wetNow_ hasta 0.0f antes de entrar en reposo (sin corte duro).
+        ctx->rirConvolver->setWetDry(0.f);
+        return;
+    }
+
+    Ivanna::RirDataset* ds = g_rirDataset.load(std::memory_order_acquire);
+    if (!ds || ds->roomCount() == 0) {
+        const uint32_t srNow = (ctx->config.outputCfg.samplingRate != 0)
+                             ? ctx->config.outputCfg.samplingRate : 48000u;
+        ctx->rirConvolver->setWetDry(wet);
+        if (ctx->rirConvolver->needsMasterStudioBrirSynthesis(rt60, static_cast<int>(srNow))) {
+            omega_rir_post_synth(ctx, rt60);
+        }
+        return;
+    }
+
+    // Selección inteligente multi-criterio (TAREA 2): RT60 prioriza (60%),
+    // volumen geométrico desempata (25%), distancia fuente→mic refina (15%).
+    // Con solo RT60 había empates y saltos de sala arbitrarios entre salas
+    // con reverberación casi idéntica pero geometría opuesta (pasillo
+    // largo vs cubiculo compacto suenan distinto al mismo RT60).
+    const size_t roomIdx = (s.room_idx >= 0 && static_cast<size_t>(s.room_idx) < ds->roomCount())
+        ? static_cast<size_t>(s.room_idx)
+        : ds->findNearestSmart(rt60);
+
+    // Solo recargar si la sala cambió respecto a la última aplicada en este contexto
+    const size_t prevRoomIdx = (ctx->pendingSnap.room_idx >= 0 && static_cast<size_t>(ctx->pendingSnap.room_idx) < ds->roomCount())
+        ? static_cast<size_t>(ctx->pendingSnap.room_idx)
+        : ((ctx->pendingSnap.room_rt60_s >= 0.01f) ? ds->findNearestSmart(ctx->pendingSnap.room_rt60_s) : static_cast<size_t>(-1));
+    if (prevRoomIdx == roomIdx && ctx->rirConvolver->isLoaded()) {
+        // Si el índice no cambió, solo actualizar wet/dry
+        ctx->rirConvolver->setWetDry(wet);
+        return;
+    }
+
+    // FIX RT (2026-08-27): la lectura del WAV + vectores salen de este hilo
+    // (omega_process = callback de audio). El worker de control hace disco +
+    // FFT y entrega vía RirConvolver::load() (crossfade incluido). El wet se
+    // aplica ya: si el IR aún no llegó, process() es no-op hasta entonces —
+    // la sala entra ~1-5 ms después, sin tronido ni XRun. La truncación a
+    // MAX_IR la hace el worker (mismo criterio: reflejo temprano conservado).
+    ctx->rirConvolver->setWetDry(wet);
+    omega_rir_post_load(ctx, roomIdx);
+}
+
+// SAF q -> RIR en vivo. wetScale se aplica al instante (atomico); early/decorrel/rt60Delta
+// estan horneados en la IR, asi que si difieren de lo horneado se pide un re-horneado al worker.
+// Hilo de audio: solo atomicos + notify, sin alloc.
+static void omega_apply_saf_to_rir(omega_effect_context_t* ctx, const ivanna::OmegaDspSnapshot& s) noexcept {
+    if (!ctx || !ctx->rirConvolver) return;
+    if (s.saf_q_valid != 1u || !ivanna::safmus::isFiniteLatent(s.saf_q)) return;
+    ctx->rirConvolver->applySofaCoupling(s.saf_q);
+    if (!ctx->rirConvolver->couplingStale()) return;
+    if (g_rirBMtx.try_lock()) {
+        g_rirBRecoupleCtx = ctx;
+        g_rirBMtx.unlock();
+        g_rirBCv.notify_one();
+    }
+}
+
+/* ── Conversión multi-formato PCM sin allocs para AudioFlinger / DAC USB-C ──
+ * Cuando se conecta un DAC Tipo-C, AudioFlinger o el HAL USB pueden configurar
+ * la cadena de efectos en PCM_16_BIT (0x01), PCM_32_BIT (0x03), PCM_8_24_BIT (0x04)
+ * o PCM_24_BIT_PACKED (0x06) además de PCM_FLOAT (0x05). Interpretar esos buffers
+ * enteros directamente como IEEE-754 float (inBuf->f32) producía ruido de estática
+ * a fondo de escala ("como tierra mal aterrizada"). Estos helpers normalizan a
+ * float [-1, 1] en la entrada y re-empaquetan al formato exacto de salida.
+ * Viven en include/omega_pcm_format.h para ser testeables en host
+ * (regresión v2.5.382: default PCM16 en vez de PCM_FLOAT → sin audio). */
+#include "include/omega_pcm_format.h"
+using ivanna::omega_bytes_per_sample;
+using ivanna::omega_deinterleave_chunk;
+using ivanna::omega_write_output_frame;
+
+/* ── Funciones de instancia (vtable) ─────────────────────────────────────── */
+
+// ── Diagnóstico v2.5.381: las salidas tempranas de omega_process() eran
+// SILENCIOSAS (passthrough sin log) y por eso el beacon 0 de la Ruta B fue
+// a ciegas: el efecto estaba creado y habilitado en la sesión real de YTM
+// (249) pero nunca llegaba a onBlock(). Cada salida loguea su motivo con
+// throttle de 5 s por motivo (el efecto procesa ~375 bloques/s; sin
+// throttle el logcat se inunda). Tag: IvannaOmegaEffect.
+namespace {
+enum class PassthroughReason : int {
+    kNotEnabledSilent = 0,
+    kNotStereo,
+    kIntegrityFail,
+    kAntitamperLockdown,
+    kFusionCoreNull,
+    kBypassBeginBlockFail,
+    kRtBuffersNull,
+    kCount,
+};
+inline void logPassthroughThrottled(PassthroughReason reason, const char* /*msg*/) {
+    static std::atomic<int64_t> s_lastMs[(int)PassthroughReason::kCount]{};
+    const int idx = (int)reason;
+    struct timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const int64_t nowMs = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    int64_t prev = s_lastMs[idx].load(std::memory_order_relaxed);
+    if (nowMs - prev < 5000) return;
+    if (!s_lastMs[idx].compare_exchange_strong(prev, nowMs,
+                                               std::memory_order_relaxed)) {
+        return;
+    }
+    // RT-SAFE (v2.5.446): antes LOGW directo desde el callback de audio
+    // (violación check_rt_safety). Ahora solo se encola el evento en el
+    // anillo lock-free; el texto sale en omega_command() (hilo no-RT).
+    ivanna::rtlog::push(ivanna::rtlog::Event::kPassthrough,
+                        static_cast<uint8_t>(reason), 0.f, 0.f, 0.f, 0.f);
+}
+}  // namespace
+
+// ── FÍSICA NUEVA (Fase 2, v2.5.472) — Ruta B ────────────────────────────────
+// Mismo NewPhysicsEngine que Ruta A, alimentado por los atomics g_np_*
+// (new_physics_globals_effect.cpp; mismo patrón que
+// syncFusedControlsFromAtomics). ABI v14: la fuente de verdad de esos
+// atomics en Ruta B es el snapshot — omega_apply_snapshot los reenvía con
+// omega_forward_snapshot_new_physics() en cada generación adoptada; este
+// helper solo los lee y los pasa al motor con setControls(). Sin snapshot
+// adoptado aún, los atomics conservan sus defaults (amount 0 = bypass
+// bit-exacto). Creación LAZY en omega_process (regla anti-bootloop
+// v2.5.396, igual que FusionEngine): el constructor del motor no hace I/O,
+// pero la regla es la misma — nunca en omega_create_effect ni en dlopen,
+// un solo intento con new (std::nothrow); si falla, passthrough.
+extern std::atomic<float>   g_np_amount;
+extern std::atomic<float>   g_np_lgn_mix;
+extern std::atomic<float>   g_np_bs_damp;
+extern std::atomic<float>   g_np_torso_mix;
+extern std::atomic<float>   g_np_head_radius_m;
+extern std::atomic<float>   g_np_az_deg;
+extern std::atomic<float>   g_np_el_deg;
+extern std::atomic<int32_t> g_np_eq_class;
+extern std::atomic<float>   g_np_omega_sig_mix;
+extern std::atomic<float>   g_np_boost_cap_db;
+extern std::atomic<float>   g_np_xtalk_mix;
+extern std::atomic<float>   g_np_sigma_dist_m;
+extern std::atomic<float>   g_np_spl_db;
+extern std::atomic<float>   g_np_air_mix;
+extern std::atomic<float>   g_np_volterra_mix;
+extern std::atomic<float>   g_np_free_energy_mix;
+extern std::atomic<int32_t> g_np_abx_mode;
+
+static void omega_apply_new_physics(omega_effect_context_t* ctx, float* L, float* R,
+                                    int frames) noexcept {
+    if (!ctx || !L || !R || frames <= 0) return;
+    if (!ctx->newPhysicsEngine && !ctx->newPhysicsInitAttempted) {
+        ctx->newPhysicsInitAttempted = true;
+        auto* np = new (std::nothrow) ivanna::newphys::NewPhysicsEngine();
+        if (np) {
+            const uint32_t sr = (ctx->lastConfiguredSr >= 8000u && ctx->lastConfiguredSr <= 384000u)
+                                    ? ctx->lastConfiguredSr : 48000u;
+            np->prepare(static_cast<float>(sr));
+            // v2.5.483: órganos v3 despiertos con los mismos defaults que
+            // Ruta A (sub-graves, Klippel H2+H3 aproximados, cola rir_0101).
+            // Una sola vez, en el init lazy (no en creación ni dlopen);
+            // si algo falla, el órgano queda OFF y el efecto sigue vivo.
+            // NOTA: el control EN VIVO de estos órganos en Ruta B (sliders
+            // de la app) llega con la extensión ABI del snapshot (pendiente):
+            // Ruta B suena con estos defaults hasta entonces.
+            (void)ivanna::newphys::wakeV3Organs(*np);
+            ctx->newPhysicsEngine = np;
+            // Sin evento rtlog: reutilizar kFusionCreated mentiría en la
+            // telemetría (ese evento significa "FusionEngine creado").
+        }
+    }
+    auto* np = ctx->newPhysicsEngine;
+    if (!np) return;
+    ivanna::newphys::NewPhysicsControls c;
+    c.amount            = g_np_amount.load(std::memory_order_relaxed);
+    c.lgnPinnaMix       = g_np_lgn_mix.load(std::memory_order_relaxed);
+    c.brightSpotDamp    = g_np_bs_damp.load(std::memory_order_relaxed);
+    c.torsoEchoMix      = g_np_torso_mix.load(std::memory_order_relaxed);
+    c.headRadiusM       = g_np_head_radius_m.load(std::memory_order_relaxed);
+    c.azimuthDeg        = g_np_az_deg.load(std::memory_order_relaxed);
+    c.elevationDeg      = g_np_el_deg.load(std::memory_order_relaxed);
+    c.eqClass           = static_cast<ivanna::newphys::EquipmentClass>(
+                            g_np_eq_class.load(std::memory_order_relaxed));
+    c.omegaSignatureMix = g_np_omega_sig_mix.load(std::memory_order_relaxed);
+    c.boostCapDb        = g_np_boost_cap_db.load(std::memory_order_relaxed);
+    c.crosstalkCompMix  = g_np_xtalk_mix.load(std::memory_order_relaxed);
+    c.sigmaDistanceM    = g_np_sigma_dist_m.load(std::memory_order_relaxed);
+    c.splEstimateDb     = g_np_spl_db.load(std::memory_order_relaxed);
+    c.airCompMix        = g_np_air_mix.load(std::memory_order_relaxed);
+    c.volterraMix       = g_np_volterra_mix.load(std::memory_order_relaxed);
+    c.freeEnergyMix     = g_np_free_energy_mix.load(std::memory_order_relaxed);
+    c.abxOverrideMode   = g_np_abx_mode.load(std::memory_order_relaxed);
+    np->setControls(c);
+    np->process(L, R, frames);
+}
+
+static int32_t omega_process(effect_handle_t self,
+                             audio_buffer_t *inBuf, audio_buffer_t *outBuf) {
+#if defined(__aarch64__)
+    uint64_t fpcr;
+    asm volatile("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1ULL << 24) | (1ULL << 19); // FTZ (Flush-To-Zero) + FZ16
+    asm volatile("msr fpcr, %0" :: "r"(fpcr));
+#elif defined(__arm__)
+    uint32_t fpscr;
+    asm volatile("vmrs %0, fpscr" : "=r"(fpscr));
+    fpscr |= (1u << 24);
+    asm volatile("vmsr fpscr, %0" :: "r"(fpscr));
+#endif
+    omega_effect_context_t *ctx = reinterpret_cast<omega_effect_context_t *>(self);
+    // FIX (clic al cambiar de app/ventana, EFFECT_CMD_DISABLE): este retorno temprano hacia INALCANZABLE
+    // la rampa de salida de masterBypassEnv (wantMasterActive abajo), asi que al deshabilitarse el efecto
+    // el audio saltaba de procesado a seco de golpe. Ahora solo se sale cuando la envolvente ya llego a
+    // cero; mientras tanto el bloque sigue por la ruta normal y mixSample() funde a seco (release 18 ms).
+    if (!ctx || !inBuf || !outBuf) return 0;
+    if (!inBuf->raw || !outBuf->raw || inBuf->frameCount == 0) return 0;
+
+    // v2.5.382 — FIX DEFINITIVO Ruta B (auto-enable): en este HAL (Qualcomm)
+    // EFFECT_CMD_ENABLE jamás llega al efecto nativo aunque la app haga
+    // setEnabled(true) (FIX 4 v2.5.465: el beacon sí tiene magic y frames,
+    // pero enabled_count NO es fiable en este HAL y queda en 0). Sin
+    // ENABLE, ctx->enabled=false y el efecto cae en passthrough silencioso
+    // para siempre. Si el efecto nunca fue deshabilitado explícitamente
+    // (EFFECT_CMD_DISABLE), auto-habilitar en el primer bloque real: la app
+    // siempre crea el efecto queriendo que procese. Esto actualiza el beacon
+    // (onEnable) y deja ctx->enabled=true para el resto del callback.
+    // v2.5.470 — NO_EFFECT: un DISABLE explícito se respeta SOLO ~1 s de
+    // audio sostenido; después se re-arme (noEffectShouldEnable en
+    // include/omega_effect_no_effect.h). El DISABLE en este HAL es siempre
+    // de AudioFlinger al reconfigurar (la app nunca lo envía), nunca
+    // intención del usuario, y sin re-arme el efecto quedaba en passthrough
+    // para siempre al cambiar de música.
+    if (!ctx->enabled &&
+        ivanna::noEffectShouldEnable(ctx->explicitlyDisabled, ctx->disabledFrames,
+                                     static_cast<uint32_t>(inBuf->frameCount))) {
+        ivanna::effectBeacon().onEnable();
+        ctx->enabled = true;
+        // RT-SAFE (v2.5.446): antes LOGI directo en el callback; ahora evento en el anillo.
+        ivanna::rtlog::push(ivanna::rtlog::Event::kAutoEnable, 0, 0.f, 0.f, 0.f, 0.f);
+    }
+
+    const int frames = (int)inBuf->frameCount;
+    const uint8_t inFmt  = ctx->config.inputCfg.format;
+    const uint8_t outFmt = (ctx->config.outputCfg.format != 0u) ? ctx->config.outputCfg.format : inFmt;
+    // ── ASRC del daemon (v2.5.439, magistral) ─────────────────────────────
+    // Corrección de deriva de reloj a la ENTRADA, antes de toda la cadena
+    // y también en passthrough (la deriva es del stream, no del DSP: el
+    // original y el procesado comparten el mismo reloj). El puente es de
+    // bloque fijo (sale = entra), in-place, init lazy (nothrow, un solo
+    // intento) y fail-closed (sin daemon o ratio inválido -> ratio 1.0 ->
+    // memcpy bit-exacto): si falla o no hay daemon, el audio SIGUE intacto
+    // y el efecto procesa `frames` como siempre (el retorno se ignora).
+    // Puerta de formato: solo PCM 16-bit estéreo (el bridge solo maneja
+    // int16 intercalado; cualquier otro formato sigue su camino normal
+    // sin ASRC). La máscara 0 = sin informar (tests) = estéreo.
+    if (inFmt == AUDIO_FORMAT_PCM_16_BIT) {
+        const uint32_t asrcChMask = ctx->config.inputCfg.channels & 0x3FFFFu;
+        const int asrcChCount = asrcChMask ? __builtin_popcount(asrcChMask) : 2;
+        if (asrcChCount == 2) {
+            (void)ivanna_asrc_bridge::process(
+                reinterpret_cast<int16_t*>(inBuf->raw), (size_t)frames, 2, 48000);
+        }
+    }
+    // FIX 2.5.475 — Telemetría de frames al asrcd en CUALQUIER formato. El
+    // puente ASRC solo procesa int16, pero el efecto recibe FLOAT (el mixer
+    // mezcla en float), así que process() jamás se invocaba y el asrcd
+    // veía "sin telemetria de frames" (ratio pegado en 1.0). reportFrames
+    // publica el conteo sin tocar el audio: el asrcd ya puede medir la
+    // deriva de reloj aunque el resampler int16 no corra aquí.
+    ivanna_asrc_bridge::reportFrames((int64_t)frames);
+    // v2.5.380 — passthrough garantizado: este retorno temprano NO copiaba
+    // input→output y callaba el hilo de salida; un efecto que no procesa
+    // jamás debe silenciar el audio.
+    if (!ctx->enabled && ctx->masterBypassEnv.isSilent()) {
+        logPassthroughThrottled(PassthroughReason::kNotEnabledSilent,
+                                "!enabled && bypass silencioso (efecto no habilitado a nivel nativo)");
+        if (outBuf->raw != inBuf->raw) {
+            const uint32_t m = ctx->config.inputCfg.channels & 0x3FFFFu;
+            const int ch = m ? __builtin_popcount(m) : 2;
+            memmove(outBuf->raw, inBuf->raw, (size_t)inBuf->frameCount *
+                    omega_bytes_per_sample(ctx->config.inputCfg.format) * (size_t)ch);
+        }
+        return 0;
+    }
+    // FIX (voces robotizadas / audio embrollado en Amazon Prime y streams
+    // multicanal): todo el DSP asume ESTEREO intercalado. Si AudioFlinger
+    // entrega mono o 5.1/7.1 (video con Dolby), se leian canales mezclados
+    // como si fueran L/R -> voz trinada y distorsion. Solo se procesa 2 canales
+    // (mascara 0 = sin informar, p.ej. tests = estereo); el resto pasa intacto.
+    {
+        const uint32_t chMask = ctx->config.inputCfg.channels & 0x3FFFFu;
+        const int chCount = __builtin_popcount(chMask);
+        if (chMask != 0u && chCount != 2) {
+            logPassthroughThrottled(PassthroughReason::kNotStereo,
+                                    "canales != 2 (no estereo)");
+            if (outBuf->raw != inBuf->raw) {
+                memmove(outBuf->raw, inBuf->raw,
+                        (size_t)frames * omega_bytes_per_sample(inFmt) * (size_t)chCount);
+            }
+            return 0;
+        }
+    }
+    const size_t frameBytes = omega_bytes_per_sample(inFmt) * 2u;
+
+    // ── Seguridad anti-piratería (v2.5.369, Ruta B fail-closed) ────────────
+    // Si libomega_effect.so fue cargada desde una ruta no legítima (sideload
+    // o inyección de una .so copiada fuera de /vendor|/system|/odm|/product),
+    // no procesar: passthrough limpio. El chequeo se cachea (una sola vez
+    // por proceso); el coste por bloque es un atomic load. El audio sigue
+    // fluyendo; solo se desactiva el DSP. La verificación completa (pin de
+    // certificado + vinculación) la hace IntegrityGate.kt en el proceso app.
+    if (!ivanna::security::integrity_self_check()) {
+        logPassthroughThrottled(PassthroughReason::kIntegrityFail,
+                                "integrity_self_check FALLO (ruta de .so no legitima)");
+        if (outBuf->raw != inBuf->raw) {
+            memmove(outBuf->raw, inBuf->raw, (size_t)frames * frameBytes);
+        }
+        return 0;
+    }
+
+    // ── Seguridad anti-piratería fase 2: anti-tamper en Ruta B ─────────────
+    // Depurador, Frida, framework de hooks o emulador en el proceso
+    // audioserver -> passthrough limpio (mismo patrón que el self-check).
+    // La evaluación se cachea (una sola vez por proceso); el coste por
+    // bloque es un atomic load. Root por sí solo NO dispara (el producto
+    // está diseñado para dispositivos rooteados; el daemon corre como root).
+    if (ivanna::security::antitamper_should_lockdown()) {
+        logPassthroughThrottled(PassthroughReason::kAntitamperLockdown,
+                                "antitamper LOCKDOWN (debugger/hook/emulador en audioserver)");
+        if (outBuf->raw != inBuf->raw) {
+            memmove(outBuf->raw, inBuf->raw, (size_t)frames * frameBytes);
+        }
+        return 0;
+    }
+
+    // AUDIT FIX (session isolation): usar el fusionCore de ESTA instancia,
+    // nunca el global g_fusionCore.
+    // FIX (v2.5.396, 4to brick 2026-11-11): creación LAZY del FusionEngine,
+    // un solo intento. No se crea en omega_create_effect para no tumbar
+    // audioserver si el constructor falla (hace I/O de archivos y muchas
+    // alocaciones con `new` plano -> std::terminate). Si la creación falla
+    // aquí, el efecto queda en passthrough y audioserver sigue vivo.
+    IvannaFusionEngine* fc = ctx->fusionCore;
+    if (!fc && !ctx->fusionCoreInitAttempted) {
+        ctx->fusionCoreInitAttempted = true;
+        // v2.5.486 (fundación mejor que el élite): el FusionCore nacía
+        // hardcodeado a 48000 Hz aunque el HAL/config ya supiera la tasa
+        // real (lastConfiguredSr, que SET_CONFIG actualiza; en este HAL
+        // SET_CONFIG no llega y el default es 48000, que es la tasa real
+        // del hilo del mixer en este G85 — el cambio no altera el sonido
+        // hoy, pero en un dispositivo con hilo a 44.1k/96k el motor ya no
+        // nacería desafinado). Un solo intento, lazy, como antes.
+        const float coreSr = (ctx->lastConfiguredSr >= 8000u)
+            ? static_cast<float>(ctx->lastConfiguredSr) : 48000.0f;
+        fc = new (std::nothrow) IvannaFusionEngine(coreSr);
+        if (fc) {
+            fc->initSpatial(coreSr, 4096);
+            ctx->fusionCore = fc;
+            // FALLO 5 (VOLTERRA·Ω, Ruta B): el .ivk1 que cargó el motor
+            // legacy en EFFECT_CMD_INIT se aplica ahora al transductor
+            // fusionado (una sola vez; el paquete ya está validado, así
+            // que esto no puede fallar salvo EngineBusy). El estado de
+            // habilitado se espeja del motor legacy (inactivo hasta
+            // VOLTERRA_ON, igual que él). Sin esto VOLTERRA·Ω nunca
+            // recibía el kernel medido en Ruta B. Si la carga falla, el
+            // transductor queda sin kernel efectivo (fail-closed, igual
+            // que si no hubiera .ivk1); no se registra evento rtlog por
+            // ello (los eventos kFusion* son solo de la creación del core).
+            if (!ctx->volterraPkg.empty()) {
+                auto& fusedVolterra = fc->fusedChain().transducer();
+                fusedVolterra.setVolterraEnabled(false);  // contrato: deshabilitar antes de cargar
+                ivanna::dsp::VolterraLoadPolicy prod;  // producción
+                const ivanna::dsp::VolterraLoadStatus stFused =
+                    fusedVolterra.loadKernelPackage(ctx->volterraPkg.data(),
+                                                    ctx->volterraPkg.size(), prod);
+                if (stFused == ivanna::dsp::VolterraLoadStatus::Ok && ctx->volterraEngine) {
+                    fusedVolterra.setVolterraEnabled(ctx->volterraEngine->isEnabled());
+                }
+            }
+            // RT-SAFE (v2.5.446): antes LOGI directo en el callback; ahora evento en el anillo.
+            ivanna::rtlog::push(ivanna::rtlog::Event::kFusionCreated, 0, 0.f, 0.f, 0.f, 0.f);
+        } else {
+            // RT-SAFE (v2.5.446): antes LOGE directo en el callback; ahora evento en el anillo.
+            ivanna::rtlog::push(ivanna::rtlog::Event::kFusionCreateFailed, 0, 0.f, 0.f, 0.f, 0.f);
+        }
+    }
+    if (!fc) {
+        logPassthroughThrottled(PassthroughReason::kFusionCoreNull,
+                                "fusionCore NULO (motor no inicializado)");
+        if (outBuf->raw != inBuf->raw) {
+            memmove(outBuf->raw, inBuf->raw, (size_t)frames * frameBytes);
+        }
+        return 0;
+    }
+
+    // Consume only a snapshot supplied by the actual HAL/PCM owner. No clock_gettime
+    // fallback is used as a hardware reference.
+    if (ctx->hardwareClockReader && ctx->hardwareClockTracker) {
+        ivanna::audio::HardwareClockSample hwSample{};
+        if (ctx->hardwareClockReader->read(hwSample)) {
+            const auto hwStatus = ctx->hardwareClockTracker->observe(hwSample);
+            if (hwStatus.valid) {
+                ivanna::effectBeacon().onHardwareClockEstimate(
+                    hwStatus.measuredSampleRateHz, hwStatus.driftPpm);
+            }
+        }
+    }
+    struct timespec cpuT0;
+    clock_gettime(CLOCK_MONOTONIC, &cpuT0);
+    if (ctx->callbackClock && ctx->lastConfiguredSr >= 8000u && ctx->lastConfiguredSr <= 768000u) {
+        const uint64_t nowNs = static_cast<uint64_t>(cpuT0.tv_sec) * 1000000000ull +
+                               static_cast<uint64_t>(cpuT0.tv_nsec);
+        const auto clockStatus = ctx->callbackClock->observe(
+            nowNs, static_cast<uint64_t>(frames), ctx->lastConfiguredSr);
+        if (clockStatus.valid) {
+            ivanna::effectBeacon().onClockEstimate(clockStatus.observedSampleRateHz,
+                                                   clockStatus.driftPpm);
+        }
+    }
+
+    // FIX 2.5.475 — El reader del control bus se abría SOLO en SET_CONFIG,
+    // pero en este HAL (Qualcomm) SET_CONFIG jamás llega al efecto (igual
+    // que ENABLE; ver v2.5.382): ctrlBusOpen quedaba en false para siempre,
+    // pendingSnap en generación 0 y la física nueva (NP) nunca llegaba a
+    // los bloques (beacon applied_control_generation = 0, evidencia en
+    // ceros). Se abre lazy aquí, en el primer bloque de audio (misma regla
+    // anti-bootloop que fusionCore, v2.5.396: un solo intento por segundo,
+    // nunca en creación/dlopen). Una vez abierto, el readLatest de abajo
+    // adopta el snapshot (NP incluido) en este mismo callback. El
+    // publicador de evidencia se abre aquí también (también vivía solo en
+    // SET_CONFIG, por eso omega_effect_evidence estaba en ceros).
+    if (!ctx->ctrlBusOpen) {
+        const uint64_t nowMs = static_cast<uint64_t>(cpuT0.tv_sec) * 1000ull +
+                               static_cast<uint64_t>(cpuT0.tv_nsec) / 1000000ull;
+        if (nowMs - ctx->ctrlBusOpenAttemptMs >= 1000ull) {
+            ctx->ctrlBusOpenAttemptMs = nowMs;
+            ctx->ctrlBusOpen = ivanna::effectControlBus().openReader();
+            if (!ivanna::effectEvidence().isOpen()) {
+                ivanna::effectEvidence().open();
+            }
+        }
+    }
+
+    // AUDIT FIX (control plane reconnect): drena a lo más UN snapshot nuevo
+    // por callback. readLatest() es lock-free (seqlock en SHM), no bloquea,
+    // no malloc, y solo retorna true si hay una generation posterior a la
+    // ya aplicada. Esto conecta finalmente los sliders de la UI -> daemon
+    // -> SHM -> omega_process, cerrando el ciclo que estaba roto.
+    if (ctx->ctrlBusOpen) {
+        ivanna::OmegaDspSnapshot snap;
+        if (ivanna::effectControlBus().readLatest(snap, ctx->lastAppliedGen)) {
+            auto& realityOrch = ivanna::reality::AcousticRealityOrchestrator::instance();
+            if (realityOrch.isEnabled()) {
+                realityOrch.coordinateSnapshot(snap);
+            }
+            ctx->adaptiveEnabled =
+                (snap.temporal_field & ivanna::OMEGA_EFFECT_ADAPTIVE_ENABLED_BIT) != 0u;
+            ctx->pendingSnap = snap; // conserva los valores originales del control plane
+            // FIX 1 (bofo Genezi): la puerta se fija al adoptar la
+            // generación. RT-SAFE (v2.5.473): el LOGI directo en el
+            // callback violaba check_rt_safety; ahora solo se encola el
+            // evento en el anillo lock-free (patrón v2.5.446) y el texto
+            // sale en omega_command() (hilo no-RT). La puerta se actualiza
+            // igual, solo al cambiar de modo (no por bloque).
+            {
+                const bool gate = omega_output_is_speakers(snap);
+                if (gate != ctx->routeBSpeakersGate) {
+                    ctx->routeBSpeakersGate = gate;
+                    ivanna::rtlog::push(ivanna::rtlog::Event::kOutputMode,
+                                        static_cast<uint8_t>(gate ? 1 : 0),
+                                        static_cast<float>(ctx->lastAppliedGen),
+                                        0.f, 0.f, 0.f);
+                }
+            }
+            if (!ctx->adaptiveEnabled) omega_neutralize_adaptive_snapshot(ctx->pendingSnap);
+            omega_apply_snapshot(fc, ctx->antiDolby, ctx->pendingSnap);
+            omega_apply_supreme_axes(ctx, ctx->pendingSnap);
+            omega_apply_room(ctx, ctx->pendingSnap);  // cable RIR: sala desde snapshot
+            omega_apply_saf_to_rir(ctx, ctx->pendingSnap);  // SAF q -> wetScale/rt60/early/decorrel de la IR viva
+        }
+    }
+
+    // FotoHolo Route B: use the most recent analysis of this effect's own PCM.
+    // This runs on every callback, not only when a control generation changes.
+    omega_apply_fotoholo_modulation(ctx, fc, ctx->antiDolby, frames);
+
+    // ── Thermal Governor & Master Bypass — transición suave Zero-Pop ────────
+    // NUNCA realizar bypass duro en el hilo de audio mientras masterBypassEnv > 0.
+    // Solo cuando la rampa de transición llega exactamente a cero se ejecuta el
+    // memmove de passthrough directo para ahorrar 100% de CPU.
+    bool wantMasterActive = ctx->enabled && ((ctx->pendingSnap.flags & 0x1u) == 0u);
+    auto masterProfile = ivanna::supreme::TransitionProfile::Standard;
+    {
+        const auto tier = ivanna::getThermalGovernor().getCurrentTier();
+        if (tier == ivanna::ThermalTier::BYPASS) {
+            wantMasterActive = false;
+            masterProfile = ivanna::supreme::TransitionProfile::Thermal;
+        }
+        // Tier LIMITED o PROTECTED: rampa suave de desactivación para RIR,
+        // Volterra y los 5 Ejes Supremos (sin corte duro de bloque).
+        ctx->thermalSkipRIR      = (tier >= ivanna::ThermalTier::LIMITED) || ctx->cpuShed;
+        ctx->thermalSkipVolterra = (tier >= ivanna::ThermalTier::LIMITED) || ctx->cpuShed;
+    }
+
+    if (!wantMasterActive) ctx->fotoHoloDelta = 0.0f;
+    if (!ctx->masterBypassEnv.beginBlock(wantMasterActive ? 1.0f : 0.0f, masterProfile)) {
+        // v2.5.382: esta salida NO tenía logging en la 381 (solo las 5
+        // primeras). Si beginBlock() falla, el bloque pasa en seco.
+        logPassthroughThrottled(PassthroughReason::kBypassBeginBlockFail,
+                                "masterBypassEnv.beginBlock() FALLO");
+        if (ctx->rtL && ctx->rtR && ctx->rtCapacity > 0) {
+            const int tailFrames = std::min(frames, std::min(ctx->rtCapacity, 64));
+            const int startFrame = frames - tailFrames;
+            omega_deinterleave_chunk(inBuf->raw, inFmt, startFrame, tailFrames, ctx->rtL, ctx->rtR);
+            if (ctx->cochlearEngine)   ctx->cochlearEngine->preserveAcousticState(ctx->rtL, ctx->rtR, tailFrames);
+            if (ctx->supremeLattice)   ctx->supremeLattice->preserveAcousticState(ctx->rtL, ctx->rtR, (size_t)tailFrames);
+            if (ctx->supremeCvnn)      ctx->supremeCvnn->preserveAcousticState(ctx->rtL, ctx->rtR, (size_t)tailFrames);
+            if (ctx->supremeSnnHoa)    ctx->supremeSnnHoa->preserveAcousticState(ctx->rtL, ctx->rtR, (size_t)tailFrames);
+            if (ctx->supremePinna)     ctx->supremePinna->preserveAcousticState(ctx->rtL, ctx->rtR, (size_t)tailFrames);
+            if (ctx->supremeMsoFarrow) ctx->supremeMsoFarrow->preserveAcousticState(ctx->rtL, ctx->rtR, (size_t)tailFrames);
+            if (ctx->volterraEngine && ctx->rtVolterraScratch) {
+                for (int n = 0; n < tailFrames; ++n) {
+                    ctx->rtVolterraScratch[2 * n]     = ctx->rtL[n];
+                    ctx->rtVolterraScratch[2 * n + 1] = ctx->rtR[n];
+                }
+                ctx->volterraEngine->preserveInterleavedTail(ctx->rtVolterraScratch, (uint32_t)tailFrames, 2u);
+            }
+        }
+        if (outBuf->raw != inBuf->raw) {
+            memmove(outBuf->raw, inBuf->raw, (size_t)frames * frameBytes);
+        }
+        return 0;
+    }
+
+    // AUDIT FIX (realtime allocation): buffers L/R preasignados en el ctx
+    // (SET_CONFIG). Si vinieran sin reservar (calloc falló en SET_CONFIG)
+    // se cae a passthrough — jamás asignar en el hilo de audio.
+    if (!ctx->rtL || !ctx->rtR || !ctx->rtDryL || !ctx->rtDryR || !ctx->rtVolterraScratch || ctx->rtCapacity <= 0) {
+        // v2.5.382: esta salida NO tenía logging en la 381. Los buffers RT
+        // solo se reservan en EFFECT_CMD_SET_CONFIG; si SET_CONFIG jamás
+        // llega del HAL, caen aquí. La 382 los crea en omega_create_effect()
+        // (ver abajo), así que este log solo debería aparecer si calloc falló.
+        logPassthroughThrottled(PassthroughReason::kRtBuffersNull,
+                                "buffers RT nulos o rtCapacity<=0 (SET_CONFIG no llego o calloc fallo)");
+        if (outBuf->raw != inBuf->raw) {
+            memmove(outBuf->raw, inBuf->raw, (size_t)frames * frameBytes);
+        }
+        return 0;
+    }
+    float* L = ctx->rtL;
+    float* R = ctx->rtR;
+    float* dryBufL = ctx->rtDryL;
+    float* dryBufR = ctx->rtDryR;
+    float* volterraScratch = ctx->rtVolterraScratch;
+
+    // AUDIT FIX (rigid buffer / silent bypass): si el bloque entrante excede
+    // la capacidad preasignada (p.ej. AudioFlinger con LDAC/LHDC puede lanzar
+    // bloques grandes), ya NO se hace bypass silencioso a plano. Se procesa
+    // el bloque completo en chunks de a lo sumo rtCapacity frames, reutilizando
+    // los mismos buffers L/R — sin malloc, sin locks, mismo coste de memoria.
+    // Solo se registra UNA vez por instancia (flag en el ctx, sin I/O de logd
+    // en el callback RT) para preservar determinismo estricto de tiempo real.
+    if (frames > ctx->rtCapacity && !ctx->chunkedWarned) {
+        ctx->chunkedWarned = true;
+    }
+
+    // ── Pre-loop: sincronizar parámetros cocleares y térmicos UNA VEZ por callback ──
+    // FIX CRÍTICO-2 (artefactos/clicks): setEnabled/setIntensity producen cambios de
+    // estado si se llaman por cada chunk dentro de while(offset < frames). Aquí se
+    // configuran antes del loop; dentro del loop solo corre process(L, R, chunk).
+    if (ctx->fusionCore) ctx->fusionCore->setNpeShed(ctx->thermalSkipVolterra);   // NPE: mismo recorte térmico/CPU
+    if (ctx->fusionCore) ctx->fusionCore->setOrbeThermalShed(ctx->thermalSkipVolterra);  // ORBE: idem (12 bandas -> off)
+    // IVANNA (v2.5.380): shed térmico — la fusión es de lo primero que se
+    // apaga (LIMITED+ o cpuShed, mismo nivel que Volterra/RIR/ORBE), antes
+    // de que HOLOS degrade por tiers. Con amount=0 por defecto hoy es no-op
+    // hasta medir CPU en el G85; cuando se active, este es su guarda.
+    if (ctx->fusionCore) ctx->fusionCore->setOmniThermalShed(ctx->thermalSkipVolterra);
+    // HOLOS: shed por TIERS (FUSION.md §7.3), no por booleano. El bool
+    // setHolosThermalShed(true) forzaría Bypass en FusionCore y saltaría los
+    // tiers Warm/Limited, así que aquí se usa setHolosThermalTier. Mapa
+    // governor → HOLOS (umbrales del governor 45/55/65/75 °C vs FUSION
+    // 65/70/75 °C: aproximación conservadora, documentada): FULL/REDUCED →
+    // Normal, LIMITED → Warm (12 bandas, H3 off, difuso ×0.5), PROTECTED →
+    // Limited (difuso off, Volterra K=32, gamma 1.0), BYPASS → Bypass
+    // (legacy bit-exacto). cpuShed (sobrecarga CPU) fuerza como mínimo Limited.
+    if (ctx->fusionCore) {
+        const auto govTier = ivanna::getThermalGovernor().getCurrentTier();
+        int holosTier = 0;  // Normal
+        if (govTier >= ivanna::ThermalTier::BYPASS) holosTier = 3;
+        else if (govTier >= ivanna::ThermalTier::PROTECTED) holosTier = 2;
+        else if (govTier >= ivanna::ThermalTier::LIMITED) holosTier = 1;
+        if (ctx->cpuShed && holosTier < 2) holosTier = 2;
+        ctx->fusionCore->setHolosThermalTier(holosTier);
+    }
+    const bool wantVolterraPre = (ctx->pendingSnap.flags & ivanna::OMEGA_FLAG_VOLTERRA_ON) != 0;
+    const bool goldenEarRequestedPre = ctx->fusionCore && ctx->fusionCore->goldenEarNeedsNonlinearSlot();
+    const bool volterraTargetEnabled = wantVolterraPre &&
+        !goldenEarRequestedPre && !ctx->thermalSkipVolterra;
+    if (ctx->volterraEngine) {
+        ctx->volterraEngine->setEnabled(volterraTargetEnabled);
+        ctx->volterraEngine->setThermalBypass(ctx->thermalSkipVolterra);
+    }
+    const auto unifiedSnapPre = ivanna::unified::UnifiedParamSnapshotBus::instance().readOncePreLoop();
+    if (ctx->cochlearEngine) {
+        const auto& snapPre = ctx->pendingSnap;
+        const bool  cochOnPre = ((snapPre.flags & ivanna::OMEGA_FLAG_COCHLEAR_ON) != 0) || unifiedSnapPre.cochlearEnabled;
+        const float intensityPre =
+            (std::isfinite(snapPre.cochlear_intensity) && snapPre.cochlear_intensity > 0.0f)
+                ? snapPre.cochlear_intensity
+                : (unifiedSnapPre.cochlearEnabled ? unifiedSnapPre.cochlearIntensity : ctx->cochlearIntensity);
+        ctx->cochlearEngine->setIntensity(intensityPre);
+        ctx->cochlearEngine->setEnabled(cochOnPre && (unifiedSnapPre.activeCochlearVariant == 0u));
+        ctx->cochlearEngine->setThermalBypass(ctx->thermalSkipVolterra);
+    }
+    if (ctx->unifiedPipeline) {
+        auto localUnifiedSnap = unifiedSnapPre;
+        if (ctx->cochlearEngine) {
+            localUnifiedSnap.setStageEnabled(ivanna::unified::StageId::CochlearPinn, false);
+        }
+        if (ctx->antiDolby) {
+            localUnifiedSnap.setStageEnabled(ivanna::unified::StageId::AntiDolbyClassic, false);
+        }
+        ctx->unifiedPipeline->syncFromSnapshotPreLoop(localUnifiedSnap);
+    }
+    if (ctx->supremeLattice)   ctx->supremeLattice->setThermalBypass(ctx->thermalSkipVolterra);
+    if (ctx->supremeCvnn)      ctx->supremeCvnn->setThermalBypass(ctx->thermalSkipVolterra);
+    if (ctx->supremePinna)     ctx->supremePinna->setThermalBypass(ctx->thermalSkipVolterra);
+    if (ctx->supremeMsoFarrow) ctx->supremeMsoFarrow->setThermalBypass(ctx->thermalSkipVolterra);
+
+    int offset = 0;
+    float sumSq = 0.0f, pk = 0.0f;
+    ivanna::rt::BandEnergy bandAccum{};
+    while (offset < frames) {
+        const int chunk = ((frames - offset) < ctx->rtCapacity)
+                          ? (frames - offset) : ctx->rtCapacity;
+
+        omega_deinterleave_chunk(inBuf->raw, inFmt, offset, chunk, L, R);
+        std::memcpy(dryBufL, L, (size_t)chunk * sizeof(float));
+        std::memcpy(dryBufR, R, (size_t)chunk * sizeof(float));
+
+        // ── IVANNA ACOUSTIC UNITY ENGINE (v2.6.0): Organismo Acústico Unificado ──
+        auto* unityCls = fc ? fc->getClassifier() : nullptr;
+        // v2.5.15: interruptor del usuario (bit OMEGA_FLAG_UNITY_OFF del snapshot) y frecuencia real.
+        ivanna::unity::AcousticUnityEngine::instance().setEnabled(
+            (ctx->pendingSnap.flags & ivanna::OMEGA_FLAG_UNITY_OFF) == 0u);
+        ivanna::unity::AcousticUnityEngine::instance().setSampleRate(
+            (ctx->config.outputCfg.samplingRate != 0) ? (float)ctx->config.outputCfg.samplingRate : 48000.0f);
+        float unityProbs[NUM_CLASSES] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        if (unityCls) unityCls->getClassProbabilities(unityProbs);
+        float probabilityMass = 0.0f;
+        bool probabilitiesFinite = (unityCls != nullptr);
+        for (size_t i = 0; i < NUM_CLASSES; ++i) {
+            if (!std::isfinite(unityProbs[i]) || unityProbs[i] < 0.0f) {
+                probabilitiesFinite = false;
+                break;
+            }
+            probabilityMass += unityProbs[i];
+        }
+        ctx->lastVoiceProbValid = probabilitiesFinite && probabilityMass > 1.0e-6f;
+        const float unityVoice = std::clamp(
+            ctx->lastVoiceProbValid
+                ? unityProbs[static_cast<size_t>(AudioContextClass::VOICE)] : 0.0f,
+            0.0f, 1.0f);
+        ctx->lastVoiceProb = unityVoice;
+        const float unityTonality = (fc && fc->getProsodyEngine())
+            ? fc->getProsodyEngine()->getMetrics().pitchConfidence : 0.0f;
+        const bool unityUpmix = (fc && fc->getUpmixer().isUpmixingEnabled());
+        const bool unityWfs = (fc && fc->isWfsEnabled());
+        // FIX 1 (bofo Genezi): la RIR efectiva es 0 con SPEAKERS.
+        const bool unityRir = (ctx->rirConvolver && !ctx->routeBSpeakersGate &&
+                               ctx->pendingSnap.room_rt60_s >= 0.01f);
+        const float unityHarm = ctx->pendingSnap.harmonic_gain;
+
+        ivanna::unity::AcousticUnityEngine::instance().coordinateAcousticOrganism(
+            dryBufL, dryBufR, (size_t)chunk,
+            unityVoice, unityTonality,
+            unityUpmix, unityWfs, unityRir, unityHarm);
+
+        const auto unityCtx = ivanna::unity::AcousticUnityEngine::instance().getContext();
+        // v2.5.15 — armónicos: exc_red (motor adaptativo: se escribía y publicaba pero NADIE lo aplicaba)
+        // y presupuesto armónico MEDIDO. Gana el más conservador (min), nunca se componen.
+        // v2.6.1 — Unity WFS arbitration is now consumed by the live FusionCore path.
+        // The Unity multiplier describes requested spread (>1 means a wider synthesized field);
+        // setSpatialCoordination is intentionally a safety attenuation [0.5, 1.0], so convert
+        // excess requested spread into a conservative reduction instead of passing >1 and
+        // silently having the consumer clamp it away. Invalid values fall back to neutral.
+        const float unityWfsSpread = std::isfinite(unityCtx.wfsSpreadMultiplier)
+            ? std::clamp(unityCtx.wfsSpreadMultiplier, 0.8f, 1.35f) : 1.0f;
+        const float coordinatedWfsScale = std::clamp(
+            ctx->adaptWfsScale / std::max(1.0f, unityWfsSpread), 0.5f, 1.0f);
+        if (fc) fc->setSpatialCoordination(coordinatedWfsScale, ctx->adaptImmScale);
+        const float requestedExciterReduction =
+            std::clamp(ctx->pendingSnap.exc_red, 0.0f, 1.0f);
+        const float adeExciterReduction =
+            ctx->adaptiveEnabled
+                ? std::clamp(ctx->adaptiveDecisionExciterReduction, 0.0f, 1.0f) : 0.0f;
+        const float totalExciterReduction =
+            std::max(requestedExciterReduction, adeExciterReduction);
+        if (fc) fc->setHarmonicCoordination(std::min(
+            1.0f - totalExciterReduction, unityCtx.harmonicBudget));
+
+        ctx->stabilityGuard.beginBlock(L, R, (size_t)chunk, true);
+
+        // GoldenEar reclama primero el único slot no lineal. La reserva se mantiene
+        // durante su cola de release, no solo mientras el slider tenga ganancia > 0.
+        const bool goldenEarOwnsNonlinearSlot = fc &&
+            fc->goldenEarNeedsNonlinearSlot() &&
+            ctx->stabilityGuard.arbitration().claimNonlinearSlot(
+                ivanna::supreme::AcousticModuleId::GoldenEarGanAdaptiveV2);
+
+        // Render binaural de objetos (VBAP + HRTF) + DSP de salida
+        fc->processStereo(L, R, (size_t)chunk);
+        ctx->stabilityGuard.enforceStageEnergyCeiling(
+            ivanna::supreme::AcousticModuleId::ObjectRenderer,
+            L, R, (size_t)chunk, 1.25f, 0.96f);
+        // FÍSICA NUEVA (Fase 2, v2.5.472): tras el render fusionado, sobre
+        // los buffers planares L/R del chunk. ABI v14: los controles np_*
+        // llegan por snapshot y omega_apply_snapshot los reenvió a los
+        // atomics g_np_*; este punto los aplica al motor cada chunk vía
+        // setControls() (amount=0 sin snapshot adoptado = bypass bit-exacto).
+        omega_apply_new_physics(ctx, L, R, chunk);
+        if (fc->getUpmixer().isUpmixingEnabled()) {
+            (void)ctx->stabilityGuard.arbitration().claimSpatialSlot(
+                ivanna::supreme::AcousticModuleId::HoaBinauralDecoder);
+        }
+
+        // Ejes 1–5 del pipeline espacial unificado (StereoObjectDecomposer,
+        // ObjectSpatialRenderer, HrtfPersonalizer, PhysicalSceneRenderer, RoomProjectionEngine)
+        // FIX CRÍTICO-1: runHearingStage=false, runCochlearStage=false (sin doble procesado coclear)
+        if (ctx->audioPipeline) {
+            ivanna::spatial::IvannaAudioPipeline::setActiveInstance(ctx->audioPipeline);
+            const uint32_t srPipe = (ctx->config.outputCfg.samplingRate != 0)
+                                  ? ctx->config.outputCfg.samplingRate : 48000u;
+            ivanna::ime::imeFeedPlanar(dryBufL, dryBufR, chunk, (float)srPipe);
+            // Cadena 4D (Ruta B): controles desde snapshot.ext_flags16 (atómicos, baratos); con 4D apagado
+            // la superficie no altera un solo bit. Va tras el IME: toma su escena y publica la adelantada.
+            {
+                const ivanna::Omega4DExt e4 = ivanna::omega_4d_decode(ctx->pendingSnap.ext_flags16);
+                {   // Geometria de sala -> cancelador de diafonia 4D (misma fuente que el del motor de fusion).
+                    const auto& rm = ivanna::spatial::RoomGeometryConfig::defaultLayout();
+                    const auto pl = ivanna::spatial::RoomGeometryConfig::crosstalkPlacement(
+                        ctx->pendingSnap.wfs_speaker_x, ctx->pendingSnap.wfs_speaker_y, ctx->pendingSnap.wfs_speaker_z,
+                        rm.listenerX, rm.listenerY, rm.listenerZ);
+                    if (pl.valid) {
+                        ivanna::spatial::CrosstalkCanceller::Geometry xg;
+                        xg.spanMeters = pl.spanM; xg.distanceMeters = pl.distanceM; xg.listenerOffsetM = pl.listenerOffsetM;
+                        ivanna::fourd::setSpeakerGeometry(xg);
+                    }
+                }
+                ivanna::fourd::setDepth(e4.depth);
+                ivanna::fourd::setLeadMs(e4.leadMs);
+                ivanna::fourd::setArcDepth(e4.arcDepth);
+                ivanna::fourd::setArcEnabled(e4.arc);
+                ivanna::fourd::setCrosstalkEnabled(e4.xtc);
+                ivanna::fourd::setEnabled(e4.on);
+                ivanna::fourd::feedPlanar(dryBufL, dryBufR, chunk);
+                ivanna::fourd::publishAnticipatedScene();
+            }
+            const bool allowPipeSpatial = !fc->getUpmixer().isUpmixingEnabled() && !fc->isWfsEnabled();
+            ctx->audioPipeline->processLiveSpatialAxes(
+                L, R, (size_t)chunk, (float)srPipe, allowPipeSpatial, 0.16f,
+                /*runHearingStage=*/false, /*runCochlearStage=*/false);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::ObjectRenderer,
+                L, R, (size_t)chunk, 1.22f, 0.95f);
+        }
+        
+        // FASE 3: Integración de TinyML Asíncrono
+        auto* classifier = fc ? fc->getClassifier() : nullptr;
+        int aiDominantClass = -1;
+        if (classifier) {
+            aiDominantClass = classifier->getDominantClass();
+        }
+
+        // FASE ADAPTATIVA INTELIGENTE V2 (EQ, HRTF, Spatial).
+        // El objetivo vuelve a 1.0 cuando se apaga el motor; la envolvente
+        // se ejecuta fuera del if para no dejar una atenuación retenida ni
+        // saltar de golpe al bypass.
+        float adaptiveGainTarget = 1.0f;
+        if (ctx->adaptiveEngine && ctx->adaptiveEnabled) {
+            ++ctx->adaptiveApplyBlocks;
+            float pitchHz = 0.0f;
+            float pitchConf = 0.0f;
+            bool isVoiced = false;
+            
+            if (auto* prosody = fc->getProsodyEngine()) {
+                auto metrics = prosody->getMetrics();
+                pitchHz = metrics.pitchFreq;
+                pitchConf = metrics.pitchConfidence;
+                isVoiced = metrics.isVoiced;
+            }
+
+            alignas(64) float monoAnalysis[128];
+            const int analysisLen = std::min(chunk, 128);
+            for (int n = 0; n < analysisLen; ++n) {
+                monoAnalysis[n] = 0.5f * (L[n] + R[n]);
+            }
+            ctx->adaptiveEngine->analyzeAudio(monoAnalysis, analysisLen);
+            ctx->adaptiveEngine->computeAdaptiveParameters(aiDominantClass, pitchHz, isVoiced, pitchConf);
+            ctx->adaptiveEngine->smoothParameters();
+            
+            const auto& adaptParams = ctx->adaptiveEngine->getSmoothParameters();
+
+            // Un solo actuador de compresión por ruta: se conserva el
+            // umbral/ratio manual del snapshot, V2 añade su corrección dinámica
+            // y ADE añade su ratio protector separado. Arbitrar aquí evita que
+            // el último escritor borre el control manual o la decisión ADE.
+            const float v2Threshold = std::clamp(
+                std::isfinite(adaptParams.compressorThreshold)
+                    ? adaptParams.compressorThreshold : -20.0f,
+                -60.0f, 0.0f);
+            const float userThreshold = std::clamp(
+                std::isfinite(ctx->pendingSnap.compressor) && ctx->pendingSnap.compressor < 0.0f
+                    ? ctx->pendingSnap.compressor : -20.0f,
+                -60.0f, 0.0f);
+            const float v2ThresholdDelta = std::clamp(v2Threshold - (-20.0f), -40.0f, 20.0f);
+            const float effectiveThreshold =
+                std::clamp(userThreshold + v2ThresholdDelta, -60.0f, 0.0f);
+
+            const float v2Ratio = std::clamp(
+                std::isfinite(adaptParams.compressorRatio) ? adaptParams.compressorRatio : 1.0f,
+                1.0f, 20.0f);
+            const float requestedRatio = 1.0f + 7.0f * std::clamp(
+                std::isfinite(ctx->pendingSnap.comp_amount) ? ctx->pendingSnap.comp_amount : 0.0f,
+                0.0f, 1.0f);
+            const float adeRatio = 1.0f + 7.0f * std::clamp(
+                std::isfinite(ctx->adaptiveDecisionCompAmount)
+                    ? ctx->adaptiveDecisionCompAmount : 0.0f,
+                0.0f, 1.0f);
+            // v2.5.386 — BOMBEO: el ratio efectivo era max(...) sin tope
+            // (hasta 20:1 con umbral de -5.5 dB) y el umbral saltaba con cada
+            // análisis de V2 -> el compresor respiraba por bloque. Tope 4:1
+            // y pendiente limitada en umbral y ratio (ver rt_gain_slew.hpp).
+            const float rawRatio = std::max(v2Ratio, std::max(requestedRatio, adeRatio));
+            const float cappedRatio = ivanna::rt::capCompressorRatio(rawRatio);
+            const float effThreshold = ivanna::rt::slewLimitValue(
+                ctx->compThresholdSmooth, effectiveThreshold,
+                ivanna::rt::kCompressorThresholdSlewDbPerBlock);
+            const float effRatio = ivanna::rt::slewLimitValue(
+                ctx->compRatioSmooth, cappedRatio,
+                ivanna::rt::kCompressorRatioSlewPerBlock);
+            ctx->compThresholdSmooth = effThreshold;
+            ctx->compRatioSmooth = effRatio;
+            if (fc) {
+                fc->setCompressorParams(effThreshold, effRatio);
+            }
+            const float overallTrim = std::clamp(adaptParams.overallGain, 0.75f, 1.15f);
+            const float isoGain = adaptParams.applyISO226
+                ? std::clamp(std::pow(10.0f, (adaptParams.iso226Correction[3] / 20.0f)), 0.50f, 1.35f)
+                : 1.0f;
+            // FIX (distorsion al subir volumen + zipper): antes la ganancia podia
+            // AMPLIFICAR hasta +4.3 dB (1.35) justo antes de la cadena de guardas,
+            // empujando picos sobre 0 dBFS (mismo defecto que el trim del FusionCore,
+            // ya corregido a "solo atenua"), y se aplicaba como ESCALON por bloque
+            // (cada bloque cambia el valor suavizado -> clic periodico). Ahora el
+            // techo es 1.0 y la ganancia se rampa linealmente por muestra desde el
+            // valor del bloque anterior hasta el nuevo.
+            const float requestedGain = std::clamp(
+                std::isfinite(ctx->pendingSnap.target_gain) ? ctx->pendingSnap.target_gain : 1.0f,
+                0.50f, 1.0f);
+            const float adeGain = std::clamp(
+                std::isfinite(ctx->adaptiveDecisionTargetGain)
+                    ? ctx->adaptiveDecisionTargetGain : 1.0f,
+                0.50f, 1.0f);
+            // Producto de objetivos de atenuación: límite final <=1 y rampa
+            // por muestra. Se respetan tanto el request del snapshot como ADE.
+            adaptiveGainTarget = std::clamp(
+                overallTrim * isoGain * requestedGain * adeGain, 0.50f, 1.0f);
+        }
+        // v2.5.386 — BOMBEO (384/385): el objetivo se rampaba DENTRO del
+        // bloque desde gStart hasta adaptiveGainTarget; si el objetivo
+        // saltaba entre bloques, la ganancia formaba un diente de sierra a
+        // ritmo de bloque. El objetivo mismo ahora se mueve como mucho
+        // 0.02 por bloque (excursión completa en ~130 ms: inaudible como
+        // bombeo, sigue respondiendo). La rampa por muestra se conserva.
+        ctx->adaptGainTargetSmooth = ivanna::rt::slewLimitValue(
+            ctx->adaptGainTargetSmooth, adaptiveGainTarget,
+            ivanna::rt::kAdaptiveGainSlewPerBlock);
+        adaptiveGainTarget = ctx->adaptGainTargetSmooth;
+        const float gStart = (ctx->adaptGainPrev > 0.0f) ? ctx->adaptGainPrev : 1.0f;
+        if (std::fabs(adaptiveGainTarget - 1.0f) > 1.0e-4f ||
+            std::fabs(gStart - 1.0f) > 1.0e-4f) {
+            ctx->adaptGainPrev = ivanna::dsp::applyStereoGainRamp(
+                L, R, static_cast<std::size_t>(chunk), gStart, adaptiveGainTarget);
+        } else {
+            ctx->adaptGainPrev = adaptiveGainTarget;
+        }
+
+        // ── Anti-Dolby Neural Acoustic De-processing & Soundstage Sculpting ──
+        if (ctx->antiDolby &&
+            ctx->stabilityGuard.arbitration().claimWidenerSlot(
+                ivanna::supreme::AcousticModuleId::AntiDolby)) {
+            Ivanna::AIModelOutput aiOut{};
+            if (classifier && classifier->getModelOutput(aiOut)) {
+                ctx->antiDolby->updateFromNeuralContext(
+                    static_cast<uint8_t>(aiOut.dominant_class),
+                    aiOut.confidence,
+                    aiOut.scene_energy
+                );
+            }
+            const uint32_t srNow = (ctx->config.outputCfg.samplingRate != 0)
+                                 ? ctx->config.outputCfg.samplingRate : 48000u;
+            const float dt = static_cast<float>(chunk) / static_cast<float>(srNow > 0 ? srNow : 48000);
+            ctx->antiDolby->tick(dt);
+
+            const bool spatialAlreadyActive =
+                ctx->stabilityGuard.arbitration().activeSpatialModule !=
+                ivanna::supreme::AcousticModuleId::None;
+            const float sideAsk = spatialAlreadyActive
+                ? 1.0f
+                : std::clamp(ctx->antiDolby->currentWidener() * unityCtx.msWidenerMultiplier, 0.75f, 1.35f);
+            // v2.5.15: si la salida medida ya es demasiado lateral / pierde correlación (spatialBudget < 1),
+            // se recorta solo el ensanche (>1); un estrechamiento (<1) no se toca.
+            const float sideTarget = (sideAsk > 1.0f)
+                ? 1.0f + (sideAsk - 1.0f) * unityCtx.spatialBudget
+                : sideAsk;
+            // FIX (tronido al cambiar de música o al activar módulo espacial):
+            // sideTarget salta entre 1.0 y currentWidener() (0.75-1.35) cuando
+            // spatialAlreadyActive cambia de estado entre bloques. La EMA fija
+            // de 10 ms NO alcanza a suavizar un salto de ±0.25-0.35 de ganancia
+            // -> escalón audible. Rampa adaptativa: salto grande (>0.10) usa
+            // tau=60 ms (inaudible); régimen permanece en 10 ms (tracking ágil).
+            const float sideJump = std::fabs(sideTarget - ctx->sideGainSmooth);
+            const float sideTauS = (sideJump > 0.10f) ? 0.060f : 0.010f;
+            const float sideCoef = std::exp(-1.0f / (sideTauS * (float)srNow));
+            if (ctx->sideGainSmooth < 0.01f) ctx->sideGainSmooth = 1.0f;
+
+            for (int n = 0; n < chunk; ++n) {
+                ctx->sideGainSmooth += (1.0f - sideCoef) * (sideTarget - ctx->sideGainSmooth);
+                const float m = (L[n] + R[n]) * 0.5f;
+                float sv = (L[n] - R[n]) * 0.5f;
+                sv *= ctx->sideGainSmooth;
+                L[n] = m + sv;
+                R[n] = m - sv;
+            }
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::AntiDolby,
+                L, R, (size_t)chunk, 1.20f, 0.95f);
+        }
+
+        // Cable RIR: aplicar reverberación de sala con transición térmica suave.
+        // RirConvolver mantiene rampa interna wetNow_ -> wetTarget y retorna en O(1)
+        // cuando ambos llegan a cero (cero clics al entrar/salir de ThermalTier::LIMITED).
+        // FIX CINEMA / AMAZON PRIME VIDEO: En pasajes con diálogo hablado activo (voz detectada),
+        // atenuamos la reverberación sintética un 75% (-12 dB) para eliminar el eco y preservar
+        // inteligibilidad cristalina y sincronía labial perfecta, abriendo la sala en pasajes puramente musicales.
+        if (ctx->rirConvolver &&
+            ctx->stabilityGuard.arbitration().claimRoomSlot(
+                ivanna::supreme::AcousticModuleId::RirConvolver)) {
+            const float limitedSnapWet = ivanna::spatial::RoomGeometryConfig::limitSyntheticReverbWetForRoomT60(
+                ctx->pendingSnap.room_wet, ctx->pendingSnap.room_rt60_s);
+            const bool isVoiceActive = (ctx->fusionCore && ctx->fusionCore->getProsodyEngine() &&
+                                        ctx->fusionCore->getProsodyEngine()->getMetrics().isVoiced);
+            // v2.5.15: antes 0.25 * rirWetDuckFactor — con escena DialogueVocal (factor 0.25) la sala caía
+            // a 0.0625 (-24 dB) en vez de los -12 dB documentados. Ahora el más conservador manda (min)
+            // y el presupuesto de sala medido (EXP/PHASE/CLAR) participa en el mismo min.
+            const float voiceDuck = std::min(
+                isVoiceActive ? std::min(0.25f, unityCtx.rirWetDuckFactor) : unityCtx.rirWetDuckFactor,
+                unityCtx.roomReverbBudget);
+            // FIX 1 (bofo Genezi): con SPEAKERS el wet RIR efectivo es 0 en
+            // cada bloque (este setWetDry por bloque es el que manda sobre
+            // omega_apply_room; sin este término la sala volvería sola).
+            const float desiredRirWet = (!ctx->thermalSkipRIR && !ctx->routeBSpeakersGate &&
+                                         ctx->pendingSnap.room_rt60_s >= 0.01f)
+                ? std::clamp(limitedSnapWet * voiceDuck, 0.0f, 0.45f)
+                : 0.0f;
+            if (ctx->audioPipeline) {
+                ctx->audioPipeline->setExternalRirActive(desiredRirWet > 1.0e-4f);
+            }
+            ctx->rirConvolver->setWetDry(desiredRirWet);
+            ctx->rirConvolver->process(L, R, chunk);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::RirConvolver,
+                L, R, (size_t)chunk, 1.22f, 0.95f);
+        }
+
+        // ── Series de Volterra de 2º Orden Truncadas (con SupremeTransitionEnvelope) ──
+        // FIX (aliasing inBuf==outBuf en AudioFlinger): usar volterraScratch preasignado
+        // en lugar de outChunk para no sobreescribir el buffer de entrada in-place.
+        const bool volterraHasKernel = ctx->volterraEngine && ctx->volterraEngine->hasEffectiveKernel();
+        const bool volterraNeedsSlot = volterraHasKernel &&
+            (volterraTargetEnabled || !ctx->volterraEngine->isSilent());
+        const bool volterraOwnsNonlinearSlot = volterraNeedsSlot &&
+            !goldenEarOwnsNonlinearSlot &&
+            ctx->stabilityGuard.arbitration().claimNonlinearSlot(
+                ivanna::supreme::AcousticModuleId::VolterraKernel);
+
+        if (volterraOwnsNonlinearSlot) {
+            // El motor ya recibió su target de enable antes del loop. Si solo conserva
+            // cola, sigue siendo dueño hasta que la envolvente llegue a silencio.
+            for (int n = 0; n < chunk; ++n) {
+                volterraScratch[2 * n]     = L[n];
+                volterraScratch[2 * n + 1] = R[n];
+            }
+            ctx->volterraEngine->processInterleaved(volterraScratch, volterraScratch, (uint32_t)chunk, 2);
+            for (int n = 0; n < chunk; ++n) {
+                L[n] = volterraScratch[2 * n];
+                R[n] = volterraScratch[2 * n + 1];
+            }
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::VolterraKernel,
+                L, R, (size_t)chunk, 1.20f, 0.95f);
+        } else if (ctx->volterraEngine && volterraHasKernel && !ctx->volterraEngine->isSilent()) {
+            // Si GoldenEar u otra etapa posee el slot, avanzar el release de Volterra
+            // sobre scratch descartable: la cola se extingue sin contaminar la salida.
+            ctx->volterraEngine->setEnabled(false);
+            for (int n = 0; n < chunk; ++n) {
+                volterraScratch[2 * n]     = L[n];
+                volterraScratch[2 * n + 1] = R[n];
+            }
+            ctx->volterraEngine->processInterleaved(
+                volterraScratch, volterraScratch, (uint32_t)chunk, 2);
+        } else if (ctx->volterraEngine) {
+            // Sin kernel efectivo o completamente silencioso: mantener caliente el
+            // historial FIR sin reclamar autoridad ni ejecutar el kernel.
+            const int tailFrames = std::min(chunk, 64);
+            const int startFrame = chunk - tailFrames;
+            for (int n = 0; n < tailFrames; ++n) {
+                volterraScratch[2 * n]     = L[startFrame + n];
+                volterraScratch[2 * n + 1] = R[startFrame + n];
+            }
+            ctx->volterraEngine->preserveInterleavedTail(volterraScratch, (uint32_t)tailFrames, 2u);
+        }
+
+        // ── Eje Supremo Neuroacústico: CochlearActiveInverseEngine (Autoridad única Ruta B) ──
+        // Parámetros (setIntensity/setEnabled/setThermalBypass) aplicados pre-loop una vez por callback.
+        if (ctx->cochlearEngine) {
+            ctx->cochlearEngine->process(L, R, (int)chunk);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::CochlearInverse,
+                L, R, (size_t)chunk, 1.20f, 0.95f);
+        }
+        if (ctx->unifiedPipeline) {
+            ctx->unifiedPipeline->process(L, R, (size_t)chunk, /*syncFromBusPreLoop=*/false);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::NeuroCochlearManifold,
+                L, R, (size_t)chunk, 1.18f, 0.95f);
+        }
+
+        // ── 5 Ejes de Supremacía Cuántico-Neuromórfica (Ruta B, Zero-Pop Transition Layer) ──
+        // Cada motor gestiona su propio SupremeTransitionEnvelope (attack 8ms, release 18ms,
+        // thermal 35ms) y ahorra 100% de CPU únicamente cuando su envolvente llega a cero.
+        if (ctx->supremeLattice) {
+            ctx->supremeLattice->process(L, R, (size_t)chunk);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::SupremeAxis1_WarpedLattice,
+                L, R, (size_t)chunk, 1.20f, 0.95f);
+        }
+        if (ctx->supremeCvnn) {
+            ctx->supremeCvnn->process(L, R, (size_t)chunk);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::SupremeAxis2_Transharmonic,
+                L, R, (size_t)chunk, 1.18f, 0.95f);
+        }
+        if (ctx->supremeSnnHoa) {
+            const bool allowSnnSpatial =
+                ctx->stabilityGuard.arbitration().claimSpatialSlot(
+                    ivanna::supreme::AcousticModuleId::SupremeAxis3_SnnNmfHoa);
+            ctx->supremeSnnHoa->setThermalBypass(ctx->thermalSkipVolterra || !allowSnnSpatial);
+            ctx->supremeSnnHoa->process(L, R, (size_t)chunk);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::SupremeAxis3_SnnNmfHoa,
+                L, R, (size_t)chunk, 1.18f, 0.95f);
+        }
+        if (ctx->supremePinna) {
+            ctx->supremePinna->process(L, R, (size_t)chunk);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::SupremeAxis4_PinnaManifold,
+                L, R, (size_t)chunk, 1.18f, 0.95f);
+        }
+        if (ctx->supremeMsoFarrow) {
+            const uint32_t srNow = (ctx->config.outputCfg.samplingRate != 0)
+                                 ? ctx->config.outputCfg.samplingRate : 48000u;
+            ctx->supremeMsoFarrow->process(L, R, (size_t)chunk, (float)srNow);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::SupremeAxis5_MsoFarrow,
+                L, R, (size_t)chunk, 1.18f, 0.95f);
+        }
+        // Fases 1-15: Acoustic Reality Reconstruction & Cognitive Evolution Pass (0 malloc, 0 mutex)
+        {
+            auto& realityOrch = ivanna::reality::AcousticRealityOrchestrator::instance();
+            const auto rSnap = realityOrch.stateBus().readLatestSnapshot();
+            const bool realityActive = realityOrch.isEnabled() && (rSnap.sequence > 0);
+            realityOrch.microExtractor().applyMicroIntelligibilityPass(
+                L, R, (size_t)chunk, rSnap.microMap, realityActive, ctx->thermalSkipVolterra);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::RealityReconstruction,
+                L, R, (size_t)chunk, 1.20f, 0.95f);
+        }
+
+        // Eje 6: compensación auditiva antes del limitador de seguridad final
+        if (ctx->audioPipeline) {
+            ctx->audioPipeline->hearingEngine().process(L, R, (size_t)chunk);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::PerceptualLoudness,
+                L, R, (size_t)chunk, 1.22f, 0.95f);
+        } else if (ctx->hearingEngine) {
+            ctx->hearingEngine->process(L, R, chunk);
+            ctx->stabilityGuard.enforceStageEnergyCeiling(
+                ivanna::supreme::AcousticModuleId::PerceptualLoudness,
+                L, R, (size_t)chunk, 1.22f, 0.95f);
+        }
+
+        // FASE 4: Protección maestra pre-limiter (bloqueador DC, amortiguador anti-runaway,
+        // gobernador C2 de headroom continuo y continuidad C1 Hermite en fronteras).
+        ctx->stabilityGuard.processBlock(L, R, (size_t)chunk, 0.985f);
+
+        // FIX (distorsion digital): ultimo eslabon real de la cadena — el mismo
+        // SafetyLimiter que corre al final de la Ruta A.
+        // v2.5.41 — PUNCH (impacto predictivo por bandas) JUSTO antes del limitador: el limitador ve el resultado
+        // y nunca «bombea» (el motor no sube el ataque si el pico ya está en el techo; ver punch_engine.hpp).
+        ctx->punch.setSampleRate((ctx->config.outputCfg.samplingRate != 0) ? (float)ctx->config.outputCfg.samplingRate : 48000.0f);
+        ctx->punch.setAmount(ivanna::omega_punch_decode(ctx->pendingSnap.ext_flags16));
+        ctx->punch.process(L, R, chunk);
+        ivanna::fourd::applyOutputPlanar(L, R, chunk);      // diafonía 4D (solo si se pidió; antes del techo)
+        if (ctx->safetyLimiter) ctx->safetyLimiter->process(L, R, chunk);
+        ctx->masterOutputStage.processTruePeakGuard(L, R, chunk);
+        ivanna::fourd::meterOutputPlanar(L, R, chunk);      // el dosímetro mide la salida real
+
+        // v2.5.15: lazo cerrado — original vs salida final (tras el limitador). El resultado de este
+        // bloque fija los presupuestos que el Unity Engine publica en el siguiente.
+        ivanna::unity::AcousticUnityEngine::instance().observeOutcome(
+            dryBufL, dryBufR, L, R, (size_t)chunk);
+
+        const auto chunkBands = ctx->bandMeter.processBlock(L, R, (size_t)chunk);
+        bool fotoHoloEnabled = false;
+        float fotoHoloIntensity = 0.0f;
+        ivanna::omega_fotoholo_decode(ctx->pendingSnap.temporal_field,
+                                      fotoHoloEnabled, fotoHoloIntensity);
+        // Observe the dry input captured before DSP: this avoids a closed-loop
+        // spectral feedback path in which the widener analyzes its own output.
+        fotoHoloEnabled = fotoHoloEnabled &&
+            static_cast<ivanna::RouteMode>(ctx->pendingSnap.active_route) == ivanna::RouteMode::SYSTEM_WIDE;
+        ctx->fotoHoloDelta = ctx->fotoHoloBarkMeter.processBlock(
+            dryBufL, dryBufR, (size_t)chunk, fotoHoloEnabled, fotoHoloIntensity);
+        bandAccum.low  += chunkBands.low;
+        bandAccum.mid  += chunkBands.mid;
+        bandAccum.high += chunkBands.high;
+
+        // Interleave -> salida con Autonomous Stability Sanitizer y rampa Master/Thermal Zero-Pop
+        // Mezcla dry/wet en 64-bit + TPDF Dither (solo 16/24-bit, solo con efecto activo).
+        const int outBitDepth = (outFmt == AUDIO_FORMAT_PCM_16_BIT) ? 16
+            : (omega_bytes_per_sample(outFmt) == 3) ? 24 : 32;
+        double sumSq64 = 0.0;
+        for (int n = 0; n < chunk; ++n) {
+            const double masterEnv = static_cast<double>(ctx->masterBypassEnv.nextSample());
+            const double dryL = static_cast<double>(dryBufL[n]);
+            const double dryR = static_cast<double>(dryBufR[n]);
+            double l = std::isfinite(L[n]) ? static_cast<double>(L[n]) : dryL;
+            double r = std::isfinite(R[n]) ? static_cast<double>(R[n]) : dryR;
+            float outL = 0.0f, outR = 0.0f;
+            ctx->masterOutputStage.mixAndDitherSample(
+                dryL, dryR, l, r, masterEnv, outBitDepth, outL, outR);
+            sumSq64 += static_cast<double>(outL) * static_cast<double>(outL)
+                     + static_cast<double>(outR) * static_cast<double>(outR);
+            const float absL = std::fabs(outL);
+            const float absR = std::fabs(outR);
+            if (absL > pk) pk = absL;
+            if (absR > pk) pk = absR;
+            omega_write_output_frame(outBuf->raw, outFmt, offset + n, outL, outR);
+        }
+        sumSq += static_cast<float>(sumSq64);
+        offset += chunk;
+    }
+
+    {
+        struct timespec cpuT1;
+        clock_gettime(CLOCK_MONOTONIC, &cpuT1);
+        const double usedNs = (double)(cpuT1.tv_sec - cpuT0.tv_sec) * 1e9
+                            + (double)(cpuT1.tv_nsec - cpuT0.tv_nsec);
+        const uint32_t srCpu = (ctx->config.outputCfg.samplingRate != 0)
+                             ? ctx->config.outputCfg.samplingRate : 48000u;
+        const double blockNs = (double)frames * 1e9 / (double)srCpu;
+        const double load = (blockNs > 0.0) ? usedNs / blockNs : 0.0;
+        if (load > 0.80) {
+            ctx->cpuUnderCount = 0;
+            if (++ctx->cpuOverCount >= 3) ctx->cpuShed = true;
+        } else if (load < 0.40) {
+            ctx->cpuOverCount = 0;
+            if (ctx->cpuShed && ++ctx->cpuUnderCount >= 600) {
+                ctx->cpuShed = false;
+                ctx->cpuUnderCount = 0;
+            }
+        } else {
+            ctx->cpuOverCount = 0;
+            ctx->cpuUnderCount = 0;
+        }
+    }
+
+    // ── Telemetría de audio real → OmegaControlBus local ─────────────────────
+    // Calcula RMS y peak sobre la salida procesada y los escribe en el snapshot
+    // pendiente (ctx->pendingSnap). OmegaControlBus.publish() los propaga via
+    // SHM al proceso de la app, donde audioRouteBridgeLoop() los lee cada 30ms.
+    // Sin esto: audioRouteBridgeLoop() nunca detecta Ruta B activa porque
+    // omega_daemon_get_shared_state() usa SHM compartida; UI refleja audio cuando el daemon está conectado.
+    {
+        const uint32_t outFrames = (uint32_t)frames;
+        const float rms = (outFrames > 0)
+            ? __builtin_sqrtf(sumSq / (float)(outFrames * 2u)) : 0.0f;
+        ctx->pendingSnap.raw_rms   = rms;
+        ctx->pendingSnap.raw_peak  = pk;
+        // v2.5.476 (ABI v15) — bandas espectrales al snapshot para el
+        // analizador SAF de la app: audioRouteBridgeLoop() las lee y alimenta
+        // nativeGetAudioCharacteristics() (centroide/tonalidad/DYN).
+        {
+            const float invFrames = (outFrames > 0) ? (1.0f / (float)outFrames) : 0.0f;
+            const float bLo = __builtin_sqrtf(bandAccum.low  * invFrames);
+            const float bMi = __builtin_sqrtf(bandAccum.mid  * invFrames);
+            const float bHi = __builtin_sqrtf(bandAccum.high * invFrames);
+            ctx->pendingSnap.raw_band_low  = bLo;
+            ctx->pendingSnap.raw_band_mid  = bMi;
+            ctx->pendingSnap.raw_band_high = bHi;
+            // Dispersión espectral (misma fórmula que nativeGetAudioCharacteristics):
+            // centroide = Σ(f_i·E_i)/ΣE_i; spread = sqrt(Σ((f_i−centroide)²·E_i)/ΣE_i).
+            const float bSum = bLo + bMi + bHi;
+            float spread = 0.0f;
+            if (bSum > 1e-6f) {
+                const float cen = (120.0f * bLo + 1500.0f * bMi + 8000.0f * bHi) / bSum;
+                const float dLo = 120.0f - cen, dMi = 1500.0f - cen, dHi = 8000.0f - cen;
+                const float var = (dLo * dLo * bLo + dMi * dMi * bMi + dHi * dHi * bHi) / bSum;
+                spread = __builtin_sqrtf(var > 0.0f ? var : 0.0f);
+            }
+            ctx->pendingSnap.raw_band_spread = spread;
+        }
+        ctx->pendingSnap.supreme_declipped_peaks = ctx->supremeLattice ? ctx->supremeLattice->declippedPeaksCount() : 0u;
+        ctx->pendingSnap.supreme_tape_mag        = ctx->supremeCvnn    ? ctx->supremeCvnn->lastTapeMagnetization() : 0.0f;
+        ctx->pendingSnap.supreme_snn_spikes      = ctx->supremeSnnHoa  ? ctx->supremeSnnHoa->lastActiveSpikes()    : 0u;
+        ctx->pendingSnap.supreme_subsample_delay = ctx->supremeLattice ? ctx->supremeLattice->lastSubSampleDelay() : 0.24f;
+        ctx->pendingSnap.effect_frames += (uint64_t)outFrames;
+
+        // Publicar métricas lock-free al hilo cognitivo/adaptativo out-of-RT (Ruta B)
+        if (rms > 1e-6f || pk > 1e-6f) {
+            ivanna::experimental::RawAudioMetrics rawM{};
+            const float invFrames = (outFrames > 0) ? (1.0f / (float)outFrames) : 0.0f;
+            rawM.rms              = rms;
+            rawM.peak             = pk;
+            // SafetyLimiter::getGainReduction() entrega dB de reducción
+            // aplicada por el último bloque, no una razón lineal ni un proxy.
+            rawM.gain_reduction_db = ctx->safetyLimiter
+                ? std::max(0.0f, ctx->safetyLimiter->getGainReduction()) : 0.0f;
+            rawM.band_low_energy  = __builtin_sqrtf(bandAccum.low  * invFrames);
+            rawM.band_mid_energy  = __builtin_sqrtf(bandAccum.mid  * invFrames);
+            rawM.band_high_energy = __builtin_sqrtf(bandAccum.high * invFrames);
+            rawM.band_energy_valid = true; // bandMeter procesó este bloque PCM real
+            rawM.voice_score      = ctx->lastVoiceProb;
+            rawM.voice_score_valid = ctx->lastVoiceProbValid;
+            rawM.wfs_active       = (ctx->pendingSnap.wfs_enabled != 0u) ? 1.0f : 0.0f;
+            // FIX 1 (bofo Genezi): la telemetría reporta el estado EFECTIVO
+            // (con SPEAKERS la RIR y el upmix están neutralizados).
+            rawM.rir_active       = (!ctx->routeBSpeakersGate && ctx->pendingSnap.room_rt60_s > 0.05f && ctx->pendingSnap.room_wet > 0.01f) ? 1.0f : 0.0f;
+            rawM.upmix_active     = (!ctx->routeBSpeakersGate && ctx->pendingSnap.upmixing_enabled != 0u) ? 1.0f : 0.0f;
+            rawM.volterra_active  = (ctx->pendingSnap.flags & ivanna::OMEGA_FLAG_VOLTERRA_ON) ? 1.0f : 0.0f;
+if (ctx->adaptive && ctx->adaptiveEnabled) {
+                // No alimentar ni ejecutar decisiones ADE cuando el snapshot
+                // del control plane deshabilita adaptación (modo manual/OFF).
+                // Las métricas PCM permanecen disponibles para la evidencia
+                // del efecto; el motor adaptativo no retiene nuevas muestras.
+                ctx->adaptive->rawMetrics.publish(
+                    ivanna::experimental::RawMetricsBus::Source::RouteB_OmegaEffect, rawM);
+                ivanna::experimental::AdaptiveState adSt{};
+                if (ctx->adaptive->adaptiveState.consumeIfNewer(adSt, ctx->lastAdaptiveSeq)) {
+                    ctx->adaptiveDecisionTargetGain =
+                        std::clamp(std::isfinite(adSt.target_gain) ? adSt.target_gain : 1.0f,
+                                   0.50f, 1.0f);
+                    ctx->adaptiveDecisionCompAmount =
+                        std::clamp(std::isfinite(adSt.compressor_amount) ? adSt.compressor_amount : 0.0f,
+                                   0.0f, 1.0f);
+                    ctx->adaptiveDecisionExciterReduction =
+                        std::clamp(std::isfinite(adSt.exciter_reduction) ? adSt.exciter_reduction : 0.0f,
+                                   0.0f, 1.0f);
+                    ctx->adaptWfsScale = std::clamp(
+                        std::isfinite(adSt.wfs_spread_scale) ? adSt.wfs_spread_scale : 1.0f,
+                        0.5f, 1.0f);
+                    ctx->adaptImmScale = std::clamp(
+                        std::isfinite(adSt.upmix_immersivity) ? adSt.upmix_immersivity : 1.0f,
+                        0.5f, 1.0f);
+                }
+            } else if (!ctx->adaptiveEnabled) {
+                // OFF/manual: los controles originales del snapshot ya fueron
+                // neutralizados; restablecer únicamente salidas ADE separadas.
+                ctx->adaptiveDecisionTargetGain = 1.0f;
+                ctx->adaptiveDecisionCompAmount = 0.0f;
+                ctx->adaptiveDecisionExciterReduction = 0.0f;
+                ctx->adaptWfsScale = 1.0f;
+                ctx->adaptImmScale = 1.0f;
+            }
+        }
+
+        // Publicación best-effort al SHM local de telemetría, separado del control plane.
+        if (ctx->localWriterOpen.load(std::memory_order_acquire)) {
+            (void)omega_publish_local_telemetry(ctx->pendingSnap);
+        }
+    }
+    // Beacon (RT-safe): un bloque paso por TODO el DSP. Es la unica senal que la app puede
+    // usar para saber que Ruta B realmente suena (isDaemonRunning solo prueba el daemon).
+    ivanna::effectBeacon().onBlock(static_cast<uint32_t>(frames), ctx->pendingSnap.generation);
+    {   // Evidencia por procesador (RT-safe: contadores atomicos -> mmap, cada 32 callbacks).
+        static std::atomic<uint32_t> s_evTick{0};
+        if ((s_evTick.fetch_add(1, std::memory_order_relaxed) & 31u) == 0u && ivanna::effectEvidence().isOpen()) {
+            ivanna::EffectEvidence ev{};
+            ev.controlGeneration = ctx->lastAppliedGen;
+            ev.hrtfEnabled = (ctx->pendingSnap.temporal_field & ivanna::OMEGA_EFFECT_HRTF_ENABLED_BIT) ? 1u : 0u;
+            ev.adaptiveEnabled = ctx->adaptiveEnabled ? 1u : 0u;
+            ev.adaptiveApplyBlocks = ctx->adaptiveApplyBlocks;
+            if (ctx->fusionCore) {
+                IvannaFusionEngine::HrtfEvidenceOut h;
+                if (ctx->fusionCore->hrtfEvidence(h)) {
+                    ev.hrtfCpuBlocks = h.cpuBlocks; ev.hrtfDspBlocks = h.dspBlocks;
+                    ev.hrtfSafRefreshes = h.safRefreshes; ev.hrtfPoseApplies = h.poseApplies;
+                    ev.hrtfInEnergy = h.inEnergy; ev.hrtfOutEnergy = h.outEnergy;
+                    ev.hrtfAzimuthDeg = h.azimuthDeg; ev.hrtfSafBiasDeg = h.safBiasDeg;
+                    ev.hrtfCurvature = h.curvature;
+                    ev.hrtfDatasetLoaded = h.datasetLoaded ? 1u : 0u;
+                }
+            }
+            // IVANNA (v2.5.380): evidencia de la fusión en Ruta B (mismo
+            // patrón que HRTF; cada 32 callbacks, RT-safe). Con amount=0
+            // publica ceros: la evidencia de "apagada por defecto".
+            if (ctx->fusionCore) {
+                IvannaFusionEngine::OmniEvidenceOut oe;
+                if (ctx->fusionCore->omniEvidence(oe)) {
+                    ev.omniProcessCalls = oe.processCalls;
+                    ev.omniBlocksRendered = oe.blocksRendered;
+                    ev.omniFramesRendered = oe.framesRendered;
+                    ev.omniAppliedAmount = oe.appliedAmount;
+                    ev.omniConvergenceR = oe.convergenceR;
+                    ev.omniSceneAzimuthDeg = oe.sceneAzimuthDeg;
+                    ev.omniDiffuseness = oe.diffuseness;
+                    ev.omniFault = oe.fault ? 1u : 0u;
+                }
+            }
+            if (ctx->rirConvolver) {
+                const auto r = ctx->rirConvolver->evidence();
+                ev.rirLoads = r.loads; ev.rirRelinks = r.relinks; ev.rirActiveBlocks = r.activeBlocks;
+                ev.rirInEnergy = r.inEnergy; ev.rirOutEnergy = r.outEnergy;
+                ev.rirBakedEarly = r.bakedEarly; ev.rirBakedDecorrel = r.bakedDecorrel;
+                ev.rirBakedRt60Delta = r.bakedRt60Delta; ev.rirWetScale = r.wetScale;
+                ev.rirWet = ctx->rirConvolver->wetDry();
+                ev.sampleRate = static_cast<uint32_t>(ctx->rirConvolver->sampleRate());
+            }
+            ivanna::effectEvidence().publish(ev);
+        }
+    }
+    // Ack solo tras consumir la generación, llamar updateHeadPose y completar el bloque DSP.
+    const auto& appliedPose = ctx->pendingSnap;
+    if (appliedPose.generation > 0u &&
+        static_cast<ivanna::RouteMode>(appliedPose.active_route) == ivanna::RouteMode::SYSTEM_WIDE &&
+        std::isfinite(appliedPose.head_yaw_rad) && std::isfinite(appliedPose.head_pitch_rad)) {
+        ivanna::effectBeacon().onHeadPoseApplied(appliedPose.generation,
+                                                 appliedPose.head_yaw_rad,
+                                                 appliedPose.head_pitch_rad);
+    }
+    return 0;
+}
+
+// ── Drenaje del anillo RT (v2.5.446, SOLO hilo no-RT) ─────────────────────
+// omega_command corre en el hilo de control de AudioFlinger, nunca en el
+// callback de audio: aquí SÍ se puede usar LOGI/LOGW. Traduce los eventos
+// encolados por omega_process/logPassthroughThrottled a texto de logcat.
+// Si AudioFlinger no llama a omega_command en mucho tiempo, los eventos
+// simplemente esperan en el anillo (capacidad 64, luego wrap con pérdida
+// de los más viejos — diagnóstico, nunca audio).
+static void rtLogDrainCallback(const ivanna::rtlog::Record& r) noexcept {
+    static const char* kPassthroughReasons[] = {
+        "!enabled && bypass silencioso (efecto no habilitado a nivel nativo)",
+        "canales != 2 (no estereo)",
+        "integrity_self_check FALLO (ruta de .so no legitima)",
+        "antitamper LOCKDOWN (debugger/hook/emulador en audioserver)",
+        "fusionCore NULO (motor no inicializado)",
+        "bypass beginBlock fallo",
+        "buffers RT nulos",
+    };
+    // (0021) r.code es std::atomic<uint8_t> desde fix(rtlog) 8ef5fcf3:
+    // static_cast<Event>(r.code) no compila con g++-14 (host) — la carga
+    // explícita es idéntica en semántica y válida en g++ y en Clang/NDK.
+    switch (static_cast<ivanna::rtlog::Event>(
+        r.code.load(std::memory_order_relaxed))) {
+        case ivanna::rtlog::Event::kPassthrough: {
+            const uint8_t idx = r.reason;
+            const char* msg = (idx < (uint8_t)ivanna::rtlog::PassthroughReason::kCount)
+                                  ? kPassthroughReasons[idx]
+                                  : "motivo desconocido";
+            LOGW("omega_process passthrough: %s", msg);
+            break;
+        }
+        case ivanna::rtlog::Event::kAutoEnable:
+            LOGI("omega_process: auto-enable (EFFECT_CMD_ENABLE no llego del HAL; beacon onEnable)");
+            break;
+        case ivanna::rtlog::Event::kFusionCreated:
+            LOGI("omega_process: FusionEngine creado lazy (1er bloque)");
+            break;
+        case ivanna::rtlog::Event::kFusionCreateFailed:
+            LOGE("omega_process: FusionEngine lazy FALLO (nothrow null) — passthrough");
+            break;
+        case ivanna::rtlog::Event::kOutputMode:
+            LOGI("OmegaControlBus output mode -> %s (gen=%llu)",
+                 r.reason ? "SPEAKERS (cadena de audifonos neutralizada)" : "HEADPHONES/UNKNOWN",
+                 (unsigned long long)(uint64_t)r.a.load(std::memory_order_relaxed));
+            break;
+        default:
+            break;
+    }
+}
+
+static int32_t omega_command(effect_handle_t self, uint32_t cmdCode,
+                             uint32_t cmdSize, void *pCmdData,
+                             uint32_t *replySize, void *pReplyData) {
+    // Drena los eventos RT pendientes (ver rt_log_ring.hpp): este es el
+    // hilo de control, no el callback de audio.
+    ivanna::rtlog::drain(&rtLogDrainCallback);
+    omega_effect_context_t *ctx = reinterpret_cast<omega_effect_context_t *>(self);
+    switch (cmdCode) {
+        case EFFECT_CMD_INIT:
+            if (ctx) {
+                ctx->stabilityGuard.reset();
+                ctx->bandMeter.reset();
+            }
+            break;
+        case EFFECT_CMD_RESET:
+            if (ctx) {
+                ctx->stabilityGuard.reset();
+                ctx->bandMeter.reset();
+                g_hrtf_flush_req.store(true, std::memory_order_release);
+            }
+            break;
+        case EFFECT_CMD_SET_CONFIG:
+            if (pCmdData && cmdSize == sizeof(effect_config_t)) {
+                // Start the thermal poller on this non-RT control thread.
+                // If thread creation fails, the governor remains PROTECTED.
+                if (!ivanna::getThermalGovernor().start()) {
+                    __android_log_print(ANDROID_LOG_WARN, "IVANNA-Thermal",
+                                        "poller unavailable; retaining PROTECTED tier");
+                }
+                ctx->config = *reinterpret_cast<effect_config_t *>(pCmdData);
+                // HAL may create the shared snapshot after effect construction.
+                // Retry mapping on this control-plane command, never in the RT callback.
+                if (ctx->hardwareClockReader) {
+                    (void)ctx->hardwareClockReader->open();
+                }
+                uint32_t sr = ctx->config.outputCfg.samplingRate;
+                if (sr == 0) sr = ctx->config.inputCfg.samplingRate;
+                if (sr == 0) sr = 48000;
+                const bool srChanged = (ctx->lastConfiguredSr != 0u && ctx->lastConfiguredSr != sr);
+                ctx->lastConfiguredSr = sr;
+                ctx->bandMeter.prepare((float)sr);
+                ctx->fotoHoloBarkMeter.prepare((float)sr);
+                ctx->fotoHoloDelta = 0.0f;
+                ctx->fotoHoloAppliedDelta = 0.0f;
+                // AUDIT FIX (session isolation): DSP se instancia POR CONTEXTO.
+                // Cada sesión AudioFlinger llega aquí y crea su propio
+                // IvannaFusionCore; ya no se pisa el global entre sesiones.
+                // FIX (v2.5.373, higiene): new (std::nothrow) en los tres.
+                // Este target compila con -fno-exceptions (BASE_FLAGS,
+                // arm64-v8a): un try/catch no compila aquí, y un new que
+                // lanza ante falta de memoria llamaría a std::terminate y
+                // tumbaría audioserver. Los tres punteros admiten nullptr
+                // (fusionCore: passthrough fail-closed; adaptiveEngine y
+                // antiDolby: usos guardados); el bloque se reintenta en la
+                // próxima configuración si alguno quedó en null.
+                if (!ctx->fusionCore) {
+                    ctx->fusionCore = new (std::nothrow) IvannaFusionEngine((float)sr);
+                    if (!ctx->adaptiveEngine) {
+                        ctx->adaptiveEngine = new (std::nothrow) ivanna::adaptive::AdaptiveEngineV2();
+                    }
+                    if (!ctx->antiDolby) {
+                        ctx->antiDolby = new (std::nothrow) AntiDolbyState();
+                    }
+                }
+                if (ctx->fusionCore) ctx->fusionCore->initSpatial((float)sr, 4096);
+                // AUDIT FIX (realtime allocation): preasignar buffers L/R
+                // AQUÍ (fuera de la ruta caliente) para que omega_process
+                // no tenga que llamar a malloc/resize en el callback.
+                if (!ctx->rtL) {
+                    ctx->rtL = reinterpret_cast<float*>(
+                        calloc((size_t)OMEGA_RT_MAX_FRAMES, sizeof(float)));
+                }
+                if (!ctx->rtR) {
+                    ctx->rtR = reinterpret_cast<float*>(
+                        calloc((size_t)OMEGA_RT_MAX_FRAMES, sizeof(float)));
+                }
+                if (!ctx->rtDryL) {
+                    ctx->rtDryL = reinterpret_cast<float*>(
+                        calloc((size_t)OMEGA_RT_MAX_FRAMES, sizeof(float)));
+                }
+                if (!ctx->rtDryR) {
+                    ctx->rtDryR = reinterpret_cast<float*>(
+                        calloc((size_t)OMEGA_RT_MAX_FRAMES, sizeof(float)));
+                }
+                if (!ctx->rtVolterraScratch) {
+                    ctx->rtVolterraScratch = reinterpret_cast<float*>(
+                        calloc((size_t)OMEGA_RT_MAX_FRAMES * 2u, sizeof(float)));
+                }
+                ctx->rtCapacity =
+                    (ctx->rtL && ctx->rtR && ctx->rtDryL && ctx->rtDryR && ctx->rtVolterraScratch)
+                        ? OMEGA_RT_MAX_FRAMES : 0;
+                // Limiter por sesion: misma instancia que la Ruta A usa en
+                // ivanna_omega_jni.cpp (g_safety_limiter) pero por-contexto,
+                // asi dos sesiones simultaneas no comparten estado de gain-
+                // reduction ni se contaminan la telemetria entre si.
+                if (!ctx->safetyLimiter) ctx->safetyLimiter = new (std::nothrow) ivanna::SafetyLimiter();  // FIX (v2.5.373): nothrow — usos guardados, null = sin limiter (passthrough seguro)
+                if (ctx->safetyLimiter) {
+                    // FIX (distorsion constante): umbral -4 dBFS hacia que cualquier
+                    // master moderno (picos > 0.63) estuviera SIEMPRE bajo reduccion
+                    // de ganancia variable por bloque. Umbral -1 dBFS: el limiter
+                    // solo actua en picos reales.
+                    ctx->safetyLimiter->setParams(0.891251f, 0.98855f);
+                    // FIX CRITICO (clipping/bombeo, 2026-08-27): faltaba
+                    // setSampleRate() — ataque/release quedaban calculados
+                    // para 48 kHz aunque el HAL corriera a 96/192/384 kHz
+                    // (constantes 2x/4x/8x CORTAS: ataque 0.19 ms a 384k =
+                    // distorsion armonica; release 6.25 ms = bombeo).
+                    // `sr` ya esta validado arriba en este mismo handler.
+                    ctx->safetyLimiter->setSampleRate((float)sr);
+                    ctx->masterOutputStage.prepare(static_cast<double>(sr));
+                }
+                // Eje 6: perfil neutro por defecto (sello perfecto, 0 dB de
+                // pérdida) hasta que el audiograma real llegue por el control
+                // bus — deja el motor activo en el hot path sin colorear el
+                // audio mientras tanto.
+                if (!ctx->hearingEngine) {
+                    ctx->hearingEngine = new (std::nothrow) ivanna::spatial::HearingAdaptationEngine();
+                }
+                if (!ctx->audioPipeline) {
+                    ctx->audioPipeline = new (std::nothrow) ivanna::spatial::IvannaAudioPipeline();
+                }
+                if (ctx->audioPipeline) {
+                    ctx->audioPipeline->prepare(
+                        static_cast<float>(sr),
+                        ivanna::spatial::IvannaAudioPipeline::MAX_BLOCK_SIZE);
+                    ivanna::spatial::IvannaAudioPipeline::setActiveInstance(ctx->audioPipeline);
+                }
+                if (!ctx->unifiedPipeline) {
+                    ctx->unifiedPipeline = new (std::nothrow) ivanna::unified::DeclarativeUnifiedPipeline();
+                }
+                if (ctx->unifiedPipeline) {
+                    ctx->unifiedPipeline->prepare(static_cast<float>(sr), 512);
+                }
+                // Supremacía Acústica: Motores de Volterra H2 y Qualcomm cDSP FastRPC
+                if (!ctx->volterraEngine) {
+                    ctx->volterraEngine = new (std::nothrow) ivanna::dsp::VolterraH2Symmetric(64, 2);
+                }
+                if (!ctx->fastRpcClient) {
+                    ctx->fastRpcClient = new (std::nothrow) ivanna::dsp::IvannaFastRpcClient();
+                    if (ctx->fastRpcClient) {
+                        ivanna::dsp::HrtfConvolutionConfig rpcCfg{};
+                        rpcCfg.sample_rate_in = sr;
+                        rpcCfg.sample_rate_out = sr;
+                        rpcCfg.hrtf_filter_length = 128;
+                        rpcCfg.block_size = 128;
+                        rpcCfg.use_fft_convolution = true;
+                        ctx->fastRpcAvailable = ctx->fastRpcClient->initialize(rpcCfg);
+                    }
+                }
+                // Eje Supremo Coclear: CochlearActiveInverseEngine
+                if (!ctx->cochlearEngine) {
+                    ctx->cochlearEngine = new (std::nothrow) ivanna::neuromorphic::CochlearActiveInverseEngine();
+                    if (ctx->cochlearEngine) {
+                        ctx->cochlearEngine->prepare(static_cast<float>(sr), (ctx->rtCapacity > 0) ? ctx->rtCapacity : 4096);
+                    }
+                } else if (srChanged) {
+                    ctx->cochlearEngine->prepare(static_cast<float>(sr), (ctx->rtCapacity > 0) ? ctx->rtCapacity : 4096);
+                }
+                ctx->cochlearIntensity = 0.35f;
+                // 5 Ejes de Supremacía Cuántico-Neuromórfica (instanciación fuera de RT)
+                if (!ctx->supremeLattice) {
+                    ctx->supremeLattice = new (std::nothrow) ivanna::supreme::WarpedLatticeTransducerInverter();
+                    if (ctx->supremeLattice) ctx->supremeLattice->prepare(static_cast<float>(sr));
+                } else if (srChanged) {
+                    ctx->supremeLattice->prepare(static_cast<float>(sr));
+                }
+                if (!ctx->supremeCvnn) {
+                    ctx->supremeCvnn = new (std::nothrow) ivanna::supreme::PhaseCoherentTransharmonicSynthesizer();
+                    if (ctx->supremeCvnn) ctx->supremeCvnn->prepare(static_cast<float>(sr));
+                } else if (srChanged) {
+                    ctx->supremeCvnn->prepare(static_cast<float>(sr));
+                }
+                if (!ctx->supremeSnnHoa) {
+                    ctx->supremeSnnHoa = new (std::nothrow) ivanna::supreme::SnnNmfHoaUpmixer();
+                    if (ctx->supremeSnnHoa) ctx->supremeSnnHoa->prepare(static_cast<float>(sr));
+                } else if (srChanged) {
+                    ctx->supremeSnnHoa->prepare(static_cast<float>(sr));
+                }
+                if (!ctx->supremePinna) {
+                    ctx->supremePinna = new (std::nothrow) ivanna::supreme::PinnaManifoldInterpolator();
+                    if (ctx->supremePinna) {
+                        ctx->supremePinna->calibrateFromLatents(
+                            ivanna::master::kMasterSafGoldenQNorm[2],
+                            ivanna::master::kMasterSafGoldenQNorm[3],
+                            ivanna::master::kMasterSafGoldenQNorm[0],
+                            static_cast<float>(sr));
+                        ctx->supremePinna->setWetMix(0.62f);
+                    }
+                    ctx->lastPinnaConcha = ivanna::master::kMasterSafGoldenQNorm[2];
+                    ctx->lastPinnaHelix  = ivanna::master::kMasterSafGoldenQNorm[3];
+                    ctx->lastPinnaHead   = ivanna::master::kMasterSafGoldenQNorm[0];
+                } else if (srChanged) {
+                    ctx->supremePinna->calibrateFromLatents(
+                        ctx->lastPinnaConcha, ctx->lastPinnaHelix, ctx->lastPinnaHead, static_cast<float>(sr));
+                }
+                if (srChanged) {
+                    ctx->stabilityGuard.reset();
+                    g_hrtf_flush_req.store(true, std::memory_order_release);
+                }
+                if (ctx->fusionCore) {
+                    ctx->fusionCore->setSafLatentParams(ivanna::master::kMasterSafGoldenQ);
+                }
+                if (!ctx->supremeMsoFarrow) {
+                    ctx->supremeMsoFarrow = new (std::nothrow) ivanna::supreme::SupremeMsoFarrowArbitrator();
+                }
+                ctx->masterBypassEnv.configure(static_cast<float>(sr), 8.0f, 18.0f, 35.0f);
+                ctx->masterBypassEnv.setImmediate(ctx->enabled ? 1.0f : 0.0f);  // deshabilitado => ya en seco; ENABLE sube con rampa de ataque
+                // FIX RT (2026-08-25): precargar dataset RIR (disco) y crear
+                // el convolver AQUÍ, en el hilo de control — nunca en el
+                // callback omega_process. Ver omega_rir_dataset_init().
+                omega_rir_dataset_init();
+                // Cadena 4D: se crea AQUÍ (hilo de control; asigna memoria), nunca en el callback de audio.
+                ivanna::fourd::ensureInit(static_cast<float>(sr), ivanna::fourd::kAnalysisChunk);
+                ivanna::effectEvidence().open();   // NO-RT: mmap de evidencia por procesador
+                if (!ctx->rirConvolver) {
+                    ctx->rirConvolver = new (std::nothrow) Ivanna::RirConvolver();
+                    // FIX (v2.5.373): nothrow — null = sala desactivada (los usos
+                    // están guardados); sin guarda, un fallo de asignación aquí
+                    // desreferenciaría null.
+                    if (ctx->rirConvolver) {
+                        ctx->rirConvolver->applySofaCoupling(ivanna::master::kMasterSafGoldenQ);
+                        ctx->rirConvolver->synthesizeMasterStudioBrir(0.34f, static_cast<int>(sr));
+                        ctx->rirConvolver->setWetDry(0.0f);
+                    }
+                }
+                // FIX RT (2026-08-27): arrancar el worker de carga de IR
+                // (hilo de control, proceso-global). Idempotente; el hilo
+                // duerme en la CV hasta que omega_apply_room publique una
+                // sala pendiente — cero coste mientras no hay cambios.
+                if (!g_rirBStarted.exchange(true, std::memory_order_acq_rel)) {
+                    std::thread(omega_rir_worker_loop).detach();
+                    // detach a propósito: vive el ciclo de vida del proceso
+                    // audioserver; el acceso a ctx se protege con g_rirBLive
+                    // bajo g_rirBMtx (release_effect des-registra antes de
+                    // liberar -> sin UAF aunque el hilo sobreviva al efecto).
+                }
+                if (!ctx->adaptive) {
+                    ctx->adaptive = new (std::nothrow) ivanna::experimental::AdaptiveDecisionEngine();  // FIX (v2.5.373): nothrow — usos guardados, null = sin motor adaptativo
+                    ctx->lastAdaptiveSeq = 0;
+                }
+                // SET_CONFIG is a non-realtime control callback. Retry start
+                // after a previous thread-creation failure; start() is
+                // serialized/idempotent and never reallocates the DSP graph.
+                if (ctx->adaptive && !ctx->adaptive->start()) {
+                    LOGE("Route-B AdaptiveDecisionEngine thread start failed; next SET_CONFIG/ENABLE will retry");
+                }
+                // AUDIT FIX (control plane reconnect): abrir el reader del
+                // OmegaControlBus (SHM cross-process). Si el daemon todavía
+                // no creó el SHM (arranque en frío del audioserver), la
+                // apertura simplemente falla y el efecto sigue como
+                // passthrough respecto al control plane; en el próximo
+                // SET_CONFIG (cada apertura de sesión) se reintenta.
+                if (!ctx->ctrlBusOpen) {
+                    ctx->ctrlBusOpen = ivanna::effectControlBus().openReader();
+                    if (ctx->ctrlBusOpen) {
+                        // Sembrar el estado inicial con el snapshot más reciente
+                        // ya publicado por el daemon — sin esto, el primer
+                        // bloque de audio corre con los defaults del core hasta
+                        // que llegue el siguiente publish() de la UI.
+                        ivanna::OmegaDspSnapshot seed;
+                        uint64_t seen = 0;
+                        if (ivanna::effectControlBus().readLatest(seed, seen)) {
+                            omega_apply_supreme_axes(ctx, seed);
+                            auto& realityOrch = ivanna::reality::AcousticRealityOrchestrator::instance();
+                            if (realityOrch.isEnabled()) {
+                                realityOrch.coordinateSnapshot(seed);
+                            }
+                            ctx->adaptiveEnabled =
+                                (seed.temporal_field & ivanna::OMEGA_EFFECT_ADAPTIVE_ENABLED_BIT) != 0u;
+                            ctx->pendingSnap = seed;
+                            // FIX 1 (bofo Genezi): puerta vigente desde el seed.
+                            ctx->routeBSpeakersGate = omega_output_is_speakers(seed);
+                            if (!ctx->adaptiveEnabled) omega_neutralize_adaptive_snapshot(ctx->pendingSnap);
+                            omega_apply_snapshot(ctx->fusionCore, ctx->antiDolby, ctx->pendingSnap);
+                            omega_apply_supreme_axes(ctx, ctx->pendingSnap);
+                            omega_apply_room(ctx, ctx->pendingSnap);
+                            ctx->lastAppliedGen = seen;
+                            LOGI("OmegaControlBus attached (seed gen=%llu route=%d)",
+                                 (unsigned long long)seen,
+                                 (int)seed.active_route);
+                        } else {
+                            LOGI("OmegaControlBus attached (no snapshot yet)");
+                        }
+                    }
+                }
+                // Dataset HRTF personalizado (si existe). Fallback: sintético.
+                // El resultado se logea SIEMPRE: es el unico punto del sistema
+                // donde se decide entre HRTF medido y HRTF sintetico, y esa
+                // decision cambia por completo la calidad de la espacializacion.
+                static const char* kHrtfCandidates[] = {
+                    "/data/adb/ivanna_omega/hrtf_dataset.ihr1",
+                    "/system/etc/ivanna_omega/hrtf/kemar.ihr1",
+                    "/data/adb/ivanna_omega/hrtf/kemar.ihr1",
+                    "/data/data/com.ivanna.omega/files/ivanna_omega/hrtf/kemar.ihr1",
+                    "/data/user/0/com.ivanna.omega/files/ivanna_omega/hrtf/kemar.ihr1"
+                };
+                bool hrtfLoaded = false;
+                for (const char* cand : kHrtfCandidates) {
+                    errno = 0;
+                    if (ctx->fusionCore->loadCustomHrtf(cand)) {
+                        LOGI("Custom HRTF dataset loaded from %s (measured path ACTIVE)", cand);
+                        hrtfLoaded = true;
+                        break;
+                    }
+                }
+                if (!hrtfLoaded) {
+                    LOGW("No custom measured HRTF file found in AudioFlinger process; internal fallback only. measured-grid-ready=%d", Ivanna::hrtfDatabaseReady() ? 1 : 0);
+                }
+                // Tabla HRTF de la rejilla (HRTFInterpolator -> HybridRenderer del
+                // pipeline). Se llena SOLO desde un dataset medido; si no carga,
+                // el renderizador híbrido usa panning de respaldo y lo reporta
+                // (usingFallbackHrtf). Camino NO-RT (init del efecto).
+                if (!Ivanna::hrtfDatabaseReady()) {
+                    const char* tbl = Ivanna::hrtfDatabaseLoadDefault();
+                    if (tbl) {
+                        LOGI("HRTF grid table loaded from measured dataset %s", tbl);
+                    } else {
+                        LOGW("HRTF grid table NOT loaded: hybrid spatial renderer will use pan fallback");
+                    }
+                }
+                // Kernel Volterra H1/H2 (v2.5.369). Mismo patrón que el
+                // dataset HRTF: se busca el .ivk1 en rutas conocidas (el
+                // efecto no puede leer assets de la app; la app copia el
+                // asset a files/ivanna_omega/kernels/ al arrancar, y el
+                // módulo Magisk puede ponerlo en /data/adb/ivanna_omega/).
+                // SELECTOR (v2.5.369): la app escribe el kernel ACTIVO en
+                // files/ivanna_omega/kernels/selected_kernel.txt al cargar
+                // o reemplazar (Ruta A). El efecto lo lee en init y ordena
+                // sus candidatos para que Ruta B siga la selección en el
+                // próximo inicio del efecto. NO es un cambio en vivo: el
+                // efecto no tiene canal de control para intercambiar el
+                // kernel en runtime (el daemon no expone esa orden); si el
+                // usuario cambia el kernel, Ruta B lo aplica cuando el
+                // efecto se recrea (nueva sesión / reinicio del
+                // audioserver). Sin marcador (o ilegible) se mantiene el
+                // orden default (PZ1D primero).
+                // DEFAULT: el PZ1D refinado (G85 + DAC + Genezi); el
+                // Genezi anterior queda como respaldo si el PZ1D no está
+                // o la puerta lo rechaza. Camino NO-RT (init del efecto).
+                // Cargar != habilitar: el kernel queda en bypass hasta que
+                // volterraTargetEnabled (flag OMEGA_FLAG_VOLTERRA_ON) lo
+                // encienda vía setEnabled() en el callback de proceso.
+                if (ctx->volterraEngine && !ctx->volterraEngine->hasEffectiveKernel()) {
+                    bool preferGenezi = false;
+                    static const char* kMarkerCandidates[] = {
+                        "/data/adb/ivanna_omega/kernels/selected_kernel.txt",
+                        "/data/data/com.ivanna.omega/files/ivanna_omega/kernels/selected_kernel.txt",
+                        "/data/user/0/com.ivanna.omega/files/ivanna_omega/kernels/selected_kernel.txt"
+                    };
+                    for (const char* marker : kMarkerCandidates) {
+                        FILE* mf = std::fopen(marker, "rb");
+                        if (!mf) continue;
+                        char buf[32] = {};
+                        const size_t got = std::fread(buf, 1, sizeof(buf) - 1, mf);
+                        std::fclose(mf);
+                        if (got == 0) continue;
+                        if (strncmp(buf, "MOTO_G85_GENEZY", 15) == 0) { preferGenezi = true; break; }
+                        if (strncmp(buf, "MOTO_G85_PZ1D", 13) == 0) { preferGenezi = false; break; }
+                    }
+                    static const char* kPz1dFiles[] = {
+                        "/data/adb/ivanna_omega/kernels/moto_g85_pz1d.ivk1",
+                        "/data/data/com.ivanna.omega/files/ivanna_omega/kernels/moto_g85_pz1d.ivk1",
+                        "/data/user/0/com.ivanna.omega/files/ivanna_omega/kernels/moto_g85_pz1d.ivk1"
+                    };
+                    static const char* kGeneziFiles[] = {
+                        "/data/adb/ivanna_omega/kernels/genezy_mhc_pz1d.ivk1",
+                        "/data/data/com.ivanna.omega/files/ivanna_omega/kernels/genezy_mhc_pz1d.ivk1",
+                        "/data/user/0/com.ivanna.omega/files/ivanna_omega/kernels/genezy_mhc_pz1d.ivk1"
+                    };
+                    // Orden: el seleccionado primero (sus 3 rutas), luego el otro.
+                    const char* ordered[6];
+                    const char** first = preferGenezi ? kGeneziFiles : kPz1dFiles;
+                    const char** second = preferGenezi ? kPz1dFiles : kGeneziFiles;
+                    for (int i = 0; i < 3; ++i) { ordered[i] = first[i]; ordered[3 + i] = second[i]; }
+                    for (const char* cand : ordered) {
+                        FILE* f = std::fopen(cand, "rb");
+                        if (!f) continue;
+                        std::fseek(f, 0, SEEK_END);
+                        const long sz = std::ftell(f);
+                        std::fseek(f, 0, SEEK_SET);
+                        if (sz <= 0 || sz > 65536) { std::fclose(f); continue; }
+                        std::vector<std::uint8_t> pkg(static_cast<size_t>(sz));
+                        const size_t got = std::fread(pkg.data(), 1, pkg.size(), f);
+                        std::fclose(f);
+                        if (got != pkg.size()) continue;
+                        // Contrato del motor: deshabilitar antes de cargar.
+                        ctx->volterraEngine->setEnabled(false);
+                        ivanna::dsp::VolterraLoadPolicy prod;  // producción
+                        const ivanna::dsp::VolterraLoadStatus st =
+                            ctx->volterraEngine->loadKernelPackage(pkg.data(), pkg.size(), prod);
+                        if (st == ivanna::dsp::VolterraLoadStatus::Ok) {
+                            LOGI("Volterra kernel loaded from %s (Ruta B READY, inactivo hasta VOLTERRA_ON)", cand);
+                            // FALLO 5 (VOLTERRA·Ω, Ruta B): guardar los bytes
+                            // para el transductor fusionado (el fusionCore no
+                            // existe aún en init; se crea lazy en omega_process
+                            // y ahí se aplica este mismo paquete).
+                            ctx->volterraPkg = pkg;
+                            break;  // solo el primer archivo que CARGA bien
+                        }
+                        LOGW("Volterra kernel RECHAZADO desde %s: %s (%d); probando siguiente candidato",
+                             cand, ivanna::dsp::volterraLoadStatusName(st), static_cast<int>(st));
+                    }
+                }
+            }
+            break;
+        case EFFECT_CMD_ENABLE:
+            // ENABLE is also a non-realtime control callback. Retry the
+            // per-session control thread if SET_CONFIG previously could not
+            // create it. A failed start leaves the DSP path intact and
+            // reports NOT_READY instead of inventing active telemetry.
+            if (ctx && ctx->adaptive && !ctx->adaptive->running() &&
+                !ctx->adaptive->start()) {
+                LOGE("Route-B AdaptiveDecisionEngine still NOT_READY on ENABLE; retry on next SET_CONFIG");
+            }
+            // Beacon: cuenta solo la transicion deshabilitado->habilitado (ENABLE repetido
+            // no debe inflar el contador). Camino NO-RT: open()/mmap permitido aqui.
+            if (ctx && !ctx->enabled) ivanna::effectBeacon().onEnable();
+            if (ctx) {
+                ctx->enabled = true;
+                // v2.5.382: un ENABLE explícito cancela cualquier auto-enable
+                // previo y marca que el efecto NO está deshabilitado.
+                ctx->explicitlyDisabled = false;
+                ctx->disabledFrames = 0; // v2.5.470: contador de re-arme a cero
+            }
+            break;
+        case EFFECT_CMD_DISABLE:
+            if (ctx && ctx->enabled) ivanna::effectBeacon().onDisable();
+            if (ctx) {
+                ctx->enabled = false;
+                // v2.5.382: DISABLE explícito — omega_process() debe respetar
+                // la desactivación y NO auto-habilitar.
+                ctx->explicitlyDisabled = true;
+                // v2.5.470: el contador de re-arme arranca en cero (el
+                // audio sostenido tras ESTE disable es lo que re-arme).
+                ctx->disabledFrames = 0;
+            }
+            break;
+        case EFFECT_CMD_SET_PARAM:
+        case EFFECT_CMD_SET_PARAM_COMMIT: {
+            // AUDIT FIX #4: enrutar al UnifiedControlBus existente (SHM).
+            // Camino cerrado: parseo AOSP -> pendingSnap -> aplicar directo
+            // a ctx->fusionCore (nunca se pierde el parámetro) -> publish
+            // al bus local (o no-op si daemon activo, ya aplicó). Sin IPC
+            // nuevo, sin degradar el path del daemon.
+            if (!ctx) break;
+            uint32_t id = 0, vsize = 0;
+            const uint8_t* val = nullptr;
+            if (!omega_param_read_id(pCmdData, cmdSize, id, vsize, val)) {
+                LOGW("SET_PARAM: layout inválido (cmdSize=%u)", cmdSize);
+                break;
+            }
+            ivanna::OmegaDspSnapshot& s = ctx->pendingSnap;
+            // Semilla del snapshot en la primera invocación: preserva
+            // magic/version/route por defecto (SYSTEM_WIDE) para que
+            // omega_apply_snapshot NO lo rechace como "otra ruta".
+            if (s.magic != ivanna::OMEGA_CTRL_MAGIC) {
+                s = ivanna::OmegaDspSnapshot::makeDefault();
+            }
+            bool touched = false;
+            switch (id) {
+                case OMEGA_PARAM_INTENSITY: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.intensity = std::clamp(v, 0.f, 1.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_SPATIAL_WIDTH: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.spatial_width = std::clamp(v, 0.f, 3.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_HARMONIC_GAIN: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.harmonic_gain = std::clamp(v, 0.f, 2.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_COMPRESSOR_THRESHOLD: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        // dB negativos; clamp a rango razonable.
+                        s.compressor = std::clamp(v, -60.f, 0.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_COMPRESSOR_AMOUNT: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.comp_amount = std::clamp(v, 0.f, 1.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_LOUDNESS_TARGET: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.loudness_target = std::clamp(v, -36.f, -6.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_ANTI_DOLBY: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.anti_dolby = std::clamp(v, 0.f, 1.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_HIGH_CUT_HZ: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.high_cut_hz = std::clamp(v, 0.f, 24000.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_BASS_BOOST_DB: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.bass_boost_db = std::clamp(v, -12.f, 12.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_DIALOG_BOOST_DB: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.dialog_boost_db = std::clamp(v, -12.f, 12.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_WIDENER_MULT: {
+                    float v; if (omega_param_val_f32(val, vsize, v)) {
+                        s.widener_mult = std::clamp(v, 0.f, 2.f); touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_ROUTE_MODE: {
+                    int32_t v; if (omega_param_val_i32(val, vsize, v)) {
+                        if (v < 0) v = 0; if (v > 2) v = 2;
+                        s.active_route = v; touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_MASTER_BYPASS: {
+                    int32_t v; if (omega_param_val_i32(val, vsize, v)) {
+                        // bit 0 del campo flags: bypass global.
+                        if (v) s.flags |= 0x1u;
+                        else   s.flags &= ~0x1u;
+                        touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_VOLTERRA_ON: {
+                    int32_t v; if (omega_param_val_i32(val, vsize, v)) {
+                        if (v) s.flags |= ivanna::OMEGA_FLAG_VOLTERRA_ON;
+                        else   s.flags &= ~ivanna::OMEGA_FLAG_VOLTERRA_ON;
+                        touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_FASTRPC_ON: {
+                    int32_t v; if (omega_param_val_i32(val, vsize, v)) {
+                        if (v) s.flags |= ivanna::OMEGA_FLAG_FASTRPC_ON;
+                        else   s.flags &= ~ivanna::OMEGA_FLAG_FASTRPC_ON;
+                        touched = true;
+                    }
+                } break;
+                case OMEGA_PARAM_ATI_ON: {
+                    int32_t v; if (omega_param_val_i32(val, vsize, v)) {
+                        if (v) s.flags |= ivanna::OMEGA_FLAG_ATI_ON;
+                        else   s.flags &= ~ivanna::OMEGA_FLAG_ATI_ON;
+                        touched = true;
+                    }
+                } break;
+                default:
+                    // ID desconocido → no-op explícito (no toca el snapshot,
+                    // no envenena el bus). Antes esto ni se logueaba.
+                    LOGW("SET_PARAM ignorado: id=0x%08x vsize=%u", id, vsize);
+                    break;
+            }
+            if (touched) {
+                omega_local_publish_or_apply(ctx);
+            }
+        } break;
+        case EFFECT_CMD_GET_PARAM: {
+            // FIX (item MEDIO de la lista de prioridades del usuario:
+            // "EFFECT_CMD_GET_PARAM sigue no-op"): antes caía directo al
+            // "break" genérico de abajo, dejando *pReplyData sin tocar (el
+            // caller lee memoria no inicializada del buffer que reservó,
+            // no un error explícito). Reusa exactamente el mismo parser
+            // (omega_param_read_id) y la misma convención de layout
+            // psize|vsize|param[psize]|pad4|value[vsize] que ya usa
+            // EFFECT_CMD_SET_PARAM arriba — sin campo status al inicio,
+            // consistente con esta base de código, no con el
+            // effect_param_t crudo de más bajo nivel que usa AudioFlinger
+            // internamente (AOSP confirma un status(i32) ahí, pero nada en
+            // esta app llama getParameter() en este efecto hoy — se prioriza
+            // consistencia interna verificable sobre una capa de
+            // compatibilidad no ejercida por ningún caller real todavía).
+            if (!ctx || !pReplyData || !replySize) break;
+            uint32_t id = 0, vsizeIn = 0;
+            const uint8_t* dummy = nullptr;
+            if (!omega_param_read_id(pCmdData, cmdSize, id, vsizeIn, dummy)) {
+                LOGW("GET_PARAM: layout inválido (cmdSize=%u)", cmdSize);
+                break;
+            }
+            const ivanna::OmegaDspSnapshot& s = ctx->pendingSnap;
+            float fv = 0.f; int32_t iv = 0; bool isInt = false, known = true;
+            switch (id) {
+                case OMEGA_PARAM_INTENSITY:            fv = s.intensity; break;
+                case OMEGA_PARAM_SPATIAL_WIDTH:        fv = s.spatial_width; break;
+                case OMEGA_PARAM_HARMONIC_GAIN:        fv = s.harmonic_gain; break;
+                case OMEGA_PARAM_COMPRESSOR_THRESHOLD: fv = s.compressor; break;
+                case OMEGA_PARAM_COMPRESSOR_AMOUNT:    fv = s.comp_amount; break;
+                case OMEGA_PARAM_LOUDNESS_TARGET:      fv = s.loudness_target; break;
+                case OMEGA_PARAM_ANTI_DOLBY:           fv = s.anti_dolby; break;
+                case OMEGA_PARAM_HIGH_CUT_HZ:          fv = s.high_cut_hz; break;
+                case OMEGA_PARAM_BASS_BOOST_DB:        fv = s.bass_boost_db; break;
+                case OMEGA_PARAM_DIALOG_BOOST_DB:      fv = s.dialog_boost_db; break;
+                case OMEGA_PARAM_WIDENER_MULT:         fv = s.widener_mult; break;
+                case OMEGA_PARAM_ROUTE_MODE:            iv = s.active_route; isInt = true; break;
+                case OMEGA_PARAM_MASTER_BYPASS:         iv = (int32_t)(s.flags & 0x1u); isInt = true; break;
+                case OMEGA_PARAM_VOLTERRA_ON:           iv = (int32_t)((s.flags & ivanna::OMEGA_FLAG_VOLTERRA_ON) ? 1 : 0); isInt = true; break;
+                case OMEGA_PARAM_FASTRPC_ON:            iv = (int32_t)((s.flags & ivanna::OMEGA_FLAG_FASTRPC_ON) ? 1 : 0); isInt = true; break;
+                case OMEGA_PARAM_ATI_ON:                iv = (int32_t)((s.flags & ivanna::OMEGA_FLAG_ATI_ON) ? 1 : 0); isInt = true; break;
+                default: known = false; break;
+            }
+            const uint32_t vsizeOut = isInt ? sizeof(int32_t) : sizeof(float);
+            const uint32_t psizeOut = sizeof(uint32_t);
+            const uint32_t hdr = sizeof(uint32_t) * 2 + psizeOut;
+            const uint32_t valOff = (hdr + 3u) & ~uint32_t(3u);
+            const uint32_t total = valOff + vsizeOut;
+            if (!known || *replySize < total) {
+                LOGW("GET_PARAM: id=0x%08x desconocido o reply chico (replySize=%u need=%u)",
+                     id, *replySize, total);
+                break;
+            }
+            uint8_t* out = reinterpret_cast<uint8_t*>(pReplyData);
+            memcpy(out + 0, &psizeOut, sizeof(uint32_t));
+            memcpy(out + sizeof(uint32_t), &vsizeOut, sizeof(uint32_t));
+            memcpy(out + sizeof(uint32_t) * 2, &id, sizeof(uint32_t));
+            if (isInt) memcpy(out + valOff, &iv, sizeof(int32_t));
+            else       memcpy(out + valOff, &fv, sizeof(float));
+            *replySize = total;
+        } break;
+        case EFFECT_CMD_SET_DEVICE:
+            if (ctx) {
+                ctx->stabilityGuard.reset();
+                g_hrtf_flush_req.store(true, std::memory_order_release);
+            }
+            break;
+        case EFFECT_CMD_SET_VOLUME:
+        case EFFECT_CMD_SET_AUDIO_MODE:
+            break;
+        default:
+            break;
+    }
+    if (replySize && pReplyData && *replySize >= sizeof(int32_t))
+        *reinterpret_cast<int32_t *>(pReplyData) = 0;
+    return 0;
+}
+
+static int32_t omega_get_descriptor(effect_handle_t self,
+                                    effect_descriptor_t *pDescriptor) {
+    if (pDescriptor) *pDescriptor = OMEGA_DESCRIPTOR;
+    return 0;
+}
+
+static int32_t omega_process_reverse(effect_handle_t self,
+                                     audio_buffer_t *inBuf, audio_buffer_t *outBuf) {
+    return 0;
+}
+
+static const struct effect_interface_s OMEGA_INTERFACE = {
+    omega_process,
+    omega_command,
+    omega_get_descriptor,
+    omega_process_reverse
+};
+
+/* ── Funciones de librería (dlopen entry points) ─────────────────────────── */
+/* FIX CRÍTICO #3: omega_query_num_effects/omega_query_effect eliminadas —
+ * no existen en audio_effect_library_s real de AOSP (7 campos, no 9; ver
+ * audio_effect_compat.h). El modelo moderno (audio_effects.xml con UUID
+ * explícito) no necesita que la librería se auto-enumere. */
+static int32_t omega_create_effect(const effect_uuid_t *uuid, int32_t sessionId,
+                                   int32_t ioId, effect_handle_t *pHandle) {
+    if (!pHandle) return -EINVAL;
+    // The context embeds stateful C++ DSP objects (RtBandMeter and FotoHoloBarkMeter).
+    // calloc alone does not begin their object lifetimes; construct the complete context
+    // in the zeroed storage so their constructors and member lifetimes are valid.
+    void* contextStorage = calloc(1, sizeof(omega_effect_context_t));
+    if (!contextStorage) return -ENOMEM;
+    omega_effect_context_t *ctx =
+        new (contextStorage) omega_effect_context_t{};
+    ctx->itfe = &OMEGA_INTERFACE;
+    ctx->enabled = false;
+    ctx->bandMeter.prepare(48000.0f);
+    ctx->fotoHoloBarkMeter.prepare(48000.0f);
+    ctx->fotoHoloDelta = 0.0f;
+    ctx->fotoHoloAppliedDelta = 0.0f;
+    ctx->callbackClock = new (std::nothrow) ivanna::audio::CallbackClockMonitor();
+    ctx->hardwareClockReader = new (std::nothrow) ivanna::audio::HardwareClockReader();
+    ctx->hardwareClockTracker = new (std::nothrow) ivanna::audio::HardwareClockTracker();
+    if (ctx->hardwareClockReader) {
+        // Keep the reader object if the HAL file does not exist yet. SET_CONFIG
+        // retries mapping off the realtime path after the HAL has opened its stream.
+        (void)ctx->hardwareClockReader->open();
+    }
+    ctx->masterBypassEnv.configure(48000.0f, 8.0f, 18.0f, 35.0f);
+    ctx->masterBypassEnv.setImmediate(ctx->enabled ? 1.0f : 0.0f);  // deshabilitado => ya en seco; ENABLE sube con rampa de ataque
+    ctx->fusionCore = nullptr;   // AUDIT FIX: init explícito (per-instance DSP)
+    ctx->newPhysicsEngine = nullptr;  // FÍSICA NUEVA (Fase 2): lazy en omega_process
+    ctx->newPhysicsInitAttempted = false;
+    ctx->antiDolby = nullptr;
+    ctx->rirConvolver = nullptr;
+    ctx->cochlearEngine = nullptr;
+    ctx->audioPipeline = nullptr;
+    ctx->unifiedPipeline = nullptr;
+    ctx->cochlearIntensity = 0.35f;
+    ctx->rtL = nullptr;          // AUDIT FIX: buffers RT se reservan en SET_CONFIG
+    ctx->rtR = nullptr;
+    ctx->rtCapacity = 0;
+    // FIX (v2.5.373, Error -3 / higiene): new (std::nothrow), NO new con
+    // lanzamiento. Este target compila con -fno-exceptions (BASE_FLAGS,
+    // arm64-v8a): un try/catch no compila aquí, y un new que lanza ante
+    // falta de memoria llamaría a std::terminate y tumbaría audioserver
+    // en vez de devolver error. Con nothrow, si la asignación falla el
+    // motor queda en nullptr — estado válido y tolerado: todos los usos
+    // están guardados (línea ~1470) y el bloque lazy de SET_CONFIG
+    // (~2018) lo crea más tarde si sigue en null. adaptiveEnabled ya
+    // nace en false, así que no hay adaptación sin motor.
+    ctx->adaptiveEngine = new (std::nothrow) ivanna::adaptive::AdaptiveEngineV2();
+    // Fail closed until a valid control snapshot explicitly requests adaptation.
+    // The daemon's makeDefault() carries the saved/default feature bit when
+    // available; an absent control plane is not permission to self-enable.
+    ctx->adaptiveEnabled = false;
+    ctx->adaptiveApplyBlocks = 0;
+    ctx->lastAppliedGen = 0;     // AUDIT FIX: control plane empieza sin generation
+    ctx->ctrlBusOpen    = false;
+    // Writer de telemetría independiente del reader de control; apertura fuera de RT.
+    // FIX (Ruta B, Moto G85 2026-11-09): si el bus local no abre, el beacon y la
+    // telemetría de Ruta B quedan offline y la app no puede confirmar Ruta B
+    // (consumer=null, effect_state=-1). Antes fallaba en silencio; se loguea una
+    // sola vez para que el diagnóstico sea visible en logcat.
+    const bool localBusOk = omega_ensure_local_telemetry_bus();
+    if (!localBusOk) {
+        static std::atomic<bool> s_localBusFailureLogged{false};
+        if (!s_localBusFailureLogged.exchange(true, std::memory_order_acq_rel)) {
+            LOGE("Ruta B bus local de telemetria NO disponible (%s): beacon/telemetria offline; "
+                 "el efecto no pudo crear/abrir el archivo en /data/adb/ivanna_omega "
+                 "(revisar pre-creacion 0666 del demonio y permisos del directorio)",
+                 OMEGA_LOCAL_BUS_PATH);
+        }
+    }
+    ctx->localWriterOpen.store(localBusOk, std::memory_order_release);
+    // pendingSnap queda con magic=0 hasta el primer SET_PARAM (se sembrará
+    // con makeDefault() ahí).
+    memset(&ctx->pendingSnap, 0, sizeof(ctx->pendingSnap));
+    {
+        // Registrar en el set de ctx vivos del worker RIR (Ruta B) — el
+        // worker solo entrega IR a ctx registrados (anti-UAF).
+        std::lock_guard<std::mutex> lk(g_rirBMtx);
+        g_rirBLive.push_back(ctx);
+    }
+    // ── v2.5.382 — FIX DEFINITIVO Ruta B (init en creación, no en SET_CONFIG) ──
+    // En este HAL (Qualcomm) EFFECT_CMD_SET_CONFIG jamás llega al efecto
+    // nativo (igual que EFFECT_CMD_ENABLE): fusionCore y los buffers RT
+    // quedaban en null y omega_process() caía en passthrough silencioso para
+    // siempre (beacon 0). El efecto NO debe depender de SET_CONFIG para
+    // existir: se inicializa aquí, en creación (hilo de control, NO-RT),
+    // con defaults 48 kHz / estéreo / PCM16 (lo que YTM entrega en este
+    // teléfono, verificado por la sonda PAL). Si SET_CONFIG llega después,
+    // sus guards (`if (!ctx->fusionCore)`, `if (!ctx->rtL)`...) evitan
+    // doble asignación y su lógica de srChanged re-inicializa con el SR
+    // real. Sin SET_CONFIG, el efecto procesa con estos defaults.
+    {
+        constexpr float kDefaultSr = 48000.0f;
+        constexpr uint32_t kDefaultSrU = 48000u;
+        // FIX (v2.5.396, 4to brick 2026-11-11): NO crear el FusionEngine aquí.
+        // La v2.5.382 lo creó en omega_create_effect porque SET_CONFIG jamás
+        // llega en este HAL — pero su constructor hace I/O (HRTF .ihr1,
+        // agent_memory.bin por mmap) y muchas alocaciones con `new` plano;
+        // si algo falla en audioserver, std::terminate tumba el servicio y
+        // el teléfono se reinicia solo y no arranca. El FusionEngine se crea
+        // lazy en omega_process() (un solo intento); si falla, el efecto
+        // queda en passthrough y audioserver sigue vivo. fusionCore queda
+        // en nullptr aquí por diseño.
+        if (!ctx->antiDolby) {
+            ctx->antiDolby = new (std::nothrow) AntiDolbyState();
+        }
+        if (!ctx->rtL) {
+            ctx->rtL = reinterpret_cast<float*>(calloc((size_t)OMEGA_RT_MAX_FRAMES, sizeof(float)));
+        }
+        if (!ctx->rtR) {
+            ctx->rtR = reinterpret_cast<float*>(calloc((size_t)OMEGA_RT_MAX_FRAMES, sizeof(float)));
+        }
+        if (!ctx->rtDryL) {
+            ctx->rtDryL = reinterpret_cast<float*>(calloc((size_t)OMEGA_RT_MAX_FRAMES, sizeof(float)));
+        }
+        if (!ctx->rtDryR) {
+            ctx->rtDryR = reinterpret_cast<float*>(calloc((size_t)OMEGA_RT_MAX_FRAMES, sizeof(float)));
+        }
+        if (!ctx->rtVolterraScratch) {
+            ctx->rtVolterraScratch = reinterpret_cast<float*>(
+                calloc((size_t)OMEGA_RT_MAX_FRAMES * 2u, sizeof(float)));
+        }
+        ctx->rtCapacity =
+            (ctx->rtL && ctx->rtR && ctx->rtDryL && ctx->rtDryR && ctx->rtVolterraScratch)
+                ? OMEGA_RT_MAX_FRAMES : 0;
+        if (!ctx->safetyLimiter) {
+            ctx->safetyLimiter = new (std::nothrow) ivanna::SafetyLimiter();
+            if (ctx->safetyLimiter) {
+                ctx->safetyLimiter->setParams(0.891251f, 0.98855f);
+                ctx->safetyLimiter->setSampleRate(kDefaultSr);
+                ctx->masterOutputStage.prepare(static_cast<double>(kDefaultSr));
+            }
+        }
+        // Config por defecto (48 kHz / estéreo / PCM_FLOAT): sin SET_CONFIG la
+        // config queda en ceros (calloc) y el DSP interpretaría el formato
+        // como float (bytes_per_sample(0)=4). ESO ES LO CORRECTO: AudioFlinger
+        // entrega el buffer del efecto en FLOAT (el mixer mezcla en float);
+        // el PCM16 que mide la sonda PAL es DESPUÉS del mixer (salida del HAL),
+        // no en el efecto. La v2.5.382 puso PCM16 por defecto y rompió el audio:
+        // frameBytes=4 en vez de 8 (solo se copiaba la mitad del buffer),
+        // el deinterleave leía float como int16 (basura) y el write escribía
+        // int16 en un buffer float (basura) → SIN AUDIO + TRONIDOS al cambiar
+        // de app. Con PCM_FLOAT por defecto, formato y canales son correctos
+        // aunque SET_CONFIG jamás llegue. Si SET_CONFIG llega, sobreescribe
+        // ctx->config con el formato real del HAL.
+        ctx->config.inputCfg.samplingRate = kDefaultSrU;
+        ctx->config.inputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
+        ctx->config.inputCfg.format = ivanna::kOmegaDefaultFormat;
+        ctx->config.outputCfg.samplingRate = kDefaultSrU;
+        ctx->config.outputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
+        ctx->config.outputCfg.format = ivanna::kOmegaDefaultFormat;
+        ctx->lastConfiguredSr = kDefaultSrU;
+        // v2.5.396: fusionCore ya NO se revisa aquí — queda en nullptr por
+        // diseño (creación lazy en omega_process). Solo importan los buffers RT.
+        if (!ctx->rtL || !ctx->rtR || ctx->rtCapacity <= 0) {
+            LOGE("omega_create_effect: init DSP por defecto INCOMPLETO "
+                 "(rtL=%p rtR=%p rtCapacity=%d) — el efecto "
+                 "caera a passthrough hasta SET_CONFIG",
+                 (const void*)ctx->rtL,
+                 (const void*)ctx->rtR, ctx->rtCapacity);
+        }
+    }
+    *pHandle = reinterpret_cast<effect_handle_t>(ctx);
+    return 0;
+}
+
+// Apply directo para SET_PARAM + publicación en el canal local de telemetría.
+// El writer local es distinto del reader del bus autoritativo del daemon.
+static void omega_local_publish_or_apply(omega_effect_context_t* ctx) noexcept {
+    if (!ctx) return;
+    ctx->adaptiveEnabled =
+        (ctx->pendingSnap.temporal_field & ivanna::OMEGA_EFFECT_ADAPTIVE_ENABLED_BIT) != 0u;
+    if (!ctx->adaptiveEnabled) omega_neutralize_adaptive_snapshot(ctx->pendingSnap);
+    if (ctx->fusionCore) {
+        omega_apply_snapshot(ctx->fusionCore, ctx->antiDolby, ctx->pendingSnap);
+    }
+    if (!ctx->localWriterOpen.load(std::memory_order_acquire)) {
+        ctx->localWriterOpen.store(omega_ensure_local_telemetry_bus(), std::memory_order_release);
+    }
+    if (ctx->localWriterOpen.load(std::memory_order_acquire)) {
+        (void)omega_publish_local_telemetry(ctx->pendingSnap);
+    }
+}
+
+static int32_t omega_release_effect(effect_handle_t handle) {
+    // AUDIT FIX (lifecycle leak): antes sólo se hacía free(handle), dejando
+    // fugado el IvannaFusionCore alojado en ctx->fusionCore. En sesiones
+    // largas de AudioFlinger (crear/destruir efectos por cada foco de
+    // audio) esto acumulaba megas de estado DSP (buffers HRTF, spatial
+    // renderer, smoothers) hasta OOM del audioserver. Se libera
+    // explícitamente el DSP antes de liberar el contexto.
+    if (handle) {
+        omega_effect_context_t *ctx =
+            reinterpret_cast<omega_effect_context_t *>(handle);
+        if (ctx->enabled) {   // liberar sin DISABLE previo no debe dejar el contador del beacon colgado
+            ivanna::effectBeacon().onDisable();
+            ctx->enabled = false;
+        }
+            
+        if (ctx->callbackClock) {
+            delete ctx->callbackClock;
+            ctx->callbackClock = nullptr;
+        }
+        if (ctx->hardwareClockReader) {
+            delete ctx->hardwareClockReader;
+            ctx->hardwareClockReader = nullptr;
+        }
+        if (ctx->hardwareClockTracker) {
+            delete ctx->hardwareClockTracker;
+            ctx->hardwareClockTracker = nullptr;
+        }
+        if (ctx->adaptive) {
+            ctx->adaptive->stop();
+            delete ctx->adaptive;
+            ctx->adaptive = nullptr;
+        }
+        if (ctx->adaptiveEngine) {
+            delete ctx->adaptiveEngine;
+            ctx->adaptiveEngine = nullptr;
+        }
+        if (ctx->antiDolby) {
+            delete ctx->antiDolby;
+            ctx->antiDolby = nullptr;
+        }
+
+        {
+            // FIX UAF (2026-08-27): des-registrar del set de ctx vivos del
+            // worker RIR ANTES de liberar nada — si el hilo estaba a mitad
+            // de una entrega (disco ya leído, esperando el mutex), al
+            // adquirirlo comprobará alive() == false y descartará la IR
+            // en vez de escribir sobre memoria liberada.
+            std::lock_guard<std::mutex> lk(g_rirBMtx);
+            for (size_t i = 0; i < g_rirBLive.size(); ++i) {
+                if (g_rirBLive[i] == ctx) {
+                    g_rirBLive[i] = g_rirBLive.back();
+                    g_rirBLive.pop_back();
+                    break;
+                }
+            }
+            if (g_rirBCtx == ctx) { g_rirBCtx = nullptr; g_rirBIdx = -1; }
+        }
+        if (ctx->fusionCore) {
+            delete ctx->fusionCore;
+            ctx->fusionCore = nullptr;
+        }
+        if (ctx->newPhysicsEngine) {
+            delete ctx->newPhysicsEngine;
+            ctx->newPhysicsEngine = nullptr;
+        }
+        // FIX lifecycle: el limiter se liberaba DENTRO del if(fusionCore)
+        // — si fusionCore era null (init fallido) pero safetyLimiter no,
+        // quedaba fugado y su puntero nunca se anulaba. Liberacion
+        // independiente y nulificado de ambos.
+        if (ctx->safetyLimiter) {
+            delete ctx->safetyLimiter;
+            ctx->safetyLimiter = nullptr;
+        }
+        if (ctx->hearingEngine) {
+            delete ctx->hearingEngine;
+            ctx->hearingEngine = nullptr;
+        }
+        if (ctx->audioPipeline) {
+            if (ivanna::spatial::IvannaAudioPipeline::peekActiveInstance() == ctx->audioPipeline) {
+                ivanna::spatial::IvannaAudioPipeline::setActiveInstance(nullptr);
+            }
+            delete ctx->audioPipeline;
+            ctx->audioPipeline = nullptr;
+        }
+        if (ctx->unifiedPipeline) {
+            delete ctx->unifiedPipeline;
+            ctx->unifiedPipeline = nullptr;
+        }
+        if (ctx->rirConvolver) {
+            delete ctx->rirConvolver;
+            ctx->rirConvolver = nullptr;
+        }
+        if (ctx->volterraEngine) {
+            delete ctx->volterraEngine;
+            ctx->volterraEngine = nullptr;
+        }
+        if (ctx->fastRpcClient) {
+            delete ctx->fastRpcClient;
+            ctx->fastRpcClient = nullptr;
+        }
+        if (ctx->cochlearEngine) {
+            delete ctx->cochlearEngine;
+            ctx->cochlearEngine = nullptr;
+        }
+        if (ctx->supremeLattice) {
+            delete ctx->supremeLattice;
+            ctx->supremeLattice = nullptr;
+        }
+        if (ctx->supremeCvnn) {
+            delete ctx->supremeCvnn;
+            ctx->supremeCvnn = nullptr;
+        }
+        if (ctx->supremeSnnHoa) {
+            delete ctx->supremeSnnHoa;
+            ctx->supremeSnnHoa = nullptr;
+        }
+        if (ctx->supremePinna) {
+            delete ctx->supremePinna;
+            ctx->supremePinna = nullptr;
+        }
+        if (ctx->supremeMsoFarrow) {
+            delete ctx->supremeMsoFarrow;
+            ctx->supremeMsoFarrow = nullptr;
+        }
+        // AUDIT FIX (realtime allocation): liberar buffers RT preasignados.
+        if (ctx->rtL) { free(ctx->rtL); ctx->rtL = nullptr; }
+        if (ctx->rtR) { free(ctx->rtR); ctx->rtR = nullptr; }
+        if (ctx->rtDryL) { free(ctx->rtDryL); ctx->rtDryL = nullptr; }
+        if (ctx->rtDryR) { free(ctx->rtDryR); ctx->rtDryR = nullptr; }
+        if (ctx->rtVolterraScratch) { free(ctx->rtVolterraScratch); ctx->rtVolterraScratch = nullptr; }
+        ctx->rtCapacity = 0;
+        // Match placement-new above: end the C++ object lifetime before freeing storage.
+        ctx->~omega_effect_context_t();
+        free(ctx);
+    }
+    return 0;
+}
+
+static int32_t omega_get_descriptor_lib(const effect_uuid_t *uuid,
+                                        effect_descriptor_t *pDescriptor) {
+    if (!pDescriptor) return -EINVAL;
+    *pDescriptor = OMEGA_DESCRIPTOR;
+    return 0;
+}
+
+// ── Cable SAF → FusionCore ────────────────────────────────────────────────────
+// EXPURGO (auditoría 2026-08-12, continuación del expurgo JNI):
+// ivanna_saf_apply_latent() también era fantasma en este target.
+//   * La definición real la provee saf_latent_bridge.cpp:35 en
+//     libivanna_omega.so (proceso app), que publica q[7] en un
+//     snapshot atómico con seqlock-lite (ivanna_saf_get_latent_snapshot).
+//   * Esta copia vivía en libomega_effect.so (proceso audioserver,
+//     sin ART) — nunca fue enlazada por SaFJniBridge (ese TU compila
+//     al target app, no a éste).
+//   * Además dependía del singleton g_fusionCore que el expurgo JNI
+//     anterior eliminó → quedó rota por construcción.
+// El push SAF→ObjectRenderer inter-proceso sigue siendo alcance
+// separado (documentado en saf_latent_bridge.cpp).
+
+extern "C" uint64_t omega_test_get_supreme_axes_apply_count(effect_handle_t self) noexcept {
+    if (!self) return 0;
+    auto* ctx = reinterpret_cast<omega_effect_context_t*>(self);
+    return ctx->supremeAxesApplyCount;
+}
+
+extern "C" void omega_test_reset_supreme_axes_apply_count(effect_handle_t self) noexcept {
+    if (!self) return;
+    auto* ctx = reinterpret_cast<omega_effect_context_t*>(self);
+    ctx->supremeAxesApplyCount = 0;
+}
+
+extern "C" void omega_test_inject_snapshot_for_next_process(effect_handle_t self,
+                                                            const ivanna::OmegaDspSnapshot& snap) noexcept {
+    if (!self) return;
+    auto* ctx = reinterpret_cast<omega_effect_context_t*>(self);
+    static constexpr const char* kTestBusPath = "/tmp/omega_test_control_bus_shm";
+    (void)ivanna::effectControlBus().openWriter(kTestBusPath);
+    ivanna::OmegaDspSnapshot s = snap;
+    ivanna::effectControlBus().publish(s);
+    ctx->ctrlBusOpen = ivanna::effectControlBus().openReader(kTestBusPath);
+    ctx->lastAppliedGen = 0;
+}
+
+extern "C" void omega_test_nullify_cochlear_engine(effect_handle_t self) noexcept {
+    if (!self) return;
+    auto* ctx = reinterpret_cast<omega_effect_context_t*>(self);
+    delete ctx->cochlearEngine;
+    ctx->cochlearEngine = nullptr;
+}
+
+extern "C" ivanna::unified::DeclarativeUnifiedPipeline* omega_test_get_unified_pipeline(effect_handle_t self) noexcept {
+    if (!self) return nullptr;
+    auto* ctx = reinterpret_cast<omega_effect_context_t*>(self);
+    return ctx->unifiedPipeline;
+}
+
+/* ── SÍMBOLO "AELI" — el que audioserver busca con dlsym() ───────────────── */
+/* FIX CRÍTICO #3 (ver audio_effect_compat.h): audio_effect_library_t real de
+ * AOSP tiene 7 campos, no 9 — query_num_effects/query_effect no existen en
+ * el struct real. Inicializador ajustado a los 7 campos reales. */
+extern "C" __attribute__((visibility("default"), used))
+audio_effect_library_t AUDIO_EFFECT_LIBRARY_INFO_SYM = {
+    AUDIO_EFFECT_LIBRARY_TAG,
+    EFFECT_LIBRARY_API_VERSION,
+    "IVANNA Omega Effect Library",
+    "IVANNA OMEGA SUPREME",
+    omega_create_effect,
+    omega_release_effect,
+    omega_get_descriptor_lib
+};

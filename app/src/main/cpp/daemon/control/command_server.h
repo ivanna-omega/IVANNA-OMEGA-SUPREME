@@ -1,0 +1,246 @@
+// app/src/main/cpp/daemon/control/command_server.h - FIX BUILD OK
+#pragma once
+#include <string>
+#include <pthread.h>
+#include <cstdint>
+
+#define OMEGA_EQ_BANDS 10
+
+// ── Version del protocolo del socket de control (HELLO handshake) ────────────
+// Distinta de OMEGA_SHM_VERSION (layout del mmap) y de OMEGA_CTRL_VERSION
+// (layout del snapshot del bus): esta cubre el CONTRATO DE COMANDOS del socket
+// (acciones JSON soportadas y su payload). El cliente la negocia con
+// {"action":"HELLO","proto":N} al conectar; el daemon responde con la suya y
+// compatible=true si puede servir a N (hoy: N <= OMEGA_PROTO_VERSION).
+// Bump cuando se anadan/eliminen acciones o cambie un payload. El reader
+// Kotlin (OmegaEngineBridge) la usa para degradar con ruido en vez de fallar
+// en silencio cuando habla con un daemon de otra epoca.
+inline constexpr uint32_t OMEGA_PROTO_VERSION = 3u;
+
+struct OmegaDspState {
+    float eq_gains[OMEGA_EQ_BANDS];
+    float listen_phon;
+    float ref_phon;
+    bool eq_calibrated;
+    float compressor;
+    float exciter_red;
+    float high_cut_hz;
+    float spatial_width;
+    float loudness_tgt;
+    float harmonic_gain;
+    float anti_dolby;
+    float target_gain;
+    float comp_amount;
+    float exc_red;
+    float pf_params[13];
+    float bass_boost;
+    float dialog_boost;
+    float widener_mult;
+    float upmixing_enabled;
+    float upmixing_immersivity;
+    float saf_delta_e;
+    float saf_metric;
+    float saf_memory;
+    float saf_gain;
+    float saf_q[7];          // vector latente Φ_SAF — poblado por SET_SAF_STATE JSON
+    float room_rt60_s;
+    int room_idx;
+    float room_wet;
+    float intensity;
+    uint64_t last_update;
+    // FIX (flanco integración cruzada, 2026-09-10): IvannaSelfHealingEngine
+    // ya detecta y corrige fallos reales (audio engine, socket IPC, kernel
+    // DSP) en ivanna_daemon.cpp, pero el resultado solo se escribía a
+    // log_message() local del daemon — nunca llegaba a ningún cliente
+    // conectado (la app), así que "auto-repararse" ocurría siendo
+    // completamente invisible para el usuario/producto. Este campo cierra
+    // esa costura: reportSelfHealRestarts() lo actualiza desde el loop
+    // principal, GET_STATUS lo expone real.
+    uint32_t self_heal_restarts = 0;
+    // Contador de clientes atendidos por el socket de comandos. Lo
+    // incrementa el daemon en cada accept() y se expone en GET_STATUS para
+    // que la app distinga "daemon vivo sin clientes" de "daemon muerto".
+    uint32_t clients_served = 0;
+
+    // Wave Field Synthesis (misión "cerrar WFS de extremo a extremo",
+    // 2026-09-19). Al FINAL del struct a propósito: kDefaultState (abajo,
+    // en command_server.cpp) inicializa por posición — insertar campos en
+    // medio desplazaría todos los valores siguientes en silencio. Los
+    // default member initializer de aquí abajo los rellena el agregado
+    // automáticamente al haber menos entradas explícitas en kDefaultState
+    // que miembros en el struct.
+    float wfs_enabled = 1.f;   // Activo por defecto en Calibración Magistral
+    float wfs_spread  = 1.18f;
+    // Geometría real precargada (RoomGeometryConfig::defaultLayout(), orden
+    // FL,FR,SL,SR,TL,TR,SW) — SET_WFS puede sobreescribirla con un layout
+    // custom, pero el default ya es una sala real, no el origen.
+    float wfs_speaker_x[7] = {0.565f, 3.265f, 0.00f, 3.83f, 0.25f, 3.58f, 3.00f};
+    float wfs_speaker_y[7] = {1.50f, 1.50f, 1.80f, 1.80f, 2.83f, 2.83f, 0.00f};
+    float wfs_speaker_z[7] = {0.00f, 0.00f, 3.50f, 3.50f, 3.50f, 3.50f, 3.00f};
+
+    // Eje Supremo Coclear (Active Inverse) — opt-in desde UI
+    bool cochlear_enabled = false;
+    float cochlear_intensity = 0.35f;  // FIX artefactos: era 0.78f (demasiado agresivo)
+
+    // Anti-Dolby SPSC Lock-Free Ring Buffer
+    float spsc_ring_factor = 0.95f;
+
+    // ── 5 Ejes de Supremacía Cuántico-Neuromórfica (Prompt Maestro 2026) ────
+    bool  supreme_lattice_enabled     = true;
+    bool  supreme_microchirp_enabled  = true;
+    float supreme_lattice_bl_drive    = 0.50f;
+    float supreme_lattice_lambda      = 0.756f;
+
+    bool  supreme_cvnn_enabled        = true;
+    float supreme_cvnn_harmonic_gain  = 0.28f;
+    float supreme_cvnn_imd_cancel     = 0.85f;
+    float supreme_cvnn_tape_drive     = 0.25f;
+
+    bool  supreme_snn_hoa_enabled     = true;
+    float supreme_snn_immersivity     = 0.65f;
+    float supreme_snn_spike_threshold = 0.55f;
+
+    bool  supreme_pinna_enabled       = true;
+    float supreme_pinna_wet_mix       = 0.65f;
+    float supreme_pinna_concha_depth  = 0.15f;
+    float supreme_pinna_helix_curl    = -0.10f;
+    float supreme_pinna_head_width    = 0.08f;
+
+    bool  supreme_farrow_mso_enabled  = true;
+    float supreme_mso_itd_ns          = 0.0f;
+    bool  supreme_ebpf_bypass_active  = false;
+    bool  reality_recon_enabled       = true;
+
+    // v2.5.16 — bits de USUARIO enviados por la app con SET_USER_FLAGS (Volterra, FastRPC, ATI, Atlas,
+    // Unity). Al FINAL del struct a propósito (kDefaultState inicializa por posición). mask = bits que el
+    // usuario ya tocó; value = su valor. Con mask = 0 el snapshot es idéntico al de v2.5.15.
+    uint32_t user_flags_mask  = 0u;
+    uint32_t user_flags_value = 0u;
+
+    // v2.5.33 — el primer vector PF que envia la app (valores por defecto de sus sliders al arrancar)
+    // solo fija la linea base: no debe mover el sonido del sistema. Los cambios POSTERIORES se derivan
+    // a los campos que omega_effect si consume (ver derivePfEffects).
+    bool pf_baseline_set = false;
+
+    // v2.5.36 — Modo AUX/altavoces (campo de presion coherente). Se publica codificado en los bits 25..31
+    // de snapshot.flags (omega_aux_field_encode). Al FINAL del struct (kDefaultState inicializa por posicion).
+    bool  aux_field_enabled = false;
+    float aux_field_xover_hz = 120.f;
+    float aux_field_coherence = 1.f;
+    // v2.5.44: dinamica espacial temporal ("4D") -> snapshot.temporal_field. Al FINAL del struct.
+    bool  temporal_field_enabled = false;
+    float temporal_field_amount = 0.6f;
+    bool  temporal_field_auto = true;     // ley adaptativa por defecto (el slider es el techo)
+    // v2.5.49: corrección acústica de sala medida -> snapshot.room_corr_db. Al FINAL del struct. 0 = apagado.
+    float room_corr_db[10] = {};
+    // v2.5.51: motor NPE en Ruta B (NpeStereoCore en omega_effect).
+    bool  xtc_enabled = false;            // cancelación de diafonía (altavoces) en el módulo; apagada por defecto
+    bool  npe_enabled = true;
+    float npe_lateral_inhib = 0.2f, npe_ohc_compression = 0.3f, npe_master_gain_db = 0.0f;
+
+    // v2.5.41 — PUNCH (impacto predictivo, PunchEngine): cantidad 0..1 publicada en snapshot.ext_flags bits 0..3.
+    // Al final del struct (kDefaultState inicializa por posición). 0 = apagado: snapshot idéntico al anterior.
+    float punch_amount = 0.f;
+
+    // Cadena 4D en Ruta B (snapshot.ext_flags16 bits 4..15). Apagada por defecto: snapshot idéntico al anterior.
+    bool  fourd_on = false, fourd_arc = false, fourd_xtc = false;
+    float fourd_arc_depth = 0.f, fourd_depth = 0.7f, fourd_lead_ms = 7.5f;
+    // ABI v8: azimut/elevación para HRTF Ruta B, expresados en radianes.
+    float head_yaw_rad = 0.f, head_pitch_rad = 0.f;
+    uint32_t scene_distance_word = 0u;   // omega_scene_distance_encode() (ya desplazada a bits 16..31 de npe_ctl); 0 = no publicada
+    // FotoHolo Route B: análisis espectral del PCM real en omega_effect; apagado por defecto.
+    bool fotoholo_enabled = false;
+    float fotoholo_intensity = 0.6f;
+
+    // Route-B global effect switches. Defaults preserve current processing.
+    bool hrtf_enabled = true;
+    bool adaptive_enabled = true;
+
+    // ORBE — Binaural Esférico de Campo Cercano (ABI v9). Al FINAL del struct
+    // (kDefaultState inicializa por posición). amount 0 = apagado por defecto.
+    float orbe_amount = 0.f;
+    float orbe_distance_m = 0.35f;
+    float orbe_spread = 1.0f;
+    float orbe_proximity_db = 3.0f;
+    float orbe_diffuse = 0.5f;
+    bool  orbe_head_tracking = true;
+
+    // HOLOS — Operador Único de Campo Acústico (ABI v10). Al FINAL del struct,
+    // tras ORBE (kDefaultState inicializa por posición). amount 0 = apagado
+    // por defecto; EQ estático plano (no-op) hasta que la UI lo exponga.
+    float holos_amount = 0.f;
+    float holos_distance_m = 0.35f;
+    float holos_spread = 1.0f;
+    float holos_proximity_db = 3.0f;
+    float holos_diffuse = 0.5f;
+    float holos_harmonics = 0.32f;
+    float holos_warmth = 0.5f;
+    float holos_dynamics = 1.0f;
+    float holos_width = 1.0f;
+    float holos_gamma = 1.0f;
+    float holos_room_rt60 = 0.34f;
+    bool  holos_head_tracking = true;
+    int   holos_band_count = 24;
+    float holos_eq_low = 0.f;
+    float holos_eq_mid = 0.f;
+    float holos_eq_high = 0.f;
+    float holos_eq_presence = 0.f;
+    float holos_eq_tilt_db = 0.f;
+    float holos_eq_freq = 1000.f;
+
+    // v2.5.379 — sesión de música descubierta por el daemon root (dumpsys
+    // media.audio_flinger -> session_discovery.hpp). Al FINAL del struct
+    // (kDefaultState inicializa por posición). 0 = sin sesión descubierta
+    // (sin música o dumpsys fallido: fail-closed). _gen = contador que
+    // incrementa SOLO cuando la sesión descubierta cambia (0->N, N->M, N->0);
+    // la app lo usa para detectar el cambio de sesión y re-acoplar el efecto.
+    int32_t  discovered_session_id = 0;
+    uint64_t discovered_session_gen = 0;
+};
+
+class CommandServer {
+public:
+    CommandServer();
+    ~CommandServer();
+    bool start(const std::string& socket_path);
+    void stop();
+    void acceptLoop();
+    void resetState();
+    int handleJsonCommand(const char* json, char* reply, int reply_sz);
+    int handleTextCommand(const char* text, char* reply, int reply_sz);
+    /** Actualiza el contador de auto-reparaciones para exponerlo en GET_STATUS
+     *  (ver DiagnosticReport::restartCount en IvannaSelfHealingEngine). */
+    void reportSelfHealRestarts(uint32_t n) noexcept {
+        pthread_mutex_lock(&m_mutex);
+        m_state.self_heal_restarts = n;
+        pthread_mutex_unlock(&m_mutex);
+    }
+    /** Incrementa el contador de clientes aceptados (telemetria real). */
+    void bumpClientsServed() noexcept {
+        pthread_mutex_lock(&m_mutex);
+        ++m_state.clients_served;
+        pthread_mutex_unlock(&m_mutex);
+    }
+
+    /** Publica la sesión de música descubierta por el daemon root (dumpsys).
+     *  Solo republica el snapshot si la sesión CAMBIÓ (gen incrementa); si es
+     *  la misma, no hace nada (evita spamear generation cada ciclo de
+     *  descubrimiento). Thread-safe. Ver session_discovery.hpp. */
+    void reportDiscoveredSession(int32_t sessionId) noexcept;
+
+private:
+    static uint64_t _nowMs();
+    static float _clamp(float v, float lo, float hi);
+    static float _jsonFloat(const char* j, const char* key, float def);
+    static bool _jsonFloatArray(const char* j, const char* key, float* out, int maxN);
+    static const char* _jsonAction(const char* j, char* buf, int bufSz);
+
+    pthread_mutex_t m_mutex;
+    OmegaDspState m_state;
+    uint64_t m_head_pose_generation = 0;
+    uint64_t m_audio_feature_generation = 0;
+    uint64_t m_audio_feature_evidence_seq = 0;
+    int m_server_fd;
+    std::string m_socket_path;
+    bool m_running;
+};

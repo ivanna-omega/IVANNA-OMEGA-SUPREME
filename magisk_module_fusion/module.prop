@@ -1,0 +1,6 @@
+id=ivanna_fusion_magistral
+name=IVANNA Fusion Magistral (ASRC v6 + Daemon v2)
+version=v1.0
+versionCode=1
+author=Luis Uriel Pimentel Pérez (Gore TNS)
+description=FUSION MAGISTRAL: ASRC v6 + nuevo daemon v2 en UN solo modulo (sin app, sin efecto Ruta B, sin SOFA). ASRC v6: reloj certificado en vivo, dos relojes fusionados en el Kalman, Kalman 3 estados, interpolacion cubica, multi-tasa 44.1/48/96/192 kHz, vigilante del servo, autoprueba al cargar. Daemon v2: solo descubre la sesion real de musica y publica un snapshot NEUTRO (todo apagado por defecto, fail-closed). .so v5 de partida (SHA ac1ef787, verificada en vivo +58.055 ppm); la v6 se compila en CI. Kill switches: /data/vendor/ivanna_audio/pal_asrc.off (ASRC bypass) y /data/adb/ivanna_omega/ivanna_daemon.off (daemon no arranca). Safe-mode: tras 3 arranques sin HAL, retira el .rc solo.

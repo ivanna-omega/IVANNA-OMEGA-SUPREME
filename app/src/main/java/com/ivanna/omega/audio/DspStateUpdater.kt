@@ -1,0 +1,210 @@
+// DspStateUpdater.kt
+// ============================================================================
+// DELTA UPDATES + DEBOUNCE — Solo envía parámetros que cambiaron
+// Sincroniza con ciclo de audio (50ms)
+// © 2026 Luis Uriel Pimentel Pérez
+// ============================================================================
+
+package com.ivanna.omega.audio
+
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import com.ivanna.omega.core.IvannaNativeLib
+
+class DspStateUpdater {
+    private val handler = Handler(Looper.getMainLooper())
+    private var updateRunnable: Runnable? = null
+    private var lastState: AudioState? = null
+    // El primer estado nativo debe ser una escritura completa, no un delta.
+    // Si la biblioteca aún no estaba cargada, no cacheamos el estado como aplicado.
+    private var nativeStateApplied = false
+    
+    companion object {
+        private const val TAG = "DspStateUpdater"
+        private const val UPDATE_INTERVAL_MS = 50L  // Sincronizado con audio @ 50ms
+        private const val DEBOUNCE_DELAY_MS = 24L
+    }
+    
+    /**
+     * Solicitar actualización de DSP (con debounce y delta)
+     */
+    fun requestUpdate(newState: AudioState) {
+        // Cancelar update anterior si existe
+        updateRunnable?.let { handler.removeCallbacks(it) }
+        
+        // Programar nuevo update
+        updateRunnable = Runnable {
+            applyUpdate(newState)
+        }
+        updateRunnable?.let { handler.postDelayed(it, DEBOUNCE_DELAY_MS) }
+    }
+    
+    /**
+     * Aplicar actualización (solo parámetros que cambiaron)
+     */
+    private fun applyUpdate(newState: AudioState) {
+        if (!IvannaNativeLib.isLoaded) {
+            Log.w(TAG, "DSP update diferido: libivanna_omega aún no está cargada")
+            return
+        }
+        // FASE 5 — Maestro: con LIMPIO_OFF activo, NO escribir NADA al
+        // nativo (EQ, compresor, exciter, width, multibanda). El guard
+        // Fase 1 solo cubría el force de multibanda; el resto de deltas
+        // re-encendía la cadena detrás de applyOff. Se marca no-aplicado
+        // (igual que un fallo nativo) para que el próximo update reemita
+        // el estado completo al volver a ACTIVO.
+        if (MasterStateController.isNeutralOffActive()) {
+            lastState = null
+            nativeStateApplied = false
+            return
+        }
+        val previousState = if (nativeStateApplied) lastState else null
+        try {
+            val deltas = mutableMapOf<String, Float>()
+            var nativeWrites = 0
+            var nativeWriteFailed = false
+
+            // 0027: compresor multibanda (Ruta A). true (default) = multibanda
+            // 3 bandas LR4; false = monobanda (fallback). Se fija en la primera
+            // aplicación del estado DSP (el default nativo ya es true; esto lo
+            // hace explícito y cablea el JNI). Read-back con el getter.
+            // 0038+0040 Parche D: con todo apagado (neutral-off), NO forzar
+            // el multibanda a ON: EffectsOffTransition ya lo apagó y este
+            // primer applyUpdate lo re-encendería detrás.
+            if (previousState == null && !EffectsOffTransition.isNeutralOffActive()) {
+                runCatching {
+                    IvannaNativeLib.nativeSetMultibandEnabled(true)
+                    if (!IvannaNativeLib.nativeIsMultibandEnabled()) {
+                        Log.w(TAG, "multiband native: read-back dice OFF tras poner ON")
+                    }
+                }.onFailure { Log.w(TAG, "multiband native: ${it.message}") }
+            }
+
+            // FIX quirúrgico (audit 2026-07-28): antes safeCompressor() sólo se
+            // disparaba cuando cambiaba threshold O ratio — si el usuario movía
+            // Attack o Release en AdaptiveEngineScreen, el delta ni se registraba.
+            // nativeSetCompressorParams SÍ recibe attackMs/releaseMs
+            // (IvannaNativeLib.kt:117, firma de 4 args viva desde v3.0).
+            fun safeCompressor() {
+                val result = runCatching {
+                    IvannaNativeLib.nativeSetCompressorParams(
+                        newState.compressorThreshold.coerceIn(-60f, 0f),
+                        newState.compressorRatio.coerceIn(1f, 20f),
+                        newState.compressorAttack.coerceIn(0.1f, 500f),
+                        newState.compressorRelease.coerceIn(1f, 2000f)
+                    )
+                }
+                if (result.isSuccess) nativeWrites++ else {
+                    nativeWriteFailed = true
+                    Log.w(TAG, "comp native: ${result.exceptionOrNull()?.message}")
+                }
+            }
+
+            if (previousState == null || newState.compressorThreshold != previousState.compressorThreshold) {
+                deltas["threshold"] = newState.compressorThreshold
+                safeCompressor()
+            }
+            if (previousState == null || newState.compressorRatio != previousState.compressorRatio) {
+                deltas["ratio"] = newState.compressorRatio
+                safeCompressor()
+            }
+            if (previousState == null || newState.compressorAttack != previousState.compressorAttack) {
+                deltas["attack"] = newState.compressorAttack
+                safeCompressor()
+            }
+            if (previousState == null || newState.compressorRelease != previousState.compressorRelease) {
+                deltas["release"] = newState.compressorRelease
+                safeCompressor()
+            }
+
+            if (previousState == null || newState.exciterAmount != previousState.exciterAmount) {
+                deltas["exciter"] = newState.exciterAmount
+                runCatching {
+                    IvannaNativeLib.nativeSetHarmonicGain(
+                        newState.exciterAmount.coerceIn(0f, 1f)
+                    )
+                }.onSuccess { nativeWrites++ }.onFailure { nativeWriteFailed = true; Log.w(TAG, "harmonic native: ${it.message}") }
+            }
+
+            if (previousState == null || newState.spatialWidth != previousState.spatialWidth) {
+                deltas["spatial_width"] = newState.spatialWidth
+                                runCatching {
+                    IvannaNativeLib.nativeSetSpatialWidthDirect(
+                        newState.spatialWidth.coerceIn(0f, 2f)
+                    )
+                }.onSuccess { nativeWrites++ }.onFailure { nativeWriteFailed = true; Log.w(TAG, "spatial native: ${it.message}") }
+                com.ivanna.omega.audio.OmegaMetrics.updateSharedLevels(spatialWidth = newState.spatialWidth)
+            }
+
+            if (previousState == null || newState.eqBass != previousState.eqBass ||
+                previousState == null || newState.eqMid != previousState.eqMid ||
+                previousState == null || newState.eqTreble != previousState.eqTreble ||
+                previousState == null || newState.masterGain != previousState.masterGain) {
+                deltas["eq"] = newState.eqBass + newState.eqMid + newState.eqTreble
+                // FIX: antes el delta "eq" se contabilizaba y logueaba pero
+                // NUNCA se enviaba al motor nativo desde esta ruta. La ruta
+                // primaria (AdaptiveBackend.applyEQ) sí lo envía, pero
+                // requestUpdate() debe ser autosuficiente: cualquier caller
+                // que empuje un AudioState nuevo por aquí debe tener EQ real,
+                // no sólo un log. Firma real: IvannaNativeLib.kt:42.
+                // También incluye masterGain, que antes ni disparaba delta.
+                runCatching {
+                    IvannaNativeLib.nativeSetEQParams(
+                        newState.eqBass.coerceIn(-18f, 18f),
+                        newState.eqMid.coerceIn(-18f, 18f),
+                        newState.eqTreble.coerceIn(-18f, 18f),
+                        newState.masterGain.coerceIn(0.1f, 2f)
+                    )
+                }.onSuccess { nativeWrites++ }.onFailure { nativeWriteFailed = true; Log.w(TAG, "eq native: ${it.message}") }
+            }
+
+            if (previousState == null || newState.voiceProtectionEnabled != previousState.voiceProtectionEnabled) {
+                deltas["voice_protection"] = if (newState.voiceProtectionEnabled) 1f else 0f
+                // Nota: la ruta real de voz es VoiceProtectionManager.applyToEngine()
+                // — este delta es sólo informativo para el log, no dispara C++.
+            }
+
+            if (deltas.isNotEmpty()) {
+                Log.d(TAG, "📡 Delta update enviado: ${deltas.keys.joinToString(", ")}")
+            }
+
+            if (nativeWriteFailed) {
+                // A partial native update cannot be treated as an atomic snapshot.
+                // Clear the cache so the next request replays the complete state.
+                lastState = null
+                nativeStateApplied = false
+                Log.w(TAG, "DSP state not committed: one or more native setters failed")
+            } else if (nativeWrites > 0) {
+                lastState = newState
+                nativeStateApplied = true
+            } else if (previousState == null) {
+                // No native setter ran (for example, only an informational field changed).
+                lastState = null
+                nativeStateApplied = false
+            } else {
+                // An empty delta means the previous native snapshot is still current.
+                lastState = previousState
+                nativeStateApplied = true
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "❌ Error en applyUpdate", t)
+        }
+    }
+
+    /**
+     * Forzar actualización sin debounce (para cambios críticos)
+     */
+    fun forceUpdate(newState: AudioState) {
+        updateRunnable?.let { handler.removeCallbacks(it) }
+        applyUpdate(newState)
+    }
+    
+    /**
+     * Obtener último estado aplicado
+     */
+    fun getLastAppliedState(): AudioState? = lastState.takeIf { nativeStateApplied }
+    
+    val lastSpatialWidth: Float
+        get() = lastState?.spatialWidth ?: 0f
+}

@@ -1,0 +1,366 @@
+"""Contrato del diagnostico LD_PRELOAD del modulo Magisk (preload_link.sh).
+
+El modulo empaqueta libivanna_pal_presence_probe.so, pero la unica evidencia
+valida de que este cargada es el mapa de memoria del proceso del HAL. Estas
+pruebas ejecutan el helper real contra un arbol /proc falso (IVANNA_PROC_DIR) y
+fijan tambien el limite de honestidad del modulo: ningun script puede exportar
+LD_PRELOAD, reiniciar el HAL ni tocar SELinux. No prueban el dispositivo.
+"""
+import os
+import re
+import subprocess
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MOD = os.path.join(ROOT, "magisk_module")
+HELPER = os.path.join(MOD, "preload_link.sh")
+LIB = "libivanna_pal_presence_probe.so"
+HAL_CMD = "/vendor/bin/hw/android.hardware.audio.service_64"
+
+
+def write(path, data, binary=False):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb" if binary else "w") as f:
+        f.write(data)
+
+
+class Sandbox:
+    """Arbol /proc falso + directorio de modulo falso, todo en un tmpdir."""
+
+    def __init__(self, root):
+        self.root = root
+        self.proc = os.path.join(root, "proc")
+        self.moddir = os.path.join(root, "module")
+        self.vendor = os.path.join(root, "vendor", "lib64", LIB)
+        self.report = os.path.join(root, "report.txt")
+        os.makedirs(self.proc)
+
+    def install_lib(self):
+        write(os.path.join(self.moddir, "system", "vendor", "lib64", LIB), "ELF-fake")
+
+    def process(self, pid, cmdline, maps="", environ=None):
+        d = os.path.join(self.proc, str(pid))
+        write(os.path.join(d, "cmdline"), cmdline.replace(" ", "\0") + "\0", binary=False)
+        write(os.path.join(d, "maps"), maps)
+        if environ is not None:
+            write(os.path.join(d, "environ"), "\0".join(environ) + "\0")
+
+    def unreadable_maps(self, pid):
+        # un directorio hace que grep falle con rc=2, como EACCES sin root
+        d = os.path.join(self.proc, str(pid), "maps")
+        os.remove(d)
+        os.makedirs(d)
+
+    def run(self, body="ivanna_preload_status"):
+        env = dict(
+            os.environ,
+            IVANNA_PROC_DIR=self.proc,
+            IVANNA_MODDIR=self.moddir,
+            IVANNA_VENDOR_LIB=self.vendor,
+            IVANNA_PRELOAD_REPORT=self.report,
+        )
+        return subprocess.run(["sh", "-c", f'. "{HELPER}"; {body}'], env=env,
+                              capture_output=True, text=True, timeout=30)
+
+
+def fields(stdout):
+    out = {}
+    for line in stdout.splitlines():
+        m = re.match(r"^(verdict|note)=(.*)$", line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+MAPPED = f"7f00-7f01 r-xp 00000000 fd:00 1 /vendor/lib64/{LIB}\n"
+UNRELATED = "7f00-7f01 r-xp 00000000 fd:00 1 /vendor/lib64/libc.so\n"
+
+
+class PreloadStatusTest(unittest.TestCase):
+    def sb(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        return Sandbox(t.name)
+
+    def test_lib_not_installed(self):
+        s = self.sb()
+        s.process(100, HAL_CMD, UNRELATED)
+        r = s.run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(fields(r.stdout)["verdict"], "LIB_NOT_INSTALLED", r.stdout)
+
+    def test_hal_not_running(self):
+        s = self.sb()
+        s.install_lib()
+        s.process(200, "/system/bin/surfaceflinger", UNRELATED)
+        r = s.run()
+        self.assertEqual(fields(r.stdout)["verdict"], "HAL_NOT_RUNNING", r.stdout)
+        self.assertIn("hal_processes=0", r.stdout)
+
+    def test_hal_running_without_library_is_not_loaded(self):
+        s = self.sb()
+        s.install_lib()
+        s.process(100, HAL_CMD, UNRELATED, environ=["PATH=/vendor/bin"])
+        r = s.run()
+        f = fields(r.stdout)
+        self.assertEqual(f["verdict"], "NOT_LOADED", r.stdout)
+        self.assertIn("hal_pid=100 mapped=no", r.stdout)
+        self.assertIn("early-init", f["note"])
+
+    def test_library_mapped_in_hal_is_loaded(self):
+        s = self.sb()
+        s.install_lib()
+        s.process(100, HAL_CMD, UNRELATED + MAPPED)
+        r = s.run()
+        self.assertEqual(fields(r.stdout)["verdict"], "LOADED", r.stdout)
+        self.assertIn("hal_pid=100 mapped=yes", r.stdout)
+        # honestidad: LOADED no se vende como ASRC/PCM activo
+        self.assertIn("no prueba PCM", fields(r.stdout)["note"])
+
+    def test_library_in_another_process_does_not_count(self):
+        # Regresion de alcance: solo el proceso del HAL decide el veredicto.
+        s = self.sb()
+        s.install_lib()
+        s.process(100, HAL_CMD, UNRELATED)
+        s.process(300, "/system/bin/audioserver", MAPPED)
+        r = s.run()
+        self.assertEqual(fields(r.stdout)["verdict"], "NOT_LOADED", r.stdout)
+        self.assertNotIn("hal_pid=300", r.stdout)
+
+    def test_unreadable_maps_asks_for_root_instead_of_guessing(self):
+        s = self.sb()
+        s.install_lib()
+        s.process(100, HAL_CMD, UNRELATED)
+        s.unreadable_maps(100)
+        r = s.run()
+        self.assertEqual(fields(r.stdout)["verdict"], "NEEDS_ROOT", r.stdout)
+        self.assertIn("mapped=unreadable", r.stdout)
+
+    def test_one_loaded_pid_among_several_hal_processes(self):
+        s = self.sb()
+        s.install_lib()
+        s.process(100, HAL_CMD, UNRELATED)
+        s.process(101, HAL_CMD, MAPPED)
+        r = s.run()
+        self.assertEqual(fields(r.stdout)["verdict"], "LOADED", r.stdout)
+        self.assertIn("hal_processes=2", r.stdout)
+
+    def test_ld_preload_environment_is_reported_and_existing_entries_visible(self):
+        s = self.sb()
+        s.install_lib()
+        both = f"LD_PRELOAD=/vendor/lib64/other.so:/vendor/lib64/{LIB}"
+        s.process(100, HAL_CMD, MAPPED, environ=["PATH=/x", both])
+        r = s.run()
+        self.assertIn(f"ld_preload_env=yes {both}", r.stdout)
+
+    def test_foreign_ld_preload_is_not_credited_to_the_probe(self):
+        s = self.sb()
+        s.install_lib()
+        s.process(100, HAL_CMD, UNRELATED,
+                  environ=["LD_PRELOAD=/vendor/lib64/other.so"])
+        r = s.run()
+        self.assertIn("ld_preload_env=no LD_PRELOAD=/vendor/lib64/other.so", r.stdout)
+
+    def test_missing_environ_is_unreadable_not_no(self):
+        s = self.sb()
+        s.install_lib()
+        s.process(100, HAL_CMD, UNRELATED)  # sin archivo environ
+        r = s.run()
+        self.assertIn("ld_preload_env=unreadable", r.stdout)
+
+    def test_report_file_presence_is_reported(self):
+        s = self.sb()
+        s.install_lib()
+        s.process(100, HAL_CMD, UNRELATED)
+        self.assertIn("report_file=absent", s.run().stdout)
+        write(s.report, "=== IVANNA PAL PRELOAD PRESENCE v1 ===\n")
+        self.assertIn("report_file=" + s.report, s.run().stdout)
+        self.assertIn("PRESENCE v1", s.run("ivanna_preload_report").stdout)
+
+    def test_report_without_file_says_so(self):
+        s = self.sb()
+        r = s.run("ivanna_preload_report")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("sin reporte", r.stdout)
+
+    def test_module_lib_hash_is_published_when_installed(self):
+        s = self.sb()
+        s.install_lib()
+        r = s.run()
+        self.assertRegex(r.stdout, r"module_lib_sha256=[0-9a-f]{64}")
+
+
+class ModuleHonestyContractTest(unittest.TestCase):
+    """El modulo no puede fingir inyeccion: init ya creo el HAL antes que service.sh."""
+
+    FORBIDDEN = [
+        r"^\s*(export\s+)?LD_PRELOAD=",       # asignar/exportar LD_PRELOAD
+        r"setenv\s+LD_PRELOAD",               # stanza de init
+        r"setprop\s+ctl\.",                   # reiniciar servicios
+        r"\bptrace\b",
+        r"process_vm_writev",
+        r"setenforce",
+    ]
+
+    def module_scripts(self):
+        for dirpath, _, files in os.walk(MOD):
+            for n in files:
+                if n.endswith(".sh"):
+                    yield os.path.join(dirpath, n)
+
+    def test_no_module_script_injects_or_restarts_the_hal(self):
+        for p in self.module_scripts():
+            text = open(p, encoding="utf-8", errors="replace").read()
+            for line in text.splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                for pat in self.FORBIDDEN:
+                    self.assertIsNone(re.search(pat, line),
+                                      f"{os.path.relpath(p, ROOT)}: {line.strip()!r}")
+
+    def test_preload_helper_is_read_only(self):
+        text = open(HELPER, encoding="utf-8").read()
+        code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+        for token in ("setprop", "chmod", "chown", "mkdir", "rm -", "kill", "stop ", "start "):
+            self.assertNotIn(token, code, f"preload_link.sh no debe usar {token!r}")
+        # escribe en stdout solamente: ninguna redireccion a archivo salvo /dev/null.
+        # Se ignoran las cadenas entrecomilladas ("<pid>" en un mensaje no es redireccion).
+        unquoted = re.sub(r'"[^"]*"', '""', code)
+        for m in re.finditer(r">\s*([^\s&|)]+)", unquoted):
+            target = m.group(1)
+            self.assertIn(target, ("/dev/null", "&2"), f"redireccion inesperada: {target}")
+
+    def test_control_cli_exposes_preload_command(self):
+        text = open(os.path.join(MOD, "ivanna_control.sh"), encoding="utf-8").read()
+        self.assertRegex(text, r"(?m)^\s*preload\)")
+        self.assertIn("preload_link.sh", text)
+        self.assertIn("preload [status|report|reach]", text)
+
+
+class ProbePackagingContractTest(unittest.TestCase):
+    """El modulo principal debe COMPILAR, VERIFICAR y EMPAQUETAR la sonda, y decir la verdad al instalar."""
+
+    BUILD = os.path.join(ROOT, ".github", "workflows", "build.yml")
+    PROBE_SRC = os.path.join(ROOT, "hal_integration", "moto_g85", "pal_preload_probe",
+                             "ivanna_pal_presence_probe.c")
+
+    def build_text(self):
+        return open(self.BUILD, encoding="utf-8").read()
+
+    def test_probe_source_exists_where_ci_compiles_it(self):
+        self.assertTrue(os.path.isfile(self.PROBE_SRC))
+        self.assertIn("pal_preload_probe/ivanna_pal_presence_probe.c", self.build_text())
+
+    def test_ci_compiles_probe_with_project_hardening_and_16kb_pages(self):
+        t = self.build_text()
+        self.assertIn("Compile + stage PAL LD_PRELOAD presence probe into Magisk module", t)
+        step = t[t.index("Compile + stage PAL LD_PRELOAD presence probe"):]
+        step = step[:step.index("MANIFIESTO DE ARTEFACTOS")]
+        for needle in ("-Wall -Wextra -Werror", "-fvisibility=hidden",
+                       "-Wl,-z,relro,-z,now", "max-page-size=16384",
+                       "validate_source.py", "libc++_shared",
+                       "--defined-only", "--undefined-only",
+                       "magisk_module/system/vendor/lib64/libivanna_pal_presence_probe.so"):
+            self.assertIn(needle, step, f"falta {needle!r} en el paso de compilacion de la sonda")
+
+    def test_zip_must_contain_probe_and_match_compiled_hash(self):
+        t = self.build_text()
+        self.assertIn('grep -q "system/vendor/lib64/libivanna_pal_presence_probe.so"', t)
+        self.assertIn("H_PROBE_ZIP", t)
+        self.assertIn("hash sonda zip != hash sonda compilada", t)
+
+    def test_build_info_records_probe_hash_and_verify_release_checks_it(self):
+        t = self.build_text()
+        self.assertIn('echo "preload_probe_sha256=', t)
+        self.assertIn('preload_probe_sha256=$H_PROBE', t)
+        self.assertIn("elf_align_gate extracted_probe.so", t)
+
+    def test_install_message_does_not_claim_active_injection(self):
+        text = open(os.path.join(MOD, "customize.sh"), encoding="utf-8").read()
+        self.assertIn("LD_PRELOAD NO queda activo", text)
+        self.assertIn("ivanna_control.sh preload", text)
+        self.assertIn("early-init", text)
+
+
+STOCK = "795aa06000-795aa08000 r--p 00000000 fe:0a 19806388  /vendor/lib64/libar-pal.so\n"
+STOCK2 = "795aa16000-795aa18000 r-xp 00010000 fe:0a 19806389  /vendor/lib64/soundfx/libdownmix.so\n"
+FOREIGN = "795ab16000-795ab18000 r-xp 00000000 fe:38 77  /vendor/lib64/soundfx/libivanna_pal_presence_probe.so\n"
+MOUNTINFO_VISIBLE = ("1 2 254:56 /adb/modules/m/system/vendor/lib64/libivanna_pal_presence_probe.so "
+                     "/vendor/lib64/libivanna_pal_presence_probe.so ro - f2fs /dev/x rw\n")
+
+
+class PreloadReachTest(unittest.TestCase):
+    """ivanna_preload_reach: evidencia de si el HAL puede ver/cargar codigo del modulo."""
+
+    def sb(self):
+        t = tempfile.TemporaryDirectory()
+        self.addCleanup(t.cleanup)
+        return Sandbox(t.name)
+
+    def reach(self, s):
+        r = s.run("ivanna_preload_reach")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r, fields(r.stdout)
+
+    def test_only_stock_vendor_libraries_means_files_not_visible(self):
+        # Replica el hallazgo de la captura real del Moto G85: todo en el dispositivo vendor original.
+        s = self.sb()
+        s.process(100, HAL_CMD, STOCK + STOCK2)
+        write(os.path.join(s.proc, "100", "mountinfo"), "1 2 254:10 / /vendor ro - erofs /dev/x ro\n")
+        r, f = self.reach(s)
+        self.assertEqual(f["verdict"], "MODULE_FILES_NOT_VISIBLE", r.stdout)
+        self.assertIn("mapped_from_module=0", r.stdout)
+        self.assertIn("module_mount_visible=no", r.stdout)
+
+    def test_without_mountinfo_visibility_is_not_claimed(self):
+        # Caso de la captura real: solo hay maps. No se puede afirmar "el HAL no ve el archivo".
+        s = self.sb()
+        s.process(100, HAL_CMD, STOCK + STOCK2)
+        r, f = self.reach(s)
+        self.assertEqual(f["verdict"], "NO_MODULE_CODE_MAPPED", r.stdout)
+        self.assertIn("module_mount_visible=unknown", r.stdout)
+
+    def test_mount_visible_but_not_mapped(self):
+        s = self.sb()
+        s.process(100, HAL_CMD, STOCK + STOCK2)
+        write(os.path.join(s.proc, "100", "mountinfo"), MOUNTINFO_VISIBLE)
+        r, f = self.reach(s)
+        self.assertEqual(f["verdict"], "VISIBLE_NOT_MAPPED", r.stdout)
+        self.assertIn("wrap.*", f["note"])
+
+    def test_region_from_foreign_device_is_module_code(self):
+        s = self.sb()
+        s.process(100, HAL_CMD, STOCK + STOCK2 + FOREIGN)
+        r, f = self.reach(s)
+        self.assertEqual(f["verdict"], "MODULE_CODE_MAPPED", r.stdout)
+        self.assertIn("mapped_from_module=1", r.stdout)
+
+    def test_hal_not_running(self):
+        s = self.sb()
+        s.process(200, "/system/bin/surfaceflinger", STOCK)
+        r, f = self.reach(s)
+        self.assertEqual(f["verdict"], "HAL_NOT_RUNNING", r.stdout)
+
+    def test_unreadable_maps_asks_for_root(self):
+        s = self.sb()
+        s.process(100, HAL_CMD, STOCK)
+        s.unreadable_maps(100)
+        r, f = self.reach(s)
+        self.assertEqual(f["verdict"], "NEEDS_ROOT", r.stdout)
+
+    def test_selinux_domain_is_reported(self):
+        s = self.sb()
+        s.process(100, HAL_CMD, STOCK)
+        write(os.path.join(s.proc, "100", "attr", "current"), "u:r:hal_audio_default:s0\0")
+        r, _ = self.reach(s)
+        self.assertIn("selinux=u:r:hal_audio_default:s0", r.stdout)
+
+    def test_control_script_exposes_reach(self):
+        src = open(os.path.join(MOD, "ivanna_control.sh")).read()
+        self.assertIn("reach)", src)
+        self.assertIn("ivanna_preload_reach", src)
+
+
+if __name__ == "__main__":
+    unittest.main()

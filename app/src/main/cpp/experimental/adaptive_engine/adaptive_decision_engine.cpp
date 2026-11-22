@@ -1,0 +1,499 @@
+// © 2026 Luis Uriel Pimentel Pérez — GORE TNS. All rights reserved.
+#include "adaptive_decision_engine.hpp"
+#include "../../include/acoustic_reality_hyperengine.hpp"
+#include "../../include/acoustic_cognitive_evolution_engine.hpp"
+#include "../../include/master_acoustic_orchestrator.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sys/resource.h>
+#endif
+
+namespace ivanna::experimental {
+
+namespace {
+constexpr float kEps = 1e-8f;
+
+// SafetyLimiter defaults (include/SafetyLimiter.h): threshold=-4 dBFS
+// (0.63096), ceiling=-0.1 dBFS (0.98855). Safety margin is measured against
+// the output ceiling; limiter attenuation telemetry arrives in dB separately.
+constexpr float kLimiterCeiling = 0.98855f;
+
+inline float clamp01(float x) noexcept {
+    if (!std::isfinite(x)) return 0.0f;   // NaN/Inf nunca sale de esta función
+    return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x);
+}
+
+inline float clampRange(float x, float lo, float hi) noexcept {
+    if (!std::isfinite(x)) return lo;     // fallback seguro y determinista
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+} // namespace
+
+float AdaptiveDecisionEngine::computeTargetGain(const RawAudioMetrics& m) noexcept {
+    // Si SafetyLimiter ya está reduciendo ganancia de forma sostenida,
+    // sugerir bajar la ganancia de entrada preventivamente en vez de
+    // depender del limiter como único freno. 6dB de gain reduction →
+    // sugerencia de recorte a la mitad (target_gain≈0.5); 0dB → sin cambio.
+    const float gr = std::max(0.0f, m.gain_reduction_db);
+    const float g  = 1.0f / (1.0f + gr * (1.0f / 6.0f));
+    return clampRange(g, 0.5f, 1.0f);
+}
+
+float AdaptiveDecisionEngine::computeCompressorAmount(const RawAudioMetrics& m) noexcept {
+    // Proxy de crest factor: peak/rms. Material muy dinámico (crest alto)
+    // se beneficia de más compresión para domar transientes; material ya
+    // comprimido/denso (crest bajo) no necesita más.
+    const float rms  = std::max(0.0f, m.rms);
+    const float peak = std::max(0.0f, m.peak);
+    const float crest = peak / std::max(rms, kEps);
+    // crest≈3 (9.5dB) → 0.0 (material ya denso). crest≈10 (20dB) → 1.0 (muy dinámico).
+    return clamp01((crest - 3.0f) / 7.0f);
+}
+
+float AdaptiveDecisionEngine::computeExciterReduction(const RawAudioMetrics& m,
+                                                       float sibilanceEma) noexcept {
+    const float low  = trustedBandEnergy(m, m.band_low_energy);
+    const float mid  = trustedBandEnergy(m, m.band_mid_energy);
+    const float high = trustedBandEnergy(m, m.band_high_energy);
+    const float total = low + mid + high + kEps;
+    const float highRatio = high / total;
+    // >15% de la energía total en la banda de sibilancia (5-9kHz) empieza
+    // a sugerir reducción; a partir de 50% se satura en máxima reducción.
+    const float instantTerm = m.band_energy_valid
+        ? clamp01((highRatio - 0.15f) / 0.35f)
+        : 0.0f;
+    // Se pondera igual la lectura instantánea (transitorio de "S"/platillos)
+    // que la EMA sostenida (fatiga acumulada) — un pico aislado no debería
+    // bajar el exciter tanto como una exposición sostenida.
+    return clamp01(0.5f * instantTerm + 0.5f * clamp01(sibilanceEma));
+}
+
+float AdaptiveDecisionEngine::computeSpatialWidth(const RawAudioMetrics& m) noexcept {
+    // Si el limiter ya está trabajando fuerte, un campo estéreo más angosto
+    // es más predecible (menos energía de "side" que pueda empujar picos
+    // en un canal mientras el otro está limpio). Reducción leve, nunca
+    // agresiva — esto es una sugerencia de seguridad, no un efecto creativo.
+    const float gr = std::max(0.0f, m.gain_reduction_db);
+    return clampRange(1.0f - gr * 0.02f, 0.5f, 1.5f);
+}
+
+float AdaptiveDecisionEngine::computeSafetyMargin(const RawAudioMetrics& m) noexcept {
+    const float peak = std::max(0.0f, m.peak);
+    // FIX (encontrado por el test real, no a ojo): proximidad LINEAL
+    // (1 - peak/threshold) subestima el margen real. Un peak=0.5 lineal
+    // está a -6dBFS del threshold del SafetyLimiter (~0dBFS) — en
+    // términos de mastering, 6dB de headroom es un margen SANO (la
+    // mayoría de masters comerciales dejan 1-3dB de true-peak headroom),
+    // pero la fórmula lineal lo reportaba como "49% de margen", casi la
+    // mitad. El headroom de audio se razona perceptualmente en dB, no en
+    // amplitud lineal — se corrige a una proximidad logarítmica real.
+    float proximityDb;
+    if (peak < kEps) {
+        proximityDb = 1.0f;  // silencio total = margen máximo, evita log(0)
+    } else {
+        const float headroomDb = 20.0f * std::log10(kLimiterCeiling / std::max(peak, kEps));
+        // 12dB de headroom o más → margen 1.0 (máximo). 0dB (peak ya en
+        // el threshold) → margen 0.0. Rango lineal entre ambos extremos.
+        proximityDb = clamp01(headroomDb / 12.0f);
+    }
+    // Cuánta reducción ya está aplicando el limiter (6dB sostenidos = margen ~0).
+    const float gr = std::max(0.0f, m.gain_reduction_db);
+    const float reductionPenalty = clamp01(1.0f - gr / 6.0f);
+    // El margen real es el más conservador de los dos indicadores, nunca
+    // un promedio que pueda ocultar que uno de los dos ya está en rojo.
+    return std::min(proximityDb, reductionPenalty);
+}
+
+float AdaptiveDecisionEngine::gainReductionLinearToDb(float peakExcessLinear, float ceiling) noexcept {
+    const float rl = std::max(0.0f, peakExcessLinear);
+    if (rl < kEps) return 0.0f;
+    if (!std::isfinite(ceiling) || ceiling < kEps) return 0.0f;  // fallback seguro
+    // peak = reductionLinear + ceiling (ver derivación en el .hpp — se
+    // reconstruye peak sin depender de SafetyLimiter directamente).
+    const float peak = rl + ceiling;
+    const float db = 20.0f * std::log10(peak / ceiling);
+    return std::isfinite(db) ? std::max(0.0f, db) : 0.0f;
+}
+
+float AdaptiveDecisionEngine::computeVoiceProtection(const RawAudioMetrics& m) noexcept {
+    // La ausencia de inferencia válida es neutral. No se estima voz a partir
+    // de RMS, bandas, contenido medio ni valores de inicialización.
+    return trustedVoiceScore(m);
+}
+
+AdaptiveDecisionEngine::HarmonicArbitration
+AdaptiveDecisionEngine::arbitrateHarmonics(const RawAudioMetrics& m, float sibilanceEma) noexcept {
+    HarmonicArbitration out;
+    const bool geActive   = (m.golden_ear_active > 0.5f);
+    const bool voltActive = (m.volterra_active > 0.5f);
+    const float sib       = clamp01(sibilanceEma);
+
+    if (geActive) {
+        // GoldenEarGAN es dominante: Volterra y Exciter reducidos para evitar IMD
+        out.golden_ear_scale = 1.0f;
+        out.volterra_scale   = 0.25f;
+        out.exciter_scale    = 0.15f * (1.0f - sib);
+    } else if (voltActive) {
+        // Volterra restaurando códec: Exciter reducido, GoldenEar desactivado
+        out.golden_ear_scale = 0.0f;
+        out.volterra_scale   = 1.0f;
+        out.exciter_scale    = 0.35f * (1.0f - sib);
+    } else {
+        // Régimen estándar
+        out.golden_ear_scale = 1.0f;
+        out.volterra_scale   = 1.0f;
+        out.exciter_scale    = clamp01(1.0f - computeExciterReduction(m, sibilanceEma));
+    }
+
+    // Presupuesto total de distorsión armónica: acotado para evitar acumulación ciega
+    const float totalDrive = out.golden_ear_scale * 0.5f +
+                             out.volterra_scale   * 0.3f +
+                             out.exciter_scale    * 0.2f;
+    out.total_drive = totalDrive;
+    if (totalDrive > 1.0f) {
+        const float inv = 1.0f / totalDrive;
+        out.golden_ear_scale *= inv;
+        out.volterra_scale   *= inv;
+        out.exciter_scale    *= inv;
+    }
+    return out;
+}
+
+AdaptiveDecisionEngine::SpatialArbitration
+AdaptiveDecisionEngine::arbitrateSpatial(const RawAudioMetrics& m) noexcept {
+    SpatialArbitration out;
+    const bool upmixActive = (m.upmix_active > 0.5f);
+    const bool wfsActive   = (m.wfs_active > 0.5f);
+    const bool rirActive   = (m.rir_active > 0.5f);
+    const float voiceScore = trustedVoiceScore(m);
+    const float gr         = std::max(0.0f, m.gain_reduction_db);
+
+    // 1. Localización HRTF: siempre 1.0 (referencia binaural directa)
+    out.hrtf_binaural_scale = 1.0f;
+
+    // 2. Profundidad WFS: síntesis de frente de onda
+    if (wfsActive) {
+        out.wfs_spread_scale = clampRange(1.0f - gr * 0.03f, 0.7f, 1.0f);
+        if (upmixActive) {
+            // Si convive con HOA Upmixer, atenuar ligeramente para evitar dispersión
+            out.wfs_spread_scale *= 0.85f;
+        }
+    } else {
+        out.wfs_spread_scale = 1.0f;
+    }
+
+    // 3. Sala RIR: balance entre reverberación y claridad/localización
+    if (rirActive) {
+        float rirWet = 1.0f;
+        if (voiceScore > 0.6f) {
+            // Proteger inteligibilidad de la voz: no ahogar en reverb de sala
+            rirWet *= 0.65f;
+        }
+        if (wfsActive || upmixActive) {
+            // Evitar que la cola de reverberación emborrone el frente de onda directo
+            rirWet *= 0.80f;
+        }
+        out.rir_wet_scale = rirWet;
+    } else {
+        out.rir_wet_scale = 1.0f;
+    }
+
+    // 4. Expansión M/S: más bajo en la jerarquía.
+    // NUNCA permitir tres ensanchadores compitiendo.
+    if (upmixActive || wfsActive) {
+        // HOA o WFS activos -> ensanche M/S neutralizado (0.0 = neutro / sin ensanche M/S adicional)
+        out.ms_widener_scale = 0.0f;
+    } else if (voiceScore > 0.6f) {
+        // Voz presente -> proteger imagen fantasma central (evitar ahuecar el centro)
+        out.ms_widener_scale = 0.25f;
+    } else {
+        out.ms_widener_scale = 1.0f;
+    }
+
+    out.upmix_immersivity = upmixActive ? clamp01(1.0f - voiceScore * 0.3f) : 1.0f;
+    return out;
+}
+
+AdaptiveDecisionEngine::DynamicsArbitration
+AdaptiveDecisionEngine::arbitrateDynamics(const RawAudioMetrics& m) noexcept {
+    DynamicsArbitration out;
+    const float rms   = std::max(0.0f, m.rms);
+    const float peak  = std::max(0.0f, m.peak);
+    const float crest = peak / std::max(rms, kEps);
+    const float crestDb = 20.0f * std::log10(std::max(crest, 1.0f));
+
+    float baseComp = computeCompressorAmount(m);
+    out.target_gain = computeTargetGain(m);
+
+    if (crestDb >= 14.0f) {
+        // Audio muy dinámico (clásico, jazz, acústico): preservar transientes e impacto
+        out.compressor_amount   = baseComp;
+        out.dynamic_headroom_db = 2.0f;
+        out.compressor_ratio    = 1.3f;
+    } else if (crestDb <= 7.0f) {
+        // Audio denso/comprimido: evitar bombeo artificial
+        out.compressor_amount   = std::min(baseComp, 0.25f);
+        out.dynamic_headroom_db = 0.5f;
+        out.compressor_ratio    = 1.2f;
+    } else {
+        out.compressor_amount   = baseComp;
+        out.dynamic_headroom_db = 1.0f;
+        out.compressor_ratio    = 1.0f + 2.0f * baseComp;
+    }
+    return out;
+}
+
+AdaptiveDecisionEngine::PersonalityArbitration
+AdaptiveDecisionEngine::arbitratePersonality(const RawAudioMetrics& m, float fatigueEma) noexcept {
+    PersonalityArbitration out;
+    const float voiceScore = trustedVoiceScore(m);
+
+    // Claridad vocal: si hay voz, realce de presencia psicoacústica
+    if (voiceScore > 0.5f) {
+        out.vocal_clarity_boost_db = (voiceScore - 0.5f) * 3.0f;
+    }
+
+    // Mitigación de fatiga: si la exposición acumulada a agudos es alta (>0.35 EMA)
+    const float fEma = clamp01(fatigueEma);
+    if (fEma > 0.35f) {
+        // Atenuación suave progresiva (hasta -2.5dB) para proteger el oído en sesiones largas
+        out.eq_tilt_db = -std::min(2.5f, (fEma - 0.35f) * 6.0f);
+    }
+
+    // Densidad musical: si el bajo es muy dominante (>55% de la energía)
+    const float low  = trustedBandEnergy(m, m.band_low_energy);
+    const float mid  = trustedBandEnergy(m, m.band_mid_energy);
+    const float high = trustedBandEnergy(m, m.band_high_energy);
+    const float total = low + mid + high + kEps;
+    if (m.band_energy_valid && low / total > 0.55f) {
+        out.sub_bass_damping = 0.3f; // Control de subgrave en música densa
+    }
+
+    return out;
+}
+
+AdaptiveState AdaptiveDecisionEngine::evaluate(const RawAudioMetrics& m,
+                                                float sibilanceEma,
+                                                float fatigueEma) noexcept {
+    AdaptiveState s;
+    s.target_gain       = computeTargetGain(m);
+    s.compressor_amount  = computeCompressorAmount(m);
+    s.exciter_reduction  = computeExciterReduction(m, sibilanceEma);
+    s.spatial_width      = computeSpatialWidth(m);
+    s.safety_margin      = computeSafetyMargin(m);
+    s.voice_protection_amount = computeVoiceProtection(m);
+
+    // ── FASE 3: Arbitraje Acústico Unificado ──────────────────────────────
+    // 1. Armónicos
+    auto harm = arbitrateHarmonics(m, sibilanceEma);
+    s.golden_ear_scale = harm.golden_ear_scale;
+    s.volterra_scale   = harm.volterra_scale;
+    s.exciter_scale    = harm.exciter_scale;
+
+    // 2. Espacialidad
+    auto spat = arbitrateSpatial(m);
+    s.hrtf_binaural_scale = spat.hrtf_binaural_scale;
+    s.wfs_spread_scale    = spat.wfs_spread_scale;
+    s.rir_wet_scale       = spat.rir_wet_scale;
+    s.ms_widener_scale    = spat.ms_widener_scale;
+    s.upmix_immersivity   = spat.upmix_immersivity;
+
+    // 3. Dinámica
+    auto dyn = arbitrateDynamics(m);
+    s.dynamic_headroom_db = dyn.dynamic_headroom_db;
+    s.compressor_amount   = dyn.compressor_amount;
+
+    // 4. Personalidad y Fatiga
+    auto pers = arbitratePersonality(m, fatigueEma);
+    s.eq_tilt_db = pers.eq_tilt_db;
+
+    s.timestamp          = 0;  // lo asigna AdaptiveStateBus::publish() al secuenciar
+    return s;
+}
+
+#if defined(__linux__) || defined(__ANDROID__)
+void* AdaptiveDecisionEngine::controlThreadEntry(void* self) noexcept {
+    auto* engine = static_cast<AdaptiveDecisionEngine*>(self);
+    if (engine) engine->controlLoop();
+    return nullptr;
+}
+#endif
+
+bool AdaptiveDecisionEngine::start() noexcept {
+    std::lock_guard<std::mutex> lock(controlLifecycleMutex_);
+    if (running_.load(std::memory_order_acquire)) return true;
+
+#if defined(__linux__) || defined(__ANDROID__)
+    // Unlike std::thread in a -fno-exceptions build, pthread_create reports
+    // resource exhaustion (EAGAIN/ENOMEM) without throwing/terminating.
+    if (controlThreadJoinable_) {
+        if (pthread_equal(pthread_self(), controlThread_)) return false;
+        const int joinResult = pthread_join(controlThread_, nullptr);
+        if (joinResult != 0) {
+            running_.store(false, std::memory_order_release);
+            return false; // retain joinable state so a later stop/start can retry
+        }
+        controlThreadJoinable_ = false;
+    }
+
+    running_.store(true, std::memory_order_release);
+    const int createResult = pthread_create(
+        &controlThread_, nullptr, &AdaptiveDecisionEngine::controlThreadEntry, this);
+    if (createResult != 0) {
+        running_.store(false, std::memory_order_release);
+        return false;
+    }
+    controlThreadJoinable_ = true;
+    return true;
+#else
+    if (controlThread_.joinable()) {
+        if (controlThread_.get_id() == std::this_thread::get_id()) return false;
+        try {
+            controlThread_.join();
+        } catch (...) {
+            running_.store(false, std::memory_order_release);
+            return false;
+        }
+    }
+
+    running_.store(true, std::memory_order_release);
+    try {
+        controlThread_ = std::thread([this]() { controlLoop(); });
+    } catch (...) {
+        running_.store(false, std::memory_order_release);
+        return false;
+    }
+    return true;
+#endif
+}
+
+void AdaptiveDecisionEngine::stop() noexcept {
+    std::lock_guard<std::mutex> lock(controlLifecycleMutex_);
+    running_.store(false, std::memory_order_release);
+
+#if defined(__linux__) || defined(__ANDROID__)
+    if (controlThreadJoinable_) {
+        if (pthread_equal(pthread_self(), controlThread_)) return;
+        const int joinResult = pthread_join(controlThread_, nullptr);
+        if (joinResult == 0) {
+            controlThreadJoinable_ = false;
+        }
+        // On failure retain joinable=true. A later external stop() retries;
+        // never detach or destroy a live thread's owner.
+    }
+#else
+    if (controlThread_.joinable()) {
+        if (controlThread_.get_id() == std::this_thread::get_id()) return;
+        try {
+            controlThread_.join();
+        } catch (...) {
+            // Keep joinable state so a later external stop() can retry.
+        }
+    }
+#endif
+}
+
+void AdaptiveDecisionEngine::controlLoop() {
+#if defined(__linux__) || defined(__ANDROID__)
+    (void)setpriority(PRIO_PROCESS, 0, 10);
+#endif
+    // Hilo de control dedicado — NUNCA el audio thread. Cadencia fija,
+    // sin malloc (RawAudioMetrics/AdaptiveState son POD en stack).
+    uint64_t lastSeenSeq = 0;
+    RawAudioMetrics metrics;
+    RawAudioMetrics lastKnownMetrics;   // último snapshot válido
+    bool hasEverReceived = false;
+    int staleCount = 0;
+    constexpr int kMaxStale = 10;       // 10 × 50ms = 500ms sin datos → usar stale
+
+    while (running_.load(std::memory_order_relaxed)) {
+        const bool gotNew = rawMetrics.consumeIfNewer(metrics, lastSeenSeq);
+        if (gotNew) {
+            lastKnownMetrics = metrics;
+            hasEverReceived  = true;
+            staleCount       = 0;
+        } else if (hasEverReceived) {
+            // Sin datos nuevos — usar las últimas métricas conocidas para
+            // seguir publicando AdaptiveState. Previene que el bus se congele
+            // cuando el audio thread está en pausa o silencio prolongado.
+            ++staleCount;
+            if (staleCount <= kMaxStale) {
+                metrics = lastKnownMetrics;
+            } else {
+                // Silencio genuino: métricas a cero para que el engine
+                // sugiera configuración neutra (safety first).
+                metrics = RawAudioMetrics{};
+                metrics.gain_reduction_db = 0.f;
+            }
+        } else {
+            // Todavía no hay ningún dato — esperar sin publicar.
+            std::this_thread::sleep_for(std::chrono::milliseconds(kControlIntervalMs));
+            continue;
+        }
+
+        {
+            const float lowBand  = trustedBandEnergy(metrics, metrics.band_low_energy);
+            const float midBand  = trustedBandEnergy(metrics, metrics.band_mid_energy);
+            const float highBand = trustedBandEnergy(metrics, metrics.band_high_energy);
+            const float total = lowBand + midBand + highBand + kEps;
+            // Sin un medidor válido se permite que las EMAs decaigan a neutro,
+            // pero no se etiqueta la ausencia de dato como una medición espectral.
+            const float highRatio = metrics.band_energy_valid ? highBand / total : 0.0f;
+
+            constexpr float kSibilanceAlpha = 0.25f;
+            sibilanceEma_ += kSibilanceAlpha * (highRatio - sibilanceEma_);
+
+            constexpr float kFatigueAlpha = 0.005f;
+            fatigueEma_ += kFatigueAlpha * (highRatio - fatigueEma_);
+
+            AdaptiveState s = evaluate(metrics, sibilanceEma_, fatigueEma_);
+
+            // Modulación real por RT60 del entorno acústico y cálculo de λ_t
+            const float rt60 = environmentRt60_.load(std::memory_order_relaxed);
+            if (rt60 > 0.35f && metrics.rir_active > 0.5f) {
+                const float rt60Damp = clampRange(1.0f - (rt60 - 0.35f) * 0.30f, 0.45f, 1.0f);
+                s.rir_wet_scale *= rt60Damp;
+            }
+            const float rms   = std::max(0.0f, metrics.rms);
+            const float peak  = std::max(0.0f, metrics.peak);
+            const float crest = peak / std::max(rms, kEps);
+            const float dynNorm = clamp01((crest - 2.0f) / 10.0f);
+            const float rt60Norm = clamp01((rt60 - 0.1f) / 2.9f);
+            const float lambdaT = clamp01(
+                0.35f + 0.35f * dynNorm + 0.20f * (1.0f - clamp01(fatigueEma_)) - 0.15f * rt60Norm
+            );
+            adaptiveLambdaT_.store(lambdaT, std::memory_order_relaxed);
+
+            adaptiveState.publish(s);
+
+            // ── FASE 8: AcousticRealityOrchestrator (entre AdaptiveDecisionEngine y DSP) ──
+            // Ejecuta inferencia neural acústica (Fase 4), síntesis de genoma (Fase 1),
+            // máquina del tiempo acústica (Fase 3), modelo auditivo personal (Fase 5),
+            // directivas 4D WFS (Fase 6) y optimización perceptual (Fase 7) FUERA del audio thread.
+            const auto nowUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            const float sideProxy = clamp01(1.0f - trustedVoiceScore(metrics) * 0.55f);
+            const float lowProxy  = metrics.band_energy_valid ? clamp01(lowBand / total) : 0.0f;
+            std::array<ivanna::spatial::DecomposedObject, 4> proxyObjects{};
+            proxyObjects[0].position = { 0.0f, 1.4f, 0.0f };
+            proxyObjects[0].energy   = midBand;
+            proxyObjects[1].position = {-0.65f * s.spatial_width, 2.1f, 0.15f };
+            proxyObjects[1].energy   = highBand * 0.6f;
+            proxyObjects[2].position = { 0.65f * s.spatial_width, 2.1f, 0.15f };
+            proxyObjects[2].energy   = highBand * 0.6f;
+            proxyObjects[3].position = { 0.0f, 1.6f, -0.20f };
+            proxyObjects[3].energy   = lowBand;
+
+            ivanna::reality::AcousticRealityOrchestrator::instance().orchestrateCycle(
+                metrics, s, proxyObjects, sideProxy, lowProxy,
+                48000.0f, static_cast<float>(kControlIntervalMs) * 0.001f, nowUs);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kControlIntervalMs));
+    }
+}
+
+} // namespace ivanna::experimental

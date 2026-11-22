@@ -1,0 +1,31 @@
+{
+  "finding": "Bofo del modulo Magisk / Ruta B: el snapshot neutro del daemon NO es neutro (HRTF a wet 1.0 + widener 2.14x) y el peine en captura es en el mezclador (dos AudioTracks)",
+  "approved": false,
+  "patch": null,
+  "rounds": [
+    {
+      "round": 1,
+      "proposer": "solución inventada",
+      "implementer": "diff redactado",
+      "reviewer": {
+        "round": 1,
+        "approved": null,
+        "text": "ENFOQUE: RECHAZADO\n\nNo corrige la causa raíz; no toca el snapshot neutro, el bit HRTF, ni el widener, ni el punto donde `omega_apply_snapshot` activa `setHrtfEnabled(true)`. El diff mostrado además está vacío: no aplica ningún cambio real, no puede arreglar nada y no trae test de regresión.\n\nExijo:\n- Implementar `OmegaDspSnapshot::makeNeutral()` con los campos neutros que indicas.\n- Sustituir `makeDefault()`/`buildNeutralSnapshot` por `makeNeutral()` en daemon v2 y en el arranque de app daemon.\n- Añadir los tests host propuestos: snapshot neutro vs default, ASRC a ratio ~1.0, y simulación del peine en captura.\n- No introducir cambios parciales en `Psychoacoustics.cpp` que no ataquen el snapshot ni el activado de HRTF."
+      },
+      "reviewer2": null
+    },
+    {
+      "round": 2,
+      "proposer": "enfoque reinventado",
+      "implementer": "sin diff utilizable (5 intentos)",
+      "reviewer": null
+    }
+  ],
+  "detector": {
+    "real": false,
+    "text": "FALSO POSITIVO\n\nCon el contexto dado no se demuestra el defecto en el código incluido: `Psychoacoustics.cpp` sí tiene la guarda/limitación y `omega_control_bus.h` / `omega_effect.cpp` están recortados, así que no puedo verificar que exista el `makeDefault()` ni que `buildNeutralSnapshot` deje vivos HRTF/widener/anti_dolby. El hallazgo mezcla inferencia de otros archivos no visibles con una conclusión absoluta; para no reportar ruido, el detector debe exigir evidencia textual del campo/función exactos en el archivo y línea donde se inicializa el snapshot, no una atribución resumida.\n\nSi quieres, puedo revisar de forma quirúrgica el resto del árbol si pegas `buildNeutralSnapshot`, `OmegaDspSnapshot::makeDefault()` y el bloque de `IvannaFusionCore::process()`."
+  },
+  "reviewer": null,
+  "arbiter": null,
+  "reason": "ronda 2: el implementer no devolvió un diff utilizable en 5 intentos"
+}

@@ -1,0 +1,232 @@
+package com.ivanna.omega.ui
+
+import android.content.Intent
+import com.ivanna.omega.fotoholo.RoomArCaptureActivity
+
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.ivanna.omega.fotoholo.FotoHoloEngine
+import com.ivanna.omega.fotoholo.FotoHoloGemini
+import com.ivanna.omega.fotoholo.FotoHoloRouteB
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import com.ivanna.omega.fotoholo.FotoHoloMath
+import com.ivanna.omega.ui.theme.*
+
+/**
+ * Ficha magistral — Pantalla VI · Spatial, módulo N (prototipo aprobado,
+ * texto exacto).
+ *
+ * Sin equivalente exacto en el código: no existe ningún botón con el texto
+ * "Capturar FotoHolo". El botón va junto al título de esta tarjeta, y el
+ * equivalente más cercano en la tarjeta es "ABRIR AR & ESCÁNER RP-88 ·
+ * CÁMARA 6-DoF", que abre la captura de la sala (RoomArCaptureActivity).
+ */
+private val fotoHoloSpec = SpecInfo(
+    title = "FotoHolo · Geometría desde una foto",
+    what = "Una estimación de la geometría acústica inicial de tu sala a partir de una foto: dimensiones aproximadas, esquinas dominantes y dónde están las bocinas respecto a tu punto de escucha.",
+    purpose = "Para que la corrección de sala y el campo ORBE no empiecen de cero: FotoHolo entrega el mapa inicial y la medición con micrófono (Control · B) lo convierte en medida.",
+    whenUse = "Primera puesta en marcha en un cuarto nuevo: foto amplia, con luz, desde tu punto de escucha, con ambas bocinas visibles.",
+    whenAvoid = "No lo uses como sustituto de la medición: es el mapa, no la medida. Fotos oscuras, recortadas o de un solo rincón producen una geometría falsa que contamina la corrección."
+)
+
+/**
+ * FOTOHOLOGRAFÍA · NANOTOMIX — control + escena paramétrica.
+ *
+ * Ruta A: la escena muestra las 64 bandas Bark de PlaybackCaptureService y el motor local modula
+ * StereoWidener. Ruta B: omega_effect analiza sus propios PCM de AudioFlinger con 64 bandas Bark y
+ * modula el propietario espacial activo (WFS, HOA o M/S); no depende de PlaybackCaptureService.
+ * La visualización de bandas en esta tarjeta corresponde a A, no es un read-back espectral de B.
+ * Qué NO es: un holograma óptico (una pantalla convencional no lo genera).
+ */
+@Composable
+fun FotoHoloCard(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val tel by FotoHoloEngine.telemetry.collectAsState()
+    var enabled by remember { mutableStateOf(FotoHoloEngine.enabled) }
+    var intensity by remember { mutableStateOf(FotoHoloEngine.intensity) }
+    var bypass by remember { mutableStateOf(FotoHoloEngine.bypass) }
+    var rotation by remember { mutableStateOf(0f) }
+    var sceneMenuExpanded by remember { mutableStateOf(false) }
+    var subEnvironmentOpen by remember { mutableStateOf(false) }
+    val prefs = remember(context) { context.getSharedPreferences("fotoholo_ui", android.content.Context.MODE_PRIVATE) }
+    var selectedScene by remember { mutableStateOf(prefs.getString("scene", "Escenario de concierto") ?: "Escenario de concierto") }
+    fun chooseScene(scene: String) { selectedScene = scene; prefs.edit().putString("scene", scene).apply() }
+    val scope = rememberCoroutineScope()
+    var geminiBusy by remember { mutableStateOf(false) }
+    var geminiStatus by remember { mutableStateOf("") }
+    val sceneOptions = listOf("Escenario de concierto", "Rock 70s", "Rock 80s", "Rock 90s", "Recinto masivo", "Sala de mezcla élite", "Estudio de grabación", "Sala de cine", "Teatro", "Club", "Auditorio", "Iglesia", "Estadio", "Playa / exterior", "Automóvil", "Cabina DJ", "Orquesta", "Instrumento individual", "Sala personalizada")
+
+    // Mientras la tarjeta está visible el motor muestrea el espectro aunque el efecto esté apagado.
+    DisposableEffect(Unit) {
+        FotoHoloEngine.viewerAttached()
+        onDispose { FotoHoloEngine.viewerDetached() }
+    }
+    // Rotación sincronizada con el refresco real de pantalla (no un delay fijo).
+    LaunchedEffect(Unit) {
+        while (true) {
+            androidx.compose.runtime.withFrameNanos { t -> rotation = (t / 1_000_000_000.0).toFloat() * 0.35f }
+        }
+    }
+
+    Column(
+        modifier
+            .fillMaxWidth()
+            .background(MagistralPanel, RoundedCornerShape(14.dp))
+            .border(1.dp, MagistralLine, RoundedCornerShape(14.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("FOTOHOLOGRAFÍA · NANOTOMIX", color = MagistralGoldHi, fontFamily = MagistralSerif, fontSize = 13.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 2.sp, modifier = Modifier.weight(1f))
+            SpecInfoButton(fotoHoloSpec)
+        }
+        Text(
+            "Escena 3D paramétrica de las 64 bandas Bark + modulación acotada del ancho estéreo. No es un holograma óptico.",
+            color = MagistralMuted, fontSize = 11.sp
+        )
+
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Box {
+                TextButton(onClick = { sceneMenuExpanded = true }) {
+                    Text("ENTORNO: $selectedScene", color = AuroraCyan)
+                }
+                DropdownMenu(expanded = sceneMenuExpanded, onDismissRequest = { sceneMenuExpanded = false }) {
+                    sceneOptions.forEach { scene ->
+                        DropdownMenuItem(
+                            text = { Text(scene) },
+                            onClick = { chooseScene(scene); sceneMenuExpanded = false }
+                        )
+                    }
+                }
+            }
+            TextButton(onClick = { subEnvironmentOpen = !subEnvironmentOpen }) {
+                Text(if (subEnvironmentOpen) "Cerrar subentorno" else "Abrir subentorno 3D", color = AuroraCyan)
+            }
+        }
+        Text("Vista paramétrica seleccionada: $selectedScene", color = TextSecondary, fontSize = 11.sp)
+        TextButton(onClick = { context.startActivity(Intent(context, RoomArCaptureActivity::class.java)) }) {
+            Text("ABRIR AR & ESCÁNER RP-88 · CÁMARA 6-DoF", color = AuroraCyan)
+        }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            TextButton(enabled = !geminiBusy, onClick = {
+                geminiBusy = true; geminiStatus = "Gemini analizando el espectro…"
+                scope.launch {
+                    val r = FotoHoloGemini.suggest(context, tel.features.lowShare, tel.features.highShare, sceneOptions)
+                    r.onSuccess { sug ->
+                        chooseScene(sug.scene)
+                        intensity = sug.intensity; FotoHoloEngine.setIntensity(context, sug.intensity)
+                        val origin = if (sug.source == "local") "Local (sin nube)" else "Gemini"
+                        geminiStatus = "$origin: ${sug.scene} · intensidad ${(sug.intensity * 100).toInt()} %"
+                    }.onFailure { geminiStatus = "Sugerencia no disponible: ${it.message}" }
+                    geminiBusy = false
+                }
+            }) { Text(if (geminiBusy) "ANALIZANDO…" else "SUGERIR ESCENA", color = AuroraCyan) }
+            TextButton(onClick = { FotoHoloRouteB.refreshEvidence() }) { Text("VERIFICAR RUTA B", color = AuroraCyan) }
+        }
+        if (geminiStatus.isNotEmpty()) Text(geminiStatus, color = TextSecondary, fontSize = 11.sp)
+
+        Canvas(Modifier.fillMaxWidth().height(if (subEnvironmentOpen) 340.dp else 170.dp).background(MagistralVoid, RoundedCornerShape(10.dp))) {
+            val cx = size.width / 2f
+            val cy = size.height / 2f
+            val half = minOf(size.width, size.height) * 0.48f
+            val pts = Array(FotoHoloMath.BANDS) { i ->
+                val p = FotoHoloMath.holoPoint(i, tel.bands.getOrElse(i) { 0f }, rotation)
+                val sceneScale = when (selectedScene) {
+                    "Estadio", "Recinto masivo", "Playa / exterior" -> 1.18f
+                    "Sala de mezcla élite", "Estudio de grabación", "Cabina DJ" -> 0.78f
+                    "Instrumento individual" -> 0.52f
+                    "Sala de cine", "Teatro", "Auditorio", "Iglesia" -> 0.92f
+                    else -> 1f
+                }
+                val depthScale = when (selectedScene) {
+                    "Rock 70s", "Rock 80s", "Rock 90s", "Escenario de concierto", "Recinto masivo", "Estadio" -> 1.18f
+                    "Automóvil", "Instrumento individual" -> 0.62f
+                    else -> 1f
+                }
+                floatArrayOf(
+                    cx + p[0] * half * (size.width / size.height).coerceIn(1f, 2.2f) * 0.55f * sceneScale,
+                    cy + p[1] * half * depthScale,
+                    p[2]
+                )
+            }
+            for (i in pts.indices) {
+                val a = pts[i]
+                val b = pts[(i + 1) % pts.size]
+                val alpha = (0.25f + (a[2] - 0.6f) * 1.2f).coerceIn(0.15f, 0.95f)
+                drawLine(AuroraCyan.copy(alpha = alpha), Offset(a[0], a[1]), Offset(b[0], b[1]), strokeWidth = 1.5f)
+                val v = tel.bands.getOrElse(i) { 0f }.coerceIn(0f, 1f)
+                drawCircle(AuroraCyan.copy(alpha = alpha), radius = 1.5f + 3.5f * v, center = Offset(a[0], a[1]))
+            }
+        }
+
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Modular el ancho estéreo", color = MagistralText, fontSize = 12.sp)
+            Switch(checked = enabled, onCheckedChange = { enabled = it; FotoHoloEngine.setEnabled(context, it) })
+        }
+        Text("Intensidad: ${(intensity * 100).toInt()} %  (±${(FotoHoloMath.MAX_OFFSET * intensity * 100).toInt()} % de ancho como máximo)", color = TextSecondary, fontSize = 11.sp)
+        Slider(
+            value = intensity,
+            onValueChange = { intensity = it; FotoHoloEngine.setIntensity(context, it) },
+            valueRange = 0f..1f
+        )
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Bypass A/B (oír sin modular)", color = MagistralText, fontSize = 12.sp)
+            Switch(checked = bypass, onCheckedChange = { bypass = it; FotoHoloEngine.setBypass(it) })
+        }
+
+        val status = when {
+            tel.nativeWriteError != null -> "ERROR DE CONTROL: ${tel.nativeWriteError}"
+            tel.activeRoute == "ROUTE_B" && !enabled -> "Ruta B global detectada; observador Bark nativo de 64 bandas desactivado."
+            tel.activeRoute == "ROUTE_B" && bypass -> "Ruta B global detectada; FotoHolo en bypass, se conserva el ancho base."
+            tel.activeRoute == "ROUTE_B" -> "Ruta B global: el PCM seco de AudioFlinger alimenta el observador Bark nativo de 64 bandas. Control: ${tel.routeB}."
+            !tel.hasSignal -> "Sin señal válida de Ruta A: se conserva el ancho seguro; no se inventan datos acústicos."
+            !enabled -> "Espectro en vivo · modulación apagada."
+            bypass -> "Bypass: suena el ancho que fijaste."
+            tel.readbackConfirmed && tel.dspWidth < tel.appliedWidth - 0.03f ->
+                "Modulando · el motor reporta un ancho efectivo menor al comando; posible recorte térmico."
+            tel.readbackConfirmed -> "Modulando · agudos abren, graves cierran · read-back del motor actualizado."
+            else -> "Modulando · esperando confirmación del motor (read-back)."
+        }
+        Text(status, color = if (tel.nativeWriteError != null) CoralWarn else AuroraCyan, fontSize = 11.sp)
+        Text("Ruta activa: ${tel.activeRoute} · ${tel.safmusDecision}", color = TextSecondary, fontSize = 11.sp)
+        Text("Ruta B (efecto global): ${tel.routeB}", color = if (tel.routeB.contains("aplicado por bloque DSP")) AuroraCyan else AmberSignal, fontSize = 11.sp)
+        Text(
+            "Ancho tuyo %.2f → comando %.2f (Δ %+.3f) · motor %s · graves %d %% · agudos %d %%".format(
+                tel.baseWidth, tel.appliedWidth, tel.offset,
+                if (tel.dspWidth.isFinite()) "%.2f".format(tel.dspWidth) else "—",
+                (tel.features.lowShare * 100).toInt(), (tel.features.highShare * 100).toInt()
+            ),
+            color = TextSecondary, fontSize = 11.sp
+        )
+    }
+}

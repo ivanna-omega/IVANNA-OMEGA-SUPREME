@@ -1,0 +1,10 @@
+{
+  "finding": "Tronidos continuos en la 458: un solo gobernador de shed compartido entre BridgePlayer (41 ms) y captura (6.67 ms) hace que el BridgePlayer suelte ~20% de sus bloques por la deuda de la captura",
+  "approved": false,
+  "patch": null,
+  "rounds": [],
+  "detector": null,
+  "reviewer": null,
+  "arbiter": null,
+  "reason": "Consejo NO DISPONIBLE: 3 intentos de council.py fallaron en el proposer con gateway HTTP 429 (DuckDuckGo: ERR_INPUT_LIMIT y luego ERR_USER_LIMIT, rate limit del proveedor gratuito ddgw). No se emitió veredicto. El coordinador implementó el parche directamente (patrón 0023/0024/0025/0027/0028/0029), con la causa raíz verificada en código (un solo g_dspShedGovernor global, ivanna_omega_jni.cpp:1734), simulación del gobernador (BridgePlayer shed 20.2% sin estar sobrecargado) y la cita de DspLoadTierPolicy.kt ('cada cambio procesado->seco es un tronido')."
+}

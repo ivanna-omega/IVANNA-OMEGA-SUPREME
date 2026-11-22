@@ -1,0 +1,24 @@
+#!/sbin/sh
+##########################################################################################
+#
+# Magisk Module Installer Script
+#
+##########################################################################################
+
+# Find the path to util_functions.sh
+if [ -f "$1" ]; then
+  . "$1"
+elif [ -f "$PWD/util_functions.sh" ]; then
+  . "$PWD/util_functions.sh"
+elif [ -f /data/adb/magisk/util_functions.sh ]; then
+  . /data/adb/magisk/util_functions.sh
+elif [ -f /data/adb/ksu/bin/util_functions.sh ]; then
+  . /data/adb/ksu/bin/util_functions.sh
+elif [ -f /data/adb/ap/bin/util_functions.sh ]; then
+  . /data/adb/ap/bin/util_functions.sh
+else
+  echo "! Cannot find util_functions.sh"
+  exit 1
+fi
+
+install_module

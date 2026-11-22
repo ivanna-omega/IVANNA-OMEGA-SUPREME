@@ -1,0 +1,359 @@
+// PsiField.hpp — Operadores del campo Ψ (FORMULACIÓN MAGISTRAL, 2026-11-10).
+//
+// Implementa en código las ecuaciones de FORMULACION_MAGISTRAL_PSI.md:
+//
+//   Ec. 2 (CORREGIDA 2026-11-10): la ley de distancia del campo cercano.
+//     La primera versión de la formulación escribía
+//       ΔILD(r,f) = 20·log10((1+(a/r)(f/f0)) / (1−(a/r)(f/f0)))
+//     con f0 = 1500 Hz. Esa forma es FÍSICAMENTE INCORRECTA: al calibrarla
+//     contra el modelo geométrico (NearFieldHeadModel::ildDb) el error era
+//     de hasta 19.8 dB. La descomposición exacta es:
+//       ILD_total(r, θ, f) = SPREAD(r, θ) + SHADOW(f, θ)
+//     donde SPREAD = 20·log10(dL/dR) es la divergencia esférica (depende
+//     de la distancia, NO de la frecuencia) y SHADOW = 20·log10(1 +
+//     0.25·(ka)²·sin²θ) es la sombra cefálica (depende de la frecuencia,
+//     NO de la distancia). Verificado en host: la sombra es idéntica
+//     (1.29 dB @500 Hz, 4.31 @1 kHz, 21.04 @4 kHz) en r = 0.15…2.0 m,
+//     y SPREAD a θ=90° es exactamente 20·log10((r+a)/(r−a)).
+//     Esta corrección es la que hace falsable la ley (experimento F1).
+//
+//   Ec. 3: operador de personalización P_l^m(a) sobre el vector
+//     antropométrico CIPIC (17 variables). Pesos v1 de primeros principios
+//     (documentados abajo); el ajuste por regresión sobre la base CIPIC
+//     real queda PENDIENTE y se marca como tal. Nada aquí pretende ser
+//     un ajuste aprendido: son pesos por defecto, fail-closed.
+//
+//   Ec. 4 (factor Γ): Γ(η) = 1 + γ·(η − η₀), el acoplamiento neural del
+//     campo. La EDO completa dη/dt = (η*−η)/τ − λ·L vive en BioControl5D
+//     (update() con pérdida opcional); aquí solo está el factor.
+//
+// Funciones puras, sin estado, sin alloc: seguras en el hilo de audio.
+// Header-only, doubles/floats, sin dependencias Android.
+#pragma once
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+
+namespace ivanna::psi {
+
+// ── Constantes ──────────────────────────────────────────────────────────────
+inline constexpr float kSoundSpeedMps = 343.0f;
+inline constexpr float kPi = 3.14159265358979323846f;
+// Radio de cabeza por defecto (KEMAR): el mismo que NearFieldHeadModel.
+inline constexpr float kHeadRadiusM = 0.0875f;
+
+// ── Ec. 2: ley de distancia + sombra (forma cerrada, verificada) ───────────
+
+// Divergencia esférica (dB) a θ y r: 20·log10(dL/dR), dL/dR = distancias
+// directas fuente→oído. A θ=90° se reduce a 20·log10((r+a)/(r−a)).
+// Depende de la distancia, NO de la frecuencia. Fail-closed: entradas no
+// finitas o r ≤ a devuelven 0.
+inline float spreadIldDb(float r, float thetaRad, float headRadiusM = kHeadRadiusM) noexcept {
+    if (!std::isfinite(r) || !std::isfinite(thetaRad) || !std::isfinite(headRadiusM)) return 0.0f;
+    const float a = std::clamp(headRadiusM, 0.05f, 0.15f);
+    const float rr = std::clamp(r, a + 0.01f, 100.0f);
+    const float th = std::clamp(thetaRad, -kPi, kPi);
+    const float sx = rr * std::sin(th);
+    const float sy = rr * std::cos(th);
+    const float dR = std::sqrt((sx - a) * (sx - a) + sy * sy);
+    const float dL = std::sqrt((sx + a) * (sx + a) + sy * sy);
+    if (dR <= 1e-6f || dL <= 1e-6f) return 0.0f;
+    return 20.0f * std::log10(dL / dR);
+}
+
+// Sombra cefálica (dB): 20·log10(1 + 0.25·(ka)²·sin²θ), con signo según
+// el lado (atenúa el oído contralateral). Depende de la frecuencia,
+// NO de la distancia. ka = 2πfa/c.
+inline float shadowDb(float thetaRad, float freqHz, float headRadiusM = kHeadRadiusM) noexcept {
+    if (!std::isfinite(thetaRad) || !std::isfinite(freqHz) || !std::isfinite(headRadiusM)) return 0.0f;
+    const float a = std::clamp(headRadiusM, 0.05f, 0.15f);
+    const float f = std::clamp(freqHz, 0.0f, 20000.0f);
+    const float ka = 2.0f * kPi * f * a / kSoundSpeedMps;
+    const float s = std::sin(std::clamp(thetaRad, -kPi, kPi));
+    const float mag = 20.0f * std::log10(1.0f + 0.25f * ka * ka * s * s);
+    return (s >= 0.0f) ? mag : -mag;
+}
+
+// ILD total (dB) de la Ec. 2 corregida: SPREAD + SHADOW.
+// Con headRadius = 0.0875 m coincide con NearFieldHeadModel::ildDb
+// (misma física, refactorizada con radio personalizable).
+inline float ildDb(float r, float thetaRad, float freqHz, float headRadiusM = kHeadRadiusM) noexcept {
+    return spreadIldDb(r, thetaRad, headRadiusM) + shadowDb(thetaRad, freqHz, headRadiusM);
+}
+
+// ── Ec. 3: vector antropométrico CIPIC + operador de personalización ───────
+//
+// Variables CIPIC (Algazi et al. 2001), en las unidades de la base:
+//   x1  ancho de cabeza [cm]      x2  alto de cabeza [cm]
+//   x3  profundidad cabeza [cm]   x4  offset pinna abajo [cm]
+//   x5  offset pinna atrás [cm]   x6  ancho de cuello [cm]
+//   x7  alto de cuello [cm]       x8  profundidad cuello [cm]
+//   x9  ancho torso superior [cm] x10 alto torso superior [cm]
+//   x11 ancho torso inferior [cm] x12 alto torso inferior [cm]
+//   x13 ancho hombros [cm]        x14 profundidad hombros [cm]
+//   x15 ancho cabeza (oreja) [cm] x16 alto pinna [cm]
+//   x17 ancho pinna [cm]
+// Los valores de referencia son el equivalente KEMAR que ya usa
+// HrtfPersonalizer (circunferencia 56 cm → diámetro 17.8 cm; pinna
+// 62 mm). NO son medias de la base CIPIC: el ajuste por regresión
+// sobre CIPIC queda pendiente y debe reemplazar estos valores.
+struct CipicAnthropometry {
+    // Valores de referencia (KEMAR-equivalente, ver comentario arriba).
+    // x1 = 17.5 cm es el diámetro de cabeza KEMAR: radio 8.75 cm, EXACTO
+    // al kHeadRadiusM de NearFieldHeadModel — sin antropometría, el campo
+    // Ψ coincide con el modelo existente (ver test PsiFieldRuntime).
+    float x1_headWidthCm = 17.5f;
+    float x2_headHeightCm = 24.0f;
+    float x3_headDepthCm = 19.0f;
+    float x4_pinnaOffsetDownCm = 0.0f;
+    float x5_pinnaOffsetBackCm = 0.0f;
+    float x6_neckWidthCm = 11.0f;
+    float x7_neckHeightCm = 7.0f;
+    float x8_neckDepthCm = 11.0f;
+    float x9_torsoTopWidthCm = 40.0f;
+    float x10_torsoTopHeightCm = 20.0f;
+    float x11_torsoBottomWidthCm = 38.0f;
+    float x12_torsoBottomHeightCm = 20.0f;
+    float x13_shoulderWidthCm = 44.0f;
+    float x14_shoulderDepthCm = 22.0f;
+    float x15_headWidthEarCm = 17.5f;
+    float x16_pinnaHeightMm = 62.0f;
+    float x17_pinnaWidthMm = 35.0f;
+
+    float operator[](int i) const noexcept {
+        switch (i) {
+            case 0: return x1_headWidthCm;
+            case 1: return x2_headHeightCm;
+            case 2: return x3_headDepthCm;
+            case 3: return x4_pinnaOffsetDownCm;
+            case 4: return x5_pinnaOffsetBackCm;
+            case 5: return x6_neckWidthCm;
+            case 6: return x7_neckHeightCm;
+            case 7: return x8_neckDepthCm;
+            case 8: return x9_torsoTopWidthCm;
+            case 9: return x10_torsoTopHeightCm;
+            case 10: return x11_torsoBottomWidthCm;
+            case 11: return x12_torsoBottomHeightCm;
+            case 12: return x13_shoulderWidthCm;
+            case 13: return x14_shoulderDepthCm;
+            case 14: return x15_headWidthEarCm;
+            case 15: return x16_pinnaHeightMm;
+            default: return x17_pinnaWidthMm;
+        }
+    }
+};
+
+// Radio de cabeza [m] desde el ancho de cabeza x1 (diámetro/2).
+inline float headRadiusFromAnthropometry(const CipicAnthropometry& a) noexcept {
+    const float widthM = std::clamp(a.x1_headWidthCm, 10.0f, 25.0f) * 0.01f;
+    return std::clamp(widthM * 0.5f, 0.05f, 0.15f);
+}
+
+// Pesos v1 de primeros principios para el orden l (suman 1.0 por orden):
+//   l=0: monopolo (nivel global) — NO se personaliza (pesos 0).
+//   l=1: dipolo (ITD/ILD, dirección) — dominado por el tamaño de cabeza.
+//   l=2: cuadrupolo — entran pinna y cuello.
+//   l>=3: detalle de pinna y torso.
+// Estos pesos son DEFAULTS documentados, no un ajuste aprendido. El
+// ajuste por regresión sobre CIPIC debe reemplazarlos (ver TODO).
+inline float personalizationWeight(int l, int varIdx) noexcept {
+    if (l <= 0) return 0.0f;
+    if (varIdx < 0 || varIdx > 16) return 0.0f;
+    if (l == 1) {
+        switch (varIdx) {
+            case 0: return 0.50f;  // ancho cabeza
+            case 2: return 0.30f;  // profundidad cabeza
+            case 1: return 0.20f;  // alto cabeza
+            default: return 0.0f;
+        }
+    }
+    if (l == 2) {
+        switch (varIdx) {
+            case 3: return 0.30f;  // pinna abajo
+            case 4: return 0.30f;  // pinna atrás
+            case 0: return 0.20f;  // ancho cabeza
+            case 5: return 0.20f;  // ancho cuello
+            default: return 0.0f;
+        }
+    }
+    // l >= 3: detalle de pinna (x16, x17) + cabeza + torso.
+    switch (varIdx) {
+        case 15: return 0.25f;  // alto pinna
+        case 16: return 0.25f;  // ancho pinna
+        case 0: return 0.15f;   // ancho cabeza
+        case 3: return 0.15f;   // pinna abajo
+        case 8: return 0.10f;   // torso superior
+        case 12: return 0.10f;  // hombros
+        default: return 0.0f;
+    }
+}
+
+// Sensibilidad global por orden: cuánto mueve el factor una desviación
+// antropométrica del 100%. Acotada para que el factor nunca se dispare.
+inline float personalizationSensitivity(int l) noexcept {
+    if (l <= 0) return 0.0f;
+    if (l == 1) return 0.50f;
+    if (l == 2) return 0.40f;
+    return 0.30f;
+}
+
+// Ec. 3: P_l^m(a) = 1 + s_l · Σ_j w_{lj}·(x̃_j − 1), con x̃_j = x_j/x_j^ref.
+// El factor es 1.0 exacto en la antropometría de referencia y está
+// clampado a [0.5, 2.0] (±6 dB): fail-closed ante perfiles extremos.
+// m no entra (simetría en m por diseño v1; documentado).
+inline float personalizationFactor(int l, int /*m*/, const CipicAnthropometry& a,
+                                   const CipicAnthropometry& ref = CipicAnthropometry{}) noexcept {
+    if (l <= 0) return 1.0f;
+    const float s = personalizationSensitivity(l);
+    double acc = 0.0;
+    for (int j = 0; j < 17; ++j) {
+        const float w = personalizationWeight(l, j);
+        if (w == 0.0f) continue;
+        const float rj = ref[j];
+        if (rj == 0.0f) continue;  // variable de referencia 0 (offset): sin efecto
+        const float xj = a[j];
+        if (!std::isfinite(xj)) continue;
+        acc += static_cast<double>(w) * (static_cast<double>(xj) / rj - 1.0);
+    }
+    const double f = 1.0 + static_cast<double>(s) * acc;
+    return static_cast<float>(std::clamp(f, 0.5, 2.0));
+}
+
+// ── Ec. 4 (factor Γ): acoplamiento neural del campo ─────────────────────────
+// Γ(η) = 1 + γ·(η − η₀), clampado a [0.5, 1.5] (±3.5 dB). γ default 0.5
+// (PROPUESTA_5D.md §3.3a). En η = η₀ devuelve exactamente 1.0.
+inline float psiGamma(float eta, float eta0, float gamma = 0.5f) noexcept {
+    if (!std::isfinite(eta) || !std::isfinite(eta0) || !std::isfinite(gamma)) return 1.0f;
+    const float g = 1.0f + gamma * (eta - eta0);
+    return std::clamp(g, 0.5f, 1.5f);
+}
+
+// ── REFORMULACIÓN POR VÍA DE REPRODUCCIÓN (2026-11-10) ──────────────────────
+// El campo Ψ original era binaural (audífonos): la Ec. 2 da el ILD entre
+// los dos oídos. Pero IVANNA suena por CUALQUIER vía — audífonos, AUX,
+// bocinas del celular, estéreo, home theater, cine — y cada vía cambia
+// lo que el oyente percibe: por bocinas cada oído escucha AMBOS canales
+// (crosstalk), así que el ILD efectivo es menor que el del campo; por
+// multicanal la fuente virtual se reparte entre bocinas discretas.
+//
+// La reformulación: el campo Ψ ahora conoce la vía. La ley física es la
+// misma (SPREAD + SHADOW), pero el ILD PERCIBIDO pasa por la ley de
+// crosstalk, y la energía de cada fuente virtual se reparte entre las
+// bocinas de la vía por la ley dipolar del campo (l=1).
+//
+//   · Ley de crosstalk (exacta): si el ILD del campo es D dB (razón de
+//     amplitudes ρ = 10^(D/20)) y la vía mezcla una fracción κ del canal
+//     opuesto en cada oído, el ILD percibido es
+//         D' = 20·log10((ρ + κ) / (1 + κ·ρ)).
+//     κ=0 (audífonos) → D'=D. κ=1 (mono) → D'=0. Sin aproximaciones.
+//   · Ley de bocina (dipolo l=1): la ganancia de una bocina en azimut φ
+//     para una fuente en θ es max(0, cos(θ−φ)): 1.0 en la bocina, 0.0 a
+//     ≥90°, simétrica. La energía se conserva en el render (no aquí).
+//   · Las constantes de cada vía son de primeros principios y están
+//     documentadas como tales (baseline y distancia típicos, κ estimado
+//     por la geometría — NO medidos en sala). El multicanal se mapea al
+//     bed 7.1: el render de IVANNA es estéreo/7.1, no hay render de cine
+//     con decenas de canales; la vía Cinema usa el mismo bed con la
+//     geometría de sala grande.
+
+enum class ReproductionRoute : int {
+    Headphones = 0,    // Audífonos (AUX / USB / BT): sin crosstalk
+    PhoneSpeakers = 1, // Bocinas nativas del celular (baseline ~12 cm)
+    StereoSpeakers = 2,// Estéreo en sala (triángulo 60°)
+    Surround51 = 3,    // 5.1: L/R ±30°, C 0°, Ls/Rs ±110° + sub
+    Surround71 = 4,    // 7.1: 5.1 + traseras ±150°
+    Cinema = 5,        // Sala de cine: bed 7.1, geometría de sala grande
+};
+
+struct RouteGeometry {
+    float baselineM;        // Separación entre transductores principales
+    float listenerDistanceM;// Distancia típica oyente–fuente
+    float crosstalk;        // κ: fracción del canal opuesto en cada oído
+    bool binaural;          // true solo en audífonos (sin mezcla acústica)
+    int channels;           // Canales de la vía (sub incluido en 5.1/7.1)
+};
+
+// Geometría de cada vía (primeros principios, ver comentario arriba).
+inline RouteGeometry routeGeometry(ReproductionRoute route) noexcept {
+    switch (route) {
+        case ReproductionRoute::Headphones:
+            return RouteGeometry{0.0f, 0.35f, 0.0f, true, 2};
+        case ReproductionRoute::PhoneSpeakers:
+            // Moto G85: bocinas superior/inferior ~12 cm; se escucha a
+            // ~40 cm. κ=0.7: a esa distancia cada oído recibe casi lo
+            // mismo de ambas bocinas.
+            return RouteGeometry{0.12f, 0.40f, 0.7f, false, 2};
+        case ReproductionRoute::StereoSpeakers:
+            return RouteGeometry{2.0f, 2.0f, 0.3f, false, 2};
+        case ReproductionRoute::Surround51:
+            return RouteGeometry{2.0f, 2.5f, 0.25f, false, 6};
+        case ReproductionRoute::Surround71:
+            return RouteGeometry{2.0f, 2.5f, 0.25f, false, 8};
+        case ReproductionRoute::Cinema:
+            return RouteGeometry{10.0f, 10.0f, 0.2f, false, 8};
+    }
+    return RouteGeometry{0.0f, 0.35f, 0.0f, true, 2};
+}
+
+// Ley de crosstalk (exacta): ILD percibido tras mezclar κ del canal
+// opuesto en cada oído. κ se clamp a [0,1]; ILD no finito → 0.
+inline float crosstalkIldDb(float ildDb, float kappa) noexcept {
+    if (!std::isfinite(ildDb)) return 0.0f;
+    const float k = std::clamp(kappa, 0.0f, 1.0f);
+    if (k <= 0.0f) return ildDb;
+    if (k >= 1.0f) return 0.0f;
+    const float rho = std::pow(10.0f, ildDb / 20.0f);
+    return 20.0f * std::log10((rho + k) / (1.0f + k * rho));
+}
+
+// ILD PERCIBIDO por la vía: la Ec. 2 del campo pasada por el crosstalk
+// de la vía. En audífonos es idéntica a la Ec. 2; por bocinas es menor.
+inline float routeIldDb(ReproductionRoute route, float r, float thetaRad,
+                        float freqHz, float headRadiusM = kHeadRadiusM) noexcept {
+    const float ild = ildDb(r, thetaRad, freqHz, headRadiusM);
+    return crosstalkIldDb(ild, routeGeometry(route).crosstalk);
+}
+
+// Azimuts de las bocinas de la vía (radianes, 0 = frontal, + = derecha).
+// Devuelve el número de bocinas direccionales (sin sub). out debe tener
+// al menos 7 entradas. Audífonos y bocinas del celular no tienen bocinas
+// discretas → 0.
+inline int routeSpeakerAzimuths(ReproductionRoute route, float* out, int maxCount) noexcept {
+    if (out == nullptr || maxCount <= 0) return 0;
+    static constexpr float kDeg = 0.017453292519943295f;
+    const float* src = nullptr;
+    int n = 0;
+    static constexpr float kStereo[2] = {-30.0f * kDeg, 30.0f * kDeg};
+    static constexpr float k51[5] = {-30.0f * kDeg, 30.0f * kDeg, 0.0f,
+                                     -110.0f * kDeg, 110.0f * kDeg};
+    static constexpr float k71[7] = {-30.0f * kDeg, 30.0f * kDeg, 0.0f,
+                                     -110.0f * kDeg, 110.0f * kDeg,
+                                     -150.0f * kDeg, 150.0f * kDeg};
+    switch (route) {
+        case ReproductionRoute::StereoSpeakers: src = kStereo; n = 2; break;
+        case ReproductionRoute::Surround51: src = k51; n = 5; break;
+        case ReproductionRoute::Surround71:
+        case ReproductionRoute::Cinema: src = k71; n = 7; break;
+        default: return 0;
+    }
+    const int count = (n < maxCount) ? n : maxCount;
+    for (int i = 0; i < count; ++i) out[i] = src[i];
+    return count;
+}
+
+// Ley de bocina (dipolo l=1 del campo): ganancia lineal de una bocina en
+// azimut φ para una fuente virtual en θ. 1.0 en la bocina, 0.0 a ≥90°.
+inline float speakerGainLinear(float sourceThetaRad, float speakerAzimuthRad) noexcept {
+    if (!std::isfinite(sourceThetaRad) || !std::isfinite(speakerAzimuthRad)) return 0.0f;
+    return std::max(0.0f, std::cos(sourceThetaRad - speakerAzimuthRad));
+}
+
+// Misma ley en dB (ganancia 0 → −120 dB, nunca −inf).
+inline float speakerGainDb(float sourceThetaRad, float speakerAzimuthRad) noexcept {
+    const float g = speakerGainLinear(sourceThetaRad, speakerAzimuthRad);
+    if (g <= 0.0f) return -120.0f;
+    return 20.0f * std::log10(g);
+}
+
+}  // namespace ivanna::psi

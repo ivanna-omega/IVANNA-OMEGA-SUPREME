@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">IVANNA-OMEGA-SUPREME</string>
+    <!-- AMI (v2.5.471 Repair 4): the name "Ami" is the same in all three languages. -->
+    <string name="assistant_name">Ami</string>
+    <!-- GOD VIEW · FLEET (v2.5.471 Repair 4). -->
+    <string name="fleet_title">God View · Fleet</string>
+    <string name="fleet_subtitle">Council cycles read from the bridge</string>
+    <string name="fleet_no_cycles">No cycles yet</string>
+    <string name="fleet_no_cycles_hint">The bridge has not delivered any council verdict to this phone yet. When the first one arrives it will appear here with its date, its rounds and its verdict.</string>
+    <string name="fleet_refresh">Refresh</string>
+    <string name="fleet_last_read">Last read</string>
+    <string name="fleet_source">Source</string>
+    <string name="fleet_rounds">Rounds</string>
+    <string name="fleet_roles">Roles</string>
+    <string name="fleet_patch">Patch</string>
+    <string name="fleet_patch_yes">yes</string>
+    <string name="fleet_patch_no">no</string>
+    <string name="fleet_verdict_approved">Approved</string>
+    <string name="fleet_verdict_rejected">Rejected</string>
+    <string name="fleet_verdict_pending">No verdict</string>
+    <string name="fleet_unreadable">unreadable files</string>
+</resources>

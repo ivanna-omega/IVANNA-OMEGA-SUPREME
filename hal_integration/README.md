@@ -1,0 +1,139 @@
+# IVANNA hardware-clock control: target HAL integration
+
+This directory contains the reusable HAL-side hook. It is not a replacement for the device vendor's HAL and must be instantiated by the target output-stream implementation.
+
+## Integration files
+
+- `ivanna_hal_output_stream.hpp`: generic HAL hook for presentation-position queries and the bounded servo.
+- `ivanna_legacy_audio_hal_adapter.hpp`: concrete adapter for Android's legacy `audio_stream_out::get_presentation_position` API; it still requires the target HAL's real ASRC callback.
+- `ivanna_audio_clock_reporter.hpp`: optional diagnostic snapshot publisher.
+- `ivanna_qualcomm_pal_clock_integration.hpp`: Qualcomm PAL seam (paired-sample validation + optional shared-memory publishing on top of `HalOutputStreamClockControl`). Both device-specific callbacks are intentionally unbound; see `MOTO_G85_PAL_CLOCK_INTEGRATION.md`. Host-tested with fake callbacks (`test_qualcomm_pal_clock_integration`); not validated against the real Moto G85 HAL.
+- `ivanna_pal_mmap_position_adapter.hpp`: converts one `pal_stream_get_mmap_position()` result (frames + `CLOCK_MONOTONIC` ns) into a validated 64-bit frame sample; target code supplies the callback bound to its existing PAL stream handle. Host tests cover 32-bit wrap and fail-closed resets; actual Motorola API support remains unverified.
+- `ivanna_pal_active_stream_clock_publisher.hpp`: report-only bridge that combines the paired-position adapter with the shared snapshot publisher. Bind its callback to the active stream's real `pal_stream_handle_t`; poll at 10–20 Hz from a serialized non-real-time control task. It does not command ASRC and does not attach itself to the proprietary HAL automatically.
+- `tools/probe_moto_g85_pal.sh`: read-only on-device probe that gathers the PAL/ASRC evidence the Qualcomm seam still needs (see `MOTO_G85_PAL_CLOCK_INTEGRATION.md`).
+- `../docs/device_audits/MOTO_G85_INIT_BOOT_AUDIT.md`: análisis del `ivanna_init_boot_a.img` recuperado (Android 14 / SDK 34), hash, inventario del ramdisk, configuración Magisk y `snapuserd`; documenta el entorno Android 14 / SDK 34 del dispositivo y por qué `init_boot` no es por sí mismo un punto de integración PAL/ASRC.
+- `sepolicy/` and `init.ivanna_audio_clock.rc`: product-specific templates only; adapt to the target policy and init layout.
+
+Add `app/src/main/cpp/include` to the target HAL module's include paths. Compile the target HAL against the same C++ standard and NDK/platform toolchain used by that HAL.
+
+## 1. Own the controller in the long-lived output stream
+
+The stream implementation owns one `HalOutputStreamClockControl` per physical output stream/clock. Pass two callbacks:
+
+1. `queryPresentationPosition`: call the stream's existing driver/HAL presentation-position method once; only return true when both the frame counter and its associated monotonic timestamp are valid.
+2. `applyExistingAsrcRatio`: set the ratio on the ASRC already used by that stream. Return true only after the converter accepts the command. Do not report success if the implementation merely stores an unused variable.
+
+Example callback contract (adapt names and types to the actual vendor implementation):
+
+```cpp
+static bool queryPresentationPosition(void* context,
+                                     ivanna::audio::HardwareClockSample* out) noexcept {
+    auto* stream = static_cast<MyOutputStream*>(context);
+    uint64_t frames = 0;
+    timespec timestamp{};
+    // This method must query the underlying driver, not call this wrapper recursively.
+    if (!stream->queryDriverPresentationPosition(&frames, &timestamp)) return false;
+    if (timestamp.tv_sec < 0 || timestamp.tv_nsec < 0 ||
+        timestamp.tv_nsec >= 1000000000L) return false;
+    out->presentedFrames = frames;
+    out->hardwareTimestampNs =
+        static_cast<uint64_t>(timestamp.tv_sec) * 1000000000ull +
+        static_cast<uint64_t>(timestamp.tv_nsec);
+    out->nominalSampleRateHz = stream->activeOutputSampleRate();
+    out->streamId = stream->stableStreamId();
+    out->routeGeneration = stream->routeGeneration();
+    return out->streamId != 0 && out->routeGeneration != 0;
+}
+
+static bool applyExistingAsrcRatio(void* context, double ratio) noexcept {
+    auto* stream = static_cast<MyOutputStream*>(context);
+    return stream->existingAsrc().setInputFramesPerOutputFrame(ratio);
+}
+```
+
+The example names are placeholders, not vendor API names. Implement them against the actual HAL source and its existing ASRC.
+
+## 2. Legacy C HAL: use the concrete adapter
+
+For a HAL that exposes `<hardware/audio.h>` and `audio_stream_out::get_presentation_position`, include `ivanna_legacy_audio_hal_adapter.hpp`. Construct one adapter for the lifetime of the output stream, pass the actual stream pointer, the active nominal sample rate, and a callback that commands the ASRC already used by that stream:
+
+```cpp
+ivanna::audio::LegacyAudioHalClockAdapter clockAdapter(
+    &streamOut, outputSampleRateHz, stableStreamId, routeGeneration,
+    &applyExistingAsrcRatio, asrcContext);
+```
+
+Call `clockAdapter.controlTick()` from the HAL's serialized low-rate control task, and `clockAdapter.reset()` on standby or discontinuity. After a stream reopen or physical route change, call `clockAdapter.rebind()` with the new stream pointer, nominal rate, non-zero stream identity, and incremented route generation. The adapter reads the paired frame/timestamp result from `get_presentation_position`; it does not guess timestamps. This header is intentionally not included in the app/host build because Android vendor HAL headers are not available there.
+
+This is the concrete integration code for the legacy HAL API, not a binary patch to a proprietary vendor module. Qualcomm PAL or HIDL/AIDL implementations must use the generic hook and their own real presentation-position and ASRC APIs.
+
+## 3. Call at a control cadence
+
+Create the controller during stream construction, after the ASRC exists:
+
+```cpp
+ivanna::audio::HalOutputStreamClockControl clockControl(
+    &queryPresentationPosition, this, &applyExistingAsrcRatio, this);
+```
+
+Call `clockControl.controlTick()` from a low-rate control task (approximately 10–20 Hz) that is serialized with stream lifecycle and ASRC configuration. Do not call it from the hard real-time render/write path. Call `clockControl.reset()` on standby, stream reopen, route/device change, or timestamp discontinuity. The ASRC callback must be thread-safe or dispatched to the HAL's existing control thread.
+
+If the presentation-position query fails, the controller resets and attempts to command unity ratio. If the ASRC rejects a command, the controller marks the applied ratio unknown and disables correction. Verify the ASRC's actual applied ratio in target logs/telemetry.
+
+## 4. Platform API mapping
+
+- Legacy C HAL: use the implementation's successful `audio_stream_out::get_presentation_position` result, where the returned frame count and `CLOCK_MONOTONIC` timestamp belong to the same query.
+- HIDL/AIDL HAL: use the stream implementation's corresponding presentation-position method and preserve the timestamp domain and frame-counter semantics.
+- Do not substitute callback entry time, wall-clock time, or a separately sampled timestamp.
+- If the HAL has no variable-ratio ASRC, the callback cannot be implemented honestly by changing a field. Integrate and validate a real ASRC in the output data path first; do not stack another resampler without analyzing the existing chain.
+
+## 5. Validation gates
+
+1. Build the actual target vendor HAL against the device's Android branch.
+2. Run host tests for lock gating, correction bounds, slew, query failure, and ASRC rejection.
+3. On device, log commanded and applied ratio, presentation-frame deltas, timestamps, underruns, and output drift.
+4. Validate speaker, wired, USB, and Bluetooth independently; these may use different output clocks and routing paths.
+5. Do not claim physical DAC-clock correction from host tests. Software ASRC compensates stream cadence; it does not directly discipline the oscillator.
+
+The repository does not contain the proprietary target HAL source, so this component is the integration implementation/contract. A target-specific patch cannot be completed safely until the vendor stream and its ASRC API are identified.
+
+
+## Moto G85 symbol finding and concrete report bridge
+
+The latest device report shows that the installed `/vendor/lib64/hw/audio.primary.blair.so` contains `StreamOutPrimary::GetMmapPosition` and references `pal_stream_get_mmap_position`. This narrows the likely source-level insertion point to the primary HAL's existing output-stream implementation, but symbol presence alone does not prove the active music route calls it or that the stream supports MMAP.
+
+For a HAL source tree with access to its existing `pal_stream_handle_t`, use `ivanna_pal_active_stream_clock_publisher.hpp` for telemetry-only wiring:
+
+```cpp
+#include <PalApi.h>
+#include "ivanna_pal_active_stream_clock_publisher.hpp"
+
+struct ActivePalContext { pal_stream_handle_t* stream; };
+
+static bool queryActivePalPosition(void* opaque, int32_t* frames,
+                                   int64_t* timeNs) noexcept {
+    auto* ctx = static_cast<ActivePalContext*>(opaque);
+    if (!ctx || !ctx->stream || !frames || !timeNs) return false;
+    pal_mmap_position position{};
+    if (pal_stream_get_mmap_position(ctx->stream, &position) != 0) return false;
+    *frames = position.position_frames;
+    *timeNs = position.time_nanoseconds;
+    return true;
+}
+
+// Construct once for the lifetime of the actual output stream, after its PAL
+// handle and sample rate are known. Start/poll/reset/stop from the HAL's
+// serialized control/lifecycle path, never from the hard-real-time write path.
+ActivePalContext context{existingPalStreamHandle};
+ivanna::audio::PalMmapActiveStreamClockPublisher clock(
+    &queryActivePalPosition, &context, activeSampleRateHz,
+    stableStreamId, routeGeneration);
+const bool reporterReady = clock.start();
+// At ~10–20 Hz: if (reporterReady) (void)clock.poll();
+// On standby/reopen/route change: clock.reset();
+// On stream destruction: clock.stop();
+```
+
+This bridge deliberately publishes telemetry only. If PAL returns `-ENOSYS` on a non-MMAP stream, it publishes no new sample. It does not infer frames from elapsed time, open a second PCM node, enable correction, or identify an ASRC actuator.
+
+**Important limit for this repository:** the proprietary Motorola `audio.primary.blair.so` source and its active `StreamOutPrimary` object are not present here. The helper is now in the repository, but the actual call site inside that vendor HAL is not patched by this change; doing so requires the matching HAL source/build integration (or a separately validated runtime instrumentation path). Do not claim the phone is connected until a live report shows advancing frames and monotonic timestamps while the relevant route is playing.

@@ -1,0 +1,242 @@
+diff --git a/tools/evolution/evolution_engine.py b/tools/evolution/evolution_engine.py
+--- a/tools/evolution/evolution_engine.py
++++ b/tools/evolution/evolution_engine.py
+@@ -699,6 +699,34 @@
+ }
+ 
+ 
++def _source_files_for_caller_search():
++    """Archivos C/C++ del repo para buscar llamadores (árbol de trabajo,
++    no solo git: un archivo nuevo sin commitear también tiene llamadores).
++    Excluye third_party (googletest vendoreado) y directorios de build.
++    """
++    out = []
++    for ext in ("*.cpp", "*.h", "*.hpp", "*.c", "*.cc"):
++        out.extend((REPO / "app/src/main/cpp").rglob(ext))
++    return sorted(
++        p for p in out
++        if "third_party" not in p.parts and "build" not in p.parts
++    )
++
++
++def _has_caller(name, def_path, def_line, file_lines):
++    """True si `name` aparece en algún archivo en una línea que no sea la
++    propia definición (0012 + 0019: búsqueda en el árbol de trabajo,
++    no `git grep`, que no ve archivos sin commitear)."""
++    word = re.compile(r"\b" + re.escape(name) + r"\b")
++    for path, lines in file_lines.items():
++        for lineno, line in enumerate(lines, start=1):
++            if path == def_path and lineno == def_line:
++                continue  # la propia definición
++            if word.search(line):
++                return True
++    return False
++
++
+ def scan_dead_functions():
+     """Funciones definidas en .cpp sin llamadores en todo el repo.
+ 
+@@ -710,6 +738,15 @@
+     (la del nombre de la función); cualquier otra mención, en el mismo
+     archivo o en otro, es un llamador.
+     """
++    # Índice de líneas por archivo (se lee una vez; la búsqueda de
++    # llamadores es en memoria, sin depender del estado de git).
++    file_lines = {}
++    for path in _source_files_for_caller_search():
++        try:
++            file_lines[path.resolve()] = path.read_text(
++                errors="ignore").splitlines()
++        except OSError:
++            continue
+     dead = []
+     for path in sorted((REPO / "app/src/main/cpp").rglob("*.cpp")):
+         src = path.read_text(errors="ignore")
+@@ -718,22 +755,7 @@
+             if name in DEAD_FUNCTION_ALLOWLIST:
+                 continue
+             def_line = src.count("\n", 0, m.start(1)) + 1
+-            # cwd explícito: el default de run() se liga en tiempo de
+-            # definición y no vería un REPO monkeado en tests.
+-            out = run(["git", "grep", "-n", name, "--", "app/src/main"],
+-                      cwd=REPO).stdout
+-            has_caller = False
+-            for line in out.splitlines():
+-                parts = line.split(":", 2)
+-                if len(parts) < 2 or not parts[1].isdigit():
+-                    continue
+-                # El path de git grep es relativo a la raíz del repo.
+-                if ((REPO / parts[0]).resolve() == path.resolve()
+-                        and int(parts[1]) == def_line):
+-                    continue  # la propia definición
+-                has_caller = True
+-                break
+-            if not has_caller:
++            if not _has_caller(name, path.resolve(), def_line, file_lines):
+                 dead.append({"function": name, "file": str(path.relative_to(REPO))})
+     return dead
+ 
+@@ -820,12 +842,23 @@
+     El detector reporta; el analista decide (no filtra por antigüedad:
+     un TODO viejo puede seguir siendo deuda real). Si git grep no encuentra
+     nada (exit 1 de grep) el total es 0, no un error.
++
++    Solo cuentan los MARCADORES DE TAREA (`TODO:` / `TODO(` / `FIXME:` /
++    `FIXME(`). La palabra española TODO (= todo/all) en comentarios
++    ("TODO el audio", "TODO apagado", "TODO cambio") NO es una tarea y
++    antes inflaba el inventario a 28 cuando solo 1 era real (0019):
++    TODO(route-arbiter-v2) en ivanna_omega_jni.cpp:1803. El resto eran
++    español o referencias vagas ("ver TODO") o ya resueltos
++    (usb_audio_pro_manager: "sustituye los dos TODO").
+     """
+-    # third_party (googletest vendoreado) excluido: sus TODOs no son deuda
+-    # de IVANNA y ahogaban el inventario (medido: varios de los 41).
+-    proc = run(["git", "grep", "-n", "-E", "TODO|FIXME", "--",
+-                "app/src/main/cpp", ":!app/src/main/cpp/tests/third_party"])
+-    pattern = re.compile(r"^(?P<file>.*?):(?P<line>\d+):(.*?\b(?P<tag>TODO|FIXME)\b.*)$")
++    # third_party (googletest vendoreado) y nlohmann/json (vendoreado)
++    # excluidos: sus TODOs no son deuda de IVANNA.
++    # cwd explícito: el default de run() se liga en tiempo de definición
++    # y no vería un REPO monkeado en tests (mismo bug que 0012).
++    proc = run(["git", "grep", "-n", "-E", r"TODO[:\(]|FIXME[:\(]", "--",
++                "app/src/main/cpp", ":!app/src/main/cpp/tests/third_party",
++                ":!app/src/main/cpp/include/nlohmann"], cwd=REPO)
++    pattern = re.compile(r"^(?P<file>.*?):(?P<line>\d+):(.*?\b(?P<tag>TODO|FIXME)[:\(].*)$")
+     items = []
+     for line in (proc.stdout or "").splitlines():
+         m = pattern.match(line)
+diff --git a/tools/evolution/tests/test_scan_dead_functions.py b/tools/evolution/tests/test_scan_dead_functions.py
+--- a/tools/evolution/tests/test_scan_dead_functions.py
++++ b/tools/evolution/tests/test_scan_dead_functions.py
+@@ -114,6 +114,24 @@
+         dead = evolution_engine.scan_dead_functions()
+         self.assertEqual(dead, [])
+ 
++    def test_0019_untracked_file_caller_is_found(self):
++        """Un helper llamado en un archivo SIN commitear también cuenta:
++        la búsqueda es en el árbol de trabajo, no `git grep` (que no ve
++        archivos untracked). Regresión de 0019: los helpers de los tests
++        nuevos (SendOneFd, FillSine, ...) salían como muertos mientras
++        los archivos estaban sin commitear."""
++        (self.repo / "app/src/main/cpp/tests").mkdir(parents=True, exist_ok=True)
++        (self.repo / "app/src/main/cpp/tests/test_new.cpp").write_text(
++            "bool HelperNew() { return true; }\n"
++            "TEST(X, UsesHelper) {\n"
++            "    EXPECT_TRUE(HelperNew());\n"
++            "}\n",
++            encoding="utf-8",
++        )
++        # Sin _commit(): el archivo queda untracked a propósito.
++        dead = evolution_engine.scan_dead_functions()
++        self.assertEqual(dead, [])
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tools/evolution/tests/test_scan_todo_fixme.py b/tools/evolution/tests/test_scan_todo_fixme.py
+new file mode 100644
+--- /dev/null
++++ b/tools/evolution/tests/test_scan_todo_fixme.py
+@@ -0,0 +1,102 @@
++"""Tests de scan_todo_fixme (propuesta 0019, coordinador del Plan
++Omnipotencia).
++
++El scanner contaba la palabra española TODO (= todo/all) en comentarios
++como si fuera un marcador de tarea: "TODO el audio", "TODO apagado",
++"TODO cambio" inflaban el inventario a 28 cuando solo 1 era real.
++El fix exige marcador de tarea (`TODO:` / `TODO(` / `FIXME:` /
++`FIXME(`) y excluye nlohmann/json vendoreado.
++
++Casos:
++- "TODO el audio" (español) -> NO se cuenta.
++- "TODO(route-arbiter-v2): ..." (marcador real) -> SÍ se cuenta.
++- "TODO(niels)" en nlohmann/json vendoreado -> NO se cuenta.
++- El repo real reporta 1: TODO(route-arbiter-v2) en
++  ivanna_omega_jni.cpp:1803.
++
++El test crea un repo git temporal porque el scanner usa `git grep`.
++"""
++import subprocess
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++import evolution_engine  # noqa: E402
++
++
++def _git(repo, *args):
++    subprocess.run(["git", *args], cwd=repo, check=True,
++                   capture_output=True, text=True)
++
++
++class TestScanTodoFixme(unittest.TestCase):
++    def setUp(self):
++        self._old_repo = evolution_engine.REPO
++        self._tmp = tempfile.TemporaryDirectory()
++        self.repo = Path(self._tmp.name)
++        (self.repo / "app/src/main/cpp").mkdir(parents=True, exist_ok=True)
++        _git(self.repo, "init", "-q")
++        _git(self.repo, "config", "user.email", "test@ivanna.local")
++        _git(self.repo, "config", "user.name", "Test")
++        evolution_engine.REPO = self.repo
++
++    def tearDown(self):
++        evolution_engine.REPO = self._old_repo
++        self._tmp.cleanup()
++
++    def _commit(self):
++        _git(self.repo, "add", "-A")
++        _git(self.repo, "commit", "-qm", "fixture")
++
++    def test_0019_spanish_todo_is_not_counted(self):
++        """'TODO el audio' (español) no es una tarea: no se cuenta."""
++        (self.repo / "app/src/main/cpp/a.cpp").write_text(
++            "// El músculo las aplica a TODO el audio.\n"
++            "// Por defecto TODO apagado.\n"
++            "// TODO cambio de ruta.\n",
++            encoding="utf-8",
++        )
++        self._commit()
++        r = evolution_engine.scan_todo_fixme()
++        self.assertEqual(r["total"], 0)
++
++    def test_0019_real_task_marker_is_counted(self):
++        """TODO: y TODO(...) sí son tareas: se cuentan."""
++        (self.repo / "app/src/main/cpp/b.cpp").write_text(
++            "// TODO(route-arbiter-v2): hacer passthrough solo si route==SYSTEM_WIDE.\n"
++            "// FIXME: el buffer puede llegar vacío.\n",
++            encoding="utf-8",
++        )
++        self._commit()
++        r = evolution_engine.scan_todo_fixme()
++        self.assertEqual(r["total"], 2)
++        self.assertEqual(
++            {i["tag"] for i in r["items"]}, {"TODO", "FIXME"})
++
++    def test_0019_vendored_nlohmann_is_excluded(self):
++        """TODO(niels) en nlohmann/json vendoreado no es deuda de IVANNA."""
++        d = self.repo / "app/src/main/cpp/include/nlohmann"
++        d.mkdir(parents=True, exist_ok=True)
++        (d / "json.hpp").write_text(
++            "get();  // TODO(niels): may we ignore N here?\n",
++            encoding="utf-8",
++        )
++        self._commit()
++        r = evolution_engine.scan_todo_fixme()
++        self.assertEqual(r["total"], 0)
++
++    def test_0019_real_repo_reports_one(self):
++        """El repo real reporta 1: el route-arbiter-v2."""
++        evolution_engine.REPO = self._old_repo
++        r = evolution_engine.scan_todo_fixme()
++        self.assertEqual(r["total"], 1)
++        self.assertEqual(r["items"][0]["file"],
++                         "app/src/main/cpp/jni/ivanna_omega_jni.cpp")
++        self.assertEqual(r["items"][0]["line"], 1803)
++
++
++if __name__ == "__main__":
++    unittest.main()

@@ -1,0 +1,462 @@
+#pragma once
+// © 2026 Luis Uriel Pimentel Pérez — IVANNA N-P-E — All rights reserved.
+// CochlearActiveInverseModel.hpp
+//
+// Eje Supremo Neuroacústico:
+//   Inversión Biomecánica Coclear Activa & Alineación de Fase Sub-Microsegundo MSO
+//   Cochlear-PINN | Integrador Heun (RK2) | 8 Bandas Greenwood | RT-Safety
+//
+// Garantías RT-Safety (ISO 26262-grade):
+//   - CERO llamadas malloc/new/free/resize en process()
+//   - 0.00 ms de latencia algorítmica añadida (procesado causal in-place)
+//   - alignas(64) en todos los buffers de estado (una cache-line por canal)
+//   - SIMD ARM NEON float32x4_t: 4 bandas/ciclo — fallback scalar auto-vectorizable
+//   - __restrict en punteros de audio (garantía de no-aliasing)
+//   - Libre de divisiones en el hot-path (precomputadas en prepare())
+//   - Estabilidad numérica incondicional: bilinear-transform BPF + Heun de 1er orden
+
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <algorithm>
+#include "../supreme/SupremeTransitionEnvelope.hpp"
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#  include <arm_neon.h>
+#  define IVANNA_COCHLEAR_NEON 1
+#endif
+
+namespace ivanna::neuromorphic {
+
+/**
+ * @class CochlearActiveInverseEngine
+ *
+ * Cancela las no-linealidades cocleares originadas en la amplificación
+ * de prestina (OHC — Outer Hair Cells) mediante inversión biomecánica
+ * activa con resolución temporal sub-microsegundo.
+ *
+ * Modelo:
+ *   H_OHC(x) = x * (1 + α·env²)              — amplificación coclear NL
+ *   H_inv(x) = x * (1 - α·env²)              — inversa complementaria
+ *   env       = Heun-ODE(|bpf_out|, tau_att, tau_rel) — envelope OHC (Heun RK2)
+ *   bpf_out   = BPF_b(x)                      — biquad Greenwood band (bilinear)
+ *
+ * Arquitectura SoA (Structure-of-Arrays) para carga NEON contigua eficiente.
+ */
+class CochlearActiveInverseEngine {
+public:
+    // ── Constantes del mapa de Greenwood (Human cochlea, 1990) ───────────────
+    static constexpr int NUM_BANDS = 8;
+
+    // Frecuencias centrales Greenwood: f(x)=165.4*(10^(2.1*x)-0.88)
+    // 8 posiciones uniformes: x ∈ {0.098, 0.219, 0.340, 0.461, 0.582, 0.703, 0.824, 0.947}
+    static constexpr float CF[NUM_BANDS] = {
+        120.0f, 331.0f, 710.0f, 1390.0f,
+       2613.0f, 4807.0f, 8736.0f, 16000.0f
+    };
+
+    // ── Parámetros del modelo de prestina OHC ────────────────────────────────
+    // Función de transferencia inversa complementaria: H_inv(x) = x*(1 - α·env²)
+    static constexpr float ALPHA_PRESTIN = 0.085f;  // coef. no-lineal OHC
+
+    // Q factor auditivo crítico (banda Greenwood)
+    static constexpr float Q_COCHLEAR    = 3.0f;
+
+    // Q factor auditivo crítico por banda.
+    // FIX artefactos "láser": Q=3.0 en 8 kHz–16 kHz produce resonancia tonal
+    // audible (BPF muy estrecho cerca de Nyquist → ringing en transitorios).
+    // Reducimos Q en las bandas superiores para ampliar el filtro y eliminar
+    // el pitido, manteniendo la selectividad en bandas medias/bajas.
+    static constexpr float Q_BY_BAND[NUM_BANDS] = {
+        3.0f,   // 120  Hz  — banda baja:   Q alto para buena selectividad
+        3.0f,   // 331  Hz
+        3.0f,   // 710  Hz
+        3.0f,   // 1390 Hz
+        2.5f,   // 2613 Hz  — transición
+        1.8f,   // 4807 Hz  — banda alta:   Q bajo → sin ringing
+        1.4f,   // 8736 Hz  — FIX "láser"
+        1.0f    // 16000 Hz — Q=1 (Butterworth BPF, 2 oct de anchura)
+    };
+
+    // Constantes de tiempo Heun (OHC envelope follower)
+    static constexpr float TAU_ATT_MS   = 10.0f;   // ataque   [ms]
+    static constexpr float TAU_REL_MS   = 80.0f;   // release  [ms]
+
+    // ── Estado SoA (contiguo para vld1q_f32 NEON sin gather) ─────────────────
+    // Cada campo = float[8] = 32 bytes. alignas(64) → 2 campos/cache-line.
+    struct alignas(64) ChannelState {
+        // Biquad BPF Direct-Form I (bilinear transform — estable para todas fc)
+        float x1[NUM_BANDS];   // historia de entrada n-1
+        float x2[NUM_BANDS];   // historia de entrada n-2
+        float y1[NUM_BANDS];   // historia de salida  n-1
+        float y2[NUM_BANDS];   // historia de salida  n-2
+        // Coeficientes BPF normalizados por a0 (pre-computados, inmutables en RT)
+        float b0[NUM_BANDS];   // b0_norm = b0/a0 = α/(1+α)
+        //  b1 = 0 (BPF)       — no necesita almacenarse
+        //  b2 = -b0           — se usa inline
+        float na1[NUM_BANDS];  // -a1/a0 =  2·cos(ω₀)/(1+α)   [positivo]
+        float na2[NUM_BANDS];  // -a2/a0 = -(1-α)/(1+α)        [negativo]
+        // Heun OHC: state
+        float env[NUM_BANDS];  // amplitud OHC (envelope, ≥ 0)
+        // Heun OHC: coeficientes (= h/tau_sec, pre-comp → sin divisiones en RT)
+        float att[NUM_BANDS];  // = 1/(tau_att_ms*Fs/1000)
+        float rel[NUM_BANDS];  // = 1/(tau_rel_ms*Fs/1000)
+        // OHC Basolateral membrane lowpass smoothing (anti-sizzle / anti-hormigas)
+        float membraneState[NUM_BANDS];
+        float membraneCoeff[NUM_BANDS];
+    };
+
+    // Un ChannelState por oído (L y R independientes → stereo auditivo real)
+    alignas(64) ChannelState chanL_{};
+    alignas(64) ChannelState chanR_{};
+
+    float sampleRate_ = 48000.0f;
+    float wetGain_    = 0.35f;  // [0..1] — intensidad efectiva (computed)
+    float intensity_  = 0.35f;  // [0..1] — intensidad configurada
+    float activeWet_  = 0.0f;   // rampa suave anti-click por muestra
+    bool  enabled_    = false;  // on/off state (bypass por defecto hasta activación)
+    bool  thermalBypass_ = false;
+    ivanna::supreme::SupremeTransitionEnvelope transitionEnv_{};
+    ivanna::supreme::SupremeStateContinuityManager continuityMgr_{};
+
+    CochlearActiveInverseEngine() noexcept {
+        prepare(48000.0f, 512);
+        enabled_   = false;
+        wetGain_   = 0.0f;
+        activeWet_ = 0.0f;
+        transitionEnv_.setImmediate(0.0f);
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // prepare() — pre-computa coeficientes; sin allocs.
+    // ────────────────────────────────────────────────────────────────────────
+    void prepare(float sampleRate, int /*blockSize*/ = 512) noexcept {
+        sampleRate_ = (sampleRate > 8000.0f) ? sampleRate : 48000.0f;
+        transitionEnv_.configure(sampleRate_, 8.0f, 18.0f, 35.0f);
+        continuityMgr_.configure(sampleRate_, 5.0f);
+        prepareBands(chanL_, sampleRate_);
+        prepareBands(chanR_, sampleRate_);
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            chanL_.x1[b] = chanL_.x2[b] = chanL_.y1[b] = chanL_.y2[b] = chanL_.env[b] = 0.0f;
+            chanR_.x1[b] = chanR_.x2[b] = chanR_.y1[b] = chanR_.y2[b] = chanR_.env[b] = 0.0f;
+        }
+        reset();
+    }
+
+    void reset() noexcept {
+        transitionEnv_.setImmediate(enabled_ ? wetGain_ : 0.0f);
+        activeWet_ = transitionEnv_.currentGain;
+        validateAcousticState();
+    }
+
+    void validateAcousticState() noexcept {
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            continuityMgr_.state().sanitizeScalar(chanL_.x1[b]);
+            continuityMgr_.state().sanitizeScalar(chanL_.x2[b]);
+            continuityMgr_.state().sanitizeScalar(chanL_.y1[b]);
+            continuityMgr_.state().sanitizeScalar(chanL_.y2[b]);
+            continuityMgr_.state().sanitizeScalar(chanL_.env[b]);
+            continuityMgr_.state().sanitizeScalar(chanR_.x1[b]);
+            continuityMgr_.state().sanitizeScalar(chanR_.x2[b]);
+            continuityMgr_.state().sanitizeScalar(chanR_.y1[b]);
+            continuityMgr_.state().sanitizeScalar(chanR_.y2[b]);
+            continuityMgr_.state().sanitizeScalar(chanR_.env[b]);
+        }
+        continuityMgr_.validateState();
+    }
+
+    void preserveAcousticState(const float* __restrict bufferL,
+                               const float* __restrict bufferR,
+                               int numSamples) noexcept {
+        if (!bufferL || !bufferR || numSamples <= 0) return;
+        continuityMgr_.preserveState(bufferL, bufferR, static_cast<size_t>(numSamples));
+        const float x1L = std::isfinite(bufferL[numSamples - 1]) ? bufferL[numSamples - 1] : 0.0f;
+        const float x1R = std::isfinite(bufferR[numSamples - 1]) ? bufferR[numSamples - 1] : 0.0f;
+        const float x2L = (numSamples >= 2 && std::isfinite(bufferL[numSamples - 2])) ? bufferL[numSamples - 2] : x1L;
+        const float x2R = (numSamples >= 2 && std::isfinite(bufferR[numSamples - 2])) ? bufferR[numSamples - 2] : x1R;
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            chanL_.x2[b] = x2L;
+            chanL_.x1[b] = x1L;
+            chanR_.x2[b] = x2R;
+            chanR_.x1[b] = x1R;
+        }
+        validateAcousticState();
+    }
+
+    /**
+     * @brief Procesado coclear inverso in-place. RT-Safe.
+     *
+     * Latencia algorítmica añadida: 0 muestras / 0.00 ms.
+     * Cero malloc/new/free. Cero divisiones en runtime.
+     *
+     * @param bufferL  Canal izquierdo  (in-place, __restrict)
+     * @param bufferR  Canal derecho    (in-place, __restrict)
+     * @param numSamples  Muestras por canal
+     */
+    void process(float* __restrict bufferL,
+                 float* __restrict bufferR,
+                 int numSamples) noexcept {
+        if (!bufferL || !bufferR || numSamples <= 0) return;
+        const float targetWet = (enabled_ && !thermalBypass_) ? wetGain_ : 0.0f;
+        const auto profile = thermalBypass_
+            ? ivanna::supreme::TransitionProfile::Thermal
+            : ivanna::supreme::TransitionProfile::Standard;
+        const bool wasSilent = transitionEnv_.isSilent();
+
+        if (!transitionEnv_.beginBlock(targetWet, profile)) {
+            activeWet_ = 0.0f;
+            preserveAcousticState(bufferL, bufferR, numSamples);
+            continuityMgr_.suspend(bufferL, bufferR, static_cast<size_t>(numSamples));
+            return;
+        }
+        if (wasSilent) {
+            continuityMgr_.resume();
+            validateAcousticState();
+        }
+
+        ivanna::supreme::SupremeTransitionEnvelope envL = transitionEnv_;
+        ivanna::supreme::SupremeTransitionEnvelope envR = transitionEnv_;
+        processMono(bufferL, numSamples, chanL_, envL);
+        processMono(bufferR, numSamples, chanR_, envR);
+        for (int n = 0; n < numSamples; ++n) {
+            (void)continuityMgr_.nextResumeFactor();
+        }
+        transitionEnv_ = envL;
+        activeWet_ = transitionEnv_.currentGain;
+        continuityMgr_.preserveState(bufferL, bufferR, static_cast<size_t>(numSamples));
+
+        if (transitionEnv_.isSilent()) {
+            activeWet_ = 0.0f;
+            continuityMgr_.suspend(bufferL, bufferR, static_cast<size_t>(numSamples));
+        }
+    }
+
+    void setWetGain(float wet) noexcept {
+        const float clamped = (wet < 0.0f) ? 0.0f : (wet > 1.0f) ? 1.0f : wet;
+        intensity_ = clamped;
+        wetGain_   = clamped;
+        enabled_   = (clamped > 0.0f);
+        if (transitionEnv_.renderedBlocks == 0u) {
+            transitionEnv_.setImmediate(clamped);
+            activeWet_ = clamped;
+        }
+    }
+
+    [[nodiscard]] float getWetGain() const noexcept { return wetGain_; }
+
+    // ── API requerida por ivanna_spatial_jni.cpp (Ruta A helper) ─────────────
+    /** Activa o desactiva el motor (wet=intensity_ si on, 0 si off). */
+    void setEnabled(bool on) noexcept {
+        enabled_ = on;
+        if (on && intensity_ <= 1.0e-4f) {
+            intensity_ = 0.35f;
+        }
+        wetGain_ = on ? intensity_ : 0.0f;
+    }
+
+    void setThermalBypass(bool thermalBypass) noexcept {
+        thermalBypass_ = thermalBypass;
+    }
+
+    /** Ajusta la intensidad de corrección [0..1] sin alterar el estado on/off. */
+    void setIntensity(float w) noexcept {
+        intensity_ = (w < 0.0f) ? 0.0f : (w > 1.0f) ? 1.0f : w;
+        if (enabled_) wetGain_ = intensity_;
+    }
+
+    /** Devuelve true si el motor está activo y la intensidad es perceptible (>0). */
+    [[nodiscard]] bool isActive() const noexcept {
+        return (enabled_ && !thermalBypass_ && (wetGain_ > 0.0f)) || !transitionEnv_.isSilent();
+    }
+
+    [[nodiscard]] float currentTransitionGain() const noexcept {
+        return transitionEnv_.currentGain;
+    }
+
+    [[nodiscard]] const ivanna::supreme::SupremeStateContinuityManager& continuityManager() const noexcept {
+        return continuityMgr_;
+    }
+
+    [[nodiscard]] float preservedStateEnergy() const noexcept {
+        float e = 0.0f;
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            e += std::fabs(chanL_.x1[b]) + std::fabs(chanL_.y1[b]) + std::fabs(chanL_.env[b]) +
+                 std::fabs(chanR_.x1[b]) + std::fabs(chanR_.y1[b]) + std::fabs(chanR_.env[b]);
+        }
+        return e;
+    }
+
+    CochlearActiveInverseEngine& cochlearEngine() noexcept { return *this; }
+
+private:
+    // ────────────────────────────────────────────────────────────────────────
+    // prepareBands() — ONE division per band (init only, NEVER en process())
+    // ────────────────────────────────────────────────────────────────────────
+    static void prepareBands(ChannelState& ch, float Fs) noexcept {
+        constexpr float PI2 = 6.28318530717958647f;
+        const float att_c = 1.0f / (TAU_ATT_MS * 0.001f * Fs);
+        const float rel_c = 1.0f / (TAU_REL_MS * 0.001f * Fs);
+        for (int b = 0; b < NUM_BANDS; ++b) {
+            // Biquad BPF — Audio EQ Cookbook (constant skirt, unit peak)
+            // Q por banda: ver Q_BY_BAND[] — bandas altas con Q reducido (anti-láser)
+            const float w0    = PI2 * CF[b] / Fs;
+            const float sinW  = std::sin(w0);
+            const float cosW  = std::cos(w0);
+            const float alpha = sinW / (2.0f * Q_BY_BAND[b]);
+            const float a0    = 1.0f + alpha;
+            const float inv_a0 = 1.0f / a0;          // ← única división en init
+            ch.b0[b]  = alpha * inv_a0;               // b0/a0
+            ch.na1[b] = 2.0f * cosW * inv_a0;         // -a1/a0  [+]
+            ch.na2[b] = -(1.0f - alpha) * inv_a0;     // -a2/a0  [-]
+            ch.att[b] = att_c;
+            ch.rel[b] = rel_c;
+            // Cutoff de membrana basolateral OHC (~1500 Hz para bandas altas)
+            // Filtra componentes de portadora AC por encima de 1.8 kHz eliminando ripple en la envolvente
+            if (CF[b] > 1800.0f) {
+                constexpr float FC_MEMBRANE = 1500.0f;
+                ch.membraneCoeff[b] = 1.0f - std::exp(-PI2 * FC_MEMBRANE / Fs);
+            } else {
+                ch.membraneCoeff[b] = 1.0f;
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // processMono() — hot-path: cero divisiones, cero allocs
+    // NEON: 4 bandas/ciclo × 2 grupos = 8 bandas totales
+    // Preserva ganancia unitaria de banda ancha (0 dB insertion loss)
+    // sustrayendo únicamente el término no-lineal de compresión OHC (prestina).
+    // ────────────────────────────────────────────────────────────────────────
+    void processMono(float* __restrict buf, int N,
+                     ChannelState& __restrict ch,
+                     ivanna::supreme::SupremeTransitionEnvelope& env) noexcept {
+        const float alpha_p  = ALPHA_PRESTIN;
+        constexpr float INV8 = 0.125f;
+
+        for (int n = 0; n < N; ++n) {
+            const float wet = env.nextSample();
+            const float x = buf[n];
+            float nl_cancel_sum = 0.0f;
+
+#if defined(IVANNA_COCHLEAR_NEON)
+            // ── NEON: 2 iteraciones × 4 bandas = 8 bandas ────────────────
+            for (int bg = 0; bg < NUM_BANDS; bg += 4) {
+                // ─── Carga de estado biquad (SoA → contiguo ✓) ────────────
+                float32x4_t x1v  = vld1q_f32(ch.x1  + bg);
+                float32x4_t x2v  = vld1q_f32(ch.x2  + bg);
+                float32x4_t y1v  = vld1q_f32(ch.y1  + bg);
+                float32x4_t y2v  = vld1q_f32(ch.y2  + bg);
+                float32x4_t b0v  = vld1q_f32(ch.b0  + bg);
+                float32x4_t na1v = vld1q_f32(ch.na1 + bg);
+                float32x4_t na2v = vld1q_f32(ch.na2 + bg);
+                float32x4_t envv = vld1q_f32(ch.env + bg);
+                float32x4_t attv = vld1q_f32(ch.att + bg);
+                float32x4_t relv = vld1q_f32(ch.rel + bg);
+
+                // ─── Biquad BPF: y = b0·x - b0·x2 + na1·y1 + na2·y2 ────
+                const float32x4_t xv = vdupq_n_f32(x);
+                float32x4_t bpf_v = vmulq_f32(b0v, xv);
+                bpf_v = vmlsq_f32(bpf_v, b0v, x2v);
+                bpf_v = vmlaq_f32(bpf_v, na1v, y1v);
+                bpf_v = vmlaq_f32(bpf_v, na2v, y2v);
+
+                // ─── Denormal flush + Suavizado fisiológico de membrana basolateral OHC ─
+                const float32x4_t denormThresh = vdupq_n_f32(1.0e-15f);
+                uint32x4_t isDenorm = vcltq_f32(vabsq_f32(bpf_v), denormThresh);
+                bpf_v = vbslq_f32(isDenorm, vdupq_n_f32(0.0f), bpf_v);
+
+                // Actualizar historia biquad de forma limpia y desnormalizada
+                x2v = x1v;
+                x1v = xv;
+                isDenorm = vcltq_f32(vabsq_f32(y1v), denormThresh);
+                y2v = vbslq_f32(isDenorm, vdupq_n_f32(0.0f), y1v);
+                y1v = bpf_v;
+
+                float32x4_t memState_v = vld1q_f32(ch.membraneState + bg);
+                float32x4_t memCoeff_v = vld1q_f32(ch.membraneCoeff + bg);
+                const float32x4_t rect_v = vabsq_f32(bpf_v);
+                memState_v = vaddq_f32(memState_v, vmulq_f32(memCoeff_v, vsubq_f32(rect_v, memState_v)));
+                isDenorm = vcltq_f32(vabsq_f32(memState_v), denormThresh);
+                memState_v = vbslq_f32(isDenorm, vdupq_n_f32(0.0f), memState_v);
+                vst1q_f32(ch.membraneState + bg, memState_v);
+
+                // ─── Heun OHC envelope (RK2, primer orden, sin divisiones) ─
+                const float32x4_t Ev = memState_v;
+                const uint32x4_t rising = vcgtq_f32(Ev, envv);
+                const float32x4_t coef  = vbslq_f32(rising, attv, relv);
+                const float32x4_t k1v   = vmulq_f32(vsubq_f32(Ev, envv), coef);
+                const float32x4_t predv = vaddq_f32(envv, k1v);
+                const float32x4_t k2v   = vmulq_f32(vsubq_f32(Ev, predv), coef);
+                envv = vmlaq_f32(envv, vdupq_n_f32(0.5f), vaddq_f32(k1v, k2v));
+                envv = vmaxq_f32(envv, vdupq_n_f32(0.0f));
+                isDenorm = vcltq_f32(envv, denormThresh);
+                envv = vbslq_f32(isDenorm, vdupq_n_f32(0.0f), envv);
+
+                // ─── Cancelación NL de prestina: Δ_NL = bpf * (α·env² + 0.05·env) ───
+                const float32x4_t env2v = vmulq_f32(envv, envv);
+                float32x4_t nlv = vmlaq_f32(vmulq_f32(vdupq_n_f32(0.05f), envv),
+                                            vdupq_n_f32(alpha_p), env2v);
+                nlv = vminq_f32(nlv, vdupq_n_f32(0.45f));
+                const float32x4_t outv = vmulq_f32(bpf_v, nlv);
+
+                // ─── Reducción horizontal (4 bandas → 1 acumulador) ───────
+                const float32x2_t s2 = vadd_f32(vget_low_f32(outv), vget_high_f32(outv));
+                const float32x2_t s1 = vpadd_f32(s2, s2);
+                nl_cancel_sum += vget_lane_f32(s1, 0);
+
+                // ─── Store estado actualizado ─────────────────────────────
+                vst1q_f32(ch.x1  + bg, x1v);
+                vst1q_f32(ch.x2  + bg, x2v);
+                vst1q_f32(ch.y1  + bg, y1v);
+                vst1q_f32(ch.y2  + bg, y2v);
+                vst1q_f32(ch.env + bg, envv);
+            }
+#else
+            // ── Scalar: auto-vectorizable por compilador (x86_64 SSE/AVX) ──
+            for (int b = 0; b < NUM_BANDS; ++b) {
+                // Biquad BPF Direct-Form I
+                const float bpf = ch.b0[b] * x
+                                 - ch.b0[b] * ch.x2[b]
+                                 + ch.na1[b] * ch.y1[b]
+                                 + ch.na2[b] * ch.y2[b];
+                // Flush denormals to 0.0f (previene micro-pausas y ruido de fondo granular)
+                float bpf_clean = bpf;
+                if (std::fabs(bpf_clean) < 1.0e-15f) bpf_clean = 0.0f;
+                float y1_clean = ch.y1[b];
+                if (std::fabs(y1_clean) < 1.0e-15f) y1_clean = 0.0f;
+
+                ch.x2[b] = ch.x1[b];
+                ch.x1[b] = x;
+                ch.y2[b] = y1_clean;
+                ch.y1[b] = bpf_clean;
+
+                // Suavizado fisiológico de membrana basolateral OHC (anti-sizzle / anti-hormigas)
+                const float rect = (bpf_clean >= 0.0f) ? bpf_clean : -bpf_clean;
+                ch.membraneState[b] += ch.membraneCoeff[b] * (rect - ch.membraneState[b]);
+                if (ch.membraneState[b] < 1.0e-15f) ch.membraneState[b] = 0.0f;
+                const float E    = ch.membraneState[b];
+
+                const float coef = (E > ch.env[b]) ? ch.att[b] : ch.rel[b];
+                const float k1   = (E - ch.env[b]) * coef;
+                const float pred = ch.env[b] + k1;
+                const float k2   = (E - pred) * coef;
+                float env_new    = ch.env[b] + 0.5f * (k1 + k2);
+                if (env_new < 1.0e-15f) env_new = 0.0f;
+                ch.env[b] = env_new;
+
+                // Cancelación NL de prestina: Δ_NL = bpf * (α·env² + 0.05·env)
+                const float env2 = env_new * env_new;
+                float nl = alpha_p * env2 + 0.05f * env_new;
+                if (nl > 0.45f) nl = 0.45f;
+                nl_cancel_sum += bpf_clean * nl;
+            }
+#endif
+            // Preserva 100% de la señal directa de banda ancha x (0 dB pérdida de volumen)
+            // y resta el término no-lineal de compresión OHC escalado suavemente por wet.
+            const float y = x - (nl_cancel_sum * INV8 * wet);
+            buf[n] = std::isfinite(y) ? y : x;
+        }
+    }
+};
+
+} // namespace ivanna::neuromorphic

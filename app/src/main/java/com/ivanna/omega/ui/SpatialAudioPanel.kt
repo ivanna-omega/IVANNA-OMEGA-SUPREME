@@ -1,0 +1,599 @@
+package com.ivanna.omega.ui
+
+import androidx.compose.ui.input.pointer.pointerInput
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import java.io.ByteArrayInputStream
+import androidx.webkit.WebViewAssetLoader
+import com.ivanna.omega.fotoholo.FotoHoloTelemetryBridge
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.ivanna.omega.magisk.OmegaEngineBridge
+import com.ivanna.omega.saf.SaFBridge
+import com.ivanna.omega.spatial.IvannaSpatialEngine
+import com.ivanna.omega.spatial.IvannaSpatialManager
+import com.ivanna.omega.spatial.SaFOptimizer
+import com.ivanna.omega.ui.theme.*
+import kotlinx.coroutines.delay
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+
+/**
+ * Fichas magistrales — Pantalla VI · Spatial (prototipo aprobado, texto exacto).
+ * L = HRTF, M = Head-Tracking · Parallax. La ficha N (FotoHolo) vive en
+ * FotoHoloCard, junto a su propio título, y se muestra dentro de este panel.
+ */
+private val spatialScreenSpec = SpecInfo(
+    title = "Spatial",
+    what = "El entorno de geometría del escenario: cómo tu cabeza filtra el sonido (HRTF), cómo el campo sigue tus movimientos (head-tracking con parallax) y cómo tu sala entra en el modelo (FotoHolo).",
+    purpose = "Control decide cuánto campo hay; Spatial decide dónde está cada cosa en ese campo. Sin esta capa bien configurada, ORBE coloca fuentes con la anatomía de otra persona o con la geometría de otro cuarto.",
+    whenUse = "Al estrenar audífonos (elige HRTF), al llegar a un cuarto nuevo (FotoHolo) y siempre que uses ORBE con movimiento de cabeza (head-tracking activo).",
+    whenAvoid = "No mezcles capas: HRTF es para audífonos; con bocinas gobiernan la corrección de sala y el campo ORBE·HOLOS. Forzar todo a la vez colorea el centro y deshace la imagen."
+)
+
+private val hrtfSpec = SpecInfo(
+    title = "HRTF · Función de tu cabeza",
+    what = "La HRTF describe cómo tu anatomía colorea el sonido según de dónde viene. Sin ella, el audio espacial suena a altavoz pegado a la oreja; con ella, las fuentes salen de tu cabeza y se colocan en el espacio. Genérica: promedio poblacional. Medida: tu perfil. Firmas élite: curvas de referencia medidas de productos insignia y la curva Harman.",
+    purpose = "Es la diferencia entre «ancho» y localizable: con la HRTF correcta distingues si una fuente está a 30 cm o a 2 m, delante o detrás, sin pensarlo.",
+    whenUse = "Con audífonos, siempre. Medida si tienes tu perfil; Firmas élite para comparar tu cadena contra las referencias de la industria; Genérica como punto de partida digno.",
+    whenAvoid = "Con bocinas la HRTF no aplica igual: ahí gobiernan sala y campo. Una HRTF ajena muy distinta a tu anatomía produce el efecto contrario: todo suena «dentro del cráneo» y con el timbre torcido."
+)
+
+// Sin equivalente exacto en el código: no existe ningún control de
+// head-tracking ni slider de parallax (65 %) en este panel. El botón va en
+// el equivalente más cercano, el Motor Híbrido Magistral, cuyos controles de
+// azimut y elevación virtual son la pose de las fuentes en el espacio.
+private val headTrackingSpec = SpecInfo(
+    title = "Head-Tracking · Parallax",
+    what = "El seguimiento de la orientación de tu cabeza para que las fuentes se queden quietas en el espacio cuando giras, como en la vida real. El parallax regula cuánto se separan las fuentes cercanas de las lejanas al moverte: es la cue de profundidad más fuerte que tiene el oído.",
+    purpose = "Sin tracking, el escenario entero gira contigo y el cerebro lo descarta como «efecto». Con tracking y pose predicha (PI-LSTM), el campo se vuelve un lugar: puedes «mirar» hacia una fuente y suena más presente.",
+    whenUse = "Con ORBE activo y sensor disponible. Parallax medio-alto (60–80 %) para fuentes de campo cercano (0.15–0.6 m): voces íntimas, instrumentos solistas.",
+    whenAvoid = "En transporte (el vehículo contamina la pose) o si tu dispositivo no ofrece sensor fiable: apágalo y el campo queda fijo y estable, que es mejor que un campo mareado."
+)
+
+/**
+ * SpatialAudioPanel — control real de HRTF / RIR / SAF.
+ * Ningún control decorativo: cada uno va Compose→Prefs→JNI/Bridge→DSP,
+ * y el estado mostrado se LEE del motor (polling 1s), no se asume.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun SpatialAudioPanel(
+    onBack: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val state by produceState(SpatialAudioPrefs.load(context)) {
+        SpatialAudioPrefs.init(context)
+        SpatialAudioPrefs.stateFlow.collect { value = it }
+    }
+    val lineOutActive = com.ivanna.omega.audio.ExternalStereoPolicy.usesExternalSpeakers(
+        com.ivanna.omega.audio.AudioRouteManager.detectOutputRoute(), state.externalStereoLineOut)
+    val latestState by rememberUpdatedState(state)
+    fun update(f: (SpatialAudioState) -> SpatialAudioState) {
+        SpatialAudioPrefs.save(context, f(state))
+    }
+
+    var supremeState by remember { mutableStateOf(SupremeAxesPrefs.load(context)) }
+    val supremeTelemetry by rememberSupremeAxesTelemetry()
+    fun updateSupreme(f: (SupremeAxesState) -> SupremeAxesState) {
+        supremeState = f(supremeState)
+        SupremeAxesPrefs.save(context, supremeState)
+    }
+
+    // Estado real leído del motor (FASE 5)
+    var hrtfLoaded by remember { mutableStateOf(false) }
+    var activeSubject by remember { mutableStateOf("none") }
+    var roomStatus by remember { mutableStateOf("") }
+    var safStatus by remember { mutableStateOf("") }
+
+    // Fuente compartida de configuración: no apagar el motor ni sobrescribir sus
+    // parámetros con defaults sintéticos cuando la telemetría JNI aún no está disponible.
+    var adaptivePrefs by remember { mutableStateOf(AdaptiveControlsPrefs.load(context)) }
+    val initialHybridTelem = remember { com.ivanna.omega.core.NativeBridge.safeGetHybridMagistralTelemetry() }
+    fun initialHybridValue(index: Int, saved: Float): Float =
+        initialHybridTelem.getOrNull(index)?.takeIf { it.isFinite() } ?: saved
+    var hybridEnabled by remember {
+        mutableStateOf(initialHybridTelem.getOrNull(0)?.takeIf { it.isFinite() }?.let { it >= 0.5f }
+            ?: adaptivePrefs.hybridMagistralEnabled)
+    }
+    var hybridBinauralWet by remember { mutableStateOf(initialHybridValue(1, adaptivePrefs.hybridBinauralWet)) }
+    var hybridAzimuthDeg by remember { mutableStateOf(initialHybridValue(2, adaptivePrefs.binauralAzimuth.takeIf { kotlin.math.abs(it) > 1f } ?: 30f)) }
+    var hybridElevationDeg by remember { mutableStateOf(initialHybridValue(3, adaptivePrefs.binauralElevation)) }
+    var hybridRoomSize by remember { mutableStateOf(initialHybridValue(4, adaptivePrefs.hybridRoomSize)) }
+    var hybridAbsorption by remember { mutableStateOf(initialHybridValue(5, adaptivePrefs.hybridRoomAbsorption)) }
+    var hybridDampening by remember { mutableStateOf(initialHybridValue(6, adaptivePrefs.hybridRoomDampening)) }
+    var hybridRoomWet by remember { mutableStateOf(initialHybridValue(7, adaptivePrefs.hybridRoomWetMix)) }
+
+    fun pushHybridMagistral() {
+        val nextPrefs = adaptivePrefs.copy(
+            hybridMagistralEnabled = hybridEnabled,
+            hybridBinauralWet = hybridBinauralWet,
+            binauralAzimuth = hybridAzimuthDeg,
+            binauralElevation = hybridElevationDeg,
+            hybridRoomSize = hybridRoomSize,
+            hybridRoomAbsorption = hybridAbsorption,
+            hybridRoomDampening = hybridDampening,
+            hybridRoomWetMix = hybridRoomWet
+        )
+        AdaptiveControlsPrefs.save(context, nextPrefs)
+        com.ivanna.omega.core.NativeBridge.safeSetHybridMagistralParams(
+            enabled = hybridEnabled,
+            binauralWet = hybridBinauralWet,
+            virtualAzimuthDeg = hybridAzimuthDeg,
+            virtualElevationDeg = hybridElevationDeg,
+            roomSize = hybridRoomSize,
+            roomAbsorption = hybridAbsorption,
+            roomDampening = hybridDampening,
+            roomWetMix = hybridRoomWet
+        )
+    }
+
+    // Restaurar controles nativos fuera de operaciones de disco/IPC; el estado Compose
+    // y los parámetros híbridos se leen y aplican en el hilo UI.
+    LaunchedEffect(state.externalStereoLineOut, lineOutActive) {
+        pushHybridMagistral()
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            IvannaSpatialEngine.enabled = state.hrtfEnabled && !lineOutActive
+            com.ivanna.omega.audio.RouteDspCalibrator.onRouteChanged(context, com.ivanna.omega.audio.AudioRouteManager.detectOutputRoute())
+            if (state.hrtfEnabled && !lineOutActive) {
+                IvannaSpatialEngine.enabled = true
+                IvannaSpatialManager.setHrtfSubject(state.hrtfSubject)
+            }
+            IvannaSpatialManager.setReverbLevel(state.objectReverbLevel)
+            if (state.rirEnabled && !lineOutActive) OmegaEngineBridge.setRoom(state.rirRt60, state.rirWet) else OmegaEngineBridge.disableRoom()
+            // Opening this panel must not reset a user's persisted personal SAF calibration.
+            runCatching {
+                com.ivanna.omega.core.NativeBridge.safeSetCochlearInverseEnabled(state.cochlearInverseEnabled)
+                com.ivanna.omega.core.NativeBridge.safeSetCochlearIntensity(state.cochlearIntensity)
+                SupremeAxesPrefs.applyToNative(supremeState)
+            }
+            while (true) {
+                hrtfLoaded    = IvannaSpatialManager.isHrtfDatasetLoaded()
+                activeSubject = IvannaSpatialManager.currentHrtfSubject()
+                val cochlearNat = IvannaSpatialManager.isCochlearActive()
+                // v2.5.197: antes se mostraba el JSON crudo del demonio ("idx":-1 = indice PEDIDO, no la
+                // sala elegida) o, sin demonio, "Studio BRIR procedimental activo" sin comprobar nada.
+                val roomNow = latestState
+                val assigned = if (roomNow.rirEnabled && !lineOutActive)
+                    OmegaEngineBridge.resolveRoomAssignment(roomNow.rirRt60) else null
+                roomStatus    = (when {
+                    !roomNow.rirEnabled || lineOutActive -> "RIR desactivado"
+                    assigned != null -> "Sala asignada por el motor: ${assigned.describe()} · wet %.2f".format(roomNow.rirWet)
+                    else -> "RIR activado pero dataset de salas NO cargado (sin sala asignada)"
+                }) + (if (cochlearNat) " · PINN ON" else "")
+                safStatus     = runCatching {
+                    if (SaFBridge.nativeSaFIsConverged()) "convergido" else "iteración ${SaFBridge.nativeSaFGetIteration()} · error %.3f".format(SaFBridge.nativeSaFGetError())
+                }.getOrDefault("modelo no cargado")
+
+                if (latestState.safEnabled && latestState.safAutoMode && !lineOutActive &&
+                    runCatching { SaFBridge.nativeSaFGetIteration() == 0 }.getOrDefault(false)) {
+                    runCatching {
+                        com.ivanna.omega.saf.SaFRoomBridge.setRoomState(latestState.rirRt60, 0f, 0f)
+                        com.ivanna.omega.saf.SaFRoomBridge.step()
+                        val qa = com.ivanna.omega.saf.SaFRoomBridge.getParams()
+                        OmegaEngineBridge.pushSafLatentQ(
+                            FloatArray(7) { i -> qa.getOrElse(i) { 0f } * latestState.safIntensity },
+                            gain = latestState.safIntensity
+                        )
+                    }
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    Column(modifier.fillMaxSize().background(MagistralVoid).verticalScroll(rememberScrollState()).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)) {
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (onBack != null) {
+                IconButton(onClick = onBack) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Atrás",
+                        tint = AuroraCyan
+                    )
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+            }
+            Text("SPATIAL AUDIO · INVERSIÓN COCLEAR (PINN)", color = MagistralGoldHi, fontFamily = MagistralSerif, fontSize = 13.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 2.sp)
+        }
+
+        // ── Ficha del entorno · Spatial (Pantalla VI del prototipo) ────────
+        ScreenSpecCard(spatialScreenSpec)
+
+        // ── Eje Supremo: Inversión Biomecánica Coclear (PINN) ──────────────
+        CochlearInverseCard(
+            initialEnabled = state.cochlearInverseEnabled,
+            initialIntensity = state.cochlearIntensity,
+            onStateChanged = { en, inten ->
+                update { it.copy(cochlearInverseEnabled = en, cochlearIntensity = inten) }
+            }
+        )
+
+        // ── Fotoholografía·Nanotomix: escena paramétrica + ancho estéreo adaptativo ──
+        FotoHoloCard()
+
+        // Perfil Genezy MHCPZ1: 16 posiciones virtuales y extensión lateral declarada.
+        GenezyMhcpz1ProfileCard()
+
+        // Declaración general de bocinas: estéreo/surround + subwoofer, para cualquier sistema (no solo Genezy).
+        SpeakerLayoutPanel()
+
+        // The same React/WebGL FotoHolo scene, packaged as a local asset and fed by
+        // the native read-only telemetry bridge. No remote page receives this bridge.
+        Text(
+            "ESCENA WEBGL CON TELEMETRÍA NATIVA",
+            color = MagistralGoldHi,
+            fontFamily = MagistralSerif,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 1.2.sp
+        )
+        val webContext = context
+        val assetLoader = remember(webContext) {
+            WebViewAssetLoader.Builder()
+                .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(webContext))
+                // Imágenes de lugar generadas en el dispositivo (caché privada de la app, no rutas externas).
+                .addPathHandler(
+                    "/${FotoHoloTelemetryBridge.PLACE_DIR}/",
+                    WebViewAssetLoader.InternalStoragePathHandler(
+                        webContext,
+                        java.io.File(webContext.cacheDir, FotoHoloTelemetryBridge.PLACE_DIR).apply { mkdirs() }
+                    )
+                )
+                .build()
+        }
+        // El proceso de render del WebView puede morir (presion de memoria con el DSP y la escena 3D
+        // activos). Por defecto Android MATA la app entera en ese caso; se atiende
+        // onRenderProcessGone y se reconstruye el WebView incrementando esta epoca.
+        var webEpoch by remember { mutableStateOf(0) }
+        val holoWebView = remember(webContext, assetLoader, webEpoch) {
+            WebView(webContext).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = false
+                settings.allowFileAccess = false
+                settings.allowContentAccess = false
+                settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                isVerticalScrollBarEnabled = false
+                isHorizontalScrollBarEnabled = false
+                setBackgroundColor(android.graphics.Color.rgb(0x04, 0x05, 0x0A)) // ObsidianDeep
+                webViewClient = object : WebViewClient() {
+                    override fun onRenderProcessGone(
+                        view: WebView,
+                        detail: android.webkit.RenderProcessGoneDetail
+                    ): Boolean {
+                        android.util.Log.w("FotoHolo", "WebView render process gone (crash=${detail.didCrash()}) — reconstruyendo")
+                        webEpoch++
+                        return true   // gestionado: la app NO debe morir
+                    }
+
+                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                        // Serve only this app's bundled assets; block every non-bundled subresource.
+                        return assetLoader.shouldInterceptRequest(request.url)
+                            ?: WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                    }
+
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        val uri = request.url
+                        return uri.host != "appassets.androidplatform.net" ||
+                            !uri.path.orEmpty().startsWith("/assets/fotoholo-web/")
+                    }
+                }
+                FotoHoloTelemetryBridge.installBeforeLoadingTrustedBundle(this, webContext)
+                loadUrl("https://appassets.androidplatform.net/assets/fotoholo-web/fotoholo-embed.html")
+            }
+        }
+        // Ciclo de vida: con la app en segundo plano el WebGL seguia animando (CPU/GPU/bateria que
+        // compiten con el hilo de audio). Se pausan timers y renderer fuera de primer plano.
+        val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+        DisposableEffect(holoWebView, lifecycleOwner) {
+            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                when (event) {
+                    androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
+                        runCatching { holoWebView.onPause(); holoWebView.pauseTimers() }
+                    }
+                    androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                        runCatching { holoWebView.onResume(); holoWebView.resumeTimers() }
+                    }
+                    else -> Unit
+                }
+            }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        }
+        DisposableEffect(holoWebView) {
+            onDispose {
+                runCatching { holoWebView.stopLoading() }
+                runCatching { holoWebView.destroy() }
+            }
+        }
+        // FIX (scroll del panel): la página embebida es larga (escena + controles + telemetría) y vivía
+        // en una caja de alto fijo con scroll PROPIO dentro del WebView: arrastrar con el dedo movía la
+        // página interna, no el panel, y el resto (HRTF, RIR…) quedaba inalcanzable. Ahora (1) el
+        // WebView toma el alto real de su contenido, así que no hay scroll interno, y (2) un
+        // enrutador de gestos decide por arrastre: vertical → desplaza el panel; toque y arrastre
+        // horizontal → se reenvían al WebView (botones, selectores, sliders, órbita 3D).
+        var holoHeightDp by remember { mutableStateOf(420) }
+        androidx.compose.runtime.LaunchedEffect(holoWebView) {
+            while (true) {
+                kotlinx.coroutines.delay(700)
+                holoWebView.evaluateJavascript(
+                    "(function(){var b=document.body,d=document.documentElement;" +
+                        "return Math.max(b?b.scrollHeight:0,d?d.scrollHeight:0);})()"
+                ) { raw ->
+                    val h = raw?.trim('"')?.toDoubleOrNull() ?: return@evaluateJavascript
+                    val target = h.coerceIn(420.0, 7000.0).toInt()
+                    if (kotlin.math.abs(target - holoHeightDp) > 6) holoHeightDp = target
+                }
+            }
+        }
+        // Key the AndroidView subtree by the WebView instance. Merely changing
+        // remember(webEpoch) is insufficient: AndroidView.factory is invoked once
+        // for a stable composition identity, so without key() the replacement WebView
+        // created after onRenderProcessGone would never be attached to the view tree.
+        androidx.compose.runtime.key(holoWebView) {
+            androidx.compose.foundation.layout.Box(Modifier.fillMaxWidth().height(holoHeightDp.dp)) {
+                AndroidView(factory = { holoWebView }, modifier = Modifier.matchParentSize())
+                androidx.compose.foundation.layout.Box(
+                    Modifier.matchParentSize().pointerInput(holoWebView) {
+                    val slop = viewConfiguration.touchSlop
+                    awaitPointerEventScope {
+                        while (true) {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val downTime = android.os.SystemClock.uptimeMillis()
+                            fun send(action: Int, x: Float, y: Float) {
+                                val ev = android.view.MotionEvent.obtain(
+                                    downTime, android.os.SystemClock.uptimeMillis(), action, x, y, 0)
+                                holoWebView.dispatchTouchEvent(ev)
+                                ev.recycle()
+                            }
+                            // 0 = sin decidir, 1 = reenviando al WebView, 2 = cedido al scroll del panel
+                            var mode = 0
+                            send(android.view.MotionEvent.ACTION_DOWN, down.position.x, down.position.y)
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (!change.pressed) {
+                                    if (mode != 2) send(android.view.MotionEvent.ACTION_UP, change.position.x, change.position.y)
+                                    break
+                                }
+                                val dx = change.position.x - down.position.x
+                                val dy = change.position.y - down.position.y
+                                if (mode == 0 && (kotlin.math.abs(dx) > slop || kotlin.math.abs(dy) > slop)) {
+                                    if (kotlin.math.abs(dy) > kotlin.math.abs(dx)) {
+                                        mode = 2
+                                        send(android.view.MotionEvent.ACTION_CANCEL, change.position.x, change.position.y)
+                                    } else mode = 1
+                                }
+                                if (mode == 1) {
+                                    send(android.view.MotionEvent.ACTION_MOVE, change.position.x, change.position.y)
+                                    change.consume()
+                                }
+                                // mode 2: sin consumir → el verticalScroll del panel recibe el arrastre.
+                            }
+                        }
+                    }
+                }
+                )
+            }
+        }
+
+        // ── HRTF ──────────────────────────────────────────────────────────
+        SpatialCard("HRTF BINAURAL", "Dataset IHR1 medido · deploy Magisk con SHA256", spec = hrtfSpec) {
+            RowSwitch("HRTF de auriculares solicitado", state.hrtfEnabled && !lineOutActive) { requested ->
+                val on = requested && !lineOutActive
+                update { it.copy(hrtfEnabled = on) }
+                IvannaSpatialEngine.enabled = on
+                if (on) IvannaSpatialManager.setHrtfSubject(state.hrtfSubject)
+                com.ivanna.omega.audio.RouteDspCalibrator.onRouteChanged(context, com.ivanna.omega.audio.AudioRouteManager.detectOutputRoute())
+            }
+            Text("Sujeto:", color = TextSecondary, fontSize = 11.sp)
+            // FIX (descableado): los IDs anteriores (kemar_subject_165,
+            // subject_003, subject_008, subject_009) no coincidían con
+            // NINGUNO de los 11 sujetos reales del índice deployado
+            // (magisk_module/.../hrtf/hrtf_index.json) — cada chip fallaba
+            // silenciosamente (runCatching en setHrtfSubject → false, sin
+            // efecto, sin log visible al usuario). IDs verificados contra
+            // el índice real: kemar, cipic_003..cipic_165, pulse.
+            val subjects = listOf(
+                "KEMAR"      to "kemar",
+                "KEMAR-LG"   to "kemar_large",
+                "CIPIC 003"  to "cipic_003",
+                "CIPIC 165"  to "cipic_165",
+                "TU-Berlin"  to "tu_berlin_kemar",
+                "Pulse"      to "pulse"
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                subjects.forEach { (label, id) ->
+                    val sel = state.hrtfSubject == id
+                    FilterChip(selected = sel, onClick = {
+                        update { it.copy(hrtfSubject = id) }
+                        IvannaSpatialManager.setHrtfSubject(id)
+                    }, label = { Text(label, fontSize = 10.sp) })
+                }
+            }
+            val statusColor = if (hrtfLoaded) PhosphorGreen else if (activeSubject == "none") TextMuted else AmberSignal
+            val statusText  = if (hrtfLoaded) "CARGADO · $activeSubject"
+                              else if (activeSubject == "none") "SIN DATASET (fallback analítico)"
+                              else "FALLBACK / CARGANDO · $activeSubject"
+            Text("Estado: $statusText", color = statusColor, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+
+        // ── RIR ───────────────────────────────────────────────────────────
+        SpatialCard("REVERB DE SALA REAL", "200 RIR medidos · convolución overlap-save · selección por RT60") {
+            RowSwitch("RIR activo", state.rirEnabled) { on ->
+                update { it.copy(rirEnabled = on) }
+                if (on) OmegaEngineBridge.setRoom(state.rirRt60, state.rirWet) else OmegaEngineBridge.disableRoom()
+            }
+            LabeledSlider("RT60 objetivo", state.rirRt60, 0.1f..1.5f, "%.2f s") { v ->
+                update { it.copy(rirRt60 = v) }
+                if (state.rirEnabled && !lineOutActive) OmegaEngineBridge.setRoom(v, state.rirWet)
+            }
+            LabeledSlider("Mezcla wet/dry", state.rirWet, 0f..1f, "%.2f") { v ->
+                update { it.copy(rirWet = v) }
+                if (state.rirEnabled && !lineOutActive) OmegaEngineBridge.setRoom(state.rirRt60, v)
+            }
+            LabeledSlider("Reverb de objetos", state.objectReverbLevel, 0f..1f, "%.2f") { v ->
+                update { it.copy(objectReverbLevel = v) }
+                IvannaSpatialManager.setReverbLevel(v)
+            }
+            Text("Motor: $roomStatus · ObjReverb=${"%.2f".format(IvannaSpatialManager.reverbLevel)}", color = TextMuted, fontSize = 10.sp)
+        }
+
+        // ── SAF ───────────────────────────────────────────────────────────
+        SpatialCard("SAF · AJUSTE ESPECTRAL ADAPTATIVO", "Vector latente q[7] → ObjectRenderer.setSafLatent") {
+            RowSwitch("SAF activo", state.safEnabled) { on ->
+                update { it.copy(safEnabled = on) }
+                if (on && !lineOutActive) {
+                    val q = runCatching { SaFBridge.nativeSaFGetParams() }.getOrNull()
+                    if (q != null) OmegaEngineBridge.pushSafLatentQ(q, gain = state.safIntensity)
+                } else {
+                    // Bypass changes gain, not the user's calibration state.
+                    OmegaEngineBridge.pushSafLatentQ(FloatArray(7), gain = 0f)
+                }
+            }
+            LabeledSlider("Intensidad", state.safIntensity, 0f..1f, "%.2f") { v ->
+                update { it.copy(safIntensity = v) }
+                if (state.safEnabled && !lineOutActive) {
+                    val q = runCatching { SaFBridge.nativeSaFGetParams() }.getOrNull()
+                    if (q != null) OmegaEngineBridge.pushSafLatentQ(q, gain = v)
+                }
+            }
+            RowSwitch("Modo automático", state.safAutoMode) { on -> update { it.copy(safAutoMode = on) } }
+            Text("Modelo: $safStatus", color = TextMuted, fontSize = 10.sp)
+        }
+
+        // ── MOTOR HÍBRIDO MAGISTRAL (VBAP 3D + AMBISONICS + HRTF + SALA) ──
+        // Ficha M (Head-Tracking · Parallax) aquí: es el equivalente más
+        // cercano — azimut y elevación virtual son la pose de las fuentes —,
+        // porque en este panel no existe control de head-tracking ni parallax.
+        SpatialCard(
+            "MOTOR HÍBRIDO MAGISTRAL",
+            "VBAP 3D → Ambisonics 1er Orden → HRTF KEMAR 128-tap + Schroeder/Moorer",
+            spec = headTrackingSpec
+        ) {
+            RowSwitch("Motor Híbrido Magistral Activo", hybridEnabled) { on ->
+                hybridEnabled = on
+                pushHybridMagistral()
+            }
+            LabeledSlider("Mezcla Binaural HRTF", hybridBinauralWet, 0f..1f, "%.2f") { v ->
+                hybridBinauralWet = v
+                pushHybridMagistral()
+            }
+            LabeledSlider("Azimut Virtual 3D", hybridAzimuthDeg, 5f..90f, "%.0f°") { v ->
+                hybridAzimuthDeg = v
+                pushHybridMagistral()
+            }
+            LabeledSlider("Elevación Virtual 3D", hybridElevationDeg, -45f..45f, "%.0f°") { v ->
+                hybridElevationDeg = v
+                pushHybridMagistral()
+            }
+            LabeledSlider("Tamaño Sala Acústica", hybridRoomSize, 0.1f..1f, "%.2f") { v ->
+                hybridRoomSize = v
+                pushHybridMagistral()
+            }
+            LabeledSlider("Absorción de Pared", hybridAbsorption, 0.05f..0.95f, "%.2f") { v ->
+                hybridAbsorption = v
+                pushHybridMagistral()
+            }
+            LabeledSlider("Amortiguamiento HF", hybridDampening, 0.05f..0.95f, "%.2f") { v ->
+                hybridDampening = v
+                pushHybridMagistral()
+            }
+            LabeledSlider("Mezcla Sala (Wet)", hybridRoomWet, 0f..0.60f, "%.2f") { v ->
+                hybridRoomWet = v
+                pushHybridMagistral()
+            }
+        }
+        
+        // ── PIPELINE ESPACIAL EN VIVO ─────────────────────────────────────
+        SpatialCard(
+            "PIPELINE ESPACIAL EN VIVO",
+            "Cadena unificada Zero-Pop · SPSC Lock-Free · Crossfade 512 muestras"
+        ) {
+            Text(
+                text = "1. Separación de Objetos + VBAP 3D (${"%.0f".format(hybridAzimuthDeg)}°)\n" +
+                       "2. Codificación Ambisonics B-Format (W, X, Y, Z) → Virtual 7.1.4\n" +
+                       "3. Convolución Binaural HRTF ($activeSubject) + Híbrido Magistral (${if (hybridEnabled) "ON" else "BYPASS"})\n" +
+                       "4. Proyección de Sala RIR (${if (state.rirEnabled) "RT60 ${"%.2f".format(state.rirRt60)}s" else "BYPASS"}) + SAF Φ_∞",
+                color = AuroraCyan,
+                fontSize = 10.sp
+            )
+        }
+
+        // ── 5 Ejes de Supremacía Cuántico-Neuromórfica (C++23 Lock-Free) ──
+        WarpedLatticeAxisCard(supremeState, supremeTelemetry, ::updateSupreme)
+        TransharmonicCvnnAxisCard(supremeState, supremeTelemetry, ::updateSupreme)
+        SnnNmfHoaAxisCard(supremeState, supremeTelemetry, ::updateSupreme)
+        PinnaManifoldAxisCard(supremeState, supremeTelemetry, ::updateSupreme)
+        ShmFarrowArbitratorAxisCard(supremeState, supremeTelemetry, ::updateSupreme)
+    }
+}
+
+@Composable
+private fun SpatialCard(title: String, subtitle: String, spec: SpecInfo? = null, content: @Composable ColumnScope.() -> Unit) {
+    Surface(
+        color = MagistralPanel,
+        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, MagistralLine)
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(title, color = MagistralGoldHi, fontFamily = MagistralSerif, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                if (spec != null) SpecInfoButton(spec)
+            }
+            Text(subtitle, color = MagistralMuted, fontSize = 9.sp)
+            content()
+        }
+    }
+}
+
+@Composable
+private fun RowSwitch(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, color = TextSecondary, fontSize = 12.sp)
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
+@Composable
+private fun LabeledSlider(label: String, value: Float, range: ClosedFloatingPointRange<Float>, fmt: String, onChange: (Float) -> Unit) {
+    val safeValue = com.ivanna.omega.safmus.SafmusUniversalKernel
+        .sanitizeControlValue(value, range.start, range.endInclusive) ?: range.start
+    Column {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(label, color = TextSecondary, fontSize = 11.sp)
+            Text(fmt.format(value), color = AuroraCyan, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        }
+        Slider(
+            value = safeValue,
+            onValueChange = { proposed ->
+                com.ivanna.omega.safmus.SafmusUniversalKernel
+                    .sanitizeControlValue(proposed, range.start, range.endInclusive)?.let(onChange)
+            },
+            valueRange = range,
+            colors = SliderDefaults.colors(thumbColor = AuroraCyan, activeTrackColor = AuroraCyan))
+    }
+}

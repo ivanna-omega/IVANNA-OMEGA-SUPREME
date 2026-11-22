@@ -1,0 +1,21 @@
+{
+  "proposal": "0005-apply-patch-format",
+  "status": "already_applied",
+  "applied": false,
+  "dry_run": true,
+  "council": {
+    "approved": false,
+    "evidence": "sin registro de aprobación del consejo en la propuesta"
+  },
+  "council_override": true,
+  "files": [
+    "tools/evolution/llm_client.py",
+    "tools/evolution/evolution_engine.py",
+    "tools/evolution/tests/test_llm_client_apply_patch.py"
+  ],
+  "already_applied": {
+    "state": "moot",
+    "detail": "tools/evolution/llm_client.py: applied; tools/evolution/evolution_engine.py: moot; tools/evolution/tests/test_llm_client_apply_patch.py: applied"
+  },
+  "reason": "el cambio ya está en el árbol (moot): tools/evolution/llm_client.py: applied; tools/evolution/evolution_engine.py: moot; tools/evolution/tests/test_llm_client_apply_patch.py: applied"
+}

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Network Security Config (v2.5.471, Repair 2) — sin red personal en el APK.
+  Release: cleartext BLOQUEADO para todo (default de Android 28+).
+  Ya NO hay ninguna IP ni dominio hardcodeado: el gateway OmniRoute es
+  la URL que cada usuario escribe en ajustes, y en release debe
+  servirse por HTTPS. El cleartext para un gateway HTTP en red privada
+  vive SOLO en la build de desarrollo (src/debug/res/xml/...).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

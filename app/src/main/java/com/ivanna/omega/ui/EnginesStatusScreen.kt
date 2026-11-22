@@ -1,0 +1,408 @@
+package com.ivanna.omega.ui
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.ivanna.omega.audio.AudioBackendSelector
+import com.ivanna.omega.audio.AudioRouteManager
+import com.ivanna.omega.audio.RouteDspCalibrator
+import com.ivanna.omega.audio.UsbAudioProManager
+import com.ivanna.omega.core.IvannaNativeLib
+import com.ivanna.omega.magisk.OmegaEngineBridge
+import com.ivanna.omega.spatial.IvannaSpatialManager
+import com.ivanna.omega.ui.theme.*
+import kotlinx.coroutines.delay
+
+/**
+ * EnginesStatusScreen — panel de estado de todos los motores en background.
+ *
+ * Motores antes invisibles en la UI (corrían en background sin ningún panel):
+ *   • RouteDspCalibrator     — calibración DSP por ruta de audio (2s poll)
+ *   • AudioBackendSelector   — Backend root / fallback Android
+ *   • UsbAudioProManager     — DAC USB OTG directo (384kHz/32bit)
+ *   • IvannaSpatialManager   — HRTF renderer + head tracker
+ *   • AdaptiveEngineModulator — suavizado y curvas no lineales del motor adaptativo
+ *   • IvannaControlLoop      — watchdog de parámetros (50ms)
+ */
+@Composable
+fun EnginesStatusScreen(onBack: () -> Unit) {
+    val ctx = LocalContext.current
+
+    // ── Estado en tiempo real (polling 500ms) ────────────────────────────
+    var backendMode    by remember { mutableStateOf(AudioBackendSelector.Mode.UNKNOWN) }
+    var activeRoute    by remember { mutableStateOf("Detectando...") }
+    var routeCalib     by remember { mutableStateOf("—") }
+    var hrtfReady      by remember { mutableStateOf(false) }
+    var hrtfSubject    by remember { mutableStateOf("none") }
+    var controlRunning by remember { mutableStateOf(false) }
+    var headTracking   by remember { mutableStateOf(false) }
+    var usbStreaming   by remember { mutableStateOf(false) }
+    var usbIso         by remember { mutableStateOf(false) }
+    var usbStats       by remember { mutableStateOf(IntArray(6)) }
+    var usbFeedback    by remember { mutableStateOf(IntArray(4)) }
+    var nativeLoaded   by remember { mutableStateOf(false) }
+    var daemonAlive    by remember { mutableStateOf(false) }
+    // FIX 4 (v2.5.465) — telemetría de Ruta B en esta pantalla: estado del
+    // beacon + frames. Se muestra SIEMPRE (no condicionada a la confirmación
+    // vieja): frames avanzando = Ruta B procesando, aunque enabled_count /
+    // consumer_gen nunca se pongan en este HAL.
+    var routeBEffectState by remember { mutableStateOf(com.ivanna.omega.dsp.DSPBridge.EffectState.UNAVAILABLE) }
+    var routeBFrames   by remember { mutableStateOf(-1L) }
+    var spatialWidth   by remember { mutableStateOf(0f) }
+    var adaptTelemetry by remember { mutableStateOf<FloatArray?>(null) }
+
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+        while (true) {
+            controlRunning = com.ivanna.omega.audio.IvannaControlLoop.isRunning
+            backendMode  = AudioBackendSelector.mode.value
+            nativeLoaded = IvannaNativeLib.isLoaded
+            daemonAlive  = runCatching { OmegaEngineBridge.isConnected }.getOrDefault(false)
+
+            // FIX 4 (v2.5.465): beacon de Ruta B en cada ciclo de 500 ms
+            // (lecturas mmap baratas; sin socket). -1 = beacon no legible.
+            routeBEffectState = runCatching { com.ivanna.omega.dsp.DSPBridge.effectState() }
+                .getOrDefault(com.ivanna.omega.dsp.DSPBridge.EffectState.UNAVAILABLE)
+            routeBFrames = runCatching { com.ivanna.omega.dsp.DSPBridge.effectBeaconFrames() }
+                .getOrDefault(-1L)
+
+            // Ruta activa de audio
+            runCatching {
+                val r = AudioRouteManager.detectOutputRoute()
+                activeRoute = r.name
+                routeCalib = "Salida detectada: ${r.name}. Perfil solicitado; aplicación y formato negociado deben verificarse con señal."
+
+            }
+
+            // HRTF / spatial
+            hrtfReady    = IvannaSpatialManager.ready
+            hrtfSubject  = IvannaSpatialManager.activeSubject
+            headTracking = IvannaSpatialManager.isHeadTrackingFresh()
+
+            // USB Pro
+            val usbMgr: UsbAudioProManager = UsbAudioProManager.getInstance(ctx)
+            usbStreaming = usbMgr.isActive()
+            usbIso       = usbMgr.isIsochronous()
+            usbStats     = usbMgr.engineStats()
+            usbFeedback  = usbMgr.feedbackInfo()
+
+            // Telemetría adaptativa
+            if (nativeLoaded) {
+                adaptTelemetry = runCatching {
+                    IvannaNativeLib.nativeGetAdaptiveTelemetry()
+                }.getOrNull()
+                spatialWidth = runCatching {
+                    IvannaNativeLib.nativeGetUnifiedPipelineStatus()?.getOrElse(6) { 0f } ?: 0f
+                }.getOrDefault(0f)
+            }
+
+            delay(500)
+        }
+    
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(ObsidianVoid)
+            .windowInsetsPadding(WindowInsets.systemBars)
+    ) {
+        // Header
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianSoft)
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            IconButton(onClick = onBack, modifier = Modifier.size(36.dp)) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Atrás", tint = AuroraCyan)
+            }
+            Column(Modifier.weight(1f)) {
+                Text("ESTADO DE MOTORES", color = AuroraCyan,
+                    fontWeight = FontWeight.ExtraBold, fontSize = 13.sp, letterSpacing = 1.5.sp)
+                Text("Disponibilidad, conexión y actividad reportadas por separado",
+                    color = TextMuted, fontSize = 10.sp)
+            }
+            // Indicador global
+            val allOk = nativeLoaded && hrtfReady
+            Box(Modifier.size(10.dp).clip(CircleShape)
+                .background(if (allOk) PhosphorGreen else AmberSignal))
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+
+            // ── 1. Audio Backend ─────────────────────────────────────────
+            // FIX 4 (v2.5.465): la línea del beacon se muestra SIEMPRE, sin
+            // condicionarla al modo confirmado: frames avanzando = Ruta B
+            // procesando (fuente de verdad en este HAL).
+            val routeBBeaconLine = when {
+                routeBFrames < 0 -> "Beacon Ruta B: no legible"
+                routeBEffectState == com.ivanna.omega.dsp.DSPBridge.EffectState.PROCESSING ->
+                    "Beacon Ruta B: PROCESANDO · frames=$routeBFrames"
+                routeBEffectState == com.ivanna.omega.dsp.DSPBridge.EffectState.ENABLED_IDLE ->
+                    "Beacon Ruta B: insertado, sin audio reciente · frames=$routeBFrames"
+                routeBFrames > 0 -> "Beacon Ruta B: sin bloques recientes · frames=$routeBFrames"
+                else -> "Beacon Ruta B: sin bloques · frames=0"
+            }
+            EngineCard(
+                icon    = Icons.Default.Router,
+                title   = "AUDIO BACKEND",
+                status  = when (backendMode) {
+                    AudioBackendSelector.Mode.ROOT_DAEMON    -> "ROOT · Daemon activo"
+                    AudioBackendSelector.Mode.ROOT_NO_DAEMON -> "ROOT · Sin daemon (AudioEffect)"
+                    AudioBackendSelector.Mode.NO_ROOT        -> "Sin root · DynamicsProcessing"
+                    else                                     -> "Detectando..."
+                },
+                ok = backendMode == AudioBackendSelector.Mode.ROOT_DAEMON ||
+                     backendMode == AudioBackendSelector.Mode.ROOT_NO_DAEMON,
+                detail  = when (backendMode) {
+                    AudioBackendSelector.Mode.ROOT_DAEMON    ->
+                        "Ruta B confirmada: el efecto procesa en el mezclador del sistema\n$routeBBeaconLine"
+                    AudioBackendSelector.Mode.ROOT_NO_DAEMON ->
+                        "Ruta B sin confirmar: daemon caído o efecto aún sin procesar · el fallback local sigue\n$routeBBeaconLine"
+                    AudioBackendSelector.Mode.NO_ROOT        ->
+                        "Sin root: fallback Android; latencia sin medir\n$routeBBeaconLine"
+                    else -> "AudioBackendSelector aún evaluando la plataforma\n$routeBBeaconLine"
+                }
+            )
+
+            // ── 2. Ruta DSP Calibrator ───────────────────────────────────
+            EngineCard(
+                icon   = Icons.Default.Tune,
+                title  = "ROUTE DSP CALIBRATOR",
+                status = "$activeRoute — activo (poll 2s)",
+                ok     = activeRoute != "UNKNOWN" && activeRoute != "Detectando...",
+                detail = routeCalib
+            )
+
+            // ── 3. Native DSP Engine ─────────────────────────────────────
+            val t = adaptTelemetry
+            EngineCard(
+                icon   = Icons.Default.GraphicEq,
+                title  = "NATIVE DSP ENGINE",
+                status = if (nativeLoaded) "libivanna_omega_native.so cargada" else "NO CARGADA",
+                ok     = nativeLoaded,
+                detail = if (t != null && t.size >= 10) buildString {
+                    append("RMS: ${"%.3f".format(t[0])}  Peak: ${"%.3f".format(t[1])}\n")
+                    append("GR: ${"%.1f".format(t[2])}dB  Target: ${"%.3f".format(t[3])}\n")
+                    append("Comp: ${"%.0f".format(t[4]*100)}%  Exciter↓: ${"%.0f".format(t[5]*100)}%\n")
+                    append("SpatialW: ${"%.2f".format(spatialWidth)}  Safety↑: ${"%.0f".format(t[7]*100)}%\n")
+                    append("VoiceProt: ${"%.0f".format(t[8]*100)}%  Applied: ${"%.0f".format(t[9]*100)}%")
+                } else if (nativeLoaded) "Telemetría disponible cuando hay señal activa"
+                  else "Cargar módulo Magisk o verificar libivanna_omega_native.so"
+            )
+
+            // ── 4. HRTF / Spatial ────────────────────────────────────────
+            EngineCard(
+                icon   = Icons.Default.SurroundSound,
+                title  = "HRTF · SPATIAL MANAGER",
+                status = if (hrtfReady) "Renderer activo · Sujeto: $hrtfSubject"
+                         else "Renderer no inicializado",
+                ok     = hrtfReady,
+                detail = buildString {
+                    if (hrtfReady) {
+                        append("Sujeto HRTF: $hrtfSubject\n")
+                        append("Head tracking: ${if (headTracking) "activo (ROTATION_VECTOR)" else "inactivo"}\n")
+                        append("Spatial width nativo: ${"%.2f".format(spatialWidth)}")
+                    } else {
+                        append("IvannaSpatialManager no está listo: ")
+                        append(IvannaSpatialManager.initError ?: "inicialización en curso o sin intentar")
+                    }
+                }
+            )
+
+            // ── 5. USB Audio Pro ─────────────────────────────────────────
+            EngineCard(
+                icon   = Icons.Default.Usb,
+                title  = "USB AUDIO PRO MANAGER",
+                status = if (usbStreaming) "Streaming activo (OTG directo · 384kHz/32bit · ISO=$usbIso)"
+                         else "En espera — conecta un DAC USB",
+                ok     = usbStreaming,
+                detail = if (usbStreaming)
+                    "Stream isochronous ($usbIso) directo al endpoint USB · URBs=${usbStats.getOrElse(0) { 0 }}/${usbStats.getOrElse(1) { 0 }} · xruns=${usbStats.getOrElse(3) { 0 }} · UAC fb=${usbFeedback.getOrElse(0) { 0 }}"
+                else
+                    "Conecta un DAC USB OTG compatible.\nEl manager detecta automáticamente CLASS=AUDIO " +
+                    "SUBCLASS=STREAMING y abre el endpoint sin pasar por AudioFlinger."
+            )
+
+            // ── 6. Omega Daemon ──────────────────────────────────────────
+            EngineCard(
+                icon   = Icons.Default.DeveloperMode,
+                title  = "OMEGA DAEMON",
+                status = if (daemonAlive) "Corriendo · SHM lista"
+                         else "Caído o sin root",
+                ok     = daemonAlive,
+                detail = if (daemonAlive)
+                    "ivanna_daemon activo · shared memory disponible · Plano de control conectado"
+                else
+                    "Sin daemon: consultar la ruta activa; reproductor propio = Ruta A.\n" +
+                    "Si el módulo está instalado, abre Magisk y verifica que el módulo esté activo."
+            )
+
+            // ── 7. Adaptive Engine Modulator ────────────────────────────
+            EngineCard(
+                icon   = Icons.Default.AutoGraph,
+                title  = "ADAPTIVE ENGINE MODULATOR",
+                status = "Modulación configurada — actividad no instrumentada",
+                ok     = false,
+                detail = "Mapea intensidad → parámetros con curvas Bézier/tanh según modo:\n" +
+                         "  NATURAL: potencia 0.8 (curva suave)\n" +
+                         "  STUDIO: lineal\n" +
+                         "  EXTREME: potencia 1.5 (curva agresiva)\n" +
+                         "Filtro de suavizado por bloque (no per-sample) para evitar zipper noise."
+            )
+
+            // ── 8. IvannaControlLoop ─────────────────────────────────────
+            EngineCard(
+                icon   = Icons.Default.Loop,
+                title  = "IVANNA CONTROL LOOP",
+                status = if (controlRunning) "Loop ejecutándose (50ms)" else "Loop detenido",
+                ok     = controlRunning,
+                detail = "Comprueba coherencia de parámetros DSP cada 50ms.\n" +
+                         "Reaplica ajustes si detecta drift entre el estado Kotlin y el engine nativo.\n" +
+                         "Corre en Dispatchers.IO — no bloquea el hilo de audio."
+            )
+
+            // ── 9. 5 Ejes de Supremacía Cuántico-Neuromórfica (C++23) ────
+            val supState = remember { SupremeAxesPrefs.load(ctx) }
+            val supTelem by rememberSupremeAxesTelemetry()
+            val activeSupremeCount = listOf(
+                supState.warpedLatticeEnabled,
+                supState.transharmonicCvnnEnabled,
+                supState.snnHoaUpmixerEnabled,
+                supState.pinnaManifoldEnabled,
+                supState.farrowMsoEnabled
+            ).count { it }
+            EngineCard(
+                icon   = Icons.Default.Memory,
+                title  = "5 EJES DE SUPREMACÍA (C++23 LOCK-FREE)",
+                status = "$activeSupremeCount/5 activos · τ_g=${"%.3f".format(supTelem.subSampleDelaySamples)} · LIF=${supTelem.snnActiveSpikes}",
+                ok     = nativeLoaded,
+                detail = buildString {
+                    append("Eje 1 (Warped Lattice Anti-Dirac): ${if (supState.warpedLatticeEnabled) "ON" else "BYPASS"} · λ=${"%.3f".format(supState.warpedLatticeLambda)} · τ_g=${"%.3f".format(supTelem.subSampleDelaySamples)} smp\n")
+                    append("Eje 2 (CVNN+DDSP Anti-DSEE): ${if (supState.transharmonicCvnnEnabled) "ON" else "BYPASS"} · Δφ̇=${"%.4f".format(supTelem.maxPhaseDerivativeRad)} rad\n")
+                    append("Eje 3 (SNN INT8 + NMF HOA 4º): ${if (supState.snnHoaUpmixerEnabled) "ON" else "BYPASS"} · Spikes=${supTelem.snnActiveSpikes}/4 · 16ch UPOLA\n")
+                    append("Eje 4 (Pinna Manifold INR-SDF): ${if (supState.pinnaManifoldEnabled) "ON" else "BYPASS"} · Notch=${"%.0f".format(supTelem.pinnaNotchFreqHz)} Hz · ITD=${"%.1f".format(supTelem.pinnaItdMicroSec)} μs\n")
+                    append("Eje 5 (SHM CAS + Farrow 5º MSO): ${if (supState.farrowMsoEnabled) "ON" else "BYPASS"} · OwnerPID=${supTelem.shmOwnerPid} · ITD=${"%+.0f".format(supState.msoItdNanoseconds)} ns")
+                }
+            )
+
+            // ── 10. Hipermotor de Realidad Acústica y Evolución Cognitiva (Fases 1–15) ──
+            val realSnap = com.ivanna.omega.core.NativeBridge.safeGetRealityTelemetryOrNull() ?: FloatArray(0)
+            val cogSnap  = com.ivanna.omega.core.NativeBridge.safeGetCognitiveTelemetryOrNull() ?: FloatArray(0)
+            // Sin telemetría viva (snapshot vacío) NO se inventan porcentajes: "—".
+            fun snapPct(a: FloatArray, i: Int): String =
+                if (a.size > i) "${(a[i] * 100f).toInt()}%" else "—"
+            val realismPct  = snapPct(realSnap, 5)
+            val judgePct    = snapPct(cogSnap, 8)
+            val homeoPct    = snapPct(cogSnap, 12)
+            val twinPct     = snapPct(cogSnap, 13)
+            val evoFitPct   = snapPct(cogSnap, 14)
+            val memCount    = if (cogSnap.size > 15) cogSnap[15].toInt().toString() else "—"
+            val topPrioIdx  = if (cogSnap.size > 0) cogSnap[0].toInt() else 0
+            val topPrioName = if (cogSnap.isEmpty()) "—" else when (topPrioIdx) {
+                0 -> "Profundidad"
+                1 -> "Microdinámica"
+                2 -> "Claridad Vocal"
+                else -> "Expansión Ambiental"
+            }
+            val realityActive = supState.realityReconstructionEnabled &&
+                com.ivanna.omega.core.NativeBridge.safeIsRealityReconstructionEnabled()
+            EngineCard(
+                icon   = Icons.Default.Psychology,
+                title  = "SISTEMA NERVIOSO SUPERIOR · COGNICIÓN (FASES 1–15)",
+                status = "${if (realityActive) "ACTIVO" else "BYPASS"} · Realismo $realismPct · Juez $judgePct · Homeostasis $homeoPct",
+                ok     = nativeLoaded && realityActive,
+                detail = buildString {
+                    append("Fases 1–8 (Órganos Acústicos): Genome · MicroReality · TimeMachine (SOURCE→ROOM→AIR→EAR) · RoomProjection · Intensidad ${(supState.realityIntensity * 100f).toInt()}%\n")
+                    append("Fase 9 (AcousticCognitiveCore): Prioridad 1º = $topPrioName\n")
+                    append("Fase 10 (Specialist Network): Spatial=${snapPct(cogSnap, 5)} · Room=${snapPct(cogSnap, 6)} · Micro=${snapPct(cogSnap, 7)} · HumanJudge=$judgePct\n")
+                    append("Fase 11–13 (ExecutiveBrain + Memory + Homeostasis): Coherencia=${snapPct(cogSnap, 10)} · Obs=$memCount · Estabilidad=$homeoPct\n")
+                    append("Fase 14–15 (DigitalAcousticTwin + CMA-ES/Q-Learning): Twin=$twinPct · Fitness=$evoFitPct")
+                }
+            )
+
+            Spacer(Modifier.height(8.dp))
+        }
+    }
+}
+
+@Composable
+private fun EngineCard(
+    icon: ImageVector,
+    title: String,
+    status: String,
+    ok: Boolean,
+    detail: String
+) {
+    var expanded by remember { mutableStateOf(false) }
+    Surface(
+        onClick = { expanded = !expanded },
+        modifier = Modifier.fillMaxWidth(),
+        color = ObsidianSoft,
+        shape = RoundedCornerShape(10.dp),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            (if (ok) PhosphorGreen else AmberSignal).copy(alpha = 0.35f)
+        )
+    ) {
+        Column(Modifier.padding(14.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Box(
+                    Modifier.size(8.dp).clip(CircleShape)
+                        .background(if (ok) PhosphorGreen else AmberSignal)
+                )
+                Icon(icon, contentDescription = null, tint = AuroraCyan,
+                    modifier = Modifier.size(18.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(title, color = TextPrimary, fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp, letterSpacing = 0.8.sp)
+                    Text(status,
+                        color = if (ok) PhosphorGreen else AmberSignal,
+                        fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                }
+                Icon(
+                    if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = null, tint = TextMuted, modifier = Modifier.size(18.dp)
+                )
+            }
+            if (expanded) {
+                Spacer(Modifier.height(8.dp))
+                HorizontalDivider(color = ObsidianEdge)
+                Spacer(Modifier.height(8.dp))
+                Text(detail, color = TextSecondary, fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace, lineHeight = 15.sp)
+            }
+        }
+    }
+}

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Revisor de actualizaciones (v2.5.444): el instalador del sistema lee la
+  APK descargada por FileProvider desde cacheDir/updates/. Solo ese
+  directorio se expone; nada más de la app es legible por otras apps.
+-->
+<paths>
+    <cache-path name="updates" path="updates/"/>
+</paths>

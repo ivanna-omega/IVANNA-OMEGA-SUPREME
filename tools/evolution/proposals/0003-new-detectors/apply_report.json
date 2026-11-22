@@ -1,0 +1,19 @@
+{
+  "proposal": "0003-new-detectors",
+  "status": "already_applied",
+  "applied": false,
+  "dry_run": false,
+  "council": {
+    "approved": false,
+    "evidence": "sin registro de aprobación del consejo en la propuesta"
+  },
+  "council_override": true,
+  "files": [
+    "tools/evolution/evolution_engine.py"
+  ],
+  "already_applied": {
+    "state": "exact",
+    "detail": "git apply --check --reverse limpio"
+  },
+  "reason": "el cambio ya está en el árbol (exact): git apply --check --reverse limpio"
+}

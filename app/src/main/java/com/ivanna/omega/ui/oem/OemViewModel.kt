@@ -1,0 +1,365 @@
+package com.ivanna.omega.ui.oem
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.ivanna.omega.audio.AudioBackendSelector
+import com.ivanna.omega.audio.AudioRouteManager
+import com.ivanna.omega.audio.SystemWideHrtfPolicy
+import com.ivanna.omega.audio.ThermalGovernor
+import com.ivanna.omega.audio.UsbAudioProManager
+import com.ivanna.omega.core.IvannaNativeLib
+import com.ivanna.omega.dsp.DSPState
+import com.ivanna.omega.magisk.OmegaDaemon
+import com.ivanna.omega.magisk.OmegaEngineBridge
+import com.ivanna.omega.neuromorphic.IvannaDspManager
+import com.ivanna.omega.saf.SaFBridge
+import com.ivanna.omega.saf.SaFRoomBridge
+import com.ivanna.omega.spatial.IvannaSpatialManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+
+class OemViewModel(app: Application) : AndroidViewModel(app) {
+
+    private val _state = MutableStateFlow(OemState())
+    val state: StateFlow<OemState> = _state.asStateFlow()
+    private val _expertMode = MutableStateFlow(false)
+
+    val expertMode: StateFlow<Boolean> = _expertMode.asStateFlow()
+
+
+    init {
+        // poll() consulta JNI, temperatura y telemetría del daemon/socket. En
+        // Main el timeout de cualquiera de esas consultas bloqueaba frames cada
+        // 500 ms y volvía torpe el display. Mantener toda la lectura fuera de UI;
+        // StateFlow publica el snapshot de forma segura para Compose.
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                runCatching { poll() }
+                delay(500)
+            }
+        }
+    }
+
+    private fun poll() {
+        val loaded = IvannaNativeLib.isLoaded
+
+        // ── Daemon ────────────────────────────────────────────────────────────
+        // OmegaEngineBridge.isConnected es la propiedad real (@Volatile Boolean)
+        val daemonAlive = OmegaEngineBridge.isConnected
+
+        // ── Backend ───────────────────────────────────────────────────────────
+        // FIX (Hexagon honesto): antes ROOT_DAEMON mapeaba a HEXAGON_DSP sin
+        // consultar el cDSP — el dashboard decia "Hexagon DSP" en cualquier
+        // dispositivo rooteado aunque el FastRPC jamas hubiera abierto (el
+        // skel QAIC propietario no esta en el APK). Ahora: HEXAGON_DSP solo
+        // cuando el DSP esta realmente abierto Y activo; si el daemon root
+        // procesa system-wide sin cDSP, eso es DSP daemon (NEON en el
+        // modulo), no Hexagon. El estado sale de IvannaDspManager, que es la
+        // unica fuente que sabe si nativeDspOpen() tuvo exito.
+        val backendMode = runCatching { AudioBackendSelector.mode.value }.getOrNull()
+        val dsp = IvannaDspManager.state.value
+        val backend = when {
+            dsp.opened && dsp.active                     -> OemState.AudioBackend.HEXAGON_DSP
+            backendMode == AudioBackendSelector.Mode.ROOT_DAEMON -> OemState.AudioBackend.NEON_ARM64
+            backendMode == AudioBackendSelector.Mode.ROOT_NO_DAEMON -> OemState.AudioBackend.NEON_ARM64
+            backendMode == AudioBackendSelector.Mode.NO_ROOT        -> OemState.AudioBackend.CPU_FALLBACK
+            else                                     -> OemState.AudioBackend.UNKNOWN
+        }
+
+        // ── Sync de parametros neuro al cDSP (cableado que faltaba) ─────────
+        // syncNeuroParams() no tenia NINGUN llamador (verificado por grep):
+        // los sliders del usuario actualizaban el motor CPU y el DSP seguia
+        // con sus defaults de apertura. Cuando el DSP esta abierto, se le
+        // empujan los valores persistidos de la SSOT (core.ParameterStore) en
+        // cada poll — idempotente y lock-free (el manager ya lo garantiza).
+        if (dsp.opened) {
+            runCatching {
+                val p = com.ivanna.omega.core.ParameterStore(getApplication())
+                IvannaDspManager.syncNeuroParams(
+                    alpha          = p.getNpeOhcCompression(),
+                    beta           = p.getNpeLateralInhib(),
+                    lateralInhib   = p.getNpeLateralInhib(),
+                    ohcCompression = p.getNpeOhcCompression(),
+                    masterGainDb   = p.getNpeMasterGain()
+                )
+            }.onFailure { android.util.Log.w("OemViewModel", "syncNeuroParams: ${it.message}") }
+        }
+
+        // ── Thermal ───────────────────────────────────────────────────────────
+        val thermalLoad  = ThermalGovernor.currentThermalLoad
+        val thermalApiOk = ThermalGovernor.thermalApiAvailable
+        val tempC        = runCatching { OmegaDaemon.getTemperature() }.getOrDefault(Float.NaN)
+        val sharedOmega  = com.ivanna.omega.audio.OmegaMetrics.shared.value
+        val latencyMs    = if (sharedOmega.latencyMs.isFinite() && sharedOmega.latencyMs > 0f) sharedOmega.latencyMs else runCatching { OmegaDaemon.getLatency() }.getOrDefault(Float.NaN)
+
+        // ── Estado del motor derivado de thermal ──────────────────────────────
+        val engineState = when {
+            !loaded              -> OemState.EngineState.UNKNOWN
+            thermalLoad >= 0.8f  -> OemState.EngineState.RECOVERY
+            thermalLoad >= 0.6f  -> OemState.EngineState.POWER_SAVE
+            !daemonAlive         -> OemState.EngineState.SUSPENDED
+            else                 -> OemState.EngineState.ACTIVE
+        }
+
+        // ── Métricas DSP (APIs reales de IvannaNativeLib) ─────────────────────
+        val clipCount = if (loaded) runCatching {
+            IvannaNativeLib.guardedNative(0) { IvannaNativeLib.nativeGetClipCount() }
+        }.getOrDefault(0) else 0
+
+        val evoBestFitness = if (loaded) runCatching {
+            IvannaNativeLib.guardedNative(0f) { IvannaNativeLib.nativeGetEvoBestFitness() }
+        }.getOrDefault(0f) else 0f
+
+        val evoGeneration = if (loaded) runCatching {
+            IvannaNativeLib.guardedNative(0) { IvannaNativeLib.nativeGetGeneration() }
+        }.getOrDefault(0) else 0
+
+        val phaseState = if (loaded) runCatching {
+            IvannaNativeLib.guardedNative(0f) { IvannaNativeLib.nativeGetPhaseState() }
+        }.getOrDefault(0f) else 0f
+
+        // ── HRTF / Espacial ───────────────────────────────────────────────────
+        val hrtfReady   = IvannaSpatialManager.ready
+        val hrtfSubject = IvannaSpatialManager.activeSubject
+        val hrtfLoaded  = IvannaSpatialManager.isHrtfDatasetLoaded()
+        // Estado real de las dos tarjetas: lo que el usuario aplicó (panel Espacial)
+        // + si el dataset está realmente cargado en el motor.
+        val spCfg = runCatching { com.ivanna.omega.spatial.SpatialControlStore.load(getApplication()) }.getOrNull()
+        val auxStore = runCatching { com.ivanna.omega.core.ParameterStore(getApplication()) }.getOrNull()
+        val auxOn = auxStore?.isAuxFieldEnabled() == true
+        // Con el modo AUX activo el HRTF binaural esta en pausa en el motor: la tarjeta no debe decir ACTIVO.
+        val hrtfOn = (spCfg?.hrtfEnabled == true) && (hrtfLoaded || hrtfReady) && !auxOn
+        val rirLoaded = runCatching { OmegaEngineBridge.isRirDatasetLoaded() }.getOrDefault(false)
+        val rirOn = spCfg?.rirEnabled == true
+        val rirWetNow = if (rirOn && rirLoaded) (spCfg?.rirWet ?: 0f).coerceIn(0f, 1f) else 0f
+
+        // ── SAF ───────────────────────────────────────────────────────────────
+        val safConverged  = runCatching { SaFBridge.nativeSaFIsConverged()  }.getOrDefault(false)
+        val safError      = runCatching { SaFBridge.nativeSaFGetError()     }.getOrDefault(0f)
+        val safIteration  = runCatching { SaFBridge.nativeSaFGetIteration() }.getOrDefault(0)
+        val safDiag       = runCatching { SaFRoomBridge.getDiagnostics()    }.getOrDefault(FloatArray(0))
+        val healLog       = runCatching { com.ivanna.omega.agent.SelfHealingAgent.log.value }.getOrDefault(emptyList())
+
+        // FIX (SAF sin root no alimentaba ningún efecto real): safDiag ya se
+        // leía y se mostraba en la UI (ver OemState más abajo), pero nunca
+        // llegaba al DSP — omega_effect.cpp (el único consumidor real de SAF
+        // hasta ahora) es root-only. En NO_ROOT, IvannaGlobalEffectManager
+        // (AudioEffect por sesión: Equalizer/Virtualizer) es la única vía de
+        // procesamiento real disponible — mismo mecanismo que ya usa
+        // DSPState.pushToNative() para los sliders manuales. Solo en
+        // NO_ROOT: en ROOT_DAEMON/ROOT_NO_DAEMON el DSP nativo ya procesa
+        // SAF por su cuenta (o lo hará al activarse) y esto interferiría
+        // por duplicado sobre la misma sesión de audio.
+        // Despachado a IO: applySafState() itera sesiones y hace llamadas
+        // Binder (getBandLevel/setBandLevel/setStrength) al audio HAL — igual
+        // que adjustLiveParams(), nunca debe correr síncrono en el hilo de
+        // poll() (viewModelScope.launch usa Main.immediate por defecto).
+        if (backendMode == AudioBackendSelector.Mode.NO_ROOT) {
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { DSPState.globalEffectManager?.applySafState(safDiag) }
+            }
+        }
+
+        // ── USB ───────────────────────────────────────────────────────────────
+        val usbStreaming = runCatching {
+            UsbAudioProManager.getInstance(getApplication()).isActive()
+        }.getOrDefault(false)
+
+        // ── Telemetría daemon ─────────────────────────────────────────────────
+        val daemonStatus = runCatching { OmegaEngineBridge.requestTelemetry() }.getOrDefault("")
+
+        // ── FIX (IA ADAPTATIVA muerta, 2026-09-01): el copy final nunca
+        // escribía probVoice/probMusic/probBass/probSilence/dominantClass ni
+        // adaptiveRunning/activeRoute/rms/peak/compAmount/exciterRed/spatialWidth/
+        // voiceProtect/safetyMargin/applied — la pantalla OemAiScreen quedaba en
+        // ceros con "FALLBACK" aunque el motor corriera. Se leen los getters
+        // reales del JNI: nativeGetUnifiedPipelineStatus()[0..7] (ruta, rms, peak,
+        // voiceProtect, comp, excRed, width, adaptiveActive) y
+        // nativeGetAudioCharacteristics() (percussiveness/tonality/centroid/spread).
+        // guardedNative con default seguro para no tumbar el poll si el .so no
+        // está cargado todavía.
+        val pipe: FloatArray = if (loaded) runCatching {
+            IvannaNativeLib.guardedNative(FloatArray(0)) { IvannaNativeLib.nativeGetUnifiedPipelineStatus() ?: FloatArray(0) }
+        }.getOrDefault(FloatArray(0)) else FloatArray(0)
+        val pipeOk = pipe.size >= 8
+        val activeRoute    = if (pipeOk) pipe[0] else 0f
+        val rms            = if (pipeOk) pipe[1] else 0f
+        val peak           = if (pipeOk) pipe[2] else 0f
+        val voiceProtect   = if (pipeOk) pipe[3] else 0f
+        val compAmount     = if (pipeOk) pipe[4] else 0f
+        val exciterRed     = if (pipeOk) pipe[5] else 0f
+        val spatialWidth   = if (pipeOk) pipe[6] else 1f
+        val adaptiveActive = if (pipeOk) pipe[7] else 0f
+
+        // Clasificador: rasgos nativos de nativeGetAudioCharacteristics() con el contrato REAL
+        // ([2]=percusividad [3]=tonalidad [6]=centroide Hz). Ver OemClassifierMath (probado en JVM).
+        val chars = if (loaded) runCatching {
+            IvannaNativeLib.guardedNative(FloatArray(0)) { IvannaNativeLib.nativeGetAudioCharacteristics() }
+        }.getOrDefault(FloatArray(0)) else FloatArray(0)
+        val cls        = OemClassifierMath.read(chars, rms)
+        val percussive = cls.percussiveness
+        val tonal      = cls.tonality
+        val centroidHz = cls.centroidHz
+        val pSilence   = cls.probSilence
+        val pBass      = cls.probBass
+        val pMusic     = cls.probMusic
+        val pVoice     = cls.probVoice
+        val domClass   = cls.dominantClass
+        val hasSignal  = rms > 1e-4f
+
+        _state.value = OemState(
+            engineState    = engineState,
+            backend        = backend,
+            dspOpened      = dsp.opened,
+            dspActive      = dsp.active,
+            dspCpuLoad     = dsp.metrics.cpuLoadRatio,
+            nativeLoaded   = loaded,
+            daemonAlive    = daemonAlive,
+            npeModuleLink  = when (com.ivanna.omega.neuromorphic.PiLstmBridge.moduleLink) {
+                com.ivanna.omega.neuromorphic.PiLstmBridge.ModuleLink.CONFIRMED -> "confirmado"
+                com.ivanna.omega.neuromorphic.PiLstmBridge.ModuleLink.NO_DAEMON -> "sin daemon"
+                else -> "—"
+            },
+            thermalLoad    = thermalLoad,
+            thermalApiOk   = thermalApiOk,
+            tempC          = tempC,
+            latencyMs      = latencyMs,
+            jitterMs       = sharedOmega.jitterMs,
+            underrunCount  = sharedOmega.underrunCount,
+            dspLoadPercent = sharedOmega.dspLoadPercent,
+            bufferHealthPercent = sharedOmega.bufferHealthPercent,
+            activeCodec    = sharedOmega.activeCodec,
+            budgetBypasses = sharedOmega.budgetBypasses,
+            antiPopEvents  = sharedOmega.antiPopEvents,
+            resyncCount    = sharedOmega.resyncCount,
+            clipCount      = clipCount,
+            evoBestFitness = evoBestFitness,
+            evoGeneration  = evoGeneration,
+            phaseState     = phaseState,
+            hrtfReady      = hrtfReady,
+            hrtfOn         = hrtfOn,
+            auxOn          = auxOn,
+            auxXoverHz     = auxStore?.getAuxXoverHz() ?: 120f,
+            auxCoherence   = auxStore?.getAuxCoherence() ?: 1f,
+            rirOn          = rirOn,
+            rirLoaded      = rirLoaded,
+            reverbLevel    = rirWetNow,
+            hrtfSubject    = hrtfSubject,
+            hrtfLoaded     = hrtfLoaded,
+            safConverged   = safConverged,
+            safError       = safError,
+            safIteration   = safIteration,
+            safDiag        = safDiag,
+            healLog        = healLog,
+            usbStreaming   = usbStreaming,
+            daemonStatus   = daemonStatus,
+            // Telemetría real del pipeline (arriba) — los campos ya no quedan
+            // en su default 0/— : la pantalla IA ADAPTATIVA cobra vida.
+            activeRoute    = activeRoute,
+            rms            = rms,
+            peak           = peak,
+            voiceProtect   = voiceProtect,
+            compAmount     = compAmount,
+            exciterRed     = exciterRed,
+            spatialWidth   = spatialWidth,
+            adaptiveActive = adaptiveActive,
+            adaptiveRunning= adaptiveActive > 0.5f,
+            probVoice      = pVoice,
+            probMusic      = pMusic,
+            probBass       = pBass,
+            probSilence    = pSilence,
+            dominantClass  = domClass,
+            percussiveness = percussive,
+            tonality       = tonal,
+            spectralCentroid = centroidHz,
+            safetyMargin   = if (hasSignal) 1f else 0f,
+        )
+    }
+
+    /** Enciende/apaga el modo AUX/altavoces: persiste, aplica en la app y lo manda al daemon (ruta B). */
+    fun toggleAuxField() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val p = com.ivanna.omega.core.ParameterStore(getApplication())
+            val en = !p.isAuxFieldEnabled()
+            p.setAuxField(en, p.getAuxXoverHz(), p.getAuxCoherence())
+            if (IvannaNativeLib.isLoaded)
+                runCatching { IvannaNativeLib.nativeSetAuxField(en, p.getAuxXoverHz(), p.getAuxCoherence()) }
+        }
+    }
+
+    // ── Acciones ──────────────────────────────────────────────────────────────
+
+    fun resetClipCount() = runCatching {
+        IvannaNativeLib.guardedNative(Unit) { IvannaNativeLib.nativeResetClipCount() }
+    }
+
+    fun setAdaptEnabled(en: Boolean) = runCatching {
+        IvannaNativeLib.guardedNative(Unit) { IvannaNativeLib.nativeSetAdaptEnabled(en) }
+    }
+
+    fun setHrtfEnabled(en: Boolean) = runCatching {
+        IvannaNativeLib.guardedNative(Unit) { IvannaNativeLib.nativeSetHRTFEnabled(en) }
+        val route = AudioRouteManager.detectOutputRoute()
+        val routeAllowed = SystemWideHrtfPolicy.allow(getApplication<Application>(), en, route)
+        OmegaEngineBridge.queueSystemWideHrtfEnabled(routeAllowed)
+    }
+
+    fun setHrtfSubject(subject: String) = runCatching {
+        IvannaSpatialManager.setHrtfSubject(subject)
+    }
+
+    fun setRoom(rt60: Float, wet: Float) = runCatching {
+        OmegaEngineBridge.setRoom(rt60, wet)
+    }
+
+    fun disableRoom() = runCatching { OmegaEngineBridge.disableRoom() }
+
+    fun safFeedback(direction: Int, positive: Boolean) = runCatching {
+        SaFBridge.nativeSaFFeedback(direction, positive)
+        SaFRoomBridge.step()
+    }
+
+    fun safReset() = runCatching {
+        SaFRoomBridge.reset()
+        SaFBridge.nativeSaFReset()
+    }
+
+    fun setExpertMode(on: Boolean) {
+        _expertMode.value = on
+    }
+
+    fun measureLatency() {
+        // FIX: era un stub vacío ("dummy or restore") — el botón "MEDIR" de
+        // la card LATENCIA DSP no hacía nada. La medición real ya existe
+        // (OmegaDaemon.getLatency(), con caché de 250 ms) y poll() ya la
+        // consume cada 500 ms automáticamente; forzar poll() aquí solo
+        // adelanta el refresh al toque del botón en vez de esperar el
+        // siguiente tick, sin reinventar ninguna medición nueva.
+        poll()
+    }
+
+    fun resetClips() {
+        resetClipCount()
+    }
+
+    fun setSpatialAngle(deg: Float) {
+        // Cableado: los sliders AZIMUT de la pantalla binaural llaman aquí.
+        runCatching {
+            IvannaNativeLib.guardedNative(Unit) {
+                IvannaNativeLib.nativeSetSpatialAngleRad(Math.toRadians(deg.toDouble()).toFloat())
+            }
+        }
+    }
+
+    fun setSpatialWidth(w: Float) {
+        // Cableado: sliders ANCHO ESPACIAL / ANCHURA ESPACIAL llaman aquí.
+        runCatching {
+            IvannaNativeLib.guardedNative(Unit) { IvannaNativeLib.nativeSetSpatialWidthDirect(w) }
+        }
+    }
+}

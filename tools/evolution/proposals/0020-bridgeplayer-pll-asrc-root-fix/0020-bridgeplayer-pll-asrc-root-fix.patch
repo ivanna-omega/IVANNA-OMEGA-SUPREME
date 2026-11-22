@@ -1,0 +1,855 @@
+diff --git a/README.md b/README.md
+--- a/README.md	2026-11-16 11:33:36.919470407 +0000
++++ b/README.md	2026-11-16 11:33:36.921258150 +0000
+@@ -505,7 +505,7 @@
+ 
+ | Suite | Result | Evidence |
+ |:---|:---|:---|
+-| CTest (DSP host suite) | **1055/1055** | Host local, suite completa (1055/1055, v2.5.456; twiddles precalculados en el RIR + micro-opts exactas en HOLOS + test_route_a_asrc cableado + test_pi_lstm_bridge_jni + test_benchmark_jni + test_saf_jni_bridge + test_omega_daemon_bridge) |
++| CTest (DSP host suite) | **1060/1060** | Host local, suite completa (1060/1060, v2.5.457; twiddles precalculados en el RIR + micro-opts exactas en HOLOS + test_route_a_asrc cableado + test_pi_lstm_bridge_jni + test_benchmark_jni + test_saf_jni_bridge + test_omega_daemon_bridge + test_bridgeplayer_level_control) |
+ | ASRC core | **25/25** | Host, v2.5.439 (see §05.4) |
+ | Daemon command responder | **28/28** | Host, v2.5.440 (real round-trip over abstract socket) |
+ | Council (multi-model) | **14/14** | Python unit tests, v2.5.445 (mocked LLM: verdicts, rounds, fail-closed) |
+diff --git a/app/src/main/cpp/tests/CMakeLists.txt b/app/src/main/cpp/tests/CMakeLists.txt
+--- a/app/src/main/cpp/tests/CMakeLists.txt	2026-11-16 11:35:25.797868990 +0000
++++ b/app/src/main/cpp/tests/CMakeLists.txt	2026-11-16 11:33:36.910390261 +0000
+@@ -135,6 +135,10 @@
+ ivanna_add_test(test_gauge_field_engine)
+ # Second-order phase/frequency tracking PLL (userspace; not a DAC clock driver).
+ ivanna_add_test(test_g_pll_core)
++# Dinámica del bucle de escritura del BridgePlayer (Ruta A, v2.5.457):
++# reproduce el fallo del snap 455 (buffer clavado en lleno + contenido
++# perdido) y valida el fix raíz (pacing: nivel al objetivo sin soltar nada).
++ivanna_add_test(test_bridgeplayer_level_control)
+ # Monotonic software clock monitor for callback cadence (diagnostic only, not DAC phase).
+ ivanna_add_test(test_audio_callback_clock)
+ # Estimator fed only by real HAL/driver presentation timestamps and frame positions.
+diff --git a/app/src/main/cpp/tests/test_bridgeplayer_level_control.cpp b/app/src/main/cpp/tests/test_bridgeplayer_level_control.cpp
+new file mode 100644
+--- /dev/null
++++ b/app/src/main/cpp/tests/test_bridgeplayer_level_control.cpp	2026-11-16 11:33:36.912957133 +0000
+@@ -0,0 +1,279 @@
++// test_bridgeplayer_level_control.cpp
++//
++// Dinámica del bucle de escritura del BridgePlayer (Ruta A) — v2.5.457.
++//
++// REPRODUCE el fallo medido en vivo en la 456 (2026-11-16 04:41 CST) y
++// VALIDA el fix raíz (control de nivel por ritmo de escritura).
++//
++// Fallo (snap 455): pll_occ clavado ~98k (cap 92_256, objetivo 46_128),
++// pll_snap=2048 disparando SIEMPRE pero el buffer NO baja (97_568 →
++// 97_967 → 98_429). Síntoma de Esse: MÚSICA = "metralleta" (micro-cortes).
++// Y el disparador del tronido es el CAMBIO DE PISTA (2026-11-16 05:16 CST):
++// estable durante una canción, pero al brincar de canción regresan los
++// tronidos y la distorsión — cada pista nueva re-prima el buffer a lleno
++// (el track/PLL/ASRC son frescos por pista) y el snap vuelve a soltar
++// contenido al arrancar.
++//
++// Mecanismo (verificado en código, no una hipótesis suelta):
++//  - El productor (decodificador) no tiene límite de tasa: decodifica por
++//    delante y `track.write(WRITE_BLOCKING)` es el único freno. Su
++//    equilibrio mantiene el buffer LLENO (~98k), no en el objetivo.
++//  - El snap soltaba 2048 frames de CONTENIDO por sondeo, pero el productor
++//    rellenaba el hueco con el siguiente bloque: el nivel no bajaba, solo
++//    se perdía audio (17% del contenido saltado = metralleta).
++//  - El ppm solo drena 24 frames/s (±500 ppm): no puede con 52k de exceso.
++// Fix (457): el nivel lo controla el RITMO DE ESCRITURA — el reproductor
++// pausa el productor cuando la ocupación estimada supera el objetivo
++// (backpressure natural del codec, sin perder audio) y el snap queda
++// legacy (siempre 0). El ppm queda solo para la deriva real (+8.5 ppm).
++// El pacing frena el priming DESDE EL PRIMER BLOQUE de cada pista
++// (estimateOccupancy sin ancla = lo enviado), así que el cambio de pista
++// tampoco sobre-llena: cada pista arranca al objetivo, no a lleno.
++//
++// Esta simulación usa los números REALES (capacidad, objetivo, bloque,
++// snap, deriva) y modela: productor con backlog infinito (decodifica por
++// delante), track con capacidad y drenado a 48 kHz, write-blocking,
++// sondeo PLL cada 250 ms (P = -800 ppm por buffer lleno + deriva) y snap
++// o pacing según el escenario. Es un modelo de tasas (el ASRC se modela
++// por su ratio; su comportamiento exacto ya lo cubre test_route_a_asrc).
++// No depende de Android: corre en host (CTest).
++
++#include <gtest/gtest.h>
++
++#include <algorithm>
++#include <cmath>
++
++namespace {
++
++constexpr double kSampleRateHz = 48000.0;
++constexpr long kCapacityFrames = 92256;   // minBuf x12 (medido en vivo)
++constexpr long kTargetFrames = 46128;     // capacidad / 2
++constexpr long kBlockFrames = 1984;       // chunkFrames 44.1k -> 48k
++constexpr double kDriftPpm = 8.5;         // deriva real medida en vivo
++constexpr long kSnapMaxFrames = 2048;
++constexpr double kSnapThresholdPhase = 0.25;
++constexpr double kPllKpPpmPerFullBuffer = 800.0;
++constexpr double kPllMaxPpm = 500.0;
++constexpr double kPollIntervalSec = 0.25;  // sondeo PLL cada 250 ms
++constexpr double kBlockProcessSec = 0.005; // decodificar+DSP+ASRC un bloque
++constexpr double kSimSeconds = 10.0;       // ventana simulada
++
++struct SimResult {
++    long finalLevelFrames = 0;
++    long maxLevelFrames = 0;
++    long droppedFrames = 0;      // contenido perdido (snap)
++    long producedFrames = 0;     // línea de tiempo consumida del decodificador
++    long writtenFrames = 0;      // frames que llegaron al track
++    double finalPpm = 0.0;
++    double simSeconds = 0.0;
++};
++
++// Estado de UNA pista (track/PLL/ASRC frescos por pista, como en el
++// reproductor real: play() -> stop() -> nuevo runDecodeLoop).
++struct TrackState {
++    double timeSec = 0.0;
++    long submitted = 0;   // frames escritos al track
++    long consumed = 0;    // frames drenados por el consumidor
++    double ppm = 0.0;         // demanda actual del PLL
++    long pendingSnap = 0;     // snap pendiente (frames a soltar)
++    double lastPollSec = 0.0;
++    long maxLevel = 0;
++    long level() const { return submitted - consumed; }
++    // Avanza el reloj virtual dt segundos: el consumidor drena a 48 kHz.
++    void advanceTime(double dt) {
++        if (dt <= 0.0) return;
++        timeSec += dt;
++        consumed += static_cast<long>(std::llround(dt * kSampleRateHz));
++        if (consumed > submitted) consumed = submitted;  // no drenar de más
++    }
++};
++
++// Corre el bucle de escritura durante `seconds` sobre el estado dado.
++// Acumula dropped/produced/written en los contadores por referencia.
++void RunLoop(TrackState& s, double seconds, bool useSnap, bool usePacing,
++             long& dropped, long& produced, long& written) {
++    const double endSec = s.timeSec + seconds;
++    while (s.timeSec < endSec) {
++        // ── Pacing (457): si el nivel supera el objetivo, el productor se
++        // pausa y deja que el track drene. Sin producir ni soltar nada.
++        if (usePacing) {
++            long occ = s.level();
++            if (occ > kTargetFrames) {
++                double waitSec =
++                    static_cast<double>(occ - kTargetFrames) / kSampleRateHz;
++                s.advanceTime(waitSec);
++                continue;
++            }
++        }
++        // ── Sondeo PLL cada 250 ms: P por error de nivel + deriva.
++        if (s.timeSec - s.lastPollSec >= kPollIntervalSec) {
++            s.lastPollSec = s.timeSec;
++            double phase = static_cast<double>(s.level() - kTargetFrames) /
++                           static_cast<double>(kCapacityFrames);
++            double pTerm = -kPllKpPpmPerFullBuffer * phase;
++            s.ppm = std::clamp(kDriftPpm + pTerm, -kPllMaxPpm, kPllMaxPpm);
++            if (useSnap && std::abs(phase) > kSnapThresholdPhase) {
++                s.pendingSnap = std::clamp(s.level() - kTargetFrames,
++                                           -kSnapMaxFrames, kSnapMaxFrames);
++            } else {
++                s.pendingSnap = 0;
++            }
++        }
++        // ── Producir un bloque (ASRC por ratio) ──
++        double ratio = 1.0 + s.ppm * 1.0e-6;
++        long producedBlock =
++            static_cast<long>(std::llround(kBlockFrames * ratio));
++        produced += kBlockFrames;  // la línea de tiempo avanza por la entrada
++        // ── Snap (455): soltar contenido del bloque ──
++        long writtenBlock = producedBlock;
++        if (useSnap && s.pendingSnap > 0) {
++            long drop = std::min(s.pendingSnap, writtenBlock - 1);
++            if (drop > 0) {
++                writtenBlock -= drop;
++                dropped += drop;
++                s.pendingSnap -= drop;
++            }
++        }
++        // ── Escribir (blocking): esperar a que haya sitio ──
++        long room = kCapacityFrames - s.level();
++        if (writtenBlock > room) {
++            double waitSec = static_cast<double>(writtenBlock - room) /
++                             kSampleRateHz;
++            s.advanceTime(waitSec);
++        }
++        s.submitted += writtenBlock;
++        written += writtenBlock;
++        s.maxLevel = std::max(s.maxLevel, s.level());
++        // Coste de producir el bloque (decodificar + DSP + ASRC).
++        s.advanceTime(kBlockProcessSec);
++    }
++}
++
++// Simula el bucle de escritura. useSnap = snap 455; usePacing = pacing 457.
++SimResult Simulate(bool useSnap, bool usePacing) {
++    TrackState s;
++    long dropped = 0, produced = 0, written = 0;
++    RunLoop(s, kSimSeconds, useSnap, usePacing, dropped, produced, written);
++    SimResult r;
++    r.finalLevelFrames = s.level();
++    r.maxLevelFrames = s.maxLevel;
++    r.droppedFrames = dropped;
++    r.producedFrames = produced;
++    r.writtenFrames = written;
++    r.finalPpm = s.ppm;
++    r.simSeconds = s.timeSec;
++    return r;
++}
++
++// Simula DOS pistas seguidas (5 s cada una): al cambiar de pista el estado
++// se resetea (track/PLL/ASRC frescos, como play() -> stop() -> nuevo
++// runDecodeLoop) y se devuelven las métricas de la SEGUNDA pista — ahí es
++// donde Esse oye el tronido (2026-11-16 05:16 CST).
++SimResult SimulateTwoTracks(bool useSnap, bool usePacing) {
++    TrackState s;
++    long dropped = 0, produced = 0, written = 0;
++    RunLoop(s, kSimSeconds / 2.0, useSnap, usePacing, dropped, produced,
++            written);
++    // ── Cambio de pista: estado fresco (el track viejo se hace
++    // pause+flush+stop+release; el nuevo arranca vacío) ──
++    TrackState s2;
++    long dropped2 = 0, produced2 = 0, written2 = 0;
++    RunLoop(s2, kSimSeconds / 2.0, useSnap, usePacing, dropped2, produced2,
++            written2);
++    SimResult r;
++    r.finalLevelFrames = s2.level();
++    r.maxLevelFrames = s2.maxLevel;
++    r.droppedFrames = dropped2;
++    r.producedFrames = produced2;
++    r.writtenFrames = written2;
++    r.finalPpm = s2.ppm;
++    r.simSeconds = s2.timeSec;
++    return r;
++}
++
++}  // namespace
++
++// ── 455 (snap): REPRODUCE el fallo ──────────────────────────────────────────
++// El buffer se queda clavado cerca de lleno y el snap pierde contenido sin
++// bajar el nivel. Si este test dejara de fallar con el snap, el modelo no
++// estaría reproduciendo el fallo real (o el fallo habría desaparecido).
++TEST(BridgePlayerLevelControl, Snap455KeepsBufferFullAndDropsContent) {
++    SimResult r = Simulate(/*useSnap=*/true, /*usePacing=*/false);
++    // El nivel se queda cerca de lleno (medido en vivo: ~98k de 92_256).
++    EXPECT_GT(r.finalLevelFrames, static_cast<long>(0.90 * kCapacityFrames))
++        << "el snap debería dejar el buffer clavado cerca de lleno";
++    // El nivel NO converge al objetivo (sigue >25% de capacidad por encima).
++    EXPECT_GT(r.finalLevelFrames - kTargetFrames,
++              static_cast<long>(0.25 * kCapacityFrames))
++        << "el snap no drena el nivel hacia el objetivo";
++    // Contenido perdido: el snap suelta 2048 frames por sondeo (teórico
++    // 8192/s = 17% del audio; el modelo mide ~11% por el acople
++    // bloque/sondeo — mismo orden, mismo mecanismo: metralleta).
++    double droppedFrac = r.producedFrames > 0
++        ? static_cast<double>(r.droppedFrames) / r.producedFrames : 0.0;
++    EXPECT_GT(droppedFrac, 0.10)
++        << "el snap debería perder >10% del contenido (metralleta)";
++    // El ppm se queda en el riel negativo (medido en vivo: ~-450).
++    EXPECT_LT(r.finalPpm, -300.0)
++        << "con el nivel clavado, el PI debería estar en el riel negativo";
++}
++
++// ── 457 (pacing): VALIDA el fix ─────────────────────────────────────────────
++// El nivel converge al objetivo sin perder contenido y el ppm se queda en
++// la deriva real (+8.5 ppm), no en el riel.
++TEST(BridgePlayerLevelControl, Pacing457ConvergesToTargetWithoutDropping) {
++    SimResult r = Simulate(/*useSnap=*/false, /*usePacing=*/true);
++    // El nivel converge al objetivo (±5% de capacidad).
++    EXPECT_NEAR(static_cast<double>(r.finalLevelFrames),
++                static_cast<double>(kTargetFrames),
++                0.05 * kCapacityFrames)
++        << "el pacing debería llevar el nivel al objetivo";
++    // Cero contenido perdido: el pacing pausa el productor, no suelta frames.
++    EXPECT_EQ(r.droppedFrames, 0L) << "el pacing no debe perder contenido";
++    // Todo lo producido llega al track (sin saltos en la línea de tiempo).
++    EXPECT_EQ(r.writtenFrames, r.producedFrames)
++        << "sin snap, lo producido debe llegar íntegro al track";
++    // El ppm se queda en la deriva real (~+8.5), no en el riel -450.
++    EXPECT_NEAR(r.finalPpm, kDriftPpm, 50.0)
++        << "con el nivel en el objetivo, el ppm debe seguir la deriva real";
++}
++
++// ── 457: el priming no llena el buffer ──────────────────────────────────────
++// Con pacing, el nivel nunca supera el objetivo más un bloque (el priming
++// se frena en el objetivo, no llena el buffer hasta arriba).
++TEST(BridgePlayerLevelControl, Pacing457CapsPrimingAtTarget) {
++    SimResult r = Simulate(/*useSnap=*/false, /*usePacing=*/true);
++    EXPECT_LE(r.maxLevelFrames, kTargetFrames + 2 * kBlockFrames)
++        << "el priming no debe llenar el buffer: el pacing lo frena en el objetivo";
++}
++
++// ── CAMBIO DE PISTA (2026-11-16 05:16 CST) ──────────────────────────────────
++// Esse: estable durante una canción, pero al BRINCAR de canción regresan los
++// tronidos y la distorsión. Cada pista nueva re-prima el buffer a lleno y el
++// snap vuelve a soltar contenido al arrancar. El pacing frena el priming
++// desde el primer bloque de CADA pista, así que la segunda pista tampoco se
++// sobre-llena ni pierde contenido.
++TEST(BridgePlayerLevelControl, Snap455OverfillsSecondTrackToo) {
++    SimResult r = SimulateTwoTracks(/*useSnap=*/true, /*usePacing=*/false);
++    // La segunda pista también se sobre-llena (re-priming a lleno).
++    EXPECT_GT(r.maxLevelFrames, static_cast<long>(0.90 * kCapacityFrames))
++        << "con snap, la segunda pista también debería sobre-llenarse al arrancar";
++    EXPECT_GT(r.droppedFrames, 0L)
++        << "con snap, la segunda pista también debería perder contenido (tronido al cambiar)";
++}
++
++TEST(BridgePlayerLevelControl, Pacing457SecondTrackStartsAtTarget) {
++    SimResult r = SimulateTwoTracks(/*useSnap=*/false, /*usePacing=*/true);
++    // La segunda pista arranca al objetivo (nunca se sobre-llena).
++    EXPECT_LE(r.maxLevelFrames, kTargetFrames + 2 * kBlockFrames)
++        << "con pacing, la segunda pista no debe sobre-llenarse al arrancar";
++    EXPECT_NEAR(static_cast<double>(r.finalLevelFrames),
++                static_cast<double>(kTargetFrames),
++                0.05 * kCapacityFrames)
++        << "con pacing, la segunda pista debe converger al objetivo";
++    // Sin contenido perdido en el cambio de pista (sin tronido).
++    EXPECT_EQ(r.droppedFrames, 0L)
++        << "con pacing, el cambio de pista no debe perder contenido";
++    EXPECT_EQ(r.writtenFrames, r.producedFrames)
++        << "la segunda pista debe llegar íntegra al track";
++}
+diff --git a/app/src/main/java/com/ivanna/omega/audio/AudioTrackBufferPll.kt b/app/src/main/java/com/ivanna/omega/audio/AudioTrackBufferPll.kt
+--- a/app/src/main/java/com/ivanna/omega/audio/AudioTrackBufferPll.kt	2026-11-16 11:33:36.714533247 +0000
++++ b/app/src/main/java/com/ivanna/omega/audio/AudioTrackBufferPll.kt	2026-11-16 11:33:36.718899479 +0000
+@@ -31,19 +31,23 @@
+         private const val KP_PPM_PER_FULL_BUFFER = 800.0
+         private const val KI_PPM_PER_FULL_BUFFER_SECOND = 120.0
+         private const val MAX_INTEGRAL_SECONDS = 4.0
+-        // Snap de nivel (v2.5.455): corrección DISCRETA del nivel del
+-        // buffer, separada de la corrección de deriva (ppm). La autoridad
+-        // ±500 ppm es demasiado débil para controlar el NIVEL de un buffer
+-        // grande: a -500 ppm solo drena 24 frames/s, así que drenar 51k
+-        // frames tomaría 36 min (medido en vivo 2026-11-15, 454: el servo
+-        // vivía clavado en el riel -500 peleando contra un fantasma, con
+-        // deriva real de solo +8.5 ppm). El nivel lo determina el priming,
+-        // no el servo. El snap salta el nivel en un solo ajuste (hasta
+-        // ±2048 frames, ~43 ms a 48 kHz, inaudible) cuando el buffer sale
+-        // de [25%,75%] de capacidad; la deriva sigue por ppm. El snap NO
+-        // toca el riel ±500 (contrato SAFMUS intacto) ni el tamaño del
+-        // buffer (sigue minBuf×12).
++        // LEGACY v2.5.457 — SNAP DE NIVEL DESACTIVADO. El snap (455) soltaba
++        // hasta ±2048 frames de CONTENIDO por sondeo cuando el buffer salía
++        // de [25%,75%], pero el nivel NO bajaba: el productor (decodificador,
++        // sin límite de tasa) rellenaba el hueco con el siguiente bloque, así
++        // que el buffer se quedaba clavado en ~98k (cap 92_256, objetivo
++        // 46_128) y el audio perdía 2048 frames cada 250 ms (metralleta, 17%
++        // del contenido saltado; medido en vivo 2026-11-16, 456). El nivel
++        // lo controla ahora el RITMO DE ESCRITURA del reproductor
++        // (IvannaBridgePlayer: pausa el productor cuando la ocupación
++        // estimada supera el objetivo), no un salto discreto. El ppm queda
++        // solo para la deriva (su autoridad ±500 ppm drena 24 frames/s: no
++        // puede con un exceso de nivel de 52k frames, pero tampoco debe:
++        // el nivel ya no es su trabajo). Las constantes del snap se
++        // conservan como referencia histórica; levelSnapFrames siempre es 0.
++        @Suppress("unused")
+         private const val LEVEL_SNAP_THRESHOLD_FRACTION = 0.25
++        @Suppress("unused")
+         private const val LEVEL_SNAP_MAX_FRAMES = 2048L
+         // Suppress small queue-measurement noise; subtract the band for continuity.
+         private const val BUFFER_DEADBAND_FRACTION = 0.02
+@@ -110,14 +114,11 @@
+     // como pll_hold; se reinicia con reset().
+     var starvationHolds: Long = 0L
+         private set
+-    // Snap de nivel pendiente (v2.5.455): frames a soltar (+) o duplicar
+-    // (−) para llevar el buffer al objetivo. 0 = dentro de [25%,75%], sin
+-    // snap. Lo lee el reproductor tras observe() y lo aplica el ASRC
+-    // (RouteAAsrc.setLevelSnapFrames). Se recalcula en cada observe() con
+-    // medida viva; 0 en reset() y en hold por inanición (medida no fiable).
+-    // No es acumulativo: el último valor manda (el PLL lo recalcula cada
+-    // 250 ms desde la ocupación viva, así que un resto sin aplicar queda
+-    // subsumido por el cálculo fresco).
++    // LEGACY v2.5.457 — SNAP DE NIVEL DESACTIVADO (siempre 0). Antes (455)
++    // era el salto discreto de nivel (±2048 frames); ver el comentario del
++    // companion. El nivel lo controla el ritmo de escritura del reproductor.
++    // El campo se conserva para la telemetría (pll_snap=0 confirma que el
++    // snap está apagado) y para no romper el contrato del snapshot.
+     var levelSnapFrames: Long = 0L
+         private set
+ 
+@@ -126,6 +127,45 @@
+     val isAtRail: Boolean get() = abs(demandedPpm) >= MAX_CORRECTION_PPM - 1e-9
+ 
+     /**
++     * Ocupación estimada del track AHORA (v2.5.457, control de nivel por
++     * ritmo de escritura). observe() solo corre cada ~250 ms; entre sondeos
++     * el reproductor necesita saber el nivel para decidir si escribe o
++     * pausa. Ancla = último sondeo (consumed + timestamp): lo consumido
++     * desde entonces se estima al ritmo nominal (el consumidor drena a la
++     * tasa del track; un error de deriva de decenas de ppm mueve la estima
++     * <1 frame en 250 ms, despreciable para el pacing). Antes del primer
++     * sondeo no hay ancla: la ocupación es lo enviado (el track acaba de
++     * arrancar y aún no ha consumido nada apreciable; sobre-estimar al
++     * inicio es seguro: frena el priming antes de que el buffer se llene).
++     * Nunca negativa (el consumo estimado no supera lo enviado).
++     */
++    fun estimateOccupancy(submittedFrames: Long, nowNs: Long): Long {
++        if (submittedFrames <= 0L) return 0L
++        if (previousTimestampNs == 0L || previousConsumedFrames < 0L) {
++            return submittedFrames
++        }
++        val elapsedSec = (nowNs - previousTimestampNs).coerceAtLeast(0L) / 1_000_000_000.0
++        val consumedEst = previousConsumedFrames +
++            (elapsedSec * nominalSampleRateHz.toDouble()).toLong()
++        return (submittedFrames - consumedEst).coerceAtLeast(0L)
++    }
++
++    /**
++     * Resetea el integrador de nivel del PI (v2.5.457). Lo llama el
++     * reproductor cuando el pacing está activo (pausa el productor porque
++     * el nivel supera el objetivo): el nivel ya lo maneja el ritmo de
++     * escritura, y el PI no debe acumular error de nivel (windup) por un
++     * error que él no corrige — sin este reset, tras 50 sondeos sobre-llenos
++     * el integrador guardaría ~1.6 s de error y la demanda seguiría en
++     * ~-200 ppm aunque el nivel ya esté en el objetivo (el reset del snap
++     * 455 hacía esto; el snap ya no existe y el pacing toma su lugar).
++     * Solo toca el integrador: la estima de reloj y el ppm no se tocan.
++     */
++    fun resetLevelIntegral() {
++        integralErrorSeconds = 0.0
++    }
++
++    /**
+      * @param submittedFrames cumulative stereo frames accepted by this AudioTrack
+      * @param consumedFrames cumulative presented frames from this same track's AudioTimestamp
+      * @param bufferCapacityFrames configured AudioTrack buffer size in frames
+@@ -180,10 +220,6 @@
+             if (starved) {
+                 clearClockEstimate()
+                 integralErrorSeconds = 0.0
+-                // Medida no fiable (inanición): no snap sobre datos viejos.
+-                // El snap anterior queda invalidado; el próximo observe()
+-                // limpio lo recalculará desde la ocupación viva.
+-                levelSnapFrames = 0L
+                 starvationHolds++
+                 // v2.5.420 — HOLD: con el sensor (framePosition) corrompido
+                 // por la inanición, la cola medida también está
+@@ -205,23 +241,13 @@
+         phaseErrorFraction = ((queued - targetOccupancyFrames).toDouble() / capacity)
+             .coerceIn(-1.0, 1.0)
+ 
+-        // Snap de nivel (v2.5.455): si el buffer está fuera de [25%,75%],
+-        // el nivel se corrige en un solo salto discreto (el ppm no puede:
+-        // a -500 ppm drena 24 frames/s). El snap es la desviación respecto
+-        // al objetivo, acotada a ±2048 frames. Se calcula aquí (antes de
+-        // los retornos tempranos) para que esté disponible desde la primera
+-        // medida viva, incluso si el ppm aún no se calcula. Al emitirlo,
+-        // el integrador se resetea: el snap ya corrigió el nivel y el PI
+-        // no debe seguir peleando contra el mismo error (si no, la demanda
+-        // se quedaría clavada en el riel aunque el nivel ya esté
+-        // corregido). Dentro de [25%,75%], snap = 0 y el PI sigue solo.
+-        levelSnapFrames = if (abs(phaseErrorFraction) > LEVEL_SNAP_THRESHOLD_FRACTION) {
+-            (occupancyFrames - targetOccupancyFrames)
+-                .coerceIn(-LEVEL_SNAP_MAX_FRAMES, LEVEL_SNAP_MAX_FRAMES)
+-        } else {
+-            0L
+-        }
+-        if (levelSnapFrames != 0L) integralErrorSeconds = 0.0
++        // LEGACY v2.5.457 — el snap ya no se emite (siempre 0). El nivel lo
++        // controla el ritmo de escritura del reproductor (que pausa el
++        // productor cuando estimateOccupancy supera el objetivo); el PI ya
++        // no necesita que nadie le resetee el integrador por un salto
++        // discreto — el reproductor lo resetea directamente con
++        // resetLevelIntegral() cuando el pacing está activo (ver abajo).
++        levelSnapFrames = 0L
+ 
+         if (previousTimestampNs == 0L) {
+             previousTimestampNs = timestampNs
+diff --git a/app/src/main/java/com/ivanna/omega/audio/IvannaBridgePlayer.kt b/app/src/main/java/com/ivanna/omega/audio/IvannaBridgePlayer.kt
+--- a/app/src/main/java/com/ivanna/omega/audio/IvannaBridgePlayer.kt	2026-11-16 11:33:36.801580283 +0000
++++ b/app/src/main/java/com/ivanna/omega/audio/IvannaBridgePlayer.kt	2026-11-16 11:33:36.807390759 +0000
+@@ -852,12 +852,9 @@
+             var submittedFrames = 0L
+             submittedFramesForMetrics = 0L
+             var lastClockPollNs = 0L
+-            // Snap de nivel (v2.5.455): aviso una sola vez si el fallback
+-            // Kotlin descarta un snap (sin ASRC nativo no hay canal de
+-            // snap; el servo ppm sigue corrigiendo la deriva). Sin esto el
+-            // log se repetiría cada 250 ms mientras el buffer esté fuera
+-            // de rango.
+-            var fallbackSnapWarned = false
++            // Pacing de nivel (v2.5.457): último log del pacing (throttle
++            // a 1 línea cada 5 s; el pacing mismo corre en cada vuelta).
++            var lastPacingLogNs = 0L
+ 
+             val spatialInL = FloatArray(MAX_CHUNK_FRAMES)
+             val spatialInR = FloatArray(MAX_CHUNK_FRAMES)
+@@ -890,7 +887,46 @@
+                     if (npeKotlinEnabled) npeKotlin.reset()
+                 }
+ 
+-                if (!sawInputEOS) {
++            // Control de nivel por RITMO DE ESCRITURA (v2.5.457, fix raíz del
++            // PLL/ASRC): si la ocupación estimada del track supera el
++            // objetivo (capacidad/2), el productor (decodificador) se PAUSA
++            // y deja que el track drene — NO se escribe este bloque y NO se
++            // decodifica más hasta que el nivel baje. Sin pérdida de audio:
++            // el codec retiene sus buffers de salida (backpressure natural)
++            // y el ASRC/FIFO no se toca. Esto reemplaza al snap de nivel
++            // (455, legacy): el snap soltaba 2048 frames de contenido por
++            // sondeo pero el productor rellenaba el hueco con el siguiente
++            // bloque, así que el nivel se quedaba en ~98k y el audio perdía
++            // 17% de su contenido (metralleta, medido en vivo 2026-11-16).
++            // El nivel lo determina el ritmo de escritura, no un salto
++            // discreto: escribir solo cuando hay sitio por debajo del
++            // objetivo hace que el nivel converja al objetivo y se quede
++            // ahí (el ppm queda solo para la deriva real, ~+8.5 ppm).
++            // La estima es viva (entre sondeos del PLL, anclada al último
++            // timestamp); el retardo por iteración se acota a 50 ms y se
++            // re-evalúa en cada vuelta, así el drenado del exceso inicial
++            // (~52k frames, ~1 s) es progresivo y el track nunca se queda
++            // sin audio (siempre guarda ~el objetivo, ~0.96 s). El
++            // integrador de nivel del PI se resetea al pausar: el nivel ya
++            // lo maneja el pacing, y el PI no debe acumular windup por un
++            // error que él no corrige.
++            val pacingNowNs = SystemClock.elapsedRealtimeNanos()
++            val pacingEstOcc = bufferPll.estimateOccupancy(submittedFrames, pacingNowNs)
++            val pacingTarget = bufferPll.targetOccupancyFrames
++                .takeIf { it > 0L } ?: (track.bufferSizeInFrames / 2L).coerceAtLeast(1L)
++            if (pacingEstOcc > pacingTarget) {
++                val excessFrames = pacingEstOcc - pacingTarget
++                bufferPll.resetLevelIntegral()
++                val drainMs = (excessFrames * 1000L / sampleRate).coerceIn(5L, 50L)
++                if (pacingNowNs - lastPacingLogNs >= 5_000_000_000L) {
++                    lastPacingLogNs = pacingNowNs
++                    Log.d(TAG, "Pacing de nivel activo: occ est. $pacingEstOcc > objetivo $pacingTarget (exceso $excessFrames frames); pausa ${drainMs}ms")
++                }
++                delay(drainMs)
++                continue
++            }
++
++            if (!sawInputEOS) {
+                     val inIndex = codec.dequeueInputBuffer(TIMEOUT_US)
+                     if (inIndex >= 0) {
+                         val inBuf = codec.getInputBuffer(inIndex) ?: continue
+@@ -1063,28 +1099,16 @@
+                                         // (fallback, comportamiento actual).
+                                         // NUNCA los dos a la vez: sería doble
+                                         // corrección (2x ppm).
+-                                        // Snap de nivel (v2.5.455): corrección
+-                                        // DISCRETA del nivel del buffer (el ppm
+-                                        // solo corrige la deriva; el nivel lo
+-                                        // determina el priming). El PLL lo emite
+-                                        // cuando el buffer sale de [25%,75%] y
+-                                        // el ASRC lo aplica en su salida (con
+-                                        // dip de 64 frames en el empalme).
++                                        // LEGACY v2.5.457 — el snap de nivel ya
++                                        // no se aplica: el nivel lo controla el
++                                        // ritmo de escritura (pacing, arriba).
++                                        // RouteAAsrc.setLevelSnapFrames queda
++                                        // como no-op legacy; no se llama.
+                                         if (routeAAsrc.isAvailable) {
+                                             routeAAsrc.setClockCorrectionPpm(correctionPpm)
+-                                            routeAAsrc.setLevelSnapFrames(bufferPll.levelSnapFrames)
+                                             resampler.setClockCorrectionPpm(0.0)
+                                         } else {
+                                             resampler.setClockCorrectionPpm(correctionPpm)
+-                                            // Fallback Kotlin: sin ASRC nativo no
+-                                            // hay canal de snap (fail-closed: el
+-                                            // snap se descarta y el servo ppm
+-                                            // sigue corrigiendo la deriva). Aviso
+-                                            // una sola vez por sesión.
+-                                            if (bufferPll.levelSnapFrames != 0L && !fallbackSnapWarned) {
+-                                                fallbackSnapWarned = true
+-                                                Log.w(TAG, "Snap de nivel PLL=${bufferPll.levelSnapFrames} descartado: ASRC nativo no disponible (fallback Kotlin sin canal de snap)")
+-                                            }
+                                         }
+                                         OmegaMetrics.updateClockServoTelemetry(
+                                             timestampAvailable = true,
+diff --git a/app/src/main/java/com/ivanna/omega/audio/RouteAAsrc.kt b/app/src/main/java/com/ivanna/omega/audio/RouteAAsrc.kt
+--- a/app/src/main/java/com/ivanna/omega/audio/RouteAAsrc.kt	2026-11-16 11:33:36.822173153 +0000
++++ b/app/src/main/java/com/ivanna/omega/audio/RouteAAsrc.kt	2026-11-16 11:33:36.887106448 +0000
+@@ -46,15 +46,13 @@
+         private const val FIFO_HIGH_WATER_FRAMES = 8192 // válvula: drenar extra
+         private const val FIFO_DRAIN_EXTRA_FRAMES = 512
+         private const val PSI_TAPS = 64
+-        // Snap de nivel (v2.5.455): corrección discreta del nivel del
+-        // buffer del track, separada de la deriva (ppm). El PLL lo emite
+-        // cuando el buffer sale de [25%,75%]; aquí se aplica sobre la
+-        // salida drenada del FIFO — el punto que determina los frames que
+-        // van al track. El nativo NO lleva snap: su salida pasa por el
+-        // FIFO, que desacopla la producción del conteo de escritura al
+-        // track (un snap nativo se absorbería: el duplicado quedaría en el
+-        // FIFO sin llegar al track, y el soltado se retrasaría hasta
+-        // vaciar el backlog). Acotado a ±2048 frames (igual que el PLL).
++        // LEGACY v2.5.457 — SNAP DE NIVEL DESACTIVADO (ver setLevelSnapFrames).
++        // El snap soltaba contenido sin bajar el nivel; el nivel lo controla
++        // el ritmo de escritura del reproductor (pacing). Estas constantes y
++        // applyLevelSnap se conservan (nunca se borra código) como
++        // pass-through: pendingSnapFrames siempre es 0, así que applyLevelSnap
++        // devuelve la salida drenada sin tocarla.
++        @Suppress("unused")
+         private const val LEVEL_SNAP_MAX_FRAMES = 2048L
+         // Dip de 64 frames (~1.33 ms a 48 kHz) en el empalme del snap:
+         // fade-out antes del salto y fade-in después, para no hacer click.
+@@ -69,11 +67,10 @@
+ 
+     private var handle: Long = 0L
+ 
+-    // Snap de nivel pendiente (frames): positivo = soltar, negativo =
+-    // duplicar. Lo fija el reproductor (setLevelSnapFrames) tras cada
+-    // observe() del PLL; lo consume applyLevelSnap en processInto.
+-    // No es acumulativo: el último valor manda (el PLL lo recalcula cada
+-    // 250 ms desde la ocupación viva).
++    // LEGACY v2.5.457 — snap desactivado: pendingSnapFrames siempre es 0
++    // (setLevelSnapFrames es no-op y el reproductor ya no lo llama).
++    // Se conserva el campo para que applyLevelSnap siga siendo pass-through
++    // y reset()/close() lo dejen en 0.
+     private var pendingSnapFrames: Long = 0L
+     // Fade-in pendiente (frames) de la segunda mitad del dip de un snap
+     // anterior: se aplica al inicio del próximo bloque drenado.
+@@ -146,22 +143,20 @@
+     }
+ 
+     /**
+-     * Snap de nivel del PLL (v2.5.455): corrección discreta de frames
+-     * para llevar el buffer del track al objetivo. Positivo = sobran
+-     * frames (soltar); negativo = faltan (duplicar). Se aplica en
+-     * processInto sobre la salida drenada (el punto que determina los
+-     * frames que van al track), con dip de 64 frames en el empalme.
+-     * Acotado a ±2048 (igual que el PLL); el último valor manda.
+-     * Sin nativo es no-op: el llamador debe registrarlo (el fallback
+-     * Kotlin no tiene canal de snap; el servo ppm sigue corrigiendo la
+-     * deriva). No toca el camino de audio si no hay snap pendiente.
++     * LEGACY v2.5.457 — SNAP DE NIVEL DESACTIVADO (no-op). Antes (455) el
++     * PLL emitía un salto discreto de frames y aquí se aplicaba sobre la
++     * salida drenada. El snap soltaba contenido sin bajar el nivel (el
++     * productor rellenaba el hueco), así que el nivel lo controla ahora el
++     * ritmo de escritura del reproductor (pacing). Este método ya no hace
++     * nada (ignora el valor) y el reproductor ya no lo llama; se conserva
++     * la firma para no romper la API. applyLevelSnap queda como pass-through
++     * (pendingSnapFrames siempre es 0).
+      */
+     fun setLevelSnapFrames(frames: Long) {
+-        if (!isAvailable) return
+-        pendingSnapFrames = frames.coerceIn(-LEVEL_SNAP_MAX_FRAMES, LEVEL_SNAP_MAX_FRAMES)
++        // No-op legacy (457): el nivel lo controla el pacing, no el snap.
+     }
+ 
+-    /** Snap de nivel pendiente de aplicar (diagnóstico, frames). */
++    /** Snap de nivel pendiente de aplicar (diagnóstico, frames). Siempre 0 (legacy 457). */
+     val levelSnapPending: Long
+         get() = pendingSnapFrames
+ 
+@@ -240,17 +235,10 @@
+         snapFadeInRemaining = 0
+     }
+ 
+-    // ── Snap de nivel (v2.5.455) ─────────────────────────────────────────
+-    // Aplica el snap pendiente sobre la salida drenada (`out[0..frames]`)
+-    // y devuelve los frames a escribir al track. Soltar = entregar menos
+-    // frames (los últimos `drop` de `out` se descartan; el FIFO ya los
+-    // consumió, así que el track recibe menos y su buffer drena).
+-    // Duplicar = repetir la cola de lo entregado (el track recibe más y
+-    // su buffer se llena). El dip de 64 frames en el empalme evita el
+-    // click del salto (soltar salta hacia adelante, duplicar hacia atrás).
+-    // El snap se consume gradualmente: lo que no cabe en este bloque queda
+-    // pendiente para el próximo (drop acotado por los frames drenados,
+-    // duplicado acotado por la capacidad de `out` y 512 por llamada).
++    // ── Snap de nivel (v2.5.455, LEGACY 457: pass-through) ─────────────
++    // applyLevelSnap se conserva sin cambios (nunca se borra código); con
++    // pendingSnapFrames siempre en 0 devuelve la salida drenada sin tocarla.
++    // El nivel lo controla el ritmo de escritura del reproductor (pacing).
+     private fun applyLevelSnap(frames: Int, out: FloatArray): Int {
+         var take = frames
+         // Fade-in pendiente de un snap anterior (segunda mitad del dip).
+diff --git a/app/src/test/java/com/ivanna/omega/audio/AudioTrackBufferPllTest.kt b/app/src/test/java/com/ivanna/omega/audio/AudioTrackBufferPllTest.kt
+--- a/app/src/test/java/com/ivanna/omega/audio/AudioTrackBufferPllTest.kt	2026-11-16 11:33:36.902222052 +0000
++++ b/app/src/test/java/com/ivanna/omega/audio/AudioTrackBufferPllTest.kt	2026-11-16 11:33:36.904140772 +0000
+@@ -404,14 +404,15 @@
+         // underruns es un error de cola real y el PI SÍ debe actuar sobre
+         // él. Si este test fallara, el hold de la 420 habría dejado al servo
+         // sordo ante la cola.
+-        // v2.5.455: con el snap de nivel, el error de cola (fase +0.40)
+-        // lo maneja el snap (2048 frames) y el PI ya no se clava en el
+-        // riel: converge al valor proporcional (~-315 ppm) porque el snap
+-        // resetea el integrador en cada sondeo. El servo SÍ actúa (la
+-        // corrección se mueve claramente en negativo y el snap se emite),
+-        // pero el riel ya no es el resultado esperado para un error de
+-        // NIVEL: el riel queda reservado para la DERIVA (ver
+-        // largeNegativeDriftRailsAtFiveHundredPpmAndReportsDemand415).
++        // v2.5.457 — el snap ya NO existe (legacy): el nivel lo controla el
++        // ritmo de escritura del reproductor (pacing), no el PLL. En
++        // aislamiento (este test, cola forzada a 9_000 sin pacing) el PI
++        // SÍ se clava en el riel -500: es el comportamiento correcto del
++        // PLL solo — el nivel es trabajo del reproductor, no del ppm. Lo que
++        // el test verifica ahora: el servo actúa (corrección muy negativa),
++        // el snap es 0 (desactivado) y no hay holds por inanición. La
++        // convergencia real del nivel la prueba el pacing (test de dinámica
++        // del bucle en host) y la escucha en vivo, no este unit test.
+         val pll = AudioTrackBufferPll(48_000)
+         repeat(100) { k ->
+             val t = 1.0 + k * 0.25
+@@ -420,10 +421,9 @@
+             val queue = if (k < 20) 5_000L else 9_000L
+             pll.observe(consumed + queue, consumed, 10_000, timeNs, underruns = 0L)
+         }
+-        assertEquals(2048L, pll.levelSnapFrames)
++        assertEquals(0L, pll.levelSnapFrames)
+         assertTrue("sin inanición, el PI debe corregir el error de cola", pll.correctionPpm <= -200.0)
+-        assertTrue("el snap maneja el nivel: el PI no debe clavarse en el riel por un error de cola", pll.correctionPpm > -500.0)
+-        assertTrue("el snap maneja el nivel: no debe estar en el riel", !pll.isAtRail)
++        assertTrue("el riel queda reservado para el error de nivel sostenido sin pacing (el pacing real lo evita)", pll.isAtRail)
+         assertEquals(0L, pll.starvationHolds)
+     }
+ 
+@@ -441,13 +441,17 @@
+         assertEquals(0L, pll.lastBufferCapacityFrames)
+     }
+ 
+-    // ── v2.5.455: SNAP DE NIVEL — DERIVA Y NIVEL SEPARADOS ──
+-    // Medido en vivo en la 454 (2026-11-15): el buffer sobre-lleno
++    // ── v2.5.457: SNAP DE NIVEL DESACTIVADO — EL NIVEL LO LLEVA EL PACING ──
++    // Medido en vivo en la 454/456 (2026-11-15/16): el buffer sobre-lleno
+     // (occ 97_802, cap 92_256, fase +0.56) clavaba el servo en el riel
+-    // -500 ppm con deriva real de solo +8.5 ppm. La autoridad ±500 ppm no
+-    // puede drenar el nivel (24 frames/s); el nivel lo corrige el snap
+-    // discreto (±2048 frames) y el ppm queda solo para la deriva.
+-    @Test fun overfullBufferEmitsBoundedPositiveSnapAndResetsIntegrator455() {
++    // -500 ppm con deriva real de solo +8.5 ppm, y el snap (455) soltaba
++    // 2048 frames de contenido por sondeo sin bajar el nivel (el productor
++    // rellenaba el hueco). El nivel lo controla ahora el ritmo de escritura
++    // del reproductor (pacing): el PLL ya no emite snap (siempre 0) y el
++    // reproductor resetea el integrador de nivel cuando el pacing está
++    // activo (resetLevelIntegral), para que el PI no acumule windup por un
++    // error que él no corrige.
++    @Test fun overfullBufferEmitsNoSnapAndPacingResetClearsIntegrator457() {
+         val pll = AudioTrackBufferPll(48_000)
+         var consumed = 0L
+         repeat(50) { k ->
+@@ -455,28 +459,32 @@
+             val timeNs = (t * 1.0e9).toLong()
+             consumed = (t * 48_000.0).toLong()
+             pll.observe(consumed + 9_000L, consumed, 10_000, timeNs, underruns = 0L)
++            // El reproductor, al pausar por pacing (nivel sobre el objetivo),
++            // resetea el integrador de nivel: sin esto, 50 sondeos sobre-llenos
++            // acumularían ~1.6 s de error y la demanda seguiría en ~-200 ppm
++            // aunque el nivel ya esté en el objetivo.
++            pll.resetLevelIntegral()
+         }
+-        // Desviación real 4_000 frames, acotada a 2048.
+-        assertEquals(2048L, pll.levelSnapFrames)
+-        // Volver al objetivo: la demanda debe ser pequeña. Sin el reset
+-        // del integrador, 50 sondeos sobre-llenos habrían acumulado ~4 s
+-        // de error y la demanda seguiría en ~-300 o más; con el reset (el
+-        // snap ya corrigió el nivel) solo queda el residuo de un paso.
++        // Sin snap: el nivel ya no se corrige con un salto discreto.
++        assertEquals(0L, pll.levelSnapFrames)
++        // Volver al objetivo: la demanda debe ser pequeña (integrador
++        // reseteado por el pacing, no por un snap).
+         val t = 1.0 + 50 * 0.25
+         val timeNs = (t * 1.0e9).toLong()
+         consumed = (t * 48_000.0).toLong()
+         pll.observe(consumed + 5_000L, consumed, 10_000, timeNs, underruns = 0L)
+         assertEquals(0L, pll.levelSnapFrames)
+         assertTrue(
+-            "tras el snap, al volver al objetivo la demanda debe ser pequeña (integrador reseteado), no ${pll.demandedPpm}",
++            "tras el reset del integrador por pacing, al volver al objetivo la demanda debe ser pequeña, no ${pll.demandedPpm}",
+             abs(pll.demandedPpm) < 50.0
+         )
+     }
+ 
+-    @Test fun nearEmptyBufferEmitsNegativeSnap455() {
+-        // Buffer casi vacío (1_000/10_000, fase -0.40): snap negativo
+-        // acotado a -2048 (la desviación real es -4_000): hay que duplicar
+-        // frames. El PI además pide producir más rápido.
++    @Test fun nearEmptyBufferEmitsNoSnap457() {
++        // Buffer casi vacío (1_000/10_000, fase -0.40): SIN snap (457).
++        // El nivel bajo lo maneja el PI (pide producir más rápido) y el
++        // productor, que va por delante del consumo; no se duplica contenido
++        // (el snap negativo duplicaba frames y el productor ya los repone).
+         val pll = AudioTrackBufferPll(48_000)
+         var timeNs = 1_000_000_000L
+         pll.observe(1_000, 0, 10_000, timeNs)
+@@ -484,14 +492,15 @@
+             timeNs += 100_000_000L
+             pll.observe(1_000, 0, 10_000, timeNs)
+         }
+-        assertEquals(-2048L, pll.levelSnapFrames)
++        assertEquals(0L, pll.levelSnapFrames)
+         assertTrue("cola baja debe pedir producir más rápido", pll.correctionPpm > 0.0)
+         assertTrue("la corrección sigue acotada a ±500", pll.correctionPpm in -500.0..500.0)
+     }
+ 
+     @Test fun bufferNearTargetEmitsNoSnap455() {
+         // Dentro de [25%,75%] de capacidad no hay snap: el ppm lleva el
+-        // nivel fino. El snap solo salta fuera de esa banda.
++        // nivel fino. (457: el snap ya no existe en ningún caso; este test
++        // queda como regresión de que el PLL no emite saltos discretos.)
+         val pll = AudioTrackBufferPll(48_000)
+         var timeNs = 1_000_000_000L
+         pll.observe(5_000, 0, 10_000, timeNs)
+@@ -513,8 +522,8 @@
+         // Caso vivo 2026-11-15 (454): deriva real de +8.5 ppm con el
+         // buffer en el objetivo. La deriva pequeña se corrige por ppm (sin
+         // tocar el riel) y NO genera snap: el snap es solo para el NIVEL,
+-        // no para la deriva. Si el snap se disparara por deriva, el servo
+-        // soltaría/duplicaría frames sin necesidad.
++        // no para la deriva. (457: el snap ya no existe; la deriva sigue
++        // por ppm y el nivel por pacing.)
+         val pll = AudioTrackBufferPll(48_000)
+         var consumed = 0L
+         repeat(100) { k ->
+@@ -529,4 +538,44 @@
+         assertTrue("la corrección por deriva pequeña no toca el riel", pll.correctionPpm < 50.0)
+         assertTrue(!pll.isAtRail)
+     }
++
++    // ── v2.5.457: ESTIMA DE OCUPACIÓN VIVA (pacing) ──
++    @Test fun estimateOccupancyTracksSubmittedMinusConsumed457() {
++        // Ancla = último sondeo (consumed + timestamp); entre sondeos el
++        // consumo se estima al ritmo nominal. Con submitted=20_000 y
++        // consumed=8_000 en t=1s, a t=1.25s el consumo estimado es
++        // 8_000 + 0.25*48_000 = 20_000 → ocupación 0.
++        val pll = AudioTrackBufferPll(48_000)
++        pll.observe(20_000, 8_000, 10_000, 1_000_000_000L, underruns = 0L)
++        assertEquals(0L, pll.estimateOccupancy(20_000, 1_250_000_000L))
++        // A t=1.125s: consumo 8_000 + 6_000 = 14_000 → ocupación 6_000.
++        assertEquals(6_000L, pll.estimateOccupancy(20_000, 1_125_000_000L))
++        // Nunca negativa: si lo enviado es menos que lo estimado, 0.
++        assertEquals(0L, pll.estimateOccupancy(5_000, 1_250_000_000L))
++    }
++
++    @Test fun estimateOccupancyBeforeFirstPollIsSubmitted457() {
++        // Sin sondeo aún no hay ancla: la ocupación es lo enviado (el track
++        // acaba de arrancar; sobre-estimar al inicio frena el priming antes
++        // de que el buffer se llene).
++        val pll = AudioTrackBufferPll(48_000)
++        assertEquals(9_000L, pll.estimateOccupancy(9_000, 1_000_000_000L))
++        assertEquals(0L, pll.estimateOccupancy(0, 1_000_000_000L))
++    }
++
++    @Test fun resetLevelIntegralClearsWindupWithoutTouchingClock457() {
++        // El reset del integrador (pacing) solo toca el PI de nivel: la
++        // estima de reloj (deriva medida) sobrevive.
++        val pll = AudioTrackBufferPll(48_000)
++        var consumed = 0L
++        repeat(100) { k ->
++            val t = 1.0 + k * 0.25
++            consumed = (t * 48_000.0 * (1.0 + 8.5e-6)).toLong()
++            pll.observe(consumed + 5_000L, consumed, 10_000, (t * 1.0e9).toLong(), underruns = 0L)
++        }
++        assertTrue("la deriva debe estar medida antes del reset", pll.isDriftLocked)
++        pll.resetLevelIntegral()
++        assertTrue("el reset de nivel no debe borrar la estima de reloj", pll.isDriftLocked)
++        assertEquals(8.5, pll.measuredDriftPpm, 3.0)
++    }
+ }
+diff --git a/telemetry/ctest_summary.json b/telemetry/ctest_summary.json
+--- a/telemetry/ctest_summary.json	2026-11-16 11:36:34.810373780 +0000
++++ b/telemetry/ctest_summary.json	2026-11-16 11:36:34.814112771 +0000
+@@ -1,8 +1,8 @@
+ {
+-  "passed": 1055,
++  "passed": 1060,
+   "failed": 0,
+-  "total": 1055,
++  "total": 1060,
+   "pass_rate_percent": 100,
+-  "duration_sec": 57.65,
+-  "badge_label": "1055/1055"
+-}
++  "duration_sec": 55.67,
++  "badge_label": "1060/1060"
++}
+\ No newline at end of file

@@ -1,0 +1,98 @@
+name: Fase 5 — Quality Gate (Controlador Maestro)
+
+# FASE 5: Banco de Laboratorio Automático en CI (Audio Quality Gate).
+# Ningún commit a main puede degradar:
+#   1. Null-test maestro (BYPASS / LIMPIO_OFF < -140 dB, bit-exacto):
+#      test_fase5_quality_gate — Fase5QualityGate.MasterNeutralNullTest...
+#   2. THD+N línea base (ORBE < -139 dB, HOLOS retune < -94 dB @1 kHz,
+#      -1 dBFS): mismo test, Fase5QualityGate.OrbeThdnBaseline /
+#      Fase5QualityGate.HolosThdnBaselineProductionRetune.
+#   3. Integridad RT (cero malloc / cero locks / cero logs en callback):
+#      test_rt_no_alloc — RtNoAllocDetectorTest.*10000BlocksZeroAlloc
+#      (el detector dinámico; NO se duplica en el test del gate).
+#   4. Contrato del flag maestro: test_master_bypass — MasterBypass.*
+#
+# Workflow NUEVO y enfocado: construye SOLO los 3 targets del gate y
+# corre SOLO sus tests (rápido, sin esperar la suite completa de
+# tests-host.yml). NO toca los umbrales de perfection-gate.py (eso lo
+# decide Esse). Si cualquiera de estos tests falla, la puerta falla y
+# el commit no debe llegar a main.
+#
+# Límite honesto: esto corre en host x86-64. El early-return bit-exacto
+# de nativeProcess / omega_process y el ABX en el G85 se validan en
+# dispositivo (ver REPORT.md de la propuesta Fase 5).
+
+on:
+  push:
+    paths:
+      - 'app/src/main/cpp/**'
+      - 'app/src/main/java/com/ivanna/omega/audio/MasterStateController.kt'
+      - 'app/src/main/java/com/ivanna/omega/audio/EffectsOffTransition.kt'
+      - 'app/src/main/java/com/ivanna/omega/audio/DspStateUpdater.kt'
+      - 'app/src/main/java/com/ivanna/omega/audio/Iso226Calibrator.kt'
+      - 'app/src/main/java/com/ivanna/omega/dsp/DSPState.kt'
+      - 'app/src/main/java/com/ivanna/omega/core/PersistedStateRestorer.kt'
+      - 'app/src/main/java/com/ivanna/omega/ui/viewmodels/PerceptualViewModel.kt'
+      - 'app/src/main/java/com/ivanna/omega/spatial/MasterStateAbxSession.kt'
+      - 'app/src/main/java/com/ivanna/omega/ui/AbxTestScreen.kt'
+      - '.github/workflows/fase5-quality-gate.yml'
+  pull_request:
+    paths:
+      - 'app/src/main/cpp/**'
+      - 'app/src/main/java/com/ivanna/omega/audio/MasterStateController.kt'
+      - 'app/src/main/java/com/ivanna/omega/audio/EffectsOffTransition.kt'
+      - 'app/src/main/java/com/ivanna/omega/audio/DspStateUpdater.kt'
+      - 'app/src/main/java/com/ivanna/omega/audio/Iso226Calibrator.kt'
+      - 'app/src/main/java/com/ivanna/omega/dsp/DSPState.kt'
+      - 'app/src/main/java/com/ivanna/omega/core/PersistedStateRestorer.kt'
+      - 'app/src/main/java/com/ivanna/omega/ui/viewmodels/PerceptualViewModel.kt'
+      - 'app/src/main/java/com/ivanna/omega/spatial/MasterStateAbxSession.kt'
+      - 'app/src/main/java/com/ivanna/omega/ui/AbxTestScreen.kt'
+      - '.github/workflows/fase5-quality-gate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fase5-quality-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fase5-quality-gate:
+    name: Fase 5 Quality Gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Instalar g++-14 (compilador CTest)
+        run: |
+          if ! command -v g++-14 >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq g++-14
+          fi
+          g++-14 --version | head -1
+
+      - name: Instalar cmake (verificación explícita de versión)
+        run: |
+          cmake --version || { sudo apt-get update -qq && sudo apt-get install -y -qq cmake; }
+          cmake --version | head -1
+
+      - name: Configurar tests host
+        run: |
+          cmake -S app/src/main/cpp/tests -B build/tests-host \
+            -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14
+
+      - name: Compilar solo los targets del gate
+        run: |
+          cmake --build build/tests-host -j2 --target \
+            test_fase5_quality_gate test_rt_no_alloc test_master_bypass
+
+      - name: Correr la puerta Fase 5 (null-test + THD+N + RT + flag maestro)
+        run: |
+          cd build/tests-host
+          ctest -R 'Fase5QualityGate|RtNoAllocDetectorTest|MasterBypass' \
+            --output-on-failure --timeout 300
+
+      - name: Resumen
+        run: echo "Puerta Fase 5 ejecutada. Un fallo aquí = regresión de calidad de audio o del controlador maestro — no se ignora."

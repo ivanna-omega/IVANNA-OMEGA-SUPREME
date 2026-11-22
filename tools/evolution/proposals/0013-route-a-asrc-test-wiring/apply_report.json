@@ -1,0 +1,21 @@
+{
+  "proposal": "0013-route-a-asrc-test-wiring",
+  "status": "already_applied",
+  "applied": false,
+  "dry_run": true,
+  "council": {
+    "approved": false,
+    "evidence": "sin registro de aprobación del consejo en la propuesta"
+  },
+  "council_override": true,
+  "files": [
+    "README.md",
+    "app/src/main/cpp/tests/CMakeLists.txt",
+    "telemetry/ctest_summary.json"
+  ],
+  "already_applied": {
+    "state": "exact",
+    "detail": "git apply --check --reverse limpio"
+  },
+  "reason": "el cambio ya está en el árbol (exact): git apply --check --reverse limpio"
+}

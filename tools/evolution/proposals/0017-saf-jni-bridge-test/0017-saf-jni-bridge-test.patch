@@ -1,0 +1,345 @@
+diff --git a/README.md b/README.md
+index b81b692..1dd555b 100644
+--- a/README.md
++++ b/README.md
+@@ -505,7 +505,7 @@ The evolution motor (`tools/evolution/`) runs on the development side (where the
+ 
+ | Suite | Result | Evidence |
+ |:---|:---|:---|
+-| CTest (DSP host suite) | **1046/1046** | Host local, suite completa (1046/1046, v2.5.456; twiddles precalculados en el RIR + micro-opts exactas en HOLOS + test_route_a_asrc cableado + test_pi_lstm_bridge_jni + test_benchmark_jni) |
++| CTest (DSP host suite) | **1052/1052** | Host local, suite completa (1052/1052, v2.5.456; twiddles precalculados en el RIR + micro-opts exactas en HOLOS + test_route_a_asrc cableado + test_pi_lstm_bridge_jni + test_benchmark_jni + test_saf_jni_bridge) |
+ | ASRC core | **25/25** | Host, v2.5.439 (see §05.4) |
+ | Daemon command responder | **28/28** | Host, v2.5.440 (real round-trip over abstract socket) |
+ | Council (multi-model) | **14/14** | Python unit tests, v2.5.445 (mocked LLM: verdicts, rounds, fail-closed) |
+diff --git a/app/src/main/cpp/tests/CMakeLists.txt b/app/src/main/cpp/tests/CMakeLists.txt
+index 6778bb9..31fbcaf 100644
+--- a/app/src/main/cpp/tests/CMakeLists.txt
++++ b/app/src/main/cpp/tests/CMakeLists.txt
+@@ -1608,6 +1608,32 @@ if(IVANNA_SAN_FLAGS)
+ endif()
+ gtest_discover_tests(test_benchmark_jni)
+ 
++# ── test_saf_jni_bridge: bridge JNI SAF (0017) ───────────────────────────────
++# SaFJniBridge.cpp (130 líneas) estaba entre los 19 módulos sin tests:
++# bridge JNI de SaFBridge ↔ SaFOptimizer. Se compila el bridge + el
++# optimizador + SafGlobalBridge (getGlobalSaF) con el stub JNI de host.
++# ivanna_saf_apply_latent (definida en el efecto AudioFlinger en producción)
++# se sustituye por un stub en el test que captura el q propagado al
++# renderer — es el cable que hace que el audio cambie tras el feedback.
++add_executable(test_saf_jni_bridge
++  test_saf_jni_bridge.cpp
++  ../SaFJniBridge.cpp
++  ../SaFOptimizer.cpp
++  ../SafGlobalBridge.cpp
++)
++target_link_libraries(test_saf_jni_bridge PRIVATE GTest::gtest_main)
++target_include_directories(test_saf_jni_bridge PRIVATE
++  ..
++  ../include
++  host_stubs
++)
++target_compile_options(test_saf_jni_bridge PRIVATE -Wall -Wextra)
++if(IVANNA_SAN_FLAGS)
++  target_compile_options(test_saf_jni_bridge PRIVATE ${IVANNA_SAN_FLAGS})
++  target_link_options(test_saf_jni_bridge PRIVATE ${IVANNA_SAN_FLAGS})
++endif()
++gtest_discover_tests(test_saf_jni_bridge)
++
+ # ── FASE 3: 41 external fun conectadas con llamadores reales en Kotlin ─────────
+ add_executable(test_phase3_jni_callers
+   test_phase3_jni_callers.cpp
+diff --git a/app/src/main/cpp/tests/test_saf_jni_bridge.cpp b/app/src/main/cpp/tests/test_saf_jni_bridge.cpp
+new file mode 100644
+index 0000000..8d53fa9
+--- /dev/null
++++ b/app/src/main/cpp/tests/test_saf_jni_bridge.cpp
+@@ -0,0 +1,172 @@
++// test_saf_jni_bridge.cpp — Tests de host del bridge JNI SAF
++// (propuesta 0017, coordinador del Plan Omnipotencia).
++//
++// SaFJniBridge.cpp (130 líneas) estaba entre los 19 módulos sin tests:
++// bridge JNI de SaFBridge (Kotlin) ↔ SaFOptimizer. El test usa el stub
++// JNI de host (tests/host_stubs/jni.h, que implementa NewFloatArray /
++// SetFloatArrayRegion / GetStringUTFChars) y un stub de
++// ivanna_saf_apply_latent que captura el vector q propagado al renderer
++// (el cable SAF → ObjectRenderer: sin él, el optimizador convergía pero
++// el audio nunca cambiaba).
++//
++// Lo que se verifica (comportamiento, no implementación):
++// - nativeSaFReset pone q=0, iteración=0 y PROPAGA q al renderer (el
++//   stub registra la llamada con q=0).
++// - nativeSaFFeedback cambia q (gradiente) y PROPAGA el q actualizado.
++// - nativeSaFGetStatus devuelve 8 floats: q[0..6] + flag modelo (0 sin
++//   init); nativeSaFGetParams devuelve los mismos 7 q.
++// - nativeSaFGetIteration crece con el feedback; nativeSaFGetError y
++//   nativeSaFIsConverged devuelven valores finitos / booleanos sanos.
++// - nativeSaFInit con ruta inexistente devuelve false (sin crash) y el
++//   flag de modelo sigue en 0.
++//
++// Nota de orden: el optimizador es un singleton global (getGlobalSaF).
++// Cada test que necesita un estado conocido llama nativeSaFReset primero.
++#include <cmath>
++#include <cstring>
++#include <gtest/gtest.h>
++#include <jni.h>
++
++namespace {
++// Stub de ivanna_saf_apply_latent (definida en omega_effect.cpp en
++// producción): captura el último q propagado y cuenta las llamadas.
++float g_lastLatent[7] = {};
++int g_applyCount = 0;
++}  // namespace
++
++extern "C" void ivanna_saf_apply_latent(const float q[7]) {
++    std::memcpy(g_lastLatent, q, sizeof(g_lastLatent));
++    ++g_applyCount;
++}
++
++extern "C" {
++JNIEXPORT jboolean JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFInit(JNIEnv*, jobject, jstring);
++JNIEXPORT void JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFFeedback(JNIEnv*, jobject, jint, jboolean);
++JNIEXPORT jfloatArray JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetStatus(JNIEnv*, jobject);
++JNIEXPORT jfloatArray JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetParams(JNIEnv*, jobject);
++JNIEXPORT jint JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetIteration(JNIEnv*, jobject);
++JNIEXPORT void JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFReset(JNIEnv*, jobject);
++JNIEXPORT jboolean JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFIsConverged(JNIEnv*, jobject);
++JNIEXPORT jfloat JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetError(JNIEnv*, jobject);
++JNIEXPORT jboolean JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFSaveState(JNIEnv*, jobject, jstring);
++JNIEXPORT jboolean JNICALL
++Java_com_ivanna_omega_saf_SaFBridge_nativeSaFLoadState(JNIEnv*, jobject, jstring);
++}
++
++namespace {
++
++void ReadParams(JNIEnv* env, float out[7]) {
++    jfloatArray arr =
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetParams(env, nullptr);
++    ASSERT_NE(arr, nullptr);
++    EXPECT_EQ(env->GetArrayLength(arr), 7);
++    jfloat* data = env->GetFloatArrayElements(arr, nullptr);
++    ASSERT_NE(data, nullptr);
++    std::memcpy(out, data, sizeof(float) * 7);
++}
++
++bool AllFinite(const float* v, int n) {
++    for (int i = 0; i < n; ++i) {
++        if (!std::isfinite(v[i])) return false;
++    }
++    return true;
++}
++
++}  // namespace
++
++TEST(SaFJniBridgeTest, ResetPropagatesZeroLatent) {
++    JNIEnv env{};
++    g_applyCount = 0;
++    Java_com_ivanna_omega_saf_SaFBridge_nativeSaFReset(&env, nullptr);
++    EXPECT_GE(g_applyCount, 1);
++    for (int i = 0; i < 7; ++i) {
++        EXPECT_FLOAT_EQ(g_lastLatent[i], 0.0f);
++    }
++    EXPECT_EQ(
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetIteration(&env, nullptr), 0);
++}
++
++TEST(SaFJniBridgeTest, FeedbackChangesParamsAndPropagates) {
++    JNIEnv env{};
++    Java_com_ivanna_omega_saf_SaFBridge_nativeSaFReset(&env, nullptr);
++    g_applyCount = 0;
++    Java_com_ivanna_omega_saf_SaFBridge_nativeSaFFeedback(&env, nullptr, 0, JNI_FALSE);
++    EXPECT_GE(g_applyCount, 1);
++    float q[7];
++    ReadParams(&env, q);
++    EXPECT_TRUE(AllFinite(q, 7));
++    bool changed = false;
++    for (int i = 0; i < 7; ++i) {
++        if (q[i] != 0.0f) changed = true;
++        EXPECT_FLOAT_EQ(g_lastLatent[i], q[i]);
++    }
++    EXPECT_TRUE(changed);
++    EXPECT_GT(
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetIteration(&env, nullptr), 0);
++}
++
++TEST(SaFJniBridgeTest, StatusMatchesParamsPlusModelFlag) {
++    JNIEnv env{};
++    Java_com_ivanna_omega_saf_SaFBridge_nativeSaFReset(&env, nullptr);
++    jfloatArray st =
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetStatus(&env, nullptr);
++    ASSERT_NE(st, nullptr);
++    EXPECT_EQ(env.GetArrayLength(st), 8);
++    jfloat* data = env.GetFloatArrayElements(st, nullptr);
++    ASSERT_NE(data, nullptr);
++    EXPECT_TRUE(AllFinite(data, 8));
++    EXPECT_FLOAT_EQ(data[7], 0.0f);  // sin init: modelo no cargado
++    float q[7];
++    ReadParams(&env, q);
++    for (int i = 0; i < 7; ++i) {
++        EXPECT_FLOAT_EQ(data[i], q[i]);
++    }
++}
++
++TEST(SaFJniBridgeTest, InitWithBadPathReturnsFalse) {
++    JNIEnv env{};
++    Java_com_ivanna_omega_saf_SaFBridge_nativeSaFReset(&env, nullptr);
++    jstring bad = env.NewStringUTF("/no/existe/SAF_model.json");
++    const jboolean ok =
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFInit(&env, nullptr, bad);
++    EXPECT_EQ(ok, JNI_FALSE);
++    jfloatArray st =
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetStatus(&env, nullptr);
++    ASSERT_NE(st, nullptr);
++    jfloat* data = env.GetFloatArrayElements(st, nullptr);
++    ASSERT_NE(data, nullptr);
++    EXPECT_FLOAT_EQ(data[7], 0.0f);  // modelo sigue sin cargar
++}
++
++TEST(SaFJniBridgeTest, ErrorAndConvergedAreSane) {
++    JNIEnv env{};
++    Java_com_ivanna_omega_saf_SaFBridge_nativeSaFReset(&env, nullptr);
++    const float err =
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetError(&env, nullptr);
++    EXPECT_TRUE(std::isfinite(err));
++    EXPECT_GE(err, 0.0f);
++    const jboolean conv =
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFIsConverged(&env, nullptr);
++    EXPECT_TRUE(conv == JNI_TRUE || conv == JNI_FALSE);
++}
++
++TEST(SaFJniBridgeTest, InvalidFeedbackDirectionIsIgnored) {
++    JNIEnv env{};
++    Java_com_ivanna_omega_saf_SaFBridge_nativeSaFReset(&env, nullptr);
++    const int iterBefore =
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetIteration(&env, nullptr);
++    Java_com_ivanna_omega_saf_SaFBridge_nativeSaFFeedback(&env, nullptr, -1, JNI_TRUE);
++    Java_com_ivanna_omega_saf_SaFBridge_nativeSaFFeedback(&env, nullptr, 99, JNI_TRUE);
++    EXPECT_EQ(
++        Java_com_ivanna_omega_saf_SaFBridge_nativeSaFGetIteration(&env, nullptr),
++        iterBefore);
++}
+diff --git a/telemetry/ctest_summary.json b/telemetry/ctest_summary.json
+index a4c89af..bb165a2 100644
+--- a/telemetry/ctest_summary.json
++++ b/telemetry/ctest_summary.json
+@@ -1,8 +1,8 @@
+ {
+-  "passed": 1046,
++  "passed": 1052,
+   "failed": 0,
+-  "total": 1046,
++  "total": 1052,
+   "pass_rate_percent": 100,
+-  "duration_sec": 58.21,
+-  "badge_label": "1046/1046"
++  "duration_sec": 57.07,
++  "badge_label": "1052/1052"
+ }
+diff --git a/tools/evolution/evolution_engine.py b/tools/evolution/evolution_engine.py
+index 36f3fd1..743b53e 100644
+--- a/tools/evolution/evolution_engine.py
++++ b/tools/evolution/evolution_engine.py
+@@ -739,8 +739,17 @@ def scan_dead_functions():
+ 
+ 
+ def scan_untested_modules():
+-    """Módulos .cpp de primer nivel sin referencia en tests/CMakeLists.txt."""
+-    cmake = (REPO / "app/src/main/cpp/tests/CMakeLists.txt").read_text()
++    """Módulos .cpp de primer nivel sin referencia en tests/CMakeLists.txt.
++
++    La referencia debe ser CÓDIGO (una fuente en add_executable o en la
++    librería), no un comentario: antes un `#` que mencionaba el nombre
++    (p. ej. IvannaFusionCore.cpp, comentado en la lista de la librería
++    y citado en una explicación) lo daba por cableado aunque ningún
++    target lo compila (0017). Se quitan los comentarios `#...` antes
++    del substring, mismo patrón que check_header_wiring.
++    """
++    cmake_raw = (REPO / "app/src/main/cpp/tests/CMakeLists.txt").read_text()
++    cmake = "\n".join(line.split("#", 1)[0] for line in cmake_raw.splitlines())
+     out = []
+     for path in sorted((REPO / "app/src/main/cpp").glob("*.cpp")):
+         if path.name not in cmake:
+diff --git a/tools/evolution/tests/test_scan_untested_modules.py b/tools/evolution/tests/test_scan_untested_modules.py
+new file mode 100644
+index 0000000..d0a9251
+--- /dev/null
++++ b/tools/evolution/tests/test_scan_untested_modules.py
+@@ -0,0 +1,70 @@
++"""Tests de scan_untested_modules (propuesta 0017, coordinador del Plan
++Omnipotencia).
++
++El scanner hacía substring sobre tests/CMakeLists.txt SIN quitar
++comentarios: un `#` que mencionaba el nombre (IvannaFusionCore.cpp,
++comentado en la lista de la librería y citado en una explicación de
++por qué no se enlaza en host) lo daba por cableado aunque ningún
++target lo compila. El fix quita los comentarios `#...` antes del
++substring, mismo patrón que check_header_wiring.
++
++Casos:
++- Un módulo mencionado SOLO en un comentario -> SÍ es sin tests.
++- Un módulo en un add_executable -> NO es sin tests.
++- El repo real reporta 16 e incluye IvannaFusionCore.cpp.
++"""
++import sys
++import tempfile
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++import evolution_engine  # noqa: E402
++
++
++class TestScanUntestedModules(unittest.TestCase):
++    def setUp(self):
++        self._old_repo = evolution_engine.REPO
++        self._tmp = tempfile.TemporaryDirectory()
++        self.repo = Path(self._tmp.name)
++        (self.repo / "app/src/main/cpp/tests").mkdir(parents=True, exist_ok=True)
++        evolution_engine.REPO = self.repo
++
++    def tearDown(self):
++        evolution_engine.REPO = self._old_repo
++        self._tmp.cleanup()
++
++    def _write(self, cmake_text, modules):
++        (self.repo / "app/src/main/cpp/tests/CMakeLists.txt").write_text(
++            cmake_text, encoding="utf-8")
++        for name in modules:
++            (self.repo / "app/src/main/cpp" / name).write_text(
++                "// stub\n", encoding="utf-8")
++
++    def test_0017_comment_only_is_untested(self):
++        """Módulo mencionado solo en comentarios: SÍ es sin tests."""
++        self._write(
++            "# IvannaFusionCore.cpp no se enlaza en host (explicación).\n"
++            "#   ${CMAKE_CURRENT_SOURCE_DIR}/../IvannaFusionCore.cpp\n"
++            "add_executable(test_x test_x.cpp ../Other.cpp)\n",
++            ["IvannaFusionCore.cpp", "Other.cpp"],
++        )
++        mods = evolution_engine.scan_untested_modules()
++        self.assertEqual(mods, ["app/src/main/cpp/IvannaFusionCore.cpp"])
++
++    def test_0017_code_reference_is_tested(self):
++        """Módulo en un add_executable: NO es sin tests."""
++        self._write(
++            "add_executable(test_x test_x.cpp ../Wired.cpp)\n",
++            ["Wired.cpp"],
++        )
++        mods = evolution_engine.scan_untested_modules()
++        self.assertEqual(mods, [])
++
++    def test_0017_real_repo_includes_fusion_core(self):
++        """El repo real reporta IvannaFusionCore.cpp como sin tests
++        (antes lo escondían los comentarios)."""
++        evolution_engine.REPO = self._old_repo
++        mods = evolution_engine.scan_untested_modules()
++        self.assertIn("app/src/main/cpp/IvannaFusionCore.cpp", mods)

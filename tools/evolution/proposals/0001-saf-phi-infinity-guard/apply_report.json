@@ -1,0 +1,21 @@
+{
+  "proposal": "0001-saf-phi-infinity-guard",
+  "status": "already_applied",
+  "applied": false,
+  "dry_run": true,
+  "council": {
+    "approved": false,
+    "evidence": "sin registro de aprobación del consejo en la propuesta"
+  },
+  "council_override": true,
+  "files": [
+    "app/src/main/cpp/saf_phi_infinity.cpp",
+    "app/src/main/cpp/tests/CMakeLists.txt",
+    "app/src/main/cpp/tests/test_saf_phi_infinity.cpp"
+  ],
+  "already_applied": {
+    "state": "content",
+    "detail": "app/src/main/cpp/saf_phi_infinity.cpp: applied; app/src/main/cpp/tests/CMakeLists.txt: applied; app/src/main/cpp/tests/test_saf_phi_infinity.cpp: applied"
+  },
+  "reason": "el cambio ya está en el árbol (content): app/src/main/cpp/saf_phi_infinity.cpp: applied; app/src/main/cpp/tests/CMakeLists.txt: applied; app/src/main/cpp/tests/test_saf_phi_infinity.cpp: applied"
+}

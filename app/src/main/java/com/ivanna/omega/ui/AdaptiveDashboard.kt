@@ -1,0 +1,346 @@
+package com.ivanna.omega.ui
+
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.ivanna.omega.ui.theme.*
+import kotlin.math.log10
+import kotlin.math.max
+import java.util.Locale
+
+// ── Fichas magistrales · Adaptive (prototipo aprobado, Pantalla V) ──────────
+// Texto exacto del prototipo; nada inventado. SpecInfo / ScreenSpecCard /
+// SpecInfoButton viven en SpecSheet.kt, mismo paquete.
+
+/** Ficha del entorno · Adaptive. */
+private val AdaptiveScreenSpec = SpecInfo(
+    title = "Adaptive",
+    what = "El entorno de auto-corrección continua: el ASRC magistral que doma la deriva de reloj, el kernel Volterra que pre-distorciona contra la no-linealidad real de tu salida, y la compensación ISO 226 que restaura el balance a volumen bajo.",
+    purpose = "Para eliminar las tres causas invisibles de que algo «suene mal sin saber por qué»: relojes que no coinciden (micro-cortes), transductores que deforman (aspereza) y un oído que a bajo volumen pierde graves y agudos (sonido delgado).",
+    whenUse = "Como capa siempre activa. Tu trabajo aquí es elegir el kernel correcto para tu DAC y el nivel de ISO 226 según tu volumen habitual; el servo ASRC no tiene perilla porque trabaja solo.",
+    whenAvoid = "No «corrijas» a mano lo que esta capa ya corrige: subir graves en Control para compensar una escucha nocturna es duplicar el trabajo de ISO 226 y terminar con un grave bofo."
+)
+
+/** I · ASRC Magistral · Corrección de reloj. */
+private val AsrcSpec = SpecInfo(
+    title = "ASRC Magistral · Corrección de reloj",
+    what = "El remuestreador asíncrono que corrige la diferencia entre el reloj de la fuente y el del DAC. Un servo PLL (estimador Theil-Sen, ±500 ppm) mide la deriva real y un FIR de 319 taps la absorbe de forma continua sin cambiar el pitch. Derivas medidas en el Moto G85: ≈ −13 ppm por bocina, ≈ −70 ppm por USB.",
+    purpose = "Dos relojes nunca coinciden: sin corrección, el búfer se llena o se vacía hasta que el audio truena o se corta. El ASRC convierte esa diferencia en un ajuste continuo e inaudible. Es invisible cuando trabaja bien — y esa es su función.",
+    whenUse = "Siempre activo. Vigila su telemetría: debe rondar los ppm de tu salida y moverse ligeramente. Esa deriva viva y corregida es la firma de que está midiendo de verdad.",
+    whenAvoid = "No lo apagues salvo diagnóstico: sin él, la reproducción depende de que los relojes casen por suerte. Y desconfía de una telemetría clavada en 0.0 ppm durante minutos: un ASRC que no mide no está corrigiendo, está en passthrough."
+)
+
+/**
+ * AdaptiveDashboard — pantalla de telemetría real del AdaptiveDecisionEngine.
+ *
+ * Fuente única de datos: IvannaNativeLib.nativeGetAdaptiveTelemetry() → FloatArray[10]
+ *   [0] rms          (lineal 0..1)
+ *   [1] peak         (lineal 0..1)
+ *   [2] gainReductionDb
+ *   [3] targetGain   (0.5..1.0)
+ *   [4] compAmount   (0..1)
+ *   [5] exciterReduction (0..1)
+ *   [6] spatialWidth (0.8..1.5)
+ *   [7] safetyMargin (dB)
+ *   [8] voiceProtect (0..1)
+ *   [9] applied      (contador)
+ *
+ * Regla anti-control-fantasma: no hay sliders ni toggles aquí porque la
+ * AdaptiveDecisionEngine no expone API de override manual. Solo visualización.
+ */
+@Composable
+fun AdaptiveDashboard(
+    telemetry: FloatArray?,        // null = ADE no corriendo o JNI no cargado
+    bandEnergies: FloatArray? = null,  // FloatArray[3]: [low, mid, high] lineal RMS
+    audioChar: FloatArray?    = null,  // FloatArray[8]: [rms,peak,percussiveness,tonality,reverb,dynRange,centroid,spread]
+    modifier: Modifier = Modifier
+) {
+    // Fail closed: a partial or non-finite JNI snapshot must never render as plausible telemetry.
+    val t = telemetry?.takeIf { values -> values.size >= 10 && values.take(10).all { it.isFinite() } }
+    val safeBands = bandEnergies?.takeIf { values -> values.size >= 3 && values.take(3).all { it.isFinite() } }
+        ?.map { it.coerceAtLeast(0f) }
+    val safeAudioChar = audioChar?.takeIf { values -> values.size >= 8 && values.take(8).all { it.isFinite() } }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(MagistralVoid)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        // Ficha del entorno · Adaptive (prototipo aprobado, Pantalla V)
+        ScreenSpecCard(spec = AdaptiveScreenSpec)
+
+        // ── Header ───────────────────────────────────────────────────────────
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            PulseDot(active = t != null && (t.getOrElse(9) { 0f } > 0f))
+            Text(
+                "ADAPTIVE ENGINE",
+                color = MagistralGoldHi,
+                fontFamily = MagistralSerif,
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp,
+                letterSpacing = 2.sp
+            )
+            Spacer(Modifier.weight(1f))
+            val appliedCount = t?.getOrElse(9) { 0f }?.toInt() ?: 0
+            StatusPill(
+                text = if (t == null) "OFFLINE" else if (appliedCount > 0) "ACTIVO" else "EN ESPERA",
+                accent = if (t != null && appliedCount > 0) AuroraCyan else NeonMagenta
+            )
+        }
+
+        if (telemetry != null && t == null) {
+            Text(
+                "Telemetría no válida o incompleta · esperando una muestra íntegra",
+                color = AmberSignal,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 11.sp
+            )
+        }
+
+        // ── Signal meters ─────────────────────────────────────────────────
+        // I · ASRC Magistral: este tablero es solo telemetría de lectura (sin
+        // controles ASRC); la tarjeta de señal es el equivalente más cercano
+        // y su telemetría se conserva tal cual en datos.
+        GlassCard(
+            title = "SEÑAL",
+            accent = AuroraCyan.copy(alpha = 0.25f),
+            rightSlot = { SpecInfoButton(spec = AsrcSpec) }
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+
+                val rmsDb  = if (t != null) linToDb(t[0].coerceIn(0f, 1f)) else -60f
+                val peakDb = if (t != null) linToDb(t[1].coerceIn(0f, 1f)) else -60f
+                val grDb   = t?.getOrElse(2) { 0f } ?: 0f
+
+                MeterRow("RMS",  rmsDb,  -60f, 0f, AuroraCyan,    "${rmsDb.format(1)} dBFS")
+                MeterRow("PEAK", peakDb, -60f, 0f, AmberSignal,   "${peakDb.format(1)} dBFS")
+                if (grDb > 0.05f)
+                    MeterRow("LIMITER", -grDb, -6f, 0f, NeonMagenta,
+                             "−${grDb.format(1)} dB")
+            }
+        }
+
+        // ── ADE decisions ─────────────────────────────────────────────────
+        GlassCard(title = "DECISIONES ADE", accent = NeonMagenta.copy(alpha = 0.20f)) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                val tg  = t?.getOrElse(3) { 1f }  ?: 1f
+                val ca  = t?.getOrElse(4) { 0f }  ?: 0f
+                val er  = t?.getOrElse(5) { 0f }  ?: 0f
+                val sw  = t?.getOrElse(6) { 1f }  ?: 1f
+                val sm  = t?.getOrElse(7) { 6f }  ?: 6f
+                val vp  = t?.getOrElse(8) { 0f }  ?: 0f
+
+                DecisionRow("target_gain",       tg,  0.5f, 1.0f, AuroraCyan,  "${(tg*100).toInt()}%")
+                DecisionRow("comp_amount",        ca,  0f,   1.0f, AmberSignal, "${(ca*100).toInt()}%")
+                DecisionRow("exciter_reduction",  er,  0f,   1.0f, NeonMagenta, "${(er*100).toInt()}%")
+                DecisionRow("spatial_width",      sw,  0.8f, 1.5f, AuroraCyan,
+                            "×${sw.format(2)}", normalizedValue = (sw - 0.8f) / 0.7f)
+                DecisionRow("voice_protect",      vp,  0f,   1.0f, AmberSignal, "${(vp*100).toInt()}%")
+
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("safety_margin", color = TextPrimary.copy(0.4f),
+                         fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                    Text("${sm.format(1)} dB", color = if (sm < 3f) NeonMagenta else AuroraCyan,
+                         fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                }
+            }
+        }
+
+        // ── Band energy (read-only, ADE inputs) ───────────────────────────
+        // Band energy — datos reales del ADE (IIR bandpass en PDEngine + omega_daemon)
+        // Ruta A: BiquadEnvelopeBank de PDEngine (bandas 0-1 low, 2-4 mid, 5-7 high)
+        // Ruta B: 3 filtros IIR en omega_daemon::processLoop (ai_band_low/mid/high)
+        // Backend real: nativeGetBandEnergies() → FloatArray[3]
+        GlassCard(title = "ENERGÍA ESPECTRAL", accent = ObsidianSoft.copy(alpha = 0.5f)) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                val bandLow  = safeBands?.getOrElse(0) { 0f } ?: 0f
+                val bandMid  = safeBands?.getOrElse(1) { 0f } ?: 0f
+                val bandHigh = safeBands?.getOrElse(2) { 0f } ?: 0f
+                val total    = (bandLow + bandMid + bandHigh).coerceAtLeast(1e-6f)
+
+                MeterRow("LOW",  bandLow,  0f, total.coerceAtLeast(0.01f), AmberSignal,
+                         "${(bandLow/total*100).toInt()}%")
+                MeterRow("MID",  bandMid,  0f, total.coerceAtLeast(0.01f), AuroraCyan,
+                         "${(bandMid/total*100).toInt()}%")
+                MeterRow("HIGH", bandHigh, 0f, total.coerceAtLeast(0.01f), NeonMagenta,
+                         "${(bandHigh/total*100).toInt()}%")
+
+                if (safeBands == null) {
+                    Text("Sin señal de audio activa",
+                         color = TextPrimary.copy(0.3f),
+                         fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                }
+            }
+        }
+
+        // ── Audio characteristics (nativeGetAudioCharacteristics — antes descableado) ──
+        if (safeAudioChar != null) {
+            val percussive = safeAudioChar[2].coerceIn(0f, 1f)
+            val tonality   = safeAudioChar[3].coerceIn(0f, 1f)
+            val centroid   = safeAudioChar[6].coerceAtLeast(0f)
+            val spread     = safeAudioChar[7].coerceAtLeast(0f)
+            GlassCard(title = "CARACTERÍSTICAS DE AUDIO", accent = AuroraCyan.copy(0.5f)) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    MeterRow("Percusividad",  percussive, 0f, 1f, AmberSignal,  "${"%.0f".format(Locale.ROOT, percussive*100)}%")
+                    MeterRow("Tonalidad",     tonality,   0f, 1f, AuroraCyan,   "${"%.0f".format(Locale.ROOT, tonality*100)}%")
+                    Row(horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(24.dp)) {
+                        androidx.compose.material3.Text("Centroide espectral: ${"%.0f".format(Locale.ROOT, centroid)} Hz",
+                            color = TextPrimary.copy(0.5f),
+                            fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                        androidx.compose.material3.Text("Spread: ${"%.0f".format(Locale.ROOT, spread)} Hz",
+                            color = TextPrimary.copy(0.5f),
+                            fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                    }
+                }
+            }
+        }
+
+        // ── applied counter ───────────────────────────────────────────────
+        val applied = t?.getOrElse(9) { 0f }?.toInt() ?: 0
+        if (applied > 0) {
+            Text(
+                "Decisiones aplicadas: $applied",
+                color = AuroraCyan.copy(0.5f),
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+// ── Helpers internos ──────────────────────────────────────────────────────────
+
+@Composable
+private fun PulseDot(active: Boolean) {
+    val inf = rememberInfiniteTransition(label = "pulse")
+    val alpha by inf.animateFloat(
+        initialValue = if (active) 0.4f else 0.15f,
+        targetValue  = if (active) 1.0f else 0.25f,
+        animationSpec = infiniteRepeatable(tween(900), RepeatMode.Reverse),
+        label = "dot"
+    )
+    Box(
+        modifier = Modifier
+            .size(8.dp)
+            .clip(CircleShape)
+            .background(if (active) AuroraCyan.copy(alpha) else NeonMagenta.copy(alpha))
+    )
+}
+
+@Composable
+private fun MeterRow(
+    label: String,
+    value: Float,   // dB value
+    min: Float,
+    max: Float,
+    accent: Color,
+    display: String
+) {
+    val fraction = if (value.isFinite() && min.isFinite() && max.isFinite() && max > min)
+        ((value - min) / (max - min)).coerceIn(0f, 1f) else 0f
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(label, color = TextPrimary.copy(0.45f), fontFamily = FontFamily.Monospace,
+             fontSize = 10.sp, modifier = Modifier.width(52.dp))
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(4.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(ObsidianSoft)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(fraction)
+                    .background(Brush.horizontalGradient(listOf(accent.copy(0.6f), accent)))
+            )
+        }
+        Text(display, color = accent, fontFamily = FontFamily.Monospace,
+             fontSize = 10.sp, modifier = Modifier.width(70.dp), textAlign = TextAlign.End)
+    }
+}
+
+@Composable
+private fun DecisionRow(
+    label: String,
+    value: Float,
+    min: Float,
+    max: Float,
+    accent: Color,
+    display: String,
+    normalizedValue: Float? = null
+) {
+    val rawFraction = normalizedValue ?: if (value.isFinite() && min.isFinite() && max.isFinite() && max > min)
+        (value - min) / (max - min) else 0f
+    val fraction = if (rawFraction.isFinite()) rawFraction.coerceIn(0f, 1f) else 0f
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(label, color = TextPrimary.copy(0.40f), fontFamily = FontFamily.Monospace,
+             fontSize = 10.sp, modifier = Modifier.width(110.dp))
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(3.dp)
+                .clip(RoundedCornerShape(1.5.dp))
+                .background(ObsidianSoft)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(fraction)
+                    .background(accent.copy(0.7f))
+            )
+        }
+        Text(display, color = accent.copy(0.85f), fontFamily = FontFamily.Monospace,
+             fontSize = 10.sp, modifier = Modifier.width(42.dp), textAlign = TextAlign.End)
+    }
+}
+
+private fun linToDb(linear: Float): Float =
+    if (linear > 1e-6f) 20f * log10(max(linear, 1e-6f)) else -60f
+
+private fun Float.format(decimals: Int) = "%.${decimals}f".format(Locale.ROOT, this)

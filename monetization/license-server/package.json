@@ -1,0 +1,1 @@
+{"description":"Servidor de licencias de IVANNA OMEGA SUPREME (Node.js puro, sin dependencias)","engines":{"node":">=20"},"name":"ivanna-license-server","private":true,"scripts":{"start":"node server.mjs","test":"node --test test.mjs"},"type":"module","version":"1.0.0"}

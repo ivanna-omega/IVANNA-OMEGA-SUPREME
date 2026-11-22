@@ -1,0 +1,131 @@
+diff --git a/scripts/check_header_wiring.py b/scripts/check_header_wiring.py
+index 8171e4b9..15dc109a 100644
+--- a/scripts/check_header_wiring.py
++++ b/scripts/check_header_wiring.py
+@@ -47,6 +47,44 @@ STANDALONE_HEADERS = {
+     # ni deben confundirse con el kernel activo del APK.
+     "evolutionary_adapter.hpp",
+     "evolutionary_adapter_enhanced.hpp",
++    # --- 0011 (2026-11-16): 12 huérfanos clasificados, no escondidos. ---
++    # Cada uno tiene su razón documentada aquí; si la razón deja de aplicar
++    # (se cablea a producción), se QUITA de esta lista y el check lo exige.
++    # Grupo LEGACY DAEMON v1 (2.5.401 FUSIÓN MAGISTRAL): el daemon viejo se
++    # reemplazó por el CEREBRO v2 (ivanna_daemon.cpp); estos archivos ya no
++    # se compilan por diseño y se conservan como referencia (nunca borrar).
++    "daemon/control/command_server.h",
++    "daemon/core/effect_integrity.h",
++    "daemon/hal_clock_producer.hpp",
++    # Solo lo usa command_server.cpp (legacy v1) + su test; telemetría del
++    # write-stage ASRC, sin consumidor de producción activo.
++    "include/write_stage_asrc_telemetry.hpp",
++    # Grupo PRIMITIVAS DE TEST / TRABAJO FUTURO: diseñadas y probadas en
++    # host, no cableadas a la ruta PCM todavía. Cada una dice en su propio
++    # header o en docs por qué no está cableada.
++    # Perfilador CPU: futuro puente JNI (documentado en el header).
++    "device_cpu_profiler.hpp",
++    # P0-b: política pura de scheduling para el poller del reloj HAL;
++    # el poller hoy arranca en SCHED_OTHER y no la consume todavía.
++    "include/poller_sched.hpp",
++    # Pilares pendientes (docs/PILARES_PENDIENTES.md): DoP v1.1 y EQ
++    # paramétrico de elevación por pinna, diseñados, no cableados.
++    "spatial/DopPacketizer.hpp",
++    "spatial/PinnaElevationEq.hpp",
++    # Operador MANT Ec. 1: necesita una respuesta MEDIDA del transductor
++    # para compensar; sin medida no puede cablearse (lo dice el header).
++    "spatial/TransducerOperator.hpp",
++    # Grupo OBJETOS STANDALONE Ψ/Φ: probados en host; sus VALORES llegan
++    # a producción por otra vía (JNI), no por #include, así que la clase
++    # en sí no aparece en el grafo de includes de producción.
++    # BioControl5D: dinámica neural η (la usa PsiFieldRuntime).
++    "spatial/BioControl5D.hpp",
++    # PsiFieldRuntime: el campo Ψ como objeto; el cableado a ORBE es vía
++    # OrbeBinaural::setHeadRadiusM + JNI (el radio, no la clase).
++    "spatial/PsiFieldRuntime.hpp",
++    # HomogeneousFusion: coordinador Φ v2.5.367; el Φ que corre en la
++    # cadena es HyperStateOperator — este coordinador aún no lo reemplaza.
++    "spatial/HomogeneousFusion.hpp",
+ }
+ 
+ INCLUDE_DIRS = [
+diff --git a/tools/evolution/tests/test_check_header_wiring.py b/tools/evolution/tests/test_check_header_wiring.py
+new file mode 100644
+index 00000000..33638825
+--- /dev/null
++++ b/tools/evolution/tests/test_check_header_wiring.py
+@@ -0,0 +1,76 @@
++"""Tests de check_header_wiring STANDALONE_HEADERS (propuesta 0011,
++coordinador del Plan Omnipotencia).
++
++El consejo no procesó este hallazgo; el coordinador clasificó los 12
++huérfanos directamente con evidencia medida (quién los incluye, si
++tienen .cpp, si están en CMakeLists, qué dice su propio header/docs).
++
++Los 12 (verdad medida 2026-11-16):
++- Legacy daemon v1 (2.5.401, reemplazado por el CEREBRO v2, no se
++  compila por diseño): daemon/control/command_server.h,
++  daemon/core/effect_integrity.h, daemon/hal_clock_producer.hpp,
++  include/write_stage_asrc_telemetry.hpp (solo la usa command_server).
++- Primitivas de test / trabajo futuro: device_cpu_profiler.hpp (futuro
++  puente JNI), include/poller_sched.hpp (P0-b, no consumida),
++  spatial/DopPacketizer.hpp, spatial/PinnaElevationEq.hpp (pilares
++  pendientes), spatial/TransducerOperator.hpp (necesita medida).
++- Objetos standalone Ψ/Φ (valores vía JNI, no vía #include):
++  spatial/BioControl5D.hpp, spatial/PsiFieldRuntime.hpp,
++  spatial/HomogeneousFusion.hpp (el Φ activo es HyperStateOperator).
++
++Casos:
++- Los 12 están en STANDALONE_HEADERS (clasificados, no escondidos).
++- Ninguna entrada de STANDALONE_HEADERS está obsoleta (todas existen
++  en el repo): la lista no se pudre si se borra o mueve un header.
++- El check pasa en el repo real (0 huérfanos, exit 0).
++"""
++import subprocess
++import sys
++import unittest
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
++
++import check_header_wiring as chw
++
++REPO = Path(__file__).resolve().parents[3]
++
++EXPECTED_0011 = {
++    "daemon/control/command_server.h",
++    "daemon/core/effect_integrity.h",
++    "daemon/hal_clock_producer.hpp",
++    "include/write_stage_asrc_telemetry.hpp",
++    "device_cpu_profiler.hpp",
++    "include/poller_sched.hpp",
++    "spatial/DopPacketizer.hpp",
++    "spatial/PinnaElevationEq.hpp",
++    "spatial/TransducerOperator.hpp",
++    "spatial/BioControl5D.hpp",
++    "spatial/PsiFieldRuntime.hpp",
++    "spatial/HomogeneousFusion.hpp",
++}
++
++
++class TestCheckHeaderWiringStandalone(unittest.TestCase):
++    def test_0011_twelve_orphans_are_classified(self):
++        missing = EXPECTED_0011 - set(chw.STANDALONE_HEADERS)
++        self.assertEqual(missing, set(),
++                         f"huérfanos sin clasificar: {sorted(missing)}")
++
++    def test_0011_no_stale_standalone_entries(self):
++        stale = [name for name in chw.STANDALONE_HEADERS
++                 if not (chw.CPP_ROOT / name).is_file()]
++        self.assertEqual(stale, [],
++                         f"entradas obsoletas en STANDALONE_HEADERS: {stale}")
++
++    def test_0011_check_passes_on_real_repo(self):
++        proc = subprocess.run(
++            [sys.executable, str(REPO / "scripts" / "check_header_wiring.py")],
++            capture_output=True, text=True, timeout=120)
++        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
++        self.assertIn("[PASS] 0 headers de producción huérfanos.",
++                      proc.stdout)
++
++
++if __name__ == "__main__":
++    unittest.main()

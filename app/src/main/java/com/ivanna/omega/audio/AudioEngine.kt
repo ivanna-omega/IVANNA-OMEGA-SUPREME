@@ -1,0 +1,423 @@
+package com.ivanna.omega.audio
+
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.util.Log
+import com.ivanna.omega.core.NativeLibraryLoader
+import kotlinx.coroutines.*
+
+/**
+ * Clock telemetry read from the native effect beacon.
+ * callbackRateHz/driftPpm describe software callback cadence, not DAC clock.
+ * hardwareClockValid is true only when real HAL/PCM timestamps are published.
+ */
+data class AudioClockTelemetry(
+    val callbackValid: Boolean = false,
+    val callbackRateHz: Float = 0f,
+    val callbackDriftPpm: Float = 0f,
+    val hardwareClockValid: Boolean = false,
+    val hardwareRateHz: Float = 0f,
+    val hardwareDriftPpm: Float = 0f
+)
+
+/**
+ * Estado del core ASRC software (AsrcClockController), publicado por el
+ * daemon de la ruta Magisk desde 2026-10-24 — antes el controlador compilaba
+ * y tenía tests propios pero ningún consumidor real lo instanciaba, así que
+ * el módulo instalado nunca mostraba nada distinto para el usuario. Sigue
+ * siendo un servo software sobre el resampler, no un actuador físico.
+ */
+enum class AsrcSoftwareState { UNKNOWN, INIT, WAITING_FOR_SAMPLES, TRACKING, HOLD, BYPASS, FAULT }
+
+data class AsrcSoftwareTelemetry(
+    val valid: Boolean = false,
+    val state: AsrcSoftwareState = AsrcSoftwareState.UNKNOWN,
+    val driftPpm: Float = 0f,
+    val targetPpm: Float = 0f,
+    val appliedRatio: Float = 1f
+)
+
+/**
+ * Write-stage ASRC PAL (v5): el actuador real en la ruta de audio viva.
+ * La .so interpuesta en el HAL (/vendor/bin/hw/android.hardware.audio.service_64)
+ * reescribe /data/vendor/ivanna_audio/pal_asrc_stage.txt cada 5 s; el daemon
+ * (root) lo lee y lo releva en GET_CLOCK_TELEMETRY (ver
+ * include/write_stage_asrc_telemetry.hpp). valid=false = dump ausente,
+ * viejo o inválido: el panel muestra "no disponible", nunca un valor simulado.
+ * Distinto del "core ASRC software" de arriba, que es solo telemetría del
+ * servo sin consumidor en ninguna ruta de audio.
+ */
+data class WriteStageAsrcTelemetry(
+    val valid: Boolean = false,
+    val pid: Int = 0,
+    val enabled: Boolean = false,
+    val ratio: Float = 1f,
+    val driftPpm: Float = 0f,
+    val kalmanDriftPpm: Float = 0f,
+    val clock: String = "unknown",
+    val opens: Long = 0L,
+    val ok: Long = 0L,
+    val saturated: Boolean = false,
+    val firTaps: Int = 0,
+    val neon: Boolean = false,
+    val ageMs: Long = 0L
+)
+
+/**
+ * AudioEngine v1.5 — Motor de audio DSP.
+ */
+class AudioEngine {
+    companion object {
+        private const val TAG = "AudioEngine"
+        /** SR real del hardware — hardcodear 96kHz rompía la captura en dispositivos 48k. */
+        @Volatile var SAMPLE_RATE: Int = android.media.AudioTrack.getNativeOutputSampleRate(
+            android.media.AudioManager.STREAM_MUSIC).takeIf { it in 8000..384000 } ?: 48000  // paridad con gates nativos 1caeb1cb: nativas directas hasta 384k
+        private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_STEREO
+        private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_FLOAT
+
+        @Volatile private var libLoaded = NativeLibraryLoader.ensureLoaded()
+
+        fun homeostasis(n: Float, omega: Float, mu: Float = 0.3f): Float {
+            if (omega.isNaN() || omega.isInfinite()) return n
+            if (n.isNaN() || n.isInfinite()) return omega
+            return (n + mu * omega) / (1.0f + mu)
+        }
+
+        fun nativeSetAntiDolbyScoresStatic(speech: Float, music: Float, bass: Float) {
+            if (!libLoaded) return
+            try {
+                nativeSetAntiDolbyScoresJni(speech, music, bass)
+            } catch (e: UnsatisfiedLinkError) {
+                Log.w(TAG, "nativeSetAntiDolbyScores JNI no disponible")
+            }
+        }
+
+        @JvmStatic
+        private external fun nativeSetAntiDolbyScoresJni(speech: Float, music: Float, bass: Float)
+
+        /**
+         * Returns true only when the app-process JNI setter was dispatched without an exception.
+         * This is NOT a DSP read-back and must not be reported as confirmed application.
+         */
+        fun nativeSetRouteProfileStatic(bassBoostDb: Float, dialogBoostDb: Float, widenerMult: Float): Boolean {
+            if (!libLoaded) return false
+            val b = if (bassBoostDb.isFinite()) bassBoostDb.coerceIn(-18f, 18f) else 0f
+            val d = if (dialogBoostDb.isFinite()) dialogBoostDb.coerceIn(-18f, 18f) else 0f
+            val w = if (widenerMult.isFinite()) widenerMult.coerceIn(0f, 3f) else 1f
+            return runCatching {
+                nativeSetRouteProfileJni(b, d, w)
+                true
+            }.onFailure { Log.w(TAG, "nativeSetRouteProfileStatic: $it") }.getOrDefault(false)
+        }
+
+        @JvmStatic
+        private external fun nativeSetRouteProfileJni(bassBoostDb: Float, dialogBoostDb: Float, widenerMult: Float)
+
+        // FIX DAC USB-C: bypass del HRTF al cambiar ruta de audio a USB-C.
+        // Llamar nativeSetHrtfWetDryStatic(0f) + nativeFlushHrtfHistoryStatic()
+        // cuando Android rota al DAC; restaurar con nativeSetHrtfWetDryStatic(1f)
+        // tras ~150ms (History ya limpio, sin riesgo de ruido).
+        fun nativeSetHrtfWetDryStatic(wet: Float) {
+            if (!libLoaded) return
+            runCatching { nativeSetHrtfWetDryJni(wet.coerceIn(0f, 1f)) }
+                .onFailure { Log.w(TAG, "nativeSetHrtfWetDry: $it") }
+        }
+
+        fun nativeFlushHrtfHistoryStatic() {
+            if (!libLoaded) return
+            runCatching { nativeFlushHrtfHistoryJni() }
+                .onFailure { Log.w(TAG, "nativeFlushHrtfHistory: $it") }
+        }
+
+        @JvmStatic private external fun nativeSetHrtfWetDryJni(wet: Float)
+        @JvmStatic private external fun nativeFlushHrtfHistoryJni()
+
+        /**
+         * Low-frequency diagnostics for the clock path. Does not alter audio.
+         * Invalid/missing beacon data is reported as unavailable, never guessed.
+         */
+        fun getClockTelemetryStatic(): AudioClockTelemetry {
+            val direct = if (!libLoaded) AudioClockTelemetry() else runCatching {
+                val v = nativeGetClockTelemetryJni() ?: return@runCatching AudioClockTelemetry()
+                if (v.size < 6) return@runCatching AudioClockTelemetry()
+                AudioClockTelemetry(
+                    callbackValid = v[0] >= 0.5f,
+                    callbackRateHz = v[1],
+                    callbackDriftPpm = v[2],
+                    hardwareClockValid = v[3] >= 0.5f,
+                    hardwareRateHz = v[4],
+                    hardwareDriftPpm = v[5]
+                )
+            }.getOrElse {
+                Log.w(TAG, "Clock telemetry unavailable: $it")
+                AudioClockTelemetry()
+            }
+            // El beacon vive en /data/adb/ivanna_omega (ivanna_data_file): una app untrusted_app normalmente NO puede
+            // abrirlo y el JNI devuelve "no válido" aunque el efecto sí publique. El daemon (root) lo relevará.
+            if (direct.callbackValid || direct.hardwareClockValid) return direct
+            val d = DaemonClockRelay.fetch() ?: return direct
+            return AudioClockTelemetry(
+                callbackValid = d.optBoolean("callbackValid", false),
+                callbackRateHz = d.optDouble("callbackRateHz", 0.0).toFloat(),
+                callbackDriftPpm = d.optDouble("callbackDriftPpm", 0.0).toFloat(),
+                hardwareClockValid = d.optBoolean("hardwareValid", false),
+                hardwareRateHz = d.optDouble("hardwareRateHz", 0.0).toFloat(),
+                hardwareDriftPpm = d.optDouble("hardwareDriftPpm", 0.0).toFloat()
+            )
+        }
+
+        @JvmStatic private external fun nativeGetClockTelemetryJni(): FloatArray?
+
+        /**
+         * Estado del core ASRC software leído del canal IPC del daemon
+         * (asrc_state_bridge.hpp). valid=false si el daemon no está corriendo
+         * con --hal-clock (Ruta A sin Magisk, o módulo detenido) — se reporta
+         * "no disponible" en vez de simular TRACKING.
+         */
+        fun getAsrcStateStatic(): AsrcSoftwareTelemetry {
+            val direct = if (!libLoaded) AsrcSoftwareTelemetry() else getAsrcStateDirect()
+            if (direct.valid) return direct
+            // /data/vendor/ivanna_audio/asrc_state es 0660 root: la app no lo abre. Relevo por el daemon.
+            val d = DaemonClockRelay.fetch() ?: return direct
+            if (!d.optBoolean("asrcValid", false)) return direct
+            return AsrcSoftwareTelemetry(
+                valid = true,
+                state = asrcStateFromCode(d.optInt("asrcState", -1)),
+                driftPpm = d.optDouble("asrcDriftPpm", 0.0).toFloat(),
+                targetPpm = d.optDouble("asrcTargetPpm", 0.0).toFloat(),
+                appliedRatio = d.optDouble("asrcRatio", 1.0).toFloat()
+            )
+        }
+
+        /**
+         * Write-stage ASRC PAL (v5) relevado por el daemon en
+         * GET_CLOCK_TELEMETRY (campos writeStage*). valid=false si el daemon
+         * no lo ve (dump ausente/viejo/inválido o módulo principal sin el
+         * write-stage): se reporta "no disponible", nunca un valor simulado.
+         */
+        fun getWriteStageAsrcStatic(): WriteStageAsrcTelemetry {
+            val d = DaemonClockRelay.fetch() ?: return WriteStageAsrcTelemetry()
+            if (!d.optBoolean("writeStageValid", false)) return WriteStageAsrcTelemetry()
+            return WriteStageAsrcTelemetry(
+                valid = true,
+                pid = d.optInt("writeStagePid", 0),
+                enabled = d.optBoolean("writeStageEnabled", false),
+                ratio = d.optDouble("writeStageRatio", 1.0).toFloat(),
+                driftPpm = d.optDouble("writeStageDriftPpm", 0.0).toFloat(),
+                kalmanDriftPpm = d.optDouble("writeStageKalmanDriftPpm", 0.0).toFloat(),
+                clock = d.optString("writeStageClock", "unknown"),
+                opens = d.optLong("writeStageOpens", 0L),
+                ok = d.optLong("writeStageOk", 0L),
+                saturated = d.optInt("writeStageSat", 0) != 0,
+                firTaps = d.optInt("writeStageFirTaps", 0),
+                neon = d.optInt("writeStageNeon", 0) != 0,
+                ageMs = d.optLong("writeStageAgeMs", 0L)
+            )
+        }
+
+        private fun asrcStateFromCode(code: Int): AsrcSoftwareState = when (code) {
+            0 -> AsrcSoftwareState.INIT
+            1 -> AsrcSoftwareState.WAITING_FOR_SAMPLES
+            2 -> AsrcSoftwareState.TRACKING
+            3 -> AsrcSoftwareState.HOLD
+            4 -> AsrcSoftwareState.BYPASS
+            5 -> AsrcSoftwareState.FAULT
+            else -> AsrcSoftwareState.UNKNOWN
+        }
+
+        private fun getAsrcStateDirect(): AsrcSoftwareTelemetry {
+            return runCatching {
+                val v = nativeGetAsrcStateJni() ?: return@runCatching AsrcSoftwareTelemetry()
+                if (v.size < 5 || v[0] < 0.5f) return@runCatching AsrcSoftwareTelemetry()
+                val state = when (v[1].toInt()) {
+                    0 -> AsrcSoftwareState.INIT
+                    1 -> AsrcSoftwareState.WAITING_FOR_SAMPLES
+                    2 -> AsrcSoftwareState.TRACKING
+                    3 -> AsrcSoftwareState.HOLD
+                    4 -> AsrcSoftwareState.BYPASS
+                    5 -> AsrcSoftwareState.FAULT
+                    else -> AsrcSoftwareState.UNKNOWN
+                }
+                AsrcSoftwareTelemetry(
+                    valid = true,
+                    state = state,
+                    driftPpm = v[2],
+                    targetPpm = v[3],
+                    appliedRatio = v[4]
+                )
+            }.getOrElse {
+                Log.w(TAG, "ASRC state telemetry unavailable: $it")
+                AsrcSoftwareTelemetry()
+            }
+        }
+
+        @JvmStatic private external fun nativeGetAsrcStateJni(): FloatArray?
+    }
+
+    private var audioRecord: AudioRecord? = null
+    private var processingJob: Job? = null
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    private var exciterAmount = 0.3f
+    private var eqGainAmount = 0.0f
+    private var widthAmount = 0.5f
+
+    fun initialize(sampleRate: Int = SAMPLE_RATE) {
+        // Seguridad anti-piratería (v2.5.369): si la integridad falló
+        // (IntegrityGate.isLocked), no inicializar el DSP. Fail-closed:
+        // el audio pasa en limpio y el teléfono sigue funcionando.
+        if (com.ivanna.omega.security.IntegrityGate.isLocked) {
+            Log.w(TAG, "Integridad bloqueada — DSP no inicializado (fail-closed)")
+            return
+        }
+        if (!libLoaded) {
+            Log.w(TAG, "Librería nativa no disponible — modo degradado")
+            return
+        }
+        runCatching { nativeInit(sampleRate) }
+            .onSuccess { Log.i(TAG, "AudioEngine inicializado @ $sampleRate Hz") }
+            .onFailure { Log.w(TAG, "nativeInit sin símbolo — modo degradado: $it") }
+    }
+
+    fun setExciter(amount: Float) {
+        exciterAmount = amount.coerceIn(0f, 1f)
+        if (libLoaded) runCatching { nativeSetExciter(exciterAmount) }
+            .onFailure { Log.w(TAG, "setExciter: símbolo ausente — $it") }
+    }
+
+    fun setGain(gain: Float) {
+        if (!libLoaded) return
+        val safe = if (gain.isFinite()) gain.coerceIn(-24f, 24f) else 0f
+        runCatching { nativeSetGain(safe) }
+            .onFailure { Log.e(TAG, "setGain crash-guard: $it") }
+    }
+
+    fun setMasterGain(gain: Float) {
+        if (!libLoaded) return
+        val safe = if (gain.isFinite()) gain.coerceIn(-24f, 24f) else 0f
+        runCatching { nativeSetGain(safe) }
+            .onFailure { Log.e(TAG, "setMasterGain crash-guard: $it") }
+    }
+
+    fun setBypass(bypass: Boolean) {
+        if (libLoaded) runCatching { nativeSetBypass(bypass) }
+            .onFailure { Log.w(TAG, "setBypass: símbolo ausente — $it") }
+    }
+
+    fun setEqGain(gain: Float) {
+        eqGainAmount = gain.coerceIn(-12f, 12f)
+        if (libLoaded) runCatching { nativeSetEqGain(eqGainAmount) }
+            .onFailure { Log.w(TAG, "setEqGain: símbolo ausente — $it") }
+    }
+
+    fun setWidth(width: Float) {
+        widthAmount = width.coerceIn(0f, 1f)
+        if (libLoaded) runCatching { nativeSetWidth(widthAmount) }
+            .onFailure { Log.w(TAG, "setWidth: símbolo ausente — $it") }
+    }
+
+    fun release() {
+        processingJob?.cancel()
+        audioRecord?.stop()
+        audioRecord?.release()
+        audioRecord = null
+        scope.cancel()
+    }
+
+    private external fun nativeInit(sampleRate: Int)
+    private external fun nativeSetGain(gain: Float)
+    private external fun nativeSetExciter(amount: Float)
+    private external fun nativeSetEqGain(gain: Float)
+    private external fun nativeSetWidth(width: Float)
+    private external fun nativeSetBypass(bypass: Boolean)
+    private external fun nativeSetRouteProfile(bassBoostDb: Float, dialogBoostDb: Float, widenerMult: Float)
+    private external fun nativeSetManifoldEnabled(enabled: Boolean)
+    // Auditoria 2026-08-19: nativeProcessAudio (in/out por bloque) fue eliminada.
+    // Era la unica declaracion nativa del proyecto sin simbolo JNI y sin caller: si algun
+    // dia se hubiese llamado, habria lanzado UnsatisfiedLinkError. El procesado real
+    // pasa por nativeSetGain/nativeSetExciter/... (parametros, si implementados).
+    private external fun nativeGetLufs(): Float
+    private external fun nativeGetPeakDbfs(): Float
+    private external fun nativeSetAntiDolbyScores(speech: Float, music: Float, bass: Float)
+
+    // ── Benchmark logger (benchmark_logger.cpp) ───────────────────────────────
+    // FASE 2: el brief de auditoría asumía nativeLogBenchmark(tag: String), pero
+    // el símbolo JNI real (Java_com_ivanna_omega_audio_AudioEngine_nativeLogBenchmark)
+    // toma 6 floats/int, no un tag. Firma tomada directo de benchmark_logger.cpp:77-90.
+    private external fun nativeLogBenchmark(
+        lufs: Float, peak: Float, speech: Float, music: Float, bass: Float, dolbyState: Int
+    )
+    private external fun nativeGetBenchmarkPath(): String
+
+    fun logBenchmark(lufs: Float, peak: Float, speech: Float, music: Float, bass: Float, dolbyState: Int) {
+        if (!libLoaded) return
+        runCatching { nativeLogBenchmark(lufs, peak, speech, music, bass, dolbyState) }
+            .onFailure { Log.w(TAG, "logBenchmark: $it") }
+    }
+
+    fun getLufs(): Float {
+        if (!libLoaded) return -70f
+        return runCatching { nativeGetLufs() }.getOrDefault(-70f)
+    }
+
+    fun getPeakDbfs(): Float {
+        if (!libLoaded) return -96f
+        return runCatching { nativeGetPeakDbfs() }.getOrDefault(-96f)
+    }
+
+    fun setRouteProfile(bassBoostDb: Float, dialogBoostDb: Float, widenerMult: Float) {
+        if (!libLoaded) return
+        val b = if (bassBoostDb.isFinite()) bassBoostDb.coerceIn(-18f, 18f) else 0f
+        val d = if (dialogBoostDb.isFinite()) dialogBoostDb.coerceIn(-18f, 18f) else 0f
+        val w = if (widenerMult.isFinite()) widenerMult.coerceIn(0f, 3f) else 1f
+        runCatching { nativeSetRouteProfile(b, d, w) }
+            .onFailure { Log.w(TAG, "setRouteProfile: $it") }
+    }
+
+    fun setAntiDolbyScores(speech: Float, music: Float, bass: Float) {
+        if (!libLoaded) return
+        val s = if (speech.isFinite()) speech.coerceIn(0f, 1f) else 0f
+        val m = if (music.isFinite()) music.coerceIn(0f, 1f) else 0f
+        val b = if (bass.isFinite()) bass.coerceIn(0f, 1f) else 0f
+        runCatching { nativeSetAntiDolbyScores(s, m, b) }
+            .onFailure { Log.w(TAG, "setAntiDolbyScores: $it") }
+    }
+
+    fun setManifoldEnabled(enabled: Boolean) {
+        if (!libLoaded) return
+        runCatching { nativeSetManifoldEnabled(enabled) }
+            .onFailure { Log.w(TAG, "setManifoldEnabled: $it") }
+    }
+
+    fun logCurrentBenchmark(speech: Float, music: Float, bass: Float, dolbyState: Int) {
+        logBenchmark(getLufs(), getPeakDbfs(), speech, music, bass, dolbyState)
+    }
+
+    fun getBenchmarkPath(): String? {
+        if (!libLoaded) return null
+        return runCatching { nativeGetBenchmarkPath() }.getOrNull()
+    }
+}
+
+/**
+ * Relevo de telemetría de reloj vía daemon (GET_CLOCK_TELEMETRY). Caché de 400 ms para que beacon y ASRC
+ * compartan una sola consulta por refresco del Profiler. Devuelve null si el daemon no responde (nunca simula).
+ */
+internal object DaemonClockRelay {
+    private const val TTL_MS = 400L
+    @Volatile private var lastAt = 0L
+    @Volatile private var last: org.json.JSONObject? = null
+
+    @Synchronized
+    fun fetch(): org.json.JSONObject? {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastAt < TTL_MS) return last
+        lastAt = now
+        last = runCatching {
+            val raw = com.ivanna.omega.magisk.MagiskBridge.sendCommand("{\"action\":\"GET_CLOCK_TELEMETRY\"}")
+            if (raw.isBlank() || raw == "ACK") null
+            else org.json.JSONObject(raw).takeIf { it.optBoolean("ok", false) }
+        }.getOrNull()
+        return last
+    }
+}

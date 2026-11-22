@@ -1,0 +1,26 @@
+{
+  "proposal": "0020-bridgeplayer-pll-asrc-root-fix",
+  "status": "already_applied",
+  "applied": false,
+  "dry_run": true,
+  "council": {
+    "approved": false,
+    "evidence": "sin registro de aprobación del consejo en la propuesta"
+  },
+  "council_override": true,
+  "files": [
+    "README.md\t2026-11-16 11:33:36.921258150 +0000",
+    "app/src/main/cpp/tests/CMakeLists.txt\t2026-11-16 11:33:36.910390261 +0000",
+    "app/src/main/cpp/tests/test_bridgeplayer_level_control.cpp\t2026-11-16 11:33:36.912957133 +0000",
+    "app/src/main/java/com/ivanna/omega/audio/AudioTrackBufferPll.kt\t2026-11-16 11:33:36.718899479 +0000",
+    "app/src/main/java/com/ivanna/omega/audio/IvannaBridgePlayer.kt\t2026-11-16 11:33:36.807390759 +0000",
+    "app/src/main/java/com/ivanna/omega/audio/RouteAAsrc.kt\t2026-11-16 11:33:36.887106448 +0000",
+    "app/src/test/java/com/ivanna/omega/audio/AudioTrackBufferPllTest.kt\t2026-11-16 11:33:36.904140772 +0000",
+    "telemetry/ctest_summary.json\t2026-11-16 11:33:36.925351343 +0000"
+  ],
+  "already_applied": {
+    "state": "exact",
+    "detail": "git apply --check --reverse limpio"
+  },
+  "reason": "el cambio ya está en el árbol (exact): git apply --check --reverse limpio"
+}

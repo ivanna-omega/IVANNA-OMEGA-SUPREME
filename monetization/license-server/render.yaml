@@ -1,0 +1,26 @@
+# Blueprint SEPARADO del puente de diagnóstico (el render.yaml de la raíz
+# del repo es solo para el puente). Para desplegar este servicio:
+#   - Dashboard: New → Blueprint → conecta el repo → pon la ruta de este
+#     archivo: monetization/license-server/render.yaml
+#   - O por API: POST /v1/services con dockerfilePath y dockerContext
+#     relativos a la raíz del repo (ver monetization/README.md).
+services:
+  - type: web
+    name: ivanna-license-server
+    runtime: docker
+    dockerfilePath: ./monetization/license-server/Dockerfile
+    dockerContext: ./monetization/license-server
+    healthCheckPath: /healthz
+    envVars:
+      - key: LICENSE_ADMIN_KEY
+        sync: false
+      - key: LICENSE_KEY_SECRET
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: PORT
+        value: "8788"

@@ -1,0 +1,262 @@
+/*
+ * ivanna_jni_stub.cpp — Stub JNI para AudioEngine.kt
+ * © 2025-2026 Luis Uriel Pimentel Pérez. Todos los derechos reservados.
+ *
+ * FIX DE CONECTIVIDAD:
+ *   Añadida Java_com_ivanna_omega_audio_AudioEngine_nativeSetAntiDolbyScoresJni
+ *   que faltaba. AudioEngine.kt declara este método @JvmStatic en companion
+ *   pero el stub no lo implementaba → UnsatisfiedLinkError en runtime.
+ *
+ *   El stub delega al gState.antiDolby del audio_orchestrator.cpp via
+ *   el símbolo externo ivanna_set_anti_dolby_scores().
+ */
+
+#include <jni.h>
+#include <android/log.h>
+#include <cmath>
+#include <algorithm>
+#include <atomic>
+#include "../include/omega_effect_beacon.h"
+#include "../include/asrc_state_bridge.hpp"
+
+#define LOG_TAG "IVANNA-Stub"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+// Bypass maestro (2.5.461): DEFINICIÓN ÚNICA del flag (ver extern en
+// omega_effect_beacon.h). Inicialización constante: listo antes de
+// cualquier JNI. Lo escriben DOS JNI (este stub y
+// DSPBridge_nativeSetBypass en ivanna_omega_jni.cpp) y lo lee
+// nativeProcess — siempre por load/store atómicos, nunca por copia.
+std::atomic<bool> g_masterBypass{false};
+
+// Símbolos externos definidos en audio_orchestrator.cpp
+#ifdef __cplusplus
+extern "C" {
+#endif
+    void ivanna_set_anti_dolby_scores(float speech, float music, float bass);
+    void ivanna_set_route_profile(float bassBoostDb, float dialogBoostDb, float widenerMult);
+    void ivanna_set_manifold_enabled(bool enabled);
+    // AUDIT FIX: setters/getters añadidos al orchestrator para los sliders
+    // de AudioEngine.kt que no tenían símbolo JNI (silenciosamente inoperantes).
+    void  ivanna_set_master_gain(float db);
+    void  ivanna_set_eq_gain(float db);
+    void  ivanna_set_stereo_width(float width);
+    void  ivanna_set_exciter_amount(float amount);
+    float ivanna_get_lufs();
+    float ivanna_get_peak_dbfs();
+    // FIX DAC USB-C: control del wet/dry y flush del HrtfManager
+    void ivanna_set_hrtf_wet_dry(float wet);
+    void ivanna_flush_hrtf_history();
+#ifdef __cplusplus
+}
+#endif
+
+extern "C" {
+
+// ── Stub para nativeSetAntiDolbyScoresJni (companion @JvmStatic) ─────────────
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetAntiDolbyScoresJni(
+    JNIEnv* /*env*/, jclass /*clazz*/,
+    jfloat speech, jfloat music, jfloat bass
+) {
+    if (!std::isfinite(speech) || !std::isfinite(music) || !std::isfinite(bass)) {
+        LOGE("nativeSetAntiDolbyScoresJni: valores NaN/Inf — ignorado");
+        return;
+    }
+    ivanna_set_anti_dolby_scores(
+        std::clamp(speech, 0.0f, 1.0f),
+        std::clamp(music,  0.0f, 1.0f),
+        std::clamp(bass,   0.0f, 1.0f)
+    );
+    LOGI("AntiDolby via stub: speech=%.2f music=%.2f bass=%.2f", speech, music, bass);
+}
+
+// ── Stub para nativeSetRouteProfileJni (companion @JvmStatic) ───────────────
+
+// ── nativeSetRouteProfile (instancia AudioEngine, no @JvmStatic) ─────────────
+// La versión @JvmStatic ya existe (nativeSetRouteProfileJni → companion object).
+// Este símbolo cubre el external fun de INSTANCIA declarado en AudioEngine.kt:
+//   private external fun nativeSetRouteProfile(...)
+// Misma semántica: delega a ivanna_set_route_profile() → control plane.
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetRouteProfile(
+    JNIEnv* /*env*/, jobject /*thiz*/,
+    jfloat bassBoostDb, jfloat dialogBoostDb, jfloat widenerMult
+) {
+    if (!std::isfinite(bassBoostDb) || !std::isfinite(dialogBoostDb) || !std::isfinite(widenerMult)) {
+        LOGE("nativeSetRouteProfile (instance): valores NaN/Inf — ignorado");
+        return;
+    }
+    ivanna_set_route_profile(bassBoostDb, dialogBoostDb, widenerMult);
+    LOGI("RouteProfile (instance): bass=%.2f dialog=%.2f widener=%.2f",
+         bassBoostDb, dialogBoostDb, widenerMult);
+}
+
+// ── nativeSetManifoldEnabled (instancia AudioEngine) ─────────────────────────
+// AUDIT FIX (JNI symbol missing): AudioEngine.kt declara este external fun
+// sin símbolo JNI correspondiente → UnsatisfiedLinkError al invocarse desde
+// el hilo de Kotlin. Se implementa el puente delegando en el símbolo
+// externo ivanna_set_manifold_enabled() ya definido en audio_orchestrator.cpp
+// (gState.manifoldEnabled). No cambia la firma pública ni la semántica.
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetManifoldEnabled(
+    JNIEnv* /*env*/, jobject /*thiz*/,
+    jboolean enabled
+) {
+    const bool en = (enabled == JNI_TRUE);
+    ivanna_set_manifold_enabled(en);
+    LOGI("ManifoldEnabled (instance): %s", en ? "true" : "false");
+}
+
+// ── AUDIT FIX: puentes para los 6 external fun huérfanos de AudioEngine.kt ───
+// AudioEngine.kt declara nativeSetGain / nativeSetEqGain / nativeSetWidth /
+// nativeGetLufs / nativeGetPeakDbfs y las invoca en runtime (setGain, setEqGain,
+// setWidth) envueltas en runCatching — sin símbolo C++ el UnsatisfiedLinkError
+// se tragaba en silencio y los sliders no hacían nada. Se implementan aquí
+// delegando al OrchestratorState (audio_orchestrator.cpp), que ahora tiene
+// campos masterGainDb / eqGainDb / stereoWidth aplicados en ivanna_orchestrate.
+// nativeProcessAudio se omite: AudioEngine.kt nunca la invoca (pipeline
+// confirmado huérfano, ver comentario en VoiceProtectionController.kt:23).
+
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetGain(
+    JNIEnv* /*env*/, jobject /*thiz*/, jfloat gain
+) {
+    if (!std::isfinite(gain)) { LOGE("nativeSetGain: NaN/Inf — ignorado"); return; }
+    ivanna_set_master_gain(gain);
+    LOGI("MasterGain: %.2f dB", gain);
+}
+
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetEqGain(
+    JNIEnv* /*env*/, jobject /*thiz*/, jfloat gain
+) {
+    if (!std::isfinite(gain)) { LOGE("nativeSetEqGain: NaN/Inf — ignorado"); return; }
+    ivanna_set_eq_gain(gain);
+    LOGI("EqGain: %.2f dB", gain);
+}
+
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetWidth(
+    JNIEnv* /*env*/, jobject /*thiz*/, jfloat width
+) {
+    if (!std::isfinite(width)) { LOGE("nativeSetWidth: NaN/Inf — ignorado"); return; }
+    ivanna_set_stereo_width(width);
+    LOGI("StereoWidth: %.2f", width);
+}
+
+JNIEXPORT jfloat JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeGetLufs(
+    JNIEnv* /*env*/, jobject /*thiz*/
+) {
+    return ivanna_get_lufs();
+}
+
+JNIEXPORT jfloat JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeGetPeakDbfs(
+    JNIEnv* /*env*/, jobject /*thiz*/
+) {
+    return ivanna_get_peak_dbfs();
+}
+
+// ── AudioEngine.kt missing JNI bindings ──
+
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeInit(
+    JNIEnv* /*env*/, jobject /*thiz*/, jint sampleRate) {
+    LOGI("AudioEngine_nativeInit: sampleRate=%d", sampleRate);
+}
+
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetExciter(
+    JNIEnv* /*env*/, jobject /*thiz*/, jfloat amount) {
+    if (!std::isfinite(amount)) { LOGE("nativeSetExciter: NaN/Inf — ignorado"); return; }
+    ivanna_set_exciter_amount(amount);
+    LOGI("AudioEngine_nativeSetExciter: amount=%.2f", amount);
+}
+
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetBypass(
+    JNIEnv* /*env*/, jobject /*thiz*/, jboolean bypass) {
+    LOGI("AudioEngine_nativeSetBypass: %s", bypass ? "true" : "false");
+    g_masterBypass.store(bypass == JNI_TRUE, std::memory_order_release);
+}
+
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetRouteProfileJni(
+    JNIEnv* /*env*/, jclass /*clazz*/,
+    jfloat bassBoostDb, jfloat dialogBoostDb, jfloat widenerMult) {
+    if (!std::isfinite(bassBoostDb) || !std::isfinite(dialogBoostDb) || !std::isfinite(widenerMult)) {
+        LOGE("nativeSetRouteProfileJni (companion): valores NaN/Inf — ignorado");
+        return;
+    }
+    ivanna_set_route_profile(bassBoostDb, dialogBoostDb, widenerMult);
+    LOGI("RouteProfile (companion): bass=%.2f dialog=%.2f widener=%.2f",
+         bassBoostDb, dialogBoostDb, widenerMult);
+}
+
+// ── FIX DAC USB-C: JNI → ivanna_set_hrtf_wet_dry / ivanna_flush_hrtf_history ──
+// AudioEngine.kt companion los expone como nativeSetHrtfWetDryJni /
+// nativeFlushHrtfHistoryJni (@JvmStatic); AudioRouteManager los llama al detectar
+// ruta USB para silenciar el HRTF antes de que los buffers residuales generen
+// el ruido "tssss" de canal de TV sin señal.
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeSetHrtfWetDryJni(
+    JNIEnv* /*env*/, jclass /*clazz*/, jfloat wet
+) {
+    if (!std::isfinite(wet)) { LOGE("nativeSetHrtfWetDryJni: NaN/Inf — ignorado"); return; }
+    ivanna_set_hrtf_wet_dry(wet);
+}
+
+JNIEXPORT void JNICALL Java_com_ivanna_omega_audio_AudioEngine_nativeFlushHrtfHistoryJni(
+    JNIEnv* /*env*/, jclass /*clazz*/
+) {
+    ivanna_flush_hrtf_history();
+    LOGI("HRTF history flushed via JNI");
+}
+
+/*
+ * Clock telemetry for the app UI.
+ * Return layout: [callbackValid, callbackRateHz, callbackDriftPpm,
+ *                 hardwareValid, hardwareRateHz, hardwareDriftPpm].
+ * Callback cadence is software scheduling telemetry; hardware values are
+ * valid only when a real HAL/PCM producer publishes hardware-correlated data.
+ */
+JNIEXPORT jfloatArray JNICALL
+Java_com_ivanna_omega_audio_AudioEngine_nativeGetClockTelemetryJni(
+    JNIEnv* env, jclass /*clazz*/) {
+    ivanna::EffectCallbackClockStatus callback{};
+    ivanna::EffectHardwareClockStatus hardware{};
+    const bool callbackOk = ivanna::readEffectCallbackClockStatus(callback);
+    const bool hardwareOk = ivanna::readEffectHardwareClockStatus(hardware);
+    const jfloat values[6] = {
+        callbackOk && callback.valid ? 1.0f : 0.0f,
+        callbackOk && callback.valid ? static_cast<jfloat>(callback.observedSampleRateHz) : 0.0f,
+        callbackOk && callback.valid ? static_cast<jfloat>(callback.driftPpm) : 0.0f,
+        hardwareOk && hardware.valid ? 1.0f : 0.0f,
+        hardwareOk && hardware.valid ? static_cast<jfloat>(hardware.measuredSampleRateHz) : 0.0f,
+        hardwareOk && hardware.valid ? static_cast<jfloat>(hardware.driftPpm) : 0.0f
+    };
+    jfloatArray result = env->NewFloatArray(6);
+    if (result != nullptr) env->SetFloatArrayRegion(result, 0, 6, values);
+    return result;
+}
+
+/*
+ * Estado del core ASRC software (AsrcClockController, cableado al daemon en
+ * 2026-10-24 — antes no tenía ningún consumidor real fuera de su propio test).
+ * Return layout: [valid, stateCode, driftPpm, targetPpm, appliedRatio].
+ * stateCode: 0=INIT 1=WAITING_FOR_SAMPLES 2=TRACKING 3=HOLD 4=BYPASS 5=FAULT.
+ * valid=0 significa que el canal no existe todavía (daemon no arrancado con
+ * --hal-clock, o Ruta A sin Magisk) — el llamador debe mostrar "no disponible",
+ * nunca simular un valor.
+ */
+JNIEXPORT jfloatArray JNICALL
+Java_com_ivanna_omega_audio_AudioEngine_nativeGetAsrcStateJni(
+    JNIEnv* env, jclass /*clazz*/) {
+    ivanna::audio::AsrcStateReader reader;
+    ivanna::audio::AsrcStateSample sample{};
+    const bool ok = reader.open() && reader.read(sample);
+    const jfloat values[5] = {
+        ok ? 1.0f : 0.0f,
+        ok ? static_cast<jfloat>(static_cast<int>(sample.state)) : 0.0f,
+        ok ? static_cast<jfloat>(sample.driftPpm) : 0.0f,
+        ok ? static_cast<jfloat>(sample.targetPpm) : 0.0f,
+        ok ? static_cast<jfloat>(sample.appliedRatio) : 1.0f
+    };
+    jfloatArray result = env->NewFloatArray(5);
+    if (result != nullptr) env->SetFloatArrayRegion(result, 0, 5, values);
+    return result;
+}
+
+} // extern "C"
+
+

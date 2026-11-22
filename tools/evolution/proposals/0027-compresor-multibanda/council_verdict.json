@@ -1,0 +1,31 @@
+{
+  "finding": "Dinamica MONOBANDA en Ruta A: el compresor g_comp usa un solo detector de pico para todo el espectro; todos los referentes mundiales (SHARC, Lake, GALAXY, Trinnov, Helix, HDX, UAD) tienen dinamica multibanda",
+  "approved": false,
+  "patch": null,
+  "rounds": [
+    {
+      "round": 1,
+      "proposer": "solución inventada",
+      "implementer": "diff redactado",
+      "reviewer": {
+        "round": 1,
+        "approved": false,
+        "text": "RECHAZADO\n\nENFOQUE: el parche no corrige nada del problema acústico ni de la arquitectura; solo añade una bandera de “legacy fallback” al compresor monobanda. Sigue habiendo un solo detector, un solo threshold y un solo ratio para todo el espectro, así que la causa raíz —la dinámica monobanda— permanece intacta.\n\nAdemás degrada el diseño:\n- inventa API pública nueva (`setLegacyFallback`, `isLegacyFallback`) sin necesidad funcional;\n- no introduce `MultibandCompressor`;\n- no integra nada en `nativeProcess`;\n- no trae tests de regresión;\n- no demuestra suma plana, independencia entre bandas, bypass bit-exacto ni coste por bloque.\n\nExijo:\n- implementar el módulo multibanda real con 3 bandas y crossovers Linkwitz-Riley 4º orden;\n- sustituirlo en la Ruta A cuando esté activo, manteniendo `setRuntimeAmount`;\n- conservar el monobanda solo como fallback real, no como excusa documental;\n- añadir tests host que cubran reconstrucción, independencia por banda, bypass bit-exacto, estabilidad y rendimiento;\n- si quieres dejar trazabilidad, hazlo sin ensuciar la API pública del compresor legacy."
+      },
+      "reviewer2": null
+    },
+    {
+      "round": 2,
+      "proposer": "enfoque reinventado",
+      "implementer": "sin diff utilizable (5 intentos)",
+      "reviewer": null
+    }
+  ],
+  "detector": {
+    "real": false,
+    "text": "FALSO POSITIVO\n\n`Compressor.h` y `Compressor.cpp` muestran un compresor monobanda a propósito: un único detector (`env_`/`envSmooth_`) y una única pareja `threshold_/ratio_` compartida por todo el audio. El hallazgo de “falta multibanda” no demuestra un bug; describe una decisión de diseño, y además el propio archivo documenta el comportamiento como compresor legacy/fallback, no como una omisión accidental.\n\nDebe corregirse el detector para que no reporte “debe ser multibanda” como defecto cuando el código implementa explícitamente un compresor monobanda con fallback/legacy."
+  },
+  "reviewer": null,
+  "arbiter": null,
+  "reason": "ronda 2: el implementer no devolvió un diff utilizable en 5 intentos"
+}

@@ -1,0 +1,232 @@
+package com.ivanna.omega.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.ivanna.omega.audio.AudioPipeline
+import com.ivanna.omega.magisk.OmegaEngineBridge
+import com.ivanna.omega.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+
+/**
+ * Techo del Fatigue Index manual. El slider es una preferencia de usuario,
+ * no una medición: por encima de 0.5 (highCut < 17 750 Hz, alpha < 0.70)
+ * el LPF ya es audible como pérdida de aire, y en 1.0 (highCut 16 kHz,
+ * alpha 0.50) opaca los agudos. Valores persistidos fuera de [0, 0.5]
+ * (p. ej. el 1.0 atascado en ivanna_tinyml_prefs.xml, 2026-11-09) se
+ * reparan al default seguro en vez de aplicarse.
+ */
+private const val FATIGUE_MAX = 0.5f
+private const val FATIGUE_DEFAULT = 0.15f
+
+@Composable
+internal fun TinyMlClassifierPanel(modifier: Modifier = Modifier) {
+    val yamnet = AudioPipeline.sharedYamnetResult.collectAsState().value
+    val scope  = rememberCoroutineScope()
+    val ctx    = androidx.compose.ui.platform.LocalContext.current
+
+    // FIX (sin persistencia): el Fatigue Index volvía a 0.15 en cada
+    // apertura del panel, así que el highCut del daemon se quedaba con el
+    // último valor enviado mientras la UI mostraba otro. Ahora se guarda.
+    val prefs = remember {
+        ctx.getSharedPreferences("ivanna_tinyml_prefs", android.content.Context.MODE_PRIVATE)
+    }
+    // FIX (colisión entre paneles): los 6 parámetros restantes de
+    // SEND_PERCEPTUAL_STATE iban hardcodeados, de modo que mover este
+    // slider sobreescribía en el daemon la ganancia armónica / antiDolby
+    // que HarmonicExciterPanel sí persiste. Se leen de su propio store.
+    val exciterPrefs = remember {
+        ctx.getSharedPreferences("harmonic_exciter_prefs", android.content.Context.MODE_PRIVATE)
+    }
+
+    // FIX (2026-11-09, Fatigue Index 100% atascado en vivo): el valor persistido
+    // en ivanna_tinyml_prefs.xml era 1.0 (alpha 0.50, highCut 16 kHz) y se
+    // cargaba sin validar, asi que opacaba los agudos para siempre. Un valor
+    // fuera de [0, FATIGUE_MAX] no es una medición: se repara al default
+    // seguro 0.15 (highCut 18 975 Hz, alpha 0.84, prácticamente transparente)
+    // y se reescribe la preferencia para que no vuelva. El slider ya no
+    // permite más de 0.5. CAMBIO AUDIBLE DE PREFERENCIA: el highCut efectivo
+    // pasa de 16 kHz a ~19 kHz hasta que el usuario lo mueva.
+    val storedFatigue = prefs.getFloat("fatigueIndex", FATIGUE_DEFAULT)
+    val initialFatigue = if (storedFatigue.isFinite() && storedFatigue in 0f..FATIGUE_MAX)
+        storedFatigue else FATIGUE_DEFAULT
+    LaunchedEffect(Unit) {
+        if (storedFatigue != initialFatigue)
+            prefs.edit().putFloat("fatigueIndex", initialFatigue).apply()
+    }
+    var fatigueIndex by remember { mutableFloatStateOf(initialFatigue) }
+    var lastFatigueSendMs by remember { mutableLongStateOf(0L) }
+    val iirAlpha  = (0.9f - fatigueIndex * 0.4f).coerceIn(0.5f, 0.95f)
+    val highCutHz = (19500f - fatigueIndex * 3500f).coerceIn(16000f, 19500f)
+
+    // FIX (2026-11-09, mapeo): estas 4 barras NO son Speech/Music/Transient/
+    // Ambient. El CRNN solo produce 4 clases (Voz/Música/Bajos/Silencio):
+    // yamnet.bass es BAJOS (la salida transitoria del CRNN también cae ahí)
+    // y el "Ambient" era solo el residuo 1-speech-music-bass. Se etiquetan
+    // con las clases reales para no mentir sobre lo que mide el modelo.
+    val speech    = yamnet.speech.coerceIn(0f, 1f)
+    val music     = yamnet.music.coerceIn(0f, 1f)
+    val bass      = yamnet.bass.coerceIn(0f, 1f)
+    val silence   = (1f - speech - music - bass).coerceIn(0f, 1f)
+    val dominant  = when { speech >= music && speech >= bass -> "VOZ"
+                           music >= bass -> "MÚSICA"; bass >= silence -> "BAJOS"
+                           else -> "SILENCIO" }
+
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        GlassCard("CLASIFICADOR DE ESCENA", NeonMagenta,
+            subtitle = "Fuente y tiempo medidos en vivo; sin datos hasta que el motor procese audio") {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SpscCard("FUENTE", if (yamnet.valid) yamnet.source else "SIN DATOS", AuroraCyan, Modifier.weight(1f))
+                SpscCard("TIEMPO DE CLASIFICACIÓN",
+                    if (yamnet.valid && yamnet.inferenceUs > 0L) "%.1f ms".format(yamnet.inferenceUs / 1000f) else "—",
+                    PhosphorGreen, Modifier.weight(1f))
+            }
+        }
+
+        GlassCard("REAL-TIME SCENE SOFTMAX PROBABILITIES", AuroraCyan,
+            rightSlot = {
+                Box(Modifier.clip(RoundedCornerShape(5.dp))
+                    .background(NeonMagenta.copy(0.15f))
+                    .border(1.dp, NeonMagenta.copy(0.4f), RoundedCornerShape(5.dp))
+                    .padding(horizontal = 7.dp, vertical = 2.dp)) {
+                    Text(dominant, color = NeonMagenta, fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                }
+            }) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                SoftBar("Voz / Diálogo",             speech,    AuroraCyan)
+                SoftBar("Música / Armónicos",        music,     NeonMagenta)
+                SoftBar("Bajos / Impacto grave",     bass,      AmberSignal)
+                SoftBar("Silencio / Residual",       silence,   PhosphorGreen)
+            }
+        }
+
+        GlassCard("ACOUSTIC FATIGUE MITIGATOR", AmberSignal,
+            subtitle = "Ajusta highCut IIR local (Ruta A) para sesiones largas") {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Fatigue Index:", color = TextSecondary, fontSize = 11.sp)
+                        Text("${"%.0f".format(fatigueIndex * 100f)}%", color = AmberSignal,
+                            fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                    }
+                    Slider(value = fatigueIndex,
+                        onValueChangeFinished = {
+                            // Garantiza que el valor FINAL llegue al daemon aunque el último
+                            // evento haya caído dentro de la ventana de throttle.
+                            val v = fatigueIndex
+                            val liveHighCut = (19500f - v * 3500f).coerceIn(16000f, 19500f)
+                            // v2.5.428 — Fatigue LOCAL: el high-cut va al DSP de Ruta A.
+                            runCatching { OmegaEngineBridge.setFatigueHighCutLocal(liveHighCut) }
+                            val hg = exciterPrefs.getFloat("harmonicGain", 0.78f)
+                            val ad = exciterPrefs.getFloat("antiDolby", 0.85f)
+                            scope.launch(Dispatchers.IO) {
+                                runCatching {
+                                    OmegaEngineBridge.sendPerceptualState(
+                                        compressor = -5.5f, exciterRed = 0.15f,
+                                        highCut = liveHighCut, spatialWidth = 1.55f,
+                                        loudnessTarget = -16f, harmonicGain = hg, antiDolby = ad)
+                                }
+                            }
+                        },
+                        onValueChange = { v ->
+                            fatigueIndex = v
+                            // FIX (botón muerto): el slider recomputa highCutHz
+                            // localmente pero el snapshot enviado al daemon
+                            // usaba el valor de la composición ANTERIOR
+                            // (highCutHz aquí viene del by remember previo),
+                            // así que mover el slider no cambiaba el cutoff
+                            // real en el daemon hasta la siguiente recomposición
+                            // — el usuario veía 15% → 84% sin efecto audible.
+                            // Se recalcula highCut LOCAL con la 'v' actual.
+                            val liveHighCut = (19500f - v * 3500f).coerceIn(16000f, 19500f)
+                            prefs.edit().putFloat("fatigueIndex", v).apply()
+                            // v2.5.428 — Fatigue LOCAL: el high-cut va al DSP de Ruta A
+                            // (el daemon está muerto). El envío al daemon se conserva
+                            // por compatibilidad, pero el efecto real es este.
+                            runCatching { OmegaEngineBridge.setFatigueHighCutLocal(liveHighCut) }
+                            val hg = exciterPrefs.getFloat("harmonicGain", 0.78f)
+                            val ad = exciterPrefs.getFloat("antiDolby", 0.85f)
+                            // Throttle 100 ms: arrastrar el slider disparaba un envío al daemon
+                            // por cada evento de touch (decenas por segundo).
+                            val nowMs = android.os.SystemClock.uptimeMillis()
+                            if (nowMs - lastFatigueSendMs < 100L) return@Slider
+                            lastFatigueSendMs = nowMs
+                            scope.launch(Dispatchers.IO) {
+                                runCatching {
+                                    OmegaEngineBridge.sendPerceptualState(
+                                        compressor = -5.5f, exciterRed = 0.15f,
+                                        highCut = liveHighCut, spatialWidth = 1.55f,
+                                        loudnessTarget = -16f, harmonicGain = hg, antiDolby = ad)
+                                }
+                            }
+                        },
+                        valueRange = 0f..FATIGUE_MAX,
+                        colors = SliderDefaults.colors(thumbColor = AmberSignal,
+                            activeTrackColor = AmberSignal, inactiveTrackColor = ObsidianEdge))
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Column {
+                        Text("Dynamic IIR Alpha:", color = TextSecondary, fontSize = 11.sp)
+                        Text("Rolloff 1st-order · ${"%.1f".format(highCutHz / 1000f)} kHz cutoff",
+                            color = TextMuted, fontSize = 9.sp)
+                    }
+                    Text("${"%.2f".format(iirAlpha)}", color = AuroraCyan,
+                        fontSize = 18.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                }
+                Button(onClick = {
+                    // v2.5.428 — el botón al daemon estaba muerto (sin daemon).
+                    // Ahora aplica el high-cut actual al DSP LOCAL de Ruta A.
+                    scope.launch(Dispatchers.IO) {
+                        runCatching { OmegaEngineBridge.setFatigueHighCutLocal(highCutHz) }
+                    }
+                }, modifier = Modifier.fillMaxWidth().height(40.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = NeonMagenta.copy(0.12f), contentColor = NeonMagenta),
+                    shape = RoundedCornerShape(8.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, NeonMagenta.copy(0.35f))) {
+                    Text("APLICAR HIGH-CUT LOCAL", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun SoftBar(label: String, value: Float, accent: Color) {
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(label, color = TextSecondary, fontSize = 11.sp)
+            Text("${"%.1f".format(value * 100f)}%", color = accent,
+                fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+        }
+        LinearProgressIndicator(progress = { value },
+            modifier = Modifier.fillMaxWidth().height(5.dp).clip(RoundedCornerShape(2.dp)),
+            color = accent, trackColor = ObsidianEdge)
+    }
+}
+@Composable private fun SpscCard(title: String, value: String, accent: Color, modifier: Modifier) {
+    Column(modifier.clip(RoundedCornerShape(8.dp)).background(ObsidianVoid)
+        .border(1.dp, accent.copy(0.2f), RoundedCornerShape(8.dp)).padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(title, color = TextMuted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+        Text(value, color = accent, fontSize = 13.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.ExtraBold)
+    }
+}
+@Composable private fun MetaItem(label: String, value: String, accent: Color) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(label, color = TextMuted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+        Text(value, color = accent, fontSize = 10.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+    }
+}

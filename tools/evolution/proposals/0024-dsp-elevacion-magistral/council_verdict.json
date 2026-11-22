@@ -1,0 +1,51 @@
+{
+  "finding": "DSP basico: el bucle cerrado neural y el modelo coclear (NPE) estan apagados en la cadena viva de Ruta A; la dinamica es monobanda",
+  "approved": false,
+  "patch": null,
+  "rounds": [
+    {
+      "round": 1,
+      "proposer": "solución inventada",
+      "implementer": "diff redactado",
+      "reviewer": {
+        "round": 1,
+        "approved": false,
+        "text": "RECHAZADO\n\nENFOQUE: este parche solo enciende un flag por defecto en un core aislado; no corrige la cadena viva Ruta A ni demuestra que el NPE entre realmente en `DSPBridge.nativeProcess` con los parámetros seguros y medidos. Tampoco toca el otro bypass crítico que reportaste: `g_npeAOn` sigue apagando `routeAApplyNpe`, así que el sonido real puede seguir igual.\n\nFaltan además los mínimos de calidad exigibles:\n- no hay activación coordinada en el punto de entrada vivo de Ruta A;\n- no hay prueba de regresión que muestre salida distinta y acotada;\n- no hay medición de THD+N, respuesta en frecuencia ni coste por bloque;\n- no hay garantía de que el cambio no rompa null-test, clipping o latencia.\n\nExijo estos arreglos exactos:\n1. Activar el NPE en la cadena viva de Ruta A donde se construye realmente el audio, no solo en el constructor del core.\n2. Eliminar o rediseñar el bypass de `g_npeAOn` para que el módulo se ejecute con bypass seguro solo bajo fallo, no por defecto.\n3. Conectar el encendido al set de parámetros seguros ya existentes, con límites explícitos.\n4. Añadir test de regresión que compare off vs on y verifique:\n   - cambio medible en salida,\n   - finitud/acotación,\n   - ausencia de clic,\n   - coste por bloque dentro de presupuesto.\n5. Añadir una prueba de null/bit-exact cuando el modo esté desactivado y otra de no-regresión cuando esté activado."
+      },
+      "reviewer2": null
+    },
+    {
+      "round": 2,
+      "proposer": "enfoque reinventado",
+      "implementer": "diff redactado",
+      "reviewer": {
+        "round": 2,
+        "approved": false,
+        "text": "RECHAZADO\n\nENFOQUE: el parche cambia defaults, pero no demuestra que eso sea la estrategia correcta ni que esté conectado a la cadena viva real. Estás activando `NpeStereoCore` por defecto en aislamiento, no corrigiendo de forma verificable la ruta `DSPBridge.nativeProcess`/Ruta A end-to-end ni el otro apagado crítico (`g_cochlearEnabled`, `g_holos_harmonics`, `g_omni_amount`) que el hallazgo dice que siguen dejando la dinámica monobanda.\n\nAdemás rompe la integridad del diff:\n- Inventa una nueva `g_npeAOn` en un archivo donde ya existía; riesgo claro de duplicado/sombra y de no compilar.\n- `reset()` forzando `enabled_ = true` es una mutación oculta de estado que puede reactivar módulos en contextos donde antes se esperaba reset limpio.\n- `DSPBridge_nativeProcess()` ahora hace `return` en el bypass, lo que puede saltarse el resto de la cadena y alterar comportamiento fuera del NPE.\n- El test no es suficientemente fiel: no cubre la ruta viva real ni comprueba el null-test/bit-exacto previo, ni el fade real de 20 ms, ni el comportamiento de apagado/encendido controlado.\n\nExijo estos arreglos exactos:\n1. No tocar defaults globales ni `reset()` hasta demostrar que la activación pertenece a la ruta viva y no a un constructor genérico.\n2. Mover la activación a la inicialización real de Ruta A, con un punto único y explícito, sin duplicar flags.\n3. Añadir test de regresión end-to-end sobre `DSPBridge.nativeProcess` que verifique:\n   - antes: bypass bit-exacto,\n   - después: salida distinta pero acotada,\n   - transición sin clic,\n   - y que no se rompe el resto de la cadena.\n4. Si el objetivo es “mejor que la élite”, también hay que activar o justificar con medición los otros módulos titulares desactivados; ahora mismo el parche solo arregla un síntoma parcial."
+      },
+      "reviewer2": null
+    },
+    {
+      "round": 3,
+      "proposer": "enfoque reinventado",
+      "implementer": "diff redactado",
+      "reviewer": {
+        "round": 3,
+        "approved": false,
+        "text": "RECHAZADO\n\nENFOQUE: el parche tapa el síntoma en `nativeInit()` en vez de arreglar la causa raíz de que la Ruta A nazca apagada y se quede monobanda. Encender flags globales al arranque no prueba que el snapshot real de parámetros, el orden de inicialización o la ruta viva respeten ese estado; además puede ser revertido luego por la propia carga de prefs.\n\nMotivos de rechazo:\n- No hay prueba de que estos `store(true)` sobrevivan al flujo real de arranque.\n- No hay test de regresión que demuestre que Ruta A procesa con NPE/bucle neural/modelo coclear activos.\n- Introduce cambios de comportamiento sin medir coste, THD+N, respuesta en frecuencia ni estabilidad.\n- Mete `extern std::atomic<...>` dentro de una función: parche frágil y sospechoso de estilo/compilación si esos símbolos no están visibles exactamente así.\n- Activa `g_holos_harmonics` y `g_omni_amount` aunque el hallazgo pedía titulares neural/coclear; es mezcla arbitraria, no solución precisa.\n- No garantiza arranque seguro si luego hay otro sitio que reescribe esos flags a `false`.\n\nExijo exactamente esto:\n1. Centralizar la activación en el flujo real de snapshot/parámetros de Ruta A, no en `nativeInit()`.\n2. Hacer que los módulos neural y coclear queden habilitados por defecto desde la fuente de verdad de configuración, no por escritura ad hoc.\n3. Añadir un test de regresión que verifique:\n   - Ruta A con NPE no es bit-exacto respecto a bypass.\n   - El bucle neural y el modelo coclear afectan la salida.\n   - No hay clic al conmutar.\n4. Incluir medición o aserciones de seguridad: salida finita, coste por bloque aceptable, y al menos un check de THD+N/energía o nulidad.\n5. No tocar `holos_harmonics` y `omni_amount` salvo que haya una razón funcional y tests específicos; aquí son ruido."
+      },
+      "reviewer2": null
+    }
+  ],
+  "detector": {
+    "real": true,
+    "text": "REAL\n\n`NpeStereoCore.hpp` deja claro que el NPE sí existe y tiene ganancia/efecto real cuando `enabled_` es `true`: `process()` aplica LIF, NHO, inhibición lateral, OHC y AGC, y solo hace bypass bit-exacto cuando `!enabled_ && fade_ <= 0.0f`. El problema no es ausencia del módulo, sino que en `ivanna_omega_jni.cpp` y en `holos_globals_effect.cpp` los estados iniciales están en `false`/`0.0f`, así que la ruta viva arranca apagada hasta que algún snapshot/llamada lo enciende.\n\nCausa raíz: los módulos “neural/coclear” están definidos y probados, pero el arranque de la cadena viva los deja deshabilitados por defecto."
+  },
+  "reviewer": {
+    "round": 3,
+    "approved": false,
+    "text": "RECHAZADO\n\nENFOQUE: el parche tapa el síntoma en `nativeInit()` en vez de arreglar la causa raíz de que la Ruta A nazca apagada y se quede monobanda. Encender flags globales al arranque no prueba que el snapshot real de parámetros, el orden de inicialización o la ruta viva respeten ese estado; además puede ser revertido luego por la propia carga de prefs.\n\nMotivos de rechazo:\n- No hay prueba de que estos `store(true)` sobrevivan al flujo real de arranque.\n- No hay test de regresión que demuestre que Ruta A procesa con NPE/bucle neural/modelo coclear activos.\n- Introduce cambios de comportamiento sin medir coste, THD+N, respuesta en frecuencia ni estabilidad.\n- Mete `extern std::atomic<...>` dentro de una función: parche frágil y sospechoso de estilo/compilación si esos símbolos no están visibles exactamente así.\n- Activa `g_holos_harmonics` y `g_omni_amount` aunque el hallazgo pedía titulares neural/coclear; es mezcla arbitraria, no solución precisa.\n- No garantiza arranque seguro si luego hay otro sitio que reescribe esos flags a `false`.\n\nExijo exactamente esto:\n1. Centralizar la activación en el flujo real de snapshot/parámetros de Ruta A, no en `nativeInit()`.\n2. Hacer que los módulos neural y coclear queden habilitados por defecto desde la fuente de verdad de configuración, no por escritura ad hoc.\n3. Añadir un test de regresión que verifique:\n   - Ruta A con NPE no es bit-exacto respecto a bypass.\n   - El bucle neural y el modelo coclear afectan la salida.\n   - No hay clic al conmutar.\n4. Incluir medición o aserciones de seguridad: salida finita, coste por bloque aceptable, y al menos un check de THD+N/energía o nulidad.\n5. No tocar `holos_harmonics` y `omni_amount` salvo que haya una razón funcional y tests específicos; aquí son ruido."
+  },
+  "arbiter": null,
+  "reason": "sin consenso en 3 rondas; último rechazo: RECHAZADO\n\nENFOQUE: el parche tapa el síntoma en `nativeInit()` en vez de arreglar la causa raíz de que la Ruta A nazca apagada y se quede monobanda. Encender flags globales al arranque no prueba que el snapshot real de parámetros, el orden de inicialización o la ruta viva respeten ese estado; ademá"
+}

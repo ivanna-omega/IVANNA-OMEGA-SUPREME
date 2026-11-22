@@ -1,0 +1,224 @@
+diff --git a/README.md b/README.md
+index 1dd555b..e612b72 100644
+--- a/README.md
++++ b/README.md
+@@ -505,7 +505,7 @@ The evolution motor (`tools/evolution/`) runs on the development side (where the
+ 
+ | Suite | Result | Evidence |
+ |:---|:---|:---|
+-| CTest (DSP host suite) | **1052/1052** | Host local, suite completa (1052/1052, v2.5.456; twiddles precalculados en el RIR + micro-opts exactas en HOLOS + test_route_a_asrc cableado + test_pi_lstm_bridge_jni + test_benchmark_jni + test_saf_jni_bridge) |
++| CTest (DSP host suite) | **1055/1055** | Host local, suite completa (1055/1055, v2.5.456; twiddles precalculados en el RIR + micro-opts exactas en HOLOS + test_route_a_asrc cableado + test_pi_lstm_bridge_jni + test_benchmark_jni + test_saf_jni_bridge + test_omega_daemon_bridge) |
+ | ASRC core | **25/25** | Host, v2.5.439 (see §05.4) |
+ | Daemon command responder | **28/28** | Host, v2.5.440 (real round-trip over abstract socket) |
+ | Council (multi-model) | **14/14** | Python unit tests, v2.5.445 (mocked LLM: verdicts, rounds, fail-closed) |
+diff --git a/app/src/main/cpp/tests/CMakeLists.txt b/app/src/main/cpp/tests/CMakeLists.txt
+index 31fbcaf..034d473 100644
+--- a/app/src/main/cpp/tests/CMakeLists.txt
++++ b/app/src/main/cpp/tests/CMakeLists.txt
+@@ -1634,6 +1634,31 @@ if(IVANNA_SAN_FLAGS)
+ endif()
+ gtest_discover_tests(test_saf_jni_bridge)
+ 
++# ── test_omega_daemon_bridge: puente SHM al daemon (0018) ────────────────────
++# omega_daemon_bridge.cpp (156 líneas) estaba entre los 19 módulos sin tests:
++# la app recibe el fd del SHM por SCM_RIGHTS en @omega_daemon_socket, valida
++# el layout y lo mapea. El test levanta un mock daemon (hilo) que envía 1
++# byte + el fd de un SHM válido (OmegaShmManager). Sin daemon devuelve
++# nullptr; con el mock devuelve el estado y la 2ª llamada es el mismo
++# puntero (caché, sin segundo handshake).
++add_executable(test_omega_daemon_bridge
++  test_omega_daemon_bridge.cpp
++  ../omega_daemon_bridge.cpp
++  ../daemon/core/shm_manager.cpp
++)
++target_link_libraries(test_omega_daemon_bridge PRIVATE GTest::gtest_main Threads::Threads)
++target_include_directories(test_omega_daemon_bridge PRIVATE
++  ..
++  ../include
++  host_stubs
++)
++target_compile_options(test_omega_daemon_bridge PRIVATE -Wall -Wextra)
++if(IVANNA_SAN_FLAGS)
++  target_compile_options(test_omega_daemon_bridge PRIVATE ${IVANNA_SAN_FLAGS})
++  target_link_options(test_omega_daemon_bridge PRIVATE ${IVANNA_SAN_FLAGS})
++endif()
++gtest_discover_tests(test_omega_daemon_bridge)
++
+ # ── FASE 3: 41 external fun conectadas con llamadores reales en Kotlin ─────────
+ add_executable(test_phase3_jni_callers
+   test_phase3_jni_callers.cpp
+diff --git a/app/src/main/cpp/tests/test_omega_daemon_bridge.cpp b/app/src/main/cpp/tests/test_omega_daemon_bridge.cpp
+new file mode 100644
+index 0000000..bbd2848
+--- /dev/null
++++ b/app/src/main/cpp/tests/test_omega_daemon_bridge.cpp
+@@ -0,0 +1,152 @@
++// test_omega_daemon_bridge.cpp — Tests de host del puente SHM al daemon
++// (propuesta 0018, coordinador del Plan Omnipotencia).
++//
++// omega_daemon_bridge.cpp (156 líneas) estaba entre los 19 módulos sin
++// tests: la app recibe el fd del SHM del daemon por SCM_RIGHTS en el
++// socket abstracto @omega_daemon_socket, valida el layout y lo mapea.
++// El test levanta un mock daemon (hilo) que escucha en ese socket y
++// envía 1 byte + el fd de un SHM válido (creado con OmegaShmManager).
++//
++// Lo que se verifica (comportamiento, no implementación):
++// - Sin daemon escuchando, omega_daemon_get_shared_state() devuelve
++//   nullptr (sin colgarse: el connect falla de inmediato).
++// - Con el mock daemon, devuelve un OmegaSharedState* no nulo cuyo
++//   header (base = state - SHM_STATE_OFFSET) pasa validateShmHeader.
++// - La segunda llamada devuelve EL MISMO puntero (caché: no se repite
++//   el handshake). El test de caché es autocontenido (su propio mock
++//   daemon): CTest ejecuta cada TEST en un proceso aparte, así que no
++//   puede depender del mapeo del test anterior.
++//
++// Nota de orden: el test NoDaemon VA PRIMERO (antes de cualquier mapeo
++// exitoso en el proceso); gtest corre en orden de definición. El mock
++// daemon tiene timeout en accept (2 s): si el bridge ya tiene el estado
++// cacheado (corrida directa de los 3 tests en un proceso), el mock no
++// recibe conexión y sale solo en vez de colgar el join.
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <gtest/gtest.h>
++#include <sys/mman.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <thread>
++#include <unistd.h>
++
++#include "daemon/core/shm_manager.h"
++#include "include/omega_shared.h"
++
++extern "C" OmegaSharedState* omega_daemon_get_shared_state();
++
++namespace {
++
++constexpr char kSocketName[] = "omega_daemon_socket";
++
++// Envía 1 byte + un fd por SCM_RIGHTS (el protocolo que espera
++// ivanna::ipc::receiveExactlyOneFd).
++bool SendOneFd(int sock, int fdToSend) {
++    char payload = 'B';
++    iovec io{};
++    io.iov_base = &payload;
++    io.iov_len = 1;
++    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
++    msghdr msg{};
++    msg.msg_iov = &io;
++    msg.msg_iovlen = 1;
++    msg.msg_control = control;
++    msg.msg_controllen = sizeof(control);
++    cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
++    cmsg->cmsg_level = SOL_SOCKET;
++    cmsg->cmsg_type = SCM_RIGHTS;
++    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++    std::memcpy(CMSG_DATA(cmsg), &fdToSend, sizeof(int));
++    return ::sendmsg(sock, &msg, 0) == 1;
++}
++
++// Mock daemon: escucha en el socket abstracto, acepta una conexión y
++// envía el fd del SHM. Señala listening=true cuando está listo. Si
++// nadie conecta en 2 s, sale solo (el bridge pudo usar el caché).
++void MockDaemon(int shmFd, std::atomic<bool>* listening) {
++    const int srv = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (srv < 0) return;
++    timeval timeout{};
++    timeout.tv_sec = 2;
++    timeout.tv_usec = 0;
++    (void)::setsockopt(srv, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++    sockaddr_un addr{};
++    addr.sun_family = AF_UNIX;
++    addr.sun_path[0] = '\0';
++    std::memcpy(addr.sun_path + 1, kSocketName, sizeof(kSocketName) - 1);
++    const socklen_t len = static_cast<socklen_t>(
++        offsetof(sockaddr_un, sun_path) + 1 + sizeof(kSocketName) - 1);
++    if (::bind(srv, reinterpret_cast<const sockaddr*>(&addr), len) != 0) {
++        ::close(srv);
++        return;
++    }
++    if (::listen(srv, 1) != 0) {
++        ::close(srv);
++        return;
++    }
++    listening->store(true, std::memory_order_release);
++    const int conn = ::accept(srv, nullptr, nullptr);
++    if (conn >= 0) {
++        (void)SendOneFd(conn, shmFd);
++        ::close(conn);
++    }
++    ::close(srv);
++}
++
++void WaitListening(const std::atomic<bool>* listening) {
++    for (int i = 0; i < 200 && !listening->load(std::memory_order_acquire); ++i) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(5));
++    }
++}
++
++// Crea un SHM válido y levanta el mock daemon; devuelve el manager
++// (debe vivir mientras el bridge use el mmap) y el hilo del daemon.
++struct MockDaemonRun {
++    ivanna::OmegaShmManager mgr;
++    std::atomic<bool> listening{false};
++    std::thread daemon;
++};
++
++bool StartMockDaemon(MockDaemonRun* run) {
++    const std::string path = "/tmp/omega_daemon_bridge_test_shm";
++    if (!run->mgr.init(path)) return false;
++    if (!run->mgr.isReady() || run->mgr.fd() < 0) return false;
++    run->daemon = std::thread(MockDaemon, run->mgr.fd(), &run->listening);
++    WaitListening(&run->listening);
++    return run->listening.load();
++}
++
++}  // namespace
++
++TEST(OmegaDaemonBridgeTest, NoDaemonReturnsNull) {
++    // Debe correr ANTES de cualquier mapeo exitoso (orden de definición).
++    EXPECT_EQ(omega_daemon_get_shared_state(), nullptr);
++}
++
++TEST(OmegaDaemonBridgeTest, MockDaemonHandshakeMapsValidShm) {
++    MockDaemonRun run;
++    ASSERT_TRUE(StartMockDaemon(&run));
++    OmegaSharedState* state = omega_daemon_get_shared_state();
++    run.daemon.join();
++    ASSERT_NE(state, nullptr);
++
++    // El header en la base del mmap pasa la validación canónica.
++    const void* base = static_cast<const uint8_t*>(
++        static_cast<const void*>(state)) - ivanna::SHM_STATE_OFFSET;
++    EXPECT_TRUE(ivanna::validateShmHeader(base, ivanna::SHM_SIZE));
++}
++
++TEST(OmegaDaemonBridgeTest, SecondCallReturnsCachedPointer) {
++    // Autocontenido: su propio mock daemon (CTest ejecuta cada TEST en
++    // un proceso aparte). Si el bridge ya mapeó en este proceso, el
++    // mock no recibe conexión y sale por timeout.
++    MockDaemonRun run;
++    ASSERT_TRUE(StartMockDaemon(&run));
++    OmegaSharedState* first = omega_daemon_get_shared_state();
++    OmegaSharedState* second = omega_daemon_get_shared_state();
++    run.daemon.join();
++    ASSERT_NE(first, nullptr);
++    EXPECT_EQ(second, first);
++}
+diff --git a/telemetry/ctest_summary.json b/telemetry/ctest_summary.json
+index bb165a2..96d5db6 100644
+--- a/telemetry/ctest_summary.json
++++ b/telemetry/ctest_summary.json
+@@ -1,8 +1,8 @@
+ {
+-  "passed": 1052,
++  "passed": 1055,
+   "failed": 0,
+-  "total": 1052,
++  "total": 1055,
+   "pass_rate_percent": 100,
+-  "duration_sec": 57.07,
+-  "badge_label": "1052/1052"
++  "duration_sec": 57.65,
++  "badge_label": "1055/1055"
+ }

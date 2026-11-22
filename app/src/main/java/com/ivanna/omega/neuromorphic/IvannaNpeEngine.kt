@@ -1,0 +1,309 @@
+package com.ivanna.omega.neuromorphic
+
+import android.util.Log
+import java.nio.FloatBuffer
+
+/**
+ * IvannaNpeEngine — wrapper de IvannaNpeNative.
+ * Único punto de entrada al motor NHO+LIF+BiquadEnvelopeBank+AutonomousBrain.
+ *
+ * FIX (comentario anterior era falso — hallazgo de auditoría): decía que se
+ * llamaba desde PlaybackCaptureService "con impacto audible directo", pero
+ * esa ruta es captura+análisis del sistema vía MediaProjection y NUNCA
+ * escribe su resultado a ningún AudioTrack — se descarta siempre. El único
+ * lugar de toda la app que sí saca audio real es IvannaBridgePlayer, que
+ * hasta este fix nunca llamaba a este motor.
+ */
+object IvannaNpeEngine {
+    private const val TAG = "IvannaNpeEngine"
+
+    private var handle: Long = 0L
+    private var maxFrames: Int = 0
+    private var initSampleRate: Int = 0
+
+    val isReady: Boolean get() = handle != 0L
+    /** Sample rate con el que se inicializó el motor (0 si no está listo). */
+    val sampleRate: Int get() = initSampleRate
+
+    private var bufInL: FloatBuffer? = null
+    private var bufInR: FloatBuffer? = null
+    private var bufOutL: FloatBuffer? = null
+    private var bufOutR: FloatBuffer? = null
+    // Buffers PROPIOS del análisis: el hilo de captura analiza mientras el reproductor puede estar
+    // procesando por processInterleavedStereo; compartir buffers directos sería una carrera.
+    private var bufAnL: FloatBuffer? = null
+    private var bufAnR: FloatBuffer? = null
+
+    fun init(sampleRate: Int, maxBlockFrames: Int) {
+        if (handle != 0L) return
+        // FIX (crash #1b): Si ivanna_omega no cargó, nativeCreate lanza
+        // UnsatisfiedLinkError. Se captura aquí para que el motor quede en
+        // estado no-op (handle=0L) en vez de crashear la Activity.
+        if (!IvannaNpeNative.isLoaded) {
+            Log.w(TAG, "libivanna_omega.so no disponible — motor NPE deshabilitado")
+            return
+        }
+        try {
+            handle = IvannaNpeNative.nativeCreate(sampleRate.toFloat(), maxBlockFrames)
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e(TAG, "nativeCreate UnsatisfiedLinkError — motor NPE deshabilitado", e)
+            return
+        }
+        if (handle == 0L) {
+            Log.e(TAG, "nativeCreate devolvió handle nulo")
+            return
+        }
+        maxFrames = maxBlockFrames
+        initSampleRate = sampleRate
+        bufInL = IvannaNpeNative.allocFloatBuffer(maxBlockFrames)
+        bufInR = IvannaNpeNative.allocFloatBuffer(maxBlockFrames)
+        bufOutL = IvannaNpeNative.allocFloatBuffer(maxBlockFrames)
+        bufOutR = IvannaNpeNative.allocFloatBuffer(maxBlockFrames)
+        bufAnL = IvannaNpeNative.allocFloatBuffer(maxBlockFrames)
+        bufAnR = IvannaNpeNative.allocFloatBuffer(maxBlockFrames)
+        val buildTag = runCatching { IvannaNpeNative.nativeGetBuildTag() }.getOrDefault("npe")
+        val copyright = runCatching { IvannaNpeNative.nativeGetCopyright() }.getOrDefault("")
+        Log.i(TAG, "init sr=$sampleRate maxBlockFrames=$maxBlockFrames handle=$handle tag=$buildTag $copyright")
+    }
+
+    /** Tiempo de la última inferencia en microsegundos. -1 si aún no se ha ejecutado. */
+    var lastInferenceUs: Long = -1L
+        private set
+
+    /**
+     * Procesa in-place un buffer intercalado estéreo (L,R,L,R,...) de
+     * PlaybackCaptureService. numFrames = muestras por canal.
+     */
+    fun processInterleavedStereo(buffer: FloatArray, numFrames: Int) {
+        if (handle == 0L || numFrames <= 0 || numFrames > maxFrames) return
+        val inL = bufInL ?: return
+        val inR = bufInR ?: return
+        val outL = bufOutL ?: return
+        val outR = bufOutR ?: return
+
+        inL.clear(); inR.clear(); outL.clear(); outR.clear()
+        for (i in 0 until numFrames) {
+            inL.put(buffer[i * 2])
+            inR.put(buffer[i * 2 + 1])
+        }
+        inL.flip(); inR.flip()
+
+        val t0 = System.nanoTime()
+        IvannaNpeNative.nativeProcessStereo(handle, inL, inR, outL, outR, numFrames)
+        lastInferenceUs = (System.nanoTime() - t0) / 1_000L
+
+        for (i in 0 until numFrames) {
+            buffer[i * 2] = outL.get(i)
+            buffer[i * 2 + 1] = outR.get(i)
+        }
+    }
+
+    /**
+     * Análisis SOLO-LECTURA de un buffer intercalado estéreo: actualiza género y firma del NPE sin
+     * modificar [buffer]. Es lo que corre el servicio de captura cuando DSPBridge nativo está activo
+     * (el NPE no procesa en ese caso para no duplicar procesamiento, pero la telemetría debe vivir).
+     */
+    fun analyzeInterleavedStereo(buffer: FloatArray, numFrames: Int) {
+        if (handle == 0L || numFrames <= 0 || numFrames > maxFrames || buffer.size < numFrames * 2) return
+        val aL = bufAnL ?: return
+        val aR = bufAnR ?: return
+        aL.clear(); aR.clear()
+        for (i in 0 until numFrames) {
+            aL.put(buffer[i * 2])
+            aR.put(buffer[i * 2 + 1])
+        }
+        aL.flip(); aR.flip()
+        IvannaNpeNative.nativeAnalyzeStereo(handle, aL, aR, numFrames)
+    }
+
+    /**
+     * Procesa in-place un buffer mono usando IvannaNpeNative.nativeProcess.
+     */
+    fun processMono(buffer: FloatArray, numFrames: Int = buffer.size) {
+        val n = numFrames.coerceAtMost(buffer.size)
+        if (handle == 0L || n <= 0 || n > maxFrames) return
+        val inBuf = bufInL ?: return
+        val outBuf = bufOutL ?: return
+
+        inBuf.clear()
+        outBuf.clear()
+        for (i in 0 until n) {
+            inBuf.put(buffer[i])
+        }
+        inBuf.flip()
+
+        val t0 = System.nanoTime()
+        IvannaNpeNative.nativeProcess(handle, inBuf, outBuf, n)
+        lastInferenceUs = (System.nanoTime() - t0) / 1_000L
+
+        for (i in 0 until n) {
+            buffer[i] = outBuf.get(i)
+        }
+    }
+
+    private var cachedHarmonicGain: Float = 0.60f
+    private var cachedLateralInhib: Float = 0.50f
+    private var cachedOhcComp: Float = 0.40f
+    private var cachedMasterGainDb: Float = 0.0f
+    private var cachedHrtf: Boolean = true
+    private var cachedCochlear: Boolean = true
+    private var cachedAdapt: Boolean = true
+
+    // ── v2.5.445 — Caché de los últimos parámetros de setParameters ──────
+    // setParameters exige los 6 parámetros principales (sin defaults), así
+    // que cambiar solo φ (el wet del Hiper-Operador Φ) obligaría a conocer
+    // los valores actuales de alpha/beta/gamma/delta/eta/zeta. Se guardan
+    // aquí en cada llamada a setParameters (valores iniciales = los que usa
+    // PiLstmBridge.syncNpeParameters), y setPhi() los reutiliza.
+    private var lastAlpha = 0.8f
+    private var lastBeta = 0.25f
+    private var lastGamma = 1.0f
+    private var lastDelta = 0.5f
+    private var lastEta = 0.5f
+    private var lastZeta = 0.3f
+    private var lastSrNoiseFloor = -60f
+    private var lastSyncThreshold = 0.5f
+    private var lastNoiseGainFar = 0.2f
+    private var lastDamping = 0.3f
+    private var lastCoupling = 0.5f
+    private var lastPhi = 0.5f
+
+    /** φ actual del Hiper-Operador Φ (wet del NPE, 0..1; 0.5 = directiva). */
+    fun getPhi(): Float = lastPhi
+
+    fun setBypass(bypass: Boolean) {
+        if (handle != 0L) IvannaNpeNative.nativeSetBypass(handle, bypass)
+    }
+
+    fun setAGC(targetDb: Float, rate: Float) {
+        if (handle != 0L) IvannaNpeNative.nativeSetAGC(handle, targetDb, rate)
+    }
+
+    fun setAgcParams(targetDb: Float, rate: Float) {
+        setAGC(targetDb, rate)
+    }
+
+    fun setEngineFlags(hrtf: Boolean, cochlear: Boolean, adapt: Boolean) {
+        cachedHrtf = hrtf
+        cachedCochlear = cochlear
+        cachedAdapt = adapt
+        if (handle != 0L) IvannaNpeNative.nativeSetEngineFlags(handle, hrtf, cochlear, adapt)
+    }
+
+    fun setBinauralEnabled(enabled: Boolean) {
+        setEngineFlags(enabled, cachedCochlear, cachedAdapt)
+    }
+
+    // NUEVO: motor coclear completo (Volterra H2 + upsampling polifásico).
+    // Opt-in, en paralelo — no reemplaza cochlear (envBank_) de setEngineFlags.
+    var isManifoldEnabled = false
+        set(value) {
+            field = value
+            if (handle != 0L) IvannaNpeNative.nativeSetManifoldEnabled(handle, value)
+        }
+
+    fun setNeuroParams(harmonicGain: Float, lateralInhib: Float, ohcCompression: Float, masterGainDb: Float) {
+        cachedHarmonicGain = harmonicGain
+        cachedLateralInhib = lateralInhib
+        cachedOhcComp = ohcCompression
+        cachedMasterGainDb = masterGainDb
+        if (handle != 0L) {
+            IvannaNpeNative.nativeSetNeuroParams(handle, harmonicGain, lateralInhib, ohcCompression, masterGainDb)
+        }
+    }
+
+    fun setOhcParams(ohcCompression: Float, lateralInhib: Float) {
+        setNeuroParams(cachedHarmonicGain, lateralInhib, ohcCompression, cachedMasterGainDb)
+    }
+
+    fun setHarmonicGain(harmonicGain: Float) {
+        setNeuroParams(harmonicGain, cachedLateralInhib, cachedOhcComp, cachedMasterGainDb)
+    }
+
+    fun setMasterGain(masterGainDb: Float) {
+        setNeuroParams(cachedHarmonicGain, cachedLateralInhib, cachedOhcComp, masterGainDb)
+    }
+
+    fun getDetectedGenre(): String =
+        if (handle != 0L) IvannaNpeNative.nativeGetDetectedGenre() else "\u2014"
+
+    /** [sub_bass, mid_bass, mids, presence, brilliance] en dB */
+    fun getSynthSignature(): FloatArray =
+        if (handle != 0L) IvannaNpeNative.nativeGetSynthSignature() else FloatArray(5)
+
+    /** [cluster_id, confidence, thd_pred_pct, score, pca0, pca1, pca2] */
+    fun getSynthClassify(): FloatArray =
+        if (handle != 0L) IvannaNpeNative.nativeGetSynthClassify() else FloatArray(7)
+
+    /** [cpuLoad, rmsOut, agcGain, spectralEntropy, lifFireRateHz, transientCue, spatialCue, residualCue] */
+    fun getMetrics(): FloatArray =
+        if (handle != 0L) (IvannaNpeNative.nativeGetMetrics(handle) ?: FloatArray(8)) else FloatArray(8)
+
+    fun setParameters(
+        alpha: Float, beta: Float, gamma: Float, delta: Float,
+        eta: Float, zeta: Float,
+        srNoiseFloor: Float = -60f, syncThreshold: Float = 0.5f, noiseGainFar: Float = 0.2f,
+        phi: Float = 0.5f, damping: Float = 0.3f, nonlinearity: Float = cachedHarmonicGain, coupling: Float = 0.5f
+    ) {
+        // v2.5.445: cachear para setPhi() (cambiar solo φ sin tocar el resto).
+        lastAlpha = alpha; lastBeta = beta; lastGamma = gamma; lastDelta = delta
+        lastEta = eta; lastZeta = zeta
+        lastSrNoiseFloor = srNoiseFloor; lastSyncThreshold = syncThreshold
+        lastNoiseGainFar = noiseGainFar; lastPhi = phi.coerceIn(0f, 1f)
+        lastDamping = damping; lastCoupling = coupling
+        if (handle != 0L) {
+            IvannaNpeNative.nativeSetParameters(
+                handle, alpha, beta, gamma, delta, eta, zeta,
+                srNoiseFloor, syncThreshold, noiseGainFar, phi, damping, nonlinearity, coupling
+            )
+        }
+    }
+
+    /**
+     * v2.5.445 — Φ (Hiper-Operador de Estado): cambia SOLO el wet φ [0,1]
+     * sin tocar el resto de parámetros del NPE (los reutiliza de la última
+     * llamada a setParameters; la no-linealidad usa cachedHarmonicGain
+     * actual, igual que el default de setParameters). Devuelve false si el
+     * motor no está listo (handle==0) o si el nativo falla — el llamador
+     * (control por voz) debe decirlo honesto, no afirmar que se aplicó.
+     * φ NO se persiste en ParameterStore: es runtime; al reiniciar vuelve
+     * a 0.5 (valor de la directiva). Control por voz, hilo de CONTROL.
+     */
+    fun setPhi(phi: Float): Boolean {
+        val p = phi.coerceIn(0f, 1f)
+        // Si el motor no está listo, NO cachear: getPhi() debe reflejar
+        // lo que el motor realmente tiene (o el 0.5 de la directiva),
+        // nunca un valor que no se aplicó.
+        if (handle == 0L) return false
+        return runCatching {
+            IvannaNpeNative.nativeSetParameters(
+                handle, lastAlpha, lastBeta, lastGamma, lastDelta, lastEta, lastZeta,
+                lastSrNoiseFloor, lastSyncThreshold, lastNoiseGainFar, p,
+                lastDamping, cachedHarmonicGain, lastCoupling
+            )
+            lastPhi = p
+            true
+        }.getOrDefault(false)
+    }
+
+    fun snapshotScope(dst: FloatBuffer, maxFrames: Int): Int =
+        if (handle != 0L) IvannaNpeNative.nativeSnapshotScope(handle, dst, maxFrames) else 0
+
+    fun getBuildTag(): String =
+        if (IvannaNpeNative.isLoaded) runCatching { IvannaNpeNative.nativeGetBuildTag() }.getOrDefault("offline") else "offline"
+
+    fun getCopyright(): String =
+        if (IvannaNpeNative.isLoaded) runCatching { IvannaNpeNative.nativeGetCopyright() }.getOrDefault("") else ""
+
+    fun reset() {
+        if (handle != 0L) IvannaNpeNative.nativeReset(handle)
+    }
+
+    fun release() {
+        if (handle != 0L) {
+            IvannaNpeNative.nativeDestroy(handle)
+            handle = 0L
+        }
+        bufInL = null; bufInR = null; bufOutL = null; bufOutR = null; bufAnL = null; bufAnR = null
+    }
+}

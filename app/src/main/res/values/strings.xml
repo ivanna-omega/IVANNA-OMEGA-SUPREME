@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">IVANNA-OMEGA-SUPREME</string>
+    <!-- AMI (v2.5.471 Repair 4): nombre del asistente. La barra del
+         asistente (IvannaAssistantScreen.IvannaAssistantTopBar) lo lee con
+         stringResource(R.string.assistant_name), no con un literal. -->
+    <string name="assistant_name">Ami</string>
+    <!-- VISTA DE DIOS · FLOTA (v2.5.471 Repair 4): pantalla que muestra los
+         ciclos reales del consejo leídos del puente. Sin ciclos no se
+         inventa actividad: se muestra "Sin ciclos todavía". -->
+    <string name="fleet_title">Vista de Dios · Flota</string>
+    <string name="fleet_subtitle">Ciclos del consejo leídos del puente</string>
+    <string name="fleet_no_cycles">Sin ciclos todavía</string>
+    <string name="fleet_no_cycles_hint">El puente aún no ha entregado ningún veredicto del consejo a este teléfono. Cuando llegue el primero aparecerá aquí con su fecha, sus rondas y su veredicto.</string>
+    <string name="fleet_refresh">Actualizar</string>
+    <string name="fleet_last_read">Última lectura</string>
+    <string name="fleet_source">Origen</string>
+    <string name="fleet_rounds">Rondas</string>
+    <string name="fleet_roles">Roles</string>
+    <string name="fleet_patch">Parche</string>
+    <string name="fleet_patch_yes">sí</string>
+    <string name="fleet_patch_no">no</string>
+    <string name="fleet_verdict_approved">Aprobado</string>
+    <string name="fleet_verdict_rejected">Rechazado</string>
+    <string name="fleet_verdict_pending">Sin veredicto</string>
+    <string name="fleet_unreadable">archivos no legibles</string>
+    <!-- FIX 3 (v2.5.465): label del attribution tag de captura declarado
+         en AndroidManifest.xml (<attribution android:tag="playback_capture">).
+         Es el texto que el panel de privacidad del sistema muestra junto a
+         los accesos de la ruta de captura (MediaProjection + wake lock). -->
+    <string name="attribution_playback_capture">Captura de audio del sistema</string>
+</resources>

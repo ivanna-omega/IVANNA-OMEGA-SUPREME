@@ -1,0 +1,1016 @@
+# Inventario de capacidades — IVANNA-OMEGA-SUPREME
+# Versión del producto: v2.5.445 (versionCode 736) · Rama: ivanna-real-completa
+# Base de evidencia: HEAD 74337b5a (commit que versiona tools/evolution/council.py).
+#
+# REGLAS DE LECTURA (obligatorias):
+# - "Existe el archivo" NO equivale a "funciona". Cada estado se basa en la
+#   evidencia citada en `evidencia` (código, tests, mediciones reales).
+# - Estados permitidos: IMPLEMENTADA, INTEGRADA, VERIFICADA EN HOST,
+#   VERIFICADA EN DISPOSITIVO, VALIDADA PERCEPTUALMENTE, PENDIENTE, BLOQUEADA.
+# - CORRECCIÓN L4 (aprobada por Esse, 2026-11-14): el v3 decía "toda
+#   capacidad: verificada en dispositivo como mínimo" — error de categoría
+#   para capacidades que NO corren en el teléfono (consejo, motor de
+#   evolución, puente GitHub, Vista de Dios). El estado objetivo es POR
+#   TIPO, campo `target_state` por capacidad:
+#     audio/DSP de sonido (criterio con ABX/escucha) ->
+#       "VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE" (solo Esse)
+#     audio/DSP (resto) -> "VERIFICADA EN DISPOSITIVO"
+#     herramientas/infraestructura -> "VERIFICADA EN HOST/CI"
+#   La puerta de perfección (scripts/perfection_gate.py) exige target_state
+#   en cada capacidad y cuenta como A_MEDIAS toda capacidad por debajo de
+#   su objetivo. Un bloqueo solo se cierra con un campo `decision_esse:`
+#   registrado en el bloque de la capacidad.
+# - Nada en este archivo afirma ventas, acuerdos, sensores ni métricas que no
+#   estén en la evidencia citada. 0 vendidos, $0. Bofo sin resolver.
+# - Discrepancia conocida y registrada (no ocultada): los atómicos del lado
+#   efecto arrancan en 0.0 (bypass) — p. ej. g_orbe_amount, g_holos_amount,
+#   g_hyper_amount, g_omni_amount en *_globals_effect.cpp — mientras
+#   ParameterStore.kt define los defaults de app ORBE 1.0 / HOLOS 0.5 /
+#   Φ 0.5. El valor efectivo depende de que la app los escriba al arrancar;
+#   en vivo se observaron amounts bajos (ORBE 0.19 / HOLOS 0.05) y
+#   fusion_active=0 en Ruta B antes del 7º reset. Ver cap-014.
+#
+# Cómo actualizar: al cambiar un estado, citar la evidencia nueva (archivo,
+# test, medición con fecha) en `evidencia` y cambiar `ultima_verificacion`.
+
+schema_version: 1
+producto: IVANNA-OMEGA-SUPREME
+version: v2.5.445
+version_code: 736
+base_evidencia: a5f67e36
+fecha_inventario: "2026-11-15"
+nota_estado_general: >
+  Ruta B: causa raíz encontrada y corregida en rama (plano de control
+  app→daemon roto — SET_PERCEPTUAL_STATE respondía "unsupported" y el
+  daemon re-publicaba su default neutro 20 veces/s); verificación en
+  dispositivo PENDIENTE de la luz verde de Esse. El bofo ("bofo feo")
+  sigue sin resolver; los cortes en BridgePlayer también ocurren en
+  Tidal dentro de IVANNA (no solo captura) — instrumentación lista para
+  medirlos, escucha en dispositivo PENDIENTE. Puerta de perfección:
+  NO PERFECTA (PENDIENTES 2, FALLOS 2, A_MEDIAS 42, BLOQUEOS 3 en
+  commit 79cf15a9; ver scripts/perfection_gate.py).
+
+capacidades:
+  - id: cap-001
+    nombre: ORBE (Binaural Esférico de Campo Cercano)
+    objetivo: >
+      Binauralización por banda ERB a azimut y distancia continuos
+      (0.15–2.0 m) con parallax por head-tracking.
+    implementacion:
+      - app/src/main/cpp/spatial/OrbeBinaural.hpp
+      - app/src/main/cpp/orbe_controls_bridge.cpp (g_orbe_amount, app)
+      - app/src/main/cpp/orbe_globals_effect.cpp (g_orbe_amount, audioserver)
+      - app/src/main/java/com/ivanna/omega/core/ParameterStore.kt (KEY_ORBE_AMOUNT)
+    ruta_ejecucion: Ruta A (BridgePlayer) y Ruta B (efecto AudioFlinger)
+    controles:
+      orbe_amount: { defecto_app: 1.0, defecto_efecto_atomico: 0.0, rango: "0.0–1.0", persistencia: ParameterStore }
+      orbe_distance_m: { defecto_app: 0.35, rango: "0.15–2.0" }
+      orbe_spread: { defecto_app: 1.0 }
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Código C++ y puentes JNI presentes; defaults de app en ParameterStore.kt:288.
+      - Atómico del efecto arranca en 0.0 (orbe_globals_effect.cpp:22); el valor
+        efectivo requiere que la app lo escriba. En vivo se observó 0.19.
+      - Tracker SO(3) por cuaterniones EN PAUSA por orden de Esse (2026-11-11);
+        el parallax por head-tracking no tiene seguidor completo activo.
+    pruebas: []
+    limites:
+      - Sin seguidor SO(3) activo; parallax limitado a la pose disponible.
+      - No hay medición perceptual ABX que valide la localización (ver docs/validation/abx-protocol.md).
+    criterio_aceptacion: >
+      ABX de localización/externalización superado en dispositivo (protocolo
+      ABX) + amounts efectivos iguales a los defaults de app en vivo.
+
+  - id: cap-002
+    nombre: HOLOS (Operador Único de Campo Acústico)
+    objetivo: >
+      Un vector de estado por banda en STFT hop 128 / FFT 512; fusión de
+      campo acústico en una sola pasada espectral.
+    implementacion:
+      - app/src/main/cpp/spatial/HolosOperator.hpp
+      - app/src/main/cpp/spatial/HolosOperator.cpp
+      - app/src/main/cpp/holos_controls_bridge.cpp
+      - app/src/main/cpp/holos_globals_effect.cpp
+    ruta_ejecucion: Ruta A y Ruta B
+    controles:
+      holos_amount: { defecto_app: 0.5, defecto_efecto_atomico: 0.0, rango: "0.0–1.0", persistencia: ParameterStore }
+      holos_harmonics: { defecto_app: 0.0 }
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Código y puentes presentes; defaults de app HOLOS 0.5 / harmonics 0.0
+        (ParameterStore.kt:313). Medición citada en memoria — THD+N −94.0 dB
+        @1 kHz (retuneo 2026-11-08); no re-medida en este inventario.
+      - En vivo se observó amount 0.05 frente al 0.5 declarado.
+    pruebas:
+      - app/src/main/cpp/tests/test_holos_chain.cpp
+    limites:
+      - La medición THD+N citada no se reproduce en este inventario; requiere
+        re-medición en host y en dispositivo.
+    criterio_aceptacion: >
+      THD+N re-medido en host y en dispositivo + ABX de preferencia superado.
+
+  - id: cap-003
+    nombre: "Φ (Phi) — Hiper-Operador de Estado"
+    objetivo: >
+      Un Único Operador Matricial Neuro-Electromecánico de Estado Continuo:
+      bucle cerrado neural, campos de onda, pre-distorsión Volterra, sensado
+      Back-EMF y Bitstream Zero-PCM; muestra a muestra, sin FFT por bloques.
+    implementacion:
+      - app/src/main/cpp/hyper_controls_bridge.cpp
+      - app/src/main/cpp/hyper_globals_effect.cpp
+      - docs/HYPER_STATE_OPERATOR.md
+    ruta_ejecucion: Ruta A y Ruta B
+    controles:
+      hyper_amount: { defecto_app: 0.5, defecto_efecto_atomico: 0.0, rango: "0.0–1.0", persistencia: ParameterStore }
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Puentes y atómicos presentes; default de efecto 0.0 = bypass
+        bit-exacto (hyper_globals_effect.cpp:6-12); default de app 0.5.
+      - Diseño documentado en docs/HYPER_STATE_OPERATOR.md; implementado
+        como v2.5.369, fail-closed.
+      - El componente "neuro on-device" es el NPE con sensor = micrófono del
+        teléfono; no hay EEG externo ni hardware de compra.
+    pruebas: []
+    limites:
+      - Sin validación perceptual; el bucle cerrado depende del micrófono del
+        teléfono, no de un sensor neural dedicado.
+    criterio_aceptacion: >
+      ABX de discriminación + preferencia en dispositivo, con el bucle
+      cerrado activo, sin regresión de THD+N.
+
+  - id: cap-004
+    nombre: Volterra — selector de kernel (PZ1D REFINADO / GENEZI)
+    objetivo: >
+      Pre-distorsión / modelado no lineal por kernels Volterra con reemplazo
+      atómico y fundido ~18 ms, persistente tras reinicio.
+    implementacion:
+      - app/src/main/cpp/neuromorphic/diagonal_volterra.hpp
+      - app/src/main/cpp/neuromorphic/volterra_h2_symmetric.cpp
+      - app/src/main/cpp/neuromorphic/volterra_kernel_package.hpp
+      - docs/VOLTERRA_KERNEL_SWITCH.md
+    ruta_ejecucion: Ruta A y Ruta B
+    controles:
+      kernel: { valores: ["PZ1D REFINADO", "GENEZI"], persistencia: ParameterStore }
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO
+    evidencia:
+      - Tests KernelSwitch 8/8 y suite 847/847 citados en memoria (2026-11-08);
+        no re-ejecutados en este inventario.
+      - Selector presente en la interfaz; reemplazo atómico documentado.
+    pruebas:
+      - tests/test_kernel_loader.py
+    limites:
+      - Los conteos 8/8 y 847/847 son históricos; requieren re-ejecución en
+        la rama actual para subir a VERIFICADA EN HOST.
+    criterio_aceptacion: >
+      Re-ejecución de KernelSwitch y suite completa en verde en esta rama.
+
+  - id: cap-005
+    nombre: "NEU·Ω — Compilador Espectral Holográfico"
+    objetivo: >
+      Compilar la cadena entera en una matriz compleja 2×2 por banda cada
+      hop; el audio pasa por el dominio espectral una sola vez (FFTs por hop
+      de 10 a 2); cola difusa sumada en frecuencia antes del único IFFT.
+    implementacion:
+      - app/src/main/cpp/spatial/NeuCompiler.hpp
+      - app/src/main/cpp/spatial/SpectralCore.hpp
+      - docs/analysis-ivanna/NEU-Omega_Compilador_Espectral_Holografico.md (privado, NO en repo)
+    ruta_ejecucion: Ruta A (Fase 6 cableada en v2.5.436, OFF por defecto)
+    controles:
+      neu_omega_enabled: { defecto: false }
+    estado: VERIFICADA EN HOST
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Fase 0 completa; Fases 1 y 2 verificadas en host; E2/E3 pasan en
+        local con margen (corrección de Esse — criterio bit-idéntico 1e-6
+        reemplazado por equivalencia medible en dB; solo E1 sigue exacta).
+      - Bug real encontrado y documentado — SpectralCore::prepare() usaba
+        fTop = 0.5f * sr_ en vez de min(16000, 0.45*sr); fix para la 442.
+      - CI roja en el leg plano "Tests host (CTest)" por 6 categorías
+        latentes preexistentes de Fase 0; no bloquea publicación.
+    pruebas:
+      - E1 (exacta), E2/E3 (equivalencia en dB) en host
+    limites:
+      - OFF por defecto; sin verificación en dispositivo; E2 broadband
+        pendiente (tonos aislados no son un E2 válido).
+    criterio_aceptacion: >
+      E2 broadband en host + activación en dispositivo con medición de
+      latencia/coste y ABX.
+
+  - id: cap-006
+    nombre: "Ω (Omega) — operador espectral"
+    objetivo: >
+      Operador Ω dentro de la cadena NEU·Ω; 10 tests dedicados añadidos en
+      v2.5.442.
+    implementacion:
+      - app/src/main/cpp/spatial/SpectralCore.hpp
+      - app/src/main/cpp/omega_effect.cpp
+    ruta_ejecucion: Ruta A
+    controles: {}
+    estado: VERIFICADA EN HOST
+    target_state: VERIFICADA EN DISPOSITIVO
+    evidencia:
+      - CTest 1008/1008 en CI v2.5.444 (998/998 en v2.5.442 + 10 tests Ω);
+        ver README §8.2. El leg plano de tests-host está en rojo en main
+        actual por las 6 categorías latentes de Fase 0 (no por Ω).
+    pruebas:
+      - CTest host (scripts/run_ctest.sh)
+    limites:
+      - Sin verificación en dispositivo.
+    criterio_aceptacion: >
+      Leg de tests-host en verde en CI + medición en dispositivo.
+
+  - id: cap-007
+    nombre: OmniField — render de escena / campo
+    objetivo: >
+      Render de escena acústica (campo, convergencia, sirena) sobre la
+      cadena espectral.
+    implementacion:
+      - app/src/main/cpp/spatial/OmniField.hpp
+      - app/src/main/cpp/spatial/OmniFieldConvergence.hpp
+      - app/src/main/cpp/spatial/OmniFieldRender.hpp
+      - app/src/main/cpp/spatial/OmniFieldScene.hpp
+      - app/src/main/cpp/spatial/OmniFieldSiren.hpp
+      - app/src/main/cpp/omni_controls_bridge.cpp
+      - app/src/main/cpp/omni_globals_effect.cpp
+    ruta_ejecucion: Ruta A y Ruta B
+    controles:
+      omni_amount: { defecto_app: 1.0, defecto_efecto_atomico: 0.0, persistencia: ParameterStore }
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Headers y puentes presentes; el atómico del efecto arranca en 0.0
+        (omni_globals_effect.cpp:15-24 — "la fusión está APAGADA por defecto
+        en Ruta B"); el puente de app declara 1.0 como default de app.
+      - No confundir con Ω (cap-006) — OmniField es render de escena, Ω es
+        el operador espectral.
+    pruebas: []
+    limites:
+      - Sin tests dedicados localizados en este inventario; sin validación
+        perceptual.
+    criterio_aceptacion: >
+      Tests host dedicados en verde + ABX de externalización en dispositivo.
+
+  - id: cap-008
+    nombre: ASRC — Ruta A (nativo v6 en la app)
+    objetivo: >
+      Resincronización de muestra magistral en la app: FIR 287 taps +
+      Catmull-Rom + Ψ 64 taps/oído, alimentado por el PLL existente
+      (servo Theil-Sen, ±500 ppm), reemplazando el remuestreador Kotlin.
+    implementacion:
+      - app/src/main/cpp/ivanna_route_a_asrc.cpp
+      - app/src/main/cpp/ivanna_route_a_asrc.h
+      - app/src/main/java/com/ivanna/omega/audio/RouteAAsrc.kt
+      - app/src/main/java/com/ivanna/omega/audio/AudioTrackBufferPll.kt
+      - app/src/main/java/com/ivanna/omega/audio/StereoAudioResampler.kt
+    ruta_ejecucion: Ruta A (dentro de la app; captura Tidal / BridgePlayer)
+    controles:
+      asrc_enabled: { defecto: true }
+    estado: VERIFICADA EN HOST
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Core Genspark v2.5.398 mergeado en v2.5.439 — 25/25 en host, residuo
+        ~0 ppm, THD+N ~−86/−84/−83 dB, underflow 0, coste 3.59% de un core.
+      - Archivo ivanna_route_a_asrc.cpp SÍ existe en el repo (la razón
+        alegada para no usar RouteAAsrc era incorrecta).
+      - Deriva medida 2026-11-07 — 47999.7 vs 48000 Hz (−6.25 ppm); v2
+        ~−13 ppm por bocina, ~−70 ppm por USB.
+    pruebas:
+      - app/src/main/cpp/ivanna_route_a_asrc_test.cpp
+      - tests/test_sync_asrc.py
+    limites:
+      - Solo procesa lo que la app captura (Tidal, YouTube Music); no
+        llamadas ni audio del sistema.
+      - Elegibilidad a 192 kHz pendiente de actualizar antes de probarla;
+        el máximo real del DAC Genezi por USB sigue sin establecerse.
+    criterio_aceptacion: >
+      Medición de deriva residual y THD+N en dispositivo (Moto G85) con
+      Tidal real + ABX.
+
+  - id: cap-009
+    nombre: ASRC — módulo Magisk / HAL (write-stage PAL)
+    objetivo: >
+      ASRC dentro del output stream real del HAL (audio.primary.blair.so)
+      por write-stage; actuador de ratio en el write-stage porque PAL no
+      expone actuador de ratio variable para música.
+    implementacion:
+      - magisk_module/system/vendor/lib64/libivanna_asrc_write_stage.so
+      - magisk_module/system/vendor/lib64/libivanna_asrc_write_stage.so.PROVENANCE.txt
+      - magisk_module/asrc_link.sh
+      - magisk_module/overlay.d.disabled/ivanna_audio.rc
+    ruta_ejecucion: HAL (PAL, card 1 blair) — vía módulo Magisk
+    controles:
+      kill_switch: { archivo: "pal_asrc.off", efecto: bypass inmediato sin reiniciar }
+    estado: BLOQUEADA
+    target_state: VERIFICADA EN DISPOSITIVO
+    decision_esse: Se mantiene BLOQUEADA hasta la prueba en vivo con voz real (orden de voz → cambio de parámetro verificado); el ASRC funciona y está medido (deriva +58 ppm), falta solo esa prueba. Decisión de Esse 2026-11-20.
+    evidencia:
+      - El wrapper del HAL está MUERTO (v2.5.403 → bootloop → 6º reset de
+        fábrica 2026-11-11) — un módulo Magisk NO puede hacer que init lea
+        un .rc al arrancar. NO instalar el zip v2.5.403; NO reintentarlo.
+      - overlay.d NO monta el .rc en Magisk 31.1 (verificado en vivo);
+        la vía system/ sí hace bind-mount, pero el .rc solo se lee en el
+        próximo arranque.
+      - Auditoría ASRC v6 — 23 hallazgos, todos corregidos y re-auditados
+        (offset mmap 0x2ec180 correcto; pread en vez de dereferencia;
+        fstat ≥1008 B; seqlock por sequence).
+      - Teléfono limpio tras el 7º reset — sin módulo, sin daemon, sin Ruta B.
+    pruebas: []
+    limites:
+      - Sin vía de instalación segura conocida hoy; cualquier retorno del
+        módulo requiere luz verde explícita de Esse y teléfono estable.
+    criterio_aceptacion: >
+      Vía de carga del HAL demostrada sin bootloop en dispositivo de
+      pruebas + kill switch verificado + ASRC midiendo eficaz (THD+N,
+      coste, latencia) o reporte de exclusión.
+
+  - id: cap-010
+    nombre: BridgePlayer (reproductor propio, Ruta A)
+    objetivo: >
+      Reproductor propio dentro de IVANNA (archivos locales y, desde la
+      v2.5.416, Tidal) que reproduce al 100% por la cadena magistral, sin
+      redirección al reproductor del sistema.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/audio/IvannaBridgePlayer.kt
+      - app/src/main/java/com/ivanna/omega/audio/BridgePlaybackService.kt
+      - app/src/main/java/com/ivanna/omega/ui/BridgePlayerCard.kt
+    ruta_ejecucion: Ruta A
+    controles: {}
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Código presente; la "Experiencia Auditiva" antes solo listaba vídeos
+        locales y los abría con ACTION_VIEW (reproductor del sistema).
+      - Por memoria — el BridgePlayer reproduce al 100% por la cadena
+        magistral; la captura, en cambio, deja el original al 100%.
+    pruebas: []
+    limites:
+      - Sin prueba de escucha documentada que compare BridgePlayer vs
+        captura en el mismo dispositivo y fecha.
+    criterio_aceptacion: >
+      Prueba de escucha documentada (BridgePlayer vs captura, mismo track,
+      mismo dispositivo) + ABX.
+
+  - id: cap-011
+    nombre: Captura de audio (Ruta A, Tidal / YouTube Music)
+    objetivo: Capturar el audio de Tidal/YouTube Music y reprocesarlo por la cadena IVANNA.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/audio/IvannaBridgePlayer.kt
+      - app/src/main/java/com/ivanna/omega/audio/AudioRouteManager.kt
+    ruta_ejecucion: Ruta A
+    controles:
+      delta_blend_solo: { valor: 0.60, nota: "copia procesada a ganancia 0.60 (−4.4 dB aprox.)" }
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Limitación estructural documentada — no existe API pública para
+        silenciar el original de Tidal; el original sigue sonando al 100%
+        y la copia procesada va 140 ms tarde a ganancia 0.60. Por eso la
+        capa con efectos se siente sutil en captura.
+      - Tronidos en Tidal tras el reset con atribución abierta (aislamiento
+        Tidal-solo pendiente).
+    pruebas: []
+    limites:
+      - Techo de la captura — original 100% + copia tardía; no es el camino
+        para sentir los efectos al 100% (ese es el BridgePlayer).
+    criterio_aceptacion: >
+      Test de aislamiento Tidal-solo documentado + ABX captura vs BridgePlayer.
+
+  - id: cap-012
+    nombre: "Ami — asistente (LLM vía OmniRoute/Gemini)"
+    objetivo: >
+      Asistente conversacional dentro de IVANNA, con enrutado LLM (fin de
+      respuestas enlatadas) y control por voz de ajustes DSP.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/ai/gemini/OmniRouteOrchestrator.kt
+      - app/src/main/java/com/ivanna/omega/assistant/IvannaVoiceEngine.kt
+      - app/src/main/java/com/ivanna/omega/assistant/OpenQuestionRouter.kt
+      - app/src/main/java/com/ivanna/omega/assistant/core/OmniRoutePrefs.kt
+      - app/src/main/java/com/ivanna/omega/ui/IvannaAssistantScreen.kt
+    ruta_ejecucion: App → gateway OmniRoute (VM) / Gemini
+    controles:
+      llm_provider: { defecto: Gemini, alternativo: OmniRoute (opt-in, flag en ajustes) }
+      combo_gratuito: ivanna-free
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO
+    evidencia:
+      - OmniRouteOrchestrator documenta — OmniRoute corre en la VM y Gemini
+        sigue siendo el DEFAULT; OmniRoute es opt-in.
+      - Enrutado LLM y control por voz llegaron en la v2.5.445.
+      - Modelos gratuitos que sí funcionan (6) — ddgw/claude-haiku-4-5,
+        ddgw/gpt-5.6-luna, ddgw/gpt-5.4-mini, ddgw/mistral-small-2603,
+        ddgw/tinfoil/gpt-oss-120b, ddgw/tinfoil/gemma4-31b. Los élite de
+        pago NO funcionan sin cuentas; no se roban claves ni se burla
+        autenticación.
+    pruebas:
+      - Router 16 tests + voice control 19 tests (v2.5.445, citados en README §8.2)
+    limites:
+      - La Tailscale de la VM es solo-cliente (salida) — el teléfono NUNCA
+        llega al gateway por 100.71.103.19; depende de un túnel público
+        (localhost.run) cuya URL rota (actual 2026-11-14 noche —
+        https://1a12c5e8452bf7.app.lhr.life/v1). Sin dominio fijo, la
+        conexión se rompe al rotar.
+    criterio_aceptacion: >
+      Túnel con nombre/dominio fijo + prueba en dispositivo de extremo a
+      extremo (pregunta → respuesta → ajuste DSP aplicado).
+
+  - id: cap-013
+    nombre: Control por voz de ajustes DSP
+    objetivo: Controlar ajustes DSP por voz dentro de IVANNA.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/VoiceController.kt
+      - app/src/main/java/com/ivanna/omega/assistant/VoiceSettingsControl.kt
+      - app/src/main/java/com/ivanna/omega/assistant/IvannaVoiceEngine.kt
+    ruta_ejecucion: App (voz → Ami → DSP)
+    controles: {}
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO
+    evidencia:
+      - 19 tests de control por voz en la v2.5.445 (citados en README §8.2).
+    pruebas:
+      - Kotlin unit tests (testReleaseUnitTest, CI)
+    limites:
+      - Sin prueba en dispositivo con voz real documentada en este inventario.
+    criterio_aceptacion: >
+      Prueba en dispositivo: orden de voz real → cambio de parámetro
+      verificado en vivo.
+
+  - id: cap-014
+    nombre: Ruta B — efecto AudioFlinger + sesión
+    objetivo: >
+      Efecto en el mezclador (AudioFlinger): procesa la mezcla real en el
+      sitio, sin copia, sin delay, sin audio doble. Lo definitivo según
+      Esse (2026-11-12).
+    implementacion:
+      - app/src/main/cpp/omega_effect.cpp
+      - app/src/main/cpp/jni/ivanna_omega_jni.cpp
+      - app/src/main/cpp/omega_daemon_bridge.cpp
+      - app/src/main/java/com/ivanna/omega/core/FourDRouteB.kt
+    ruta_ejecucion: Ruta B (AudioFlinger, audioserver)
+    controles:
+      fusion_active: { observado_pre_reset: 0 }
+      psi_active: { observado_pre_reset: 0 }
+      ratio_asrc: { observado_pre_reset: 1.0 }
+    estado: BLOQUEADA
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    decision_esse: Se mantiene BLOQUEADA hasta que el puente reciba diagnóstico real del teléfono con el watcher activo; el efecto Ruta B ya acopla y procesa, lo pendiente es la evidencia de diagnóstico. Decisión de Esse 2026-11-20.
+    evidencia:
+      - Antes del 7º reset — efecto en cadena (Effect 899, sesión 2169,
+        enabled, 1 track activo) pero SIN procesar — fusion_active=0,
+        psi_active=0, ratio 1.0, sin frames ni beacon.
+      - Pista estática — el estado bajo /data/adb/ivanna_omega es
+        inalcanzable para un audioserver no-root (/data/adb es 0700 root
+        y ningún script hace chmod); explica ratio 1.0 y frames
+        ausentes, pero NO fusion 0 ni el bofo.
+      - El log decisivo IvannaOmegaEffect nunca se leyó; no existe en el
+        teléfono limpio. El módulo viejo se desecha — uno NUEVO DESDE CERO.
+      - Amounts en vivo bajos (ORBE 0.19 / HOLOS 0.05 vs 1.0 / 0.5).
+      - CAUSA RAÍZ encontrada en rama 2026-11-15 (commit 9896323d) —
+        el plano de control app→daemon estaba roto — la app enviaba
+        ORBE/HOLOS por SET_PERCEPTUAL_STATE pero el daemon v2 solo servía
+        HELLO/GET_STATUS y respondía "unsupported" a todo SET_*; el bucle
+        re-publicaba su default neutro (ORBE 0 / HOLOS 0, bypass bit-exacto)
+        20 veces/s. Fix — rama SET_PERCEPTUAL_STATE en el responder +
+        drenaje en el bucle antes de applyFusionToSnapshot. Kill switch v2
+        corregido a pal_asr.off (684a60ce). Vía LD_PRELOAD retirada del
+        módulo (d7bc98ae). Telemetría ASRC corregida uint32→uint64
+        (a7f649d4). Doctor con 3 puertas nuevas (d772c9b9).
+        Procedimientos en docs/09-operations/route-b-*.md. Verificación
+        en dispositivo PENDIENTE de la luz verde de Esse.
+    pruebas: []
+    limites:
+      - Teléfono limpio tras el 7º reset — no hay módulo, daemon ni Ruta B.
+        Reconstrucción pendiente con luz verde de Esse.
+      - fusion_active=1 es imposible sin músculo HAL (retirado por diseño);
+        la señal real de procesado es el beacon (effect_state==2 +
+        dsp_frames creciendo), no fusion_active.
+    criterio_aceptacion: >
+      Efecto acoplado a sesión viva + fusion_active=1 + frames procesados
+      medidos + log IvannaOmegaEffect leído + ABX en dispositivo.
+
+  - id: cap-015
+    nombre: Consejo multi-modelo (puerta de reescritura)
+    objetivo: >
+      Tres modelos gratuitos dialogan (PROPOSER → REVIEWER → ARBITER, máx.
+      3 rondas) antes de tocar IVANNA; sin consenso → RECHAZADO
+      (fail-closed). El consejo NO aplica nada: devuelve el parche acordado.
+    implementacion:
+      - tools/evolution/council.py
+      - tools/evolution/test_council.py
+      - tools/evolution/evolution_engine.py
+      - tools/evolution/test_draft_council.py
+    ruta_ejecucion: Herramienta Python (host / evolución)
+    controles:
+      proposer: ddgw/tinfoil/gpt-oss-120b
+      reviewer: ddgw/claude-haiku-4-5
+      arbiter: ddgw/gpt-5.6-luna
+      max_rondas: 3
+    estado: VERIFICADA EN HOST
+    target_state: VERIFICADA EN HOST/CI
+    evidencia:
+      - 14/14 tests (test_council.py, Python unittest, LLM mockeado;
+        veredictos, rondas, fail-closed).
+      - Hallazgo de auditoría externa 2026-11-14 — council.py NO estaba
+        versionado (solo local, untracked); fix commit 74337b5a lo versiona
+        (443 líneas). La CI no corría los tests Python de evolución, por
+        eso la 445 se publicó en verde con el módulo ausente.
+    pruebas:
+      - python3 -m unittest discover -s tools/evolution/tests (14/14)
+    limites:
+      - Tests con LLM mockeado, no con los modelos reales en vivo.
+      - La CI no corría estos tests al publicar la 445; pendiente añadirlos
+        al gate de publicación.
+    criterio_aceptacion: >
+      Tests del consejo en el gate de CI + un ciclo completo con modelos
+      reales (mockeado no basta) documentado.
+
+  - id: cap-016
+    nombre: Autonomía / auto-reparación (motor de evolución)
+    objetivo: >
+      IVANNA detecta, repara, verifica (tests + CI verde) y publica sola,
+      dentro de su dominio (repo, código, releases, diagnóstico) y con
+      guardia de contención fail-closed. Fuera del dominio: bloqueo y reporte.
+    implementacion:
+      - tools/evolution/evolution_engine.py
+      - tools/evolution/council.py
+      - tools/evolution/github_bridge.py
+      - tools/evolution/llm_client.py
+    ruta_ejecucion: Host / evolución (OmniRoute + Floot)
+    controles:
+      prohibido: ["deshabilitar IntegrityGate", "tocar credenciales", "comprar"]
+      contencion: fail-closed fuera del dominio IVANNA
+    estado: INTEGRADA
+    target_state: VERIFICADA EN HOST/CI
+    evidencia:
+      - Auto-reparación autorizada por Esse 2026-11-14 12:56–12:58 CST;
+        autonomía total con contención 17:21 CST; potencia 17:24 CST.
+      - Primer ciclo 100% autónomo (detectar → reparar → publicar solo)
+        AÚN NO ha pasado (2026-11-14 noche) — es la prueba de fuego pendiente.
+      - GitHub bridge 26/26 tests Python (v2.5.445).
+    pruebas:
+      - tools/evolution/tests (council 14/14, github bridge 26/26)
+    limites:
+      - Sin ciclo autónomo completo demostrado; la autonomía total no
+        equivale a autonomía verificada.
+    criterio_aceptacion: >
+      Un ciclo completo 100% autónomo documentado de extremo a extremo
+      (detección → parche del consejo → tests + CI verde → release).
+
+  - id: cap-017
+    nombre: Vista de Dios (tablero en vivo de la flota)
+    objetivo: >
+      Pantalla directa a Ami / tablero en vivo e ilimitado para monitorear
+      desde arriba los planes de la flota, actualizándose solo
+      continuamente, en tiempo real. Solo lectura (Esse ve, no manda).
+    implementacion:
+      - tools/evolution/status_export.py (exportación de estado para la Vista)
+      - tools/evolution/evolution_engine.py --status
+    ruta_ejecucion: Artefacto externo (fuera del repo) + exportación en el repo
+    controles: {}
+    estado: PENDIENTE
+    target_state: VERIFICADA EN HOST/CI
+    evidencia:
+      - Foto estática del estado al 2026-11-14 17:48 CST, construida ese día;
+        no en vivo. Esse pidió esa noche la versión en vivo ilimitada.
+      - La versión EN VIVO existe como artefacto externo
+        ("Ami — Vista de Dios En Vivo", sonda cada 5 min, cron
+        ami-vista-de-dios-live-refresh; fuentes reales — API pública de
+        GitHub, probe 401 a OmniRoute, probe del túnel). NO está versionada
+        en el repo.
+      - En el repo ahora existe tools/evolution/status_export.py +
+        `evolution_engine.py --status` (JSON sin secretos con rama/HEAD,
+        salud del gateway, roles del consejo, propuestas y cola de
+        auditoría). El artefacto en vivo aún NO lee este JSON solo — el
+        operador lo publica/adjunta cuando la Vista lo pida.
+    pruebas: []
+    limites:
+      - El artefacto en vivo no está versionado en el repo; la alimentación
+        automática (artefacto lee status_export.py) no está conectada.
+    criterio_aceptacion: >
+      Tablero en vivo verificable por Esse (actualización continua) o
+      documento que fije su ubicación, fuente de datos y cadencia.
+
+  - id: cap-018
+    nombre: Calibración ISO 226 (equal-loudness)
+    objetivo: Corrección de sonoridad por curvas ISO 226 (fletcher-munson).
+    implementacion:
+      - app/src/main/cpp/equal_loudness.hpp
+      - app/src/main/cpp/audio_control_plane.cpp
+      - app/src/main/cpp/spatial/HearingAdaptationEngine.hpp
+    ruta_ejecucion: Ruta A y Ruta B
+    controles:
+      iso226_fix_441: { cambio: "+9.4 dB @31.5 Hz, +3.2 dB @12.5 kHz" }
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Fix de signo ISO 226 en la v2.5.441 (+9.4 dB @31.5 Hz, +3.2 dB
+        @12.5 kHz) NO resolvió el bofo tras instalarse (~15:00, 2026-11-14).
+        El bofo es ahora un problema de Ruta A por descartar.
+    pruebas: []
+    limites:
+      - El bofo sigue sin resolver; la calibración ISO 226 no era la causa.
+    criterio_aceptacion: >
+      Bofo diagnosticado (causa raíz con evidencia) + ABX antes/después.
+
+  - id: cap-019
+    nombre: HRTF / SOFA (datasets y carga)
+    objetivo: >
+      Carga de HRTF SOFA/HDF5 (HRIR, HPIR, RIR, SOS) con reconstrucción
+      HRIR desde base PCA compilada; Data.IR no se lee en runtime.
+    implementacion:
+      - app/src/main/cpp/SofaHRTFLoader.cpp
+      - app/src/main/cpp/SofaHRTFLoader.hpp
+      - app/src/main/cpp/HrtfManager.cpp
+      - app/src/main/assets/ivanna_omega/sofa/
+      - magisk_module/system/etc/ivanna_omega/sofa/
+      - scripts/validate_sofa_hdf5.py
+      - scripts/inventory_sofa_metadata.py
+    ruta_ejecucion: App (carga) y módulo (copia de datasets)
+    controles: {}
+    estado: VERIFICADA EN HOST
+    target_state: VERIFICADA EN HOST/CI
+    evidencia:
+      - Inventario SOFA — 239/239 legibles en el subconjunto del módulo
+        (magisk_module/.../sofa, 239 archivos) tras re-encode float32 +
+        gzip-9 (zip 106 → 94.73 MB, nada borrado). Total en repo — 694
+        archivos .sofa (455 en app/src/main/assets + 239 en el módulo);
+        el workflow sofa-inventory.yml espera 694 (expected-count 694).
+      - El README §8.2 decía "239/239 readable" sin precisar el alcance;
+        se corrige en este trabajo para distinguir 239 (módulo) de 694 (repo).
+      - SofaHRTFLoader::load() solo verifica firma HDF5 (8 bytes) + tamaño
+        ≥512 B; Data.IR NO se lee en runtime.
+    pruebas:
+      - scripts/validate_sofa_hdf5.py
+      - .github/workflows/sofa-inventory.yml (expected-count 694)
+    limites:
+      - Un HDF5 legible no garantiza semántica SOFA/AES69 completa
+        (docs/SOFA_METADATA_INVENTORY.md); las licencias deben revisarse
+        por conjunto antes de redistribuir.
+      - El leg de tests-host cita "SOFA datasets" entre las 6 categorías
+        latentes de Fase 0.
+    criterio_aceptacion: >
+      Inventario 694/694 en CI + validación semántica SOFA por convención.
+
+  - id: cap-020
+    nombre: RouteBDoctor (doctor runtime Ruta B)
+    objetivo: Diagnóstico runtime de Ruta B (sesión, efecto, acoplamiento).
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/audio/RouteBDoctor.kt
+      - app/src/main/java/com/ivanna/omega/core/FourDRouteB.kt
+    ruta_ejecucion: App (diagnóstico de Ruta B)
+    controles: {}
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO
+    evidencia:
+      - RouteBDoctor.kt presente (RouteBDoctorOutcome, RouteBDoctorLlmProvider).
+      - Llegó con la v2.5.443 (OmniRouteOrchestrator + doctor runtime Ruta B
+        + motor de evolución).
+    pruebas: []
+    limites:
+      - Sin Ruta B viva en el teléfono limpio, el doctor no tiene nada que
+        diagnosticar hoy; su eficacia en vivo no está demostrada.
+    criterio_aceptacion: >
+      Diagnóstico correcto en dispositivo con Ruta B viva (sesión real,
+      efecto acoplado o no, con causa).
+
+  - id: cap-021
+    nombre: Daemon asrcd (ivanna_asrcd)
+    objetivo: >
+      Daemon que descubre la sesión de música, acopla el efecto de Ruta B
+      y sirve el reloj ASRC / fusión por socket abstracto y memoria compartida.
+    implementacion:
+      - app/src/main/cpp/daemon/ivanna_daemon.cpp
+      - app/src/main/cpp/daemon/session_discovery.hpp
+      - app/src/main/cpp/daemon/hal_clock_producer.cpp
+      - app/src/main/cpp/omega_daemon_bridge.cpp
+    ruta_ejecucion: Daemon root en el teléfono (Magisk) — socket abstracto @omega_daemon_socket
+    controles:
+      kill_switch: { archivo: "pal_asr.off (sin la c, daemon v2)", nota: "distinto de pal_asrc.off del daemon v1 / write-stage" }
+      socket: "@omega_daemon_socket (AF_UNIX abstracto)"
+      estado_dir: /data/adb/ivanna_omega (0700 root)
+    estado: VERIFICADA EN HOST
+    target_state: VERIFICADA EN DISPOSITIVO
+    evidencia:
+      - 28/28 tests del respondedor de comandos en host v2.5.440 (round-trip
+        real sobre socket abstracto).
+      - Daemon activo por defecto en la v2.5.439; kill switch pal_asr.off.
+      - EN DISPOSITIVO — teléfono limpio tras el 7º reset; no hay daemon.
+        El estado VERIFICADA EN HOST no afirma funcionamiento en dispositivo.
+      - Riesgo conocido — /data/adb es 0700 root; audioserver no-root no
+        puede leer /data/adb/ivanna_omega (ver cap-014).
+    pruebas:
+      - Daemon command responder 28/28 (host, v2.5.440)
+      - app/src/main/cpp/tests/regression/test_daemon_shm_health.cpp
+    limites:
+      - Sin verificación en dispositivo tras el 7º reset.
+    criterio_aceptacion: >
+      Daemon vivo en dispositivo + heartbeat + socket respondiendo +
+      sesión descubierta real.
+
+  - id: cap-022
+    nombre: OmniRoute (gateway LLM)
+    objetivo: Gateway LLM gratuito (453 modelos) en la VM para Ami, el consejo y la evolución.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/ai/gemini/OmniRouteOrchestrator.kt
+      - app/src/main/java/com/ivanna/omega/assistant/core/OmniRoutePrefs.kt
+      - tools/evolution/llm_client.py
+    ruta_ejecucion: VM (localhost:20128) → túnel público → teléfono
+    controles:
+      combo: ivanna-free
+      tunel_actual: "https://1a12c5e8452bf7.app.lhr.life/v1 (2026-11-14 noche; rota)"
+    estado: INTEGRADA
+    target_state: VERIFICADA EN HOST/CI
+    evidencia:
+      - OmniRoute v3.8.53 en la VM (localhost:20128, heap 512 MB; .env en
+        ~/.omniroute/, solo en host). Floot conectado (MCP, OAuth, gratis
+        100 acciones/día).
+      - La app muestra "conectada a OmniRoute (gratis)".
+      - Límite estructural — la Tailscale de la VM es solo-cliente; el
+        teléfono nunca llega por 100.71.103.19. El túnel localhost.run rota
+        (tercera rotación el 2026-11-14; la anterior devolvía 502).
+    pruebas: []
+    limites:
+      - URL temporal; si vuelve a fallar con 502, reiniciar el túnel y dar
+        la URL nueva. Pendiente túnel con nombre/dominio fijo.
+    criterio_aceptacion: >
+      Dominio fijo + uptime documentado + llamada real teléfono → gateway →
+      respuesta.
+
+  - id: cap-023
+    nombre: Revisor de actualizaciones (AppUpdateChecker)
+    objetivo: >
+      Comprobar releases de GitHub y verificar el APK descargado antes de
+      ofrecer instalarlo.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/core/AppUpdateChecker.kt
+    ruta_ejecucion: App → api.github.com (releases)
+    controles:
+      sha256sums: { asset: SHA256SUMS.txt, nota: "opcional: si el release no lo publica, no se exige" }
+    estado: INTEGRADA
+    target_state: VERIFICADA EN HOST/CI
+    evidencia:
+      - 11 tests AppUpdateCheckerTest en la v2.5.444.
+      - Verifica tamaño completo y SHA256 si se conoce; si no se conoce el
+        SHA256 esperado, NO se exige (AppUpdateChecker.kt:177-183).
+      - La firma del APK la verifica el instalador del sistema (misma
+        keystore); el revisor NO verifica firma propia (sin clave pública
+        anclada). Ver docs/security/threat-model.md § actualizador.
+    pruebas:
+      - AppUpdateCheckerTest (11 tests, v2.5.444)
+    limites:
+      - Un hash del mismo origen (GitHub release) no basta solo como prueba
+        de autenticidad si el origen se compromete; falta verificación de
+        firma independiente (p. ej. firma detached con clave pública anclada).
+    criterio_aceptacion: >
+      Verificación de firma independiente implementada + test de APK
+      manipulado rechazado.
+
+  - id: cap-024
+    nombre: Diagnóstico vivo (puente de diagnóstico)
+    objetivo: Telemetría/diagnóstico en vivo de la app y del teléfono hacia un puente remoto.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/core/LiveDiagnosticConnector.kt
+      - app/src/main/java/com/ivanna/omega/core/CloudSyncManager.kt
+    ruta_ejecucion: App → puente Floot / Render
+    controles:
+      endpoint_primario: "https://ivanna-diagnostic-bridge.floot.app/_api/v1/diagnostics"
+      endpoint_secundario: "https://ivanna-diagnostic-bridge.onrender.com/v1/diagnostics"
+    estado: INTEGRADA
+    target_state: VERIFICADA EN HOST/CI
+    evidencia:
+      - Endpoints presentes en LiveDiagnosticConnector.kt:41-46; puente
+        publicado en Floot. Plan free de Render pendiente de configurar
+        URL + token en la app (SISTEMA → Conector de diagnóstico vivo) y
+        de activar el cron del watcher (cada 5 min) — pendientes citados
+        en memoria (2026-11-10).
+    pruebas: []
+    limites:
+      - Configuración (URL + token) y watcher pendientes; sin evidencia de
+        tráfico real de diagnóstico en vivo en este inventario.
+    criterio_aceptacion: >
+      Diagnóstico real recibido en el puente desde el teléfono + watcher
+      activo.
+
+  - id: cap-025
+    nombre: TIDAL — integración completa (vía autorizada)
+    objetivo: >
+      Reproducción completa de TIDAL (catálogo + streams FLAC hasta HiRes)
+      por vías autorizadas, con acuerdo comercial si se vende con Tidal.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/tidal/TidalClient.kt
+      - app/src/main/java/com/ivanna/omega/tidal/TidalAuth.kt
+      - app/src/main/java/com/ivanna/omega/tidal/TidalStreamResolver.kt
+      - docs/TIDAL_CONTRACTS.md
+    ruta_ejecucion: App → API TIDAL
+    controles: {}
+    estado: BLOQUEADA
+    target_state: VERIFICADA EN DISPOSITIVO
+    decision_esse: Objetivo ABANDONADO: TIDAL dentro de IVANNA es LEGACY desde la 447; la vía es música local + app nativa de TIDAL; no se persigue acuerdo comercial. El código queda como legacy, no se borra. Decisión de Esse 2026-11-20.
+    evidencia:
+      - Programa oficial — catálogo y previews, NO reproducción completa.
+        La app aún NO está registrada en developer.tidal.com y no hay
+        client ID propio; registrarla es gratis y la hace Esse.
+      - Vender con Tidal completo exige acuerdo comercial; probabilidad
+        honesta ~1 de 10 (2026-11-12). Sin acuerdo inventado.
+      - La carta a TIDAL NO debe enviarse como está — afirma uso del
+        Programa de Desarrolladores, pero la app no está registrada.
+    pruebas: []
+    limites:
+      - Sin registro, sin client ID propio, sin acuerdo.
+    criterio_aceptacion: >
+      Registro en developer.tidal.com + client ID propio + migración del
+      catálogo a la API oficial v2 + acuerdo o alcance sin reproducción
+      completa declarado.
+
+  - id: cap-026
+    nombre: TIDAL — reproducción vía endpoint no oficial (actual)
+    objetivo: Reproducción completa hoy (FLAC hasta 24-bit/192 kHz) vía endpoint no oficial documentado por la comunidad.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/tidal/TidalStreamResolver.kt
+      - app/src/main/java/com/ivanna/omega/tidal/TidalHttp.kt
+      - app/src/main/java/com/ivanna/omega/tidal/TidalSessionStore.kt
+      - app/src/main/java/com/ivanna/omega/tidal/TidalStreamCache.kt
+    ruta_ejecucion: App → playbackinfopostpaywall (no oficial)
+    controles:
+      cache: { tamano: 500 MB, archivos: 12, politica: LRU }
+      calidad_auto: { wifi: HI_RES, movil: LOSSLESS }
+      reintentos: 1
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO
+    evidencia:
+      - Funciona (v2.5.416–421) — prefetch, caché 500 MB / 12 archivos LRU,
+        calidad AUTO, 1 reintento, telemetría. Lo usan también High Tide,
+        Kelp, tidalbar y cliamp.
+      - Fuera de términos y revocable (docs/TIDAL_CONTRACTS.md:14). El
+        refresh usa client_id PKCE de la app de TIDAL; sin client_secret
+        PKCE en el refresh — si TIDAL lo exige, re-login al caducar el
+        token (~1 semana).
+    pruebas: []
+    limites:
+      - Revocable en cualquier momento por TIDAL; no es una integración
+        autorizada; no vender como tal.
+    criterio_aceptacion: >
+      Migración a cap-025 (vía autorizada) o degradación documentada si
+      TIDAL revoca el endpoint.
+
+  - id: cap-027
+    nombre: FotoHolo / sensor acústico / NPE
+    objetivo: >
+      Medición de la sala y del oyente (foto de cabeza, sensado acústico)
+      para adaptar la cadena; componente neuro on-device (NPE) con el
+      micrófono del teléfono como sensor.
+    implementacion:
+      - app/src/main/cpp/IvannaNeuromorphicTinyML.cpp
+      - app/src/main/cpp/neuromorphic/neuro_acoustic_closed_loop.hpp
+      - app/src/main/cpp/neuromorphic/npe_analysis_tap.hpp
+      - app/src/main/java/com/ivanna/omega/fotoholo/FotoHoloRouteB.kt
+      - docs/REAL_ACOUSTIC_SENSOR.md
+      - docs/FOTOHOLO_FIRST_RUN_CONSENT_IMPLEMENTATION.md
+    ruta_ejecucion: Ruta A (y Ruta B cuando exista)
+    controles:
+      consentimiento: { primera_ejecucion: true, documento: docs/FOTOHOLO_FIRST_RUN_CONSENT_IMPLEMENTATION.md }
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - Código NPE y puentes FotoHolo presentes; consentimiento de primera
+        ejecución implementado y documentado.
+      - Entregas FotoHolo/HRTF/fatiga comprometidas como REFINADAS, no solo
+        cableadas (directiva 2026-11-12 21:12 CST); el grado de refinado no
+        se verifica en este inventario.
+    pruebas: []
+    limites:
+      - Sin validación perceptual de la adaptación por sala/oyente.
+    criterio_aceptacion: >
+      ABX con adaptación activa vs inactiva en sala real + consentimiento
+      verificado en flujo de primera ejecución.
+
+  - id: cap-028
+    nombre: Validación de licencias en la app
+    objetivo: >
+      Validar la licencia del usuario contra el servidor (POST
+      /v1/licenses/validate) al arrancar, con fail-open y caché: sin red
+      la app sigue funcionando con la última validación válida; nunca se
+      bloquea el audio por un fallo de red.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/licensing/LicenseClient.kt
+      - app/src/main/java/com/ivanna/omega/licensing/LicenseManager.kt
+      - app/src/main/java/com/ivanna/omega/licensing/LicenseStore.kt
+      - app/src/main/java/com/ivanna/omega/licensing/LicenseConfig.kt
+      - app/src/main/java/com/ivanna/omega/MainActivity.kt (gancho, 8 líneas)
+    ruta_ejecucion: App (Kotlin) → servidor de licencias (Render, no desplegado)
+    controles:
+      url_default: https://ivanna-license-server.onrender.com
+      planes: [lifetime, monthly]
+      max_dispositivos: 3
+    estado: INTEGRADA
+    target_state: VERIFICADA EN DISPOSITIVO
+    evidencia:
+      - Cliente implementado en rama (commits 5fbdeaa1, 0c744c88,
+        403f4228, d658ac43) — contrato exacto del servidor leído de
+        monetization/license-server/README.md + licenses.mjs; deviceId =
+        SHA-256 del ANDROID_ID; clave normalizada (Crockford) y nunca en
+        logs (solo huella de 8 hex).
+      - Modo libre definido CON EVIDENCIA — no existe ninguna distinción
+        libre/pro ni paywall en el repo; el modo libre es la app
+        funcionando exactamente como hoy, sin bloquear nada; estado
+        UNVALIDATED/INVALID mostrado así.
+      - Tests unitarios escritos (éxito lifetime/monthly, not_found,
+        revoked, expired, device_limit, bad_request, sin red con/sin
+        caché, respuesta corrupta). NO ejecutados (sin Android SDK en VM).
+    pruebas: []
+    limites:
+      - Servidor SIN desplegar — la URL por defecto no responde hoy; cada
+        arranque cae en fail-open/modo libre. Validación real PENDIENTE.
+      - Sin UI para escribir la clave (saveLicenseKey() existe, sin pantalla).
+      - Decisión de producto de Esse PENDIENTE — qué se limita exactamente
+        en modo libre (no se inventó ninguna restricción).
+    criterio_aceptacion: >
+      Validación real contra servidor desplegado + tests Kotlin en CI en
+      verde + UI para introducir la clave + decisión de Esse sobre el
+      modo libre.
+
+  - id: cap-029
+    nombre: BridgePlayer sin cortes (F2 — sonido)
+    objetivo: >
+      Tidal dentro de IVANNA (BridgePlayer) sin micro-cortes/tronidos.
+      Hallazgo en vivo de Esse 2026-11-14 20:11 CST: los cortes TAMBIÉN
+      ocurren en el BridgePlayer, no solo en la captura.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/audio/IvannaBridgePlayer.kt
+      - app/src/main/java/com/ivanna/omega/dsp/DSPBridge.kt
+      - app/src/main/cpp/tests/test_bofo_isolation_matrix.cpp (celda BridgePlayer)
+    ruta_ejecucion: Ruta A (BridgePlayer)
+    controles:
+      periodo_bloque_96k: 21333 us
+    estado: PENDIENTE
+    target_state: VERIFICADA EN DISPOSITIVO + VALIDADA PERCEPTUALMENTE
+    evidencia:
+      - El snapshot 394 NO probaba "DSP parado" — dspProcessingUs=0 era un
+        hueco de telemetría (reportFrameProcessed() sin llamadores);
+        adaptiveEngineRunning=false no es la cadena del BridgePlayer;
+        daemonConnected=false es Ruta B (irrelevante).
+      - Red excluida DURANTE la reproducción — TidalStreamResolver descarga
+        el archivo completo antes de sonar. Hilo URGENT_AUDIO y FGS
+        mediaPlayback ya existen desde la 438.
+      - Cambio en rama (568ad23a) — DSPBridge mide nativeProcess y reporta;
+        BridgePlayer publica el delta de AudioTrack.underrunCount;
+        matriz con celda BridgePlayer (filas G/H) + regla de veredicto
+        fijada. Tests host 10/10.
+      - NO hay causa raíz de los cortes demostrada en código; no se bajó a
+        48 kHz unilateralmente (degradaría el hi-res sin evidencia).
+    pruebas:
+      - test_bofo_isolation_matrix (host, 10/10)
+    limites:
+      - Escucha en dispositivo PENDIENTE (protocolo fila G — 1 tema FLAC,
+        local vs Tidal-dentro-de-IVANNA, primer plano, WiFi, 60 s; leer
+        underrunCount delta, dspProcessingUs real y clipCount DELTA).
+    criterio_aceptacion: >
+      Esse escucha sin cortes en BridgePlayer; nunca un test host.
+
+  - id: cap-030
+    nombre: Scroll en pantalla Tidal (UI)
+    objetivo: >
+      El scroll funciona en la pantalla de Tidal dentro de IVANNA.
+      Bug en vivo de Esse 2026-11-14 20:11 CST — el scroll NO servía.
+    implementacion:
+      - app/src/main/java/com/ivanna/omega/ui/TidalScreen.kt
+    ruta_ejecucion: App (Compose)
+    controles: {}
+    estado: PENDIENTE
+    target_state: VERIFICADA EN DISPOSITIVO
+    evidencia:
+      - Causa raíz estructural (commit f86d9828) — la lista era un LazyColumn
+        con weight(1f) bajo ~790 dp de cromo fijo; en el G85 (~840 dp
+        útiles) le quedaban 0–50 dp (0 dp con un tema cargado). Además
+        positionMs recomponía toda la pantalla a 5–20 Hz y sizeBytes()
+        hacía I/O de disco en composición.
+      - Cambio — una sola LazyColumn con TODO el contenido; NowPlayingCard
+        aparte (ticks solo la recomponen a ella); sizeBytes() a
+        Dispatchers.IO; login también con scroll. Verificación estructural
+        (balance, un solo LazyColumn). NO compilado en VM (sin Android SDK).
+    pruebas: []
+    limites:
+      - Sin compilación Kotlin en VM; la CI debe compilarlo antes del APK
+        de prueba. Sin verificación visual — la confirmación es en
+        dispositivo (Esse).
+    criterio_aceptacion: >
+      Esse confirma que el scroll sirve (lista se desplaza, ficha y
+      búsqueda se apartan, no tironea mientras suena, login desplazable).
+
+pendientes_resumen:
+  - cap-017 Vista de Dios en vivo — artefacto externo existe; alimentación automática no conectada.
+  - cap-014 Ruta B — control plano corregido en rama; verificación en dispositivo pendiente de luz verde de Esse.
+  - cap-009 ASRC HAL — vía de carga muerta; sin vía segura conocida.
+  - cap-025 TIDAL autorizado — sin registro ni acuerdo.
+  - cap-029 BridgePlayer sin cortes (F2) — instrumentación lista; escucha en dispositivo pendiente.
+  - cap-030 Scroll Tidal — fix en rama sin compilar en VM; verificación visual pendiente.
+  - cap-028 Licencias — servidor sin desplegar; validación real pendiente.
+  - Validación perceptual (ABX) de todas las capacidades DSP — sin ejecutar
+    (ver docs/validation/abx-protocol.md).
+bloqueados_resumen:
+  - cap-009 ASRC HAL/módulo
+  - cap-014 Ruta B (efecto sin procesar)
+  - cap-025 TIDAL autorizado

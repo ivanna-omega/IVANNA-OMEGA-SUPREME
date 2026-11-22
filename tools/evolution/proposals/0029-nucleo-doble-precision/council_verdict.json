@@ -1,0 +1,51 @@
+{
+  "finding": "Núcleo en simple precisión: la acumulación del FIR ASRC (319 taps) y de la FDL del RIR es float32, mientras SHARC/Helix trabajan a 64 bits",
+  "approved": false,
+  "patch": null,
+  "rounds": [
+    {
+      "round": 1,
+      "proposer": "solución inventada",
+      "implementer": "diff redactado",
+      "reviewer": {
+        "round": 1,
+        "approved": false,
+        "text": "RECHAZADO\n\nENFOQUE: no corrige nada del núcleo; el parche está vacío. No toca ni la acumulación float32 del FIR ASRC ni la FDL del RIR, no añade acumulación float64, no introduce fallback fail-closed, no trae tests de regresión, y además apunta a un archivo de detector de reglas en vez del código de audio real.\n\nExijo un parche real que:\n- cambie la acumulación del FIR ASRC a double;\n- cambie la acumulación de la FDL del RIR a double;\n- mantenga la salida en float;\n- añada fallback a float32 si no cabe el coste;\n- agregue tests host de THD+N, coste por bloque, tolerancia de respuesta y finitud/acotado;\n- no toque Biquad, VariableAsrc ni Ruta B."
+      },
+      "reviewer2": null
+    },
+    {
+      "round": 2,
+      "proposer": "enfoque reinventado",
+      "implementer": "diff redactado",
+      "reviewer": {
+        "round": 2,
+        "approved": false,
+        "text": "RECHAZADO\n\nENFOQUE: el parche cambia la estrategia equivocada. No implementa una solución verificable de “acumulación double con fail-closed por presupuesto”; la sustituye por heurísticas de compilación/arquitectura (`__ARM_NEON`, `__aarch64__`) que no miden coste real ni cumplen el criterio exigido. Eso no corrige la causa raíz del requisito de presupuesto/precisión.\n\nMotivos concretos:\n- No hay medición real de coste por bloque ni comparación contra presupuesto.\n- El “fail-closed” no depende del coste; depende de macros de compilación, así que no cumple la especificación.\n- No hay parche para `RirConvolver.cpp` FDL, que era parte obligatoria del hallazgo.\n- No hay tests nuevos de regresión: ni THD+N antes/después, ni coste por bloque, ni FDL en tolerancia, ni finita/acotada.\n- El comentario promete mantener `PCM_FLOAT`, pero la implementación solo toca una ruta y no demuestra integración completa.\n- La ruta NEON propuesta es dudosa/incompleta y puede no compilar tal como está en entornos no-AArch64; además mezcla supuestos de disponibilidad de instrucciones sin garantía.\n- El parche deja el producto a medias: arregla parcialmente un síntoma en una sola función, no el sistema completo.\n\nArreglos exactos que exijo:\n1. Implementar acumulación `double` real en el FIR ASRC 319 taps.\n2. Implementar acumulación `double` real en la FDL de `RirConvolver`.\n3. Mantener salida en `float`, sin tocar Biquad, VariableAsrc ni Ruta B.\n4. Añadir medición real de coste por bloque y un fallback explícito a `float32` si no cabe en presupuesto.\n5. Añadir tests host de regresión:\n   - THD+N ASRC antes/después,\n   - coste por bloque,\n   - FDL RIR en tolerancia,\n   - salida finita y acotada.\n6. Hacer que los tests usen tolerancia, no `memcmp`.\n7. Asegurar que el diff aplica limpio y compila en los targets soportados."
+      },
+      "reviewer2": null
+    },
+    {
+      "round": 3,
+      "proposer": "enfoque reinventado",
+      "implementer": "diff redactado",
+      "reviewer": {
+        "round": 3,
+        "approved": false,
+        "text": "RECHAZADO\nEl reviewer no pudo ser consultado (error del proveedor: gateway HTTP 429: {\"error\":{\"message\":\"[429]: DuckDuckGo AI Chat error: ERR_USER_LIMIT\",\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}})."
+      },
+      "reviewer2": null
+    }
+  ],
+  "detector": {
+    "real": false,
+    "text": "FALSO POSITIVO\n\nLa evidencia del propio código contradice el hallazgo: en `app/src/main/cpp/ivanna_route_a_asrc.cpp` la ruta crítica no está forzada a `float32` en todos los acumuladores, porque ya existe `double` en partes relevantes del diseño y el problema descrito mezcla precisión de estados/ratio con la suma FIR sin demostrar un bug real. En `app/src/main/cpp/spatial/RirConvolver.hpp` y `RirConvolver.cpp` se ve una convolución particionada con infraestructura de doble en el motor FFT/twiddles, así que el hallazgo de “FDL en float32” no queda probado por el fragmento dado.\n\nQué corregir en el detector: no marcar “núcleo en simple precisión” solo por ver `float acc` local o vectores NEON float si el archivo también usa `double` en el camino numérico o si el resultado final está limitado a `PCM_FLOAT` por diseño; exige demostrar una acumulación crítica sin guarda equivalente, con línea exacta y sin inferirla de forma global."
+  },
+  "reviewer": {
+    "round": 3,
+    "approved": false,
+    "text": "RECHAZADO\nEl reviewer no pudo ser consultado (error del proveedor: gateway HTTP 429: {\"error\":{\"message\":\"[429]: DuckDuckGo AI Chat error: ERR_USER_LIMIT\",\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}})."
+  },
+  "arbiter": null,
+  "reason": "sin consenso en 3 rondas; último rechazo: RECHAZADO\nEl reviewer no pudo ser consultado (error del proveedor: gateway HTTP 429: {\"error\":{\"message\":\"[429]: DuckDuckGo AI Chat error: ERR_USER_LIMIT\",\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}})."
+}

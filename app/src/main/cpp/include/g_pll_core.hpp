@@ -1,0 +1,130 @@
+#pragma once
+// Second-order software PLL for phase tracking in userspace DSP.
+// The reference is a measured phase (radians), not an OS timestamp.
+// This estimates phase/frequency; it does not clock or discipline the physical DAC.
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
+namespace ivanna::gfe {
+inline constexpr double kPllPi = 3.141592653589793238462643383279502884;
+inline constexpr double kPllTwoPi = 2.0 * kPllPi;
+
+struct PllStatus {
+    bool valid = false;
+    double phaseRadians = 0.0;
+    double frequencyRadiansPerSecond = 0.0;
+    double phaseErrorRadians = 0.0;
+};
+
+class GeometricPll {
+public:
+    // naturalFrequencyHz controls loop bandwidth; damping=1 is critically damped
+    // for the linearized continuous-time model. maxCorrection bounds frequency pull.
+    explicit GeometricPll(double nominalFrequencyHz,
+                          double naturalFrequencyHz = 3.0,
+                          double damping = 1.0,
+                          double maxCorrectionHz = 100.0) noexcept {
+        configure(nominalFrequencyHz, naturalFrequencyHz, damping, maxCorrectionHz);
+    }
+
+    bool configure(double nominalFrequencyHz, double naturalFrequencyHz,
+                   double damping, double maxCorrectionHz) noexcept {
+        if (!finitePositive(nominalFrequencyHz) || !finitePositive(naturalFrequencyHz) ||
+            !finitePositive(damping) || !finitePositive(maxCorrectionHz) ||
+            naturalFrequencyHz >= nominalFrequencyHz) {
+            m_configured = false;
+            return false;
+        }
+        m_nominalOmega = kPllTwoPi * nominalFrequencyHz;
+        const double wn = kPllTwoPi * naturalFrequencyHz;
+        // Type-II PI loop with phase detector gain and NCO gain normalized to 1.
+        m_kp = 2.0 * damping * wn;
+        m_ki = wn * wn;
+        m_maxCorrectionOmega = kPllTwoPi * maxCorrectionHz;
+        m_configured = true;
+        reset();
+        return true;
+    }
+
+    // Convenience configuration for clock-drift tracking. The limit is expressed
+    // as parts per million of the nominal frequency, not an absolute Hz value.
+    // A 50 ppm limit matches the software estimator's conservative drift budget.
+    bool configurePpm(double nominalFrequencyHz, double naturalFrequencyHz,
+                      double damping = 1.0, double maxCorrectionPpm = 50.0) noexcept {
+        if (!finitePositive(nominalFrequencyHz) || !finitePositive(maxCorrectionPpm) ||
+            maxCorrectionPpm > 1000.0) {
+            m_configured = false;
+            return false;
+        }
+        const double maxCorrectionHz = nominalFrequencyHz * maxCorrectionPpm * 1.0e-6;
+        if (!finitePositive(maxCorrectionHz)) {
+            m_configured = false;
+            return false;
+        }
+        return configure(nominalFrequencyHz, naturalFrequencyHz, damping, maxCorrectionHz);
+    }
+
+    void reset(double initialPhaseRadians = 0.0) noexcept {
+        m_phase = std::isfinite(initialPhaseRadians) ? wrap(initialPhaseRadians) : 0.0;
+        m_integral = 0.0;
+        m_lastError = 0.0;
+        m_initialized = false;
+    }
+
+    // dtSeconds must be the elapsed time between phase observations. First sample
+    // establishes phase; later samples update a bounded PI estimate. No allocations,
+    // locks, syscalls, or dynamic memory occur here.
+    PllStatus update(double referencePhaseRadians, double dtSeconds) noexcept {
+        if (!m_configured || !std::isfinite(referencePhaseRadians) ||
+            !finitePositive(dtSeconds) || dtSeconds > 1.0) return status(false);
+
+        const double reference = wrap(referencePhaseRadians);
+        if (!m_initialized) {
+            m_phase = reference;
+            m_initialized = true;
+            m_lastError = 0.0;
+            return status(true);
+        }
+
+        // Predict the oscillator forward before comparing it with the new sample.
+        // Comparing against the previous phase mistakes the expected phase advance
+        // (nominalOmega * dt) for a phase error and drives the loop to its clamp.
+        const double predictedPhase = wrap(m_phase + estimatedOmega() * dtSeconds);
+        const double error = wrap(reference - predictedPhase);
+        // Integrator anti-windup by clamping the integral's frequency contribution.
+        const double integralLimit = m_maxCorrectionOmega / m_ki;
+        m_integral = std::clamp(m_integral + error * dtSeconds,
+                                -integralLimit, integralLimit);
+        const double correction = std::clamp(m_kp * error + m_ki * m_integral,
+                                             -m_maxCorrectionOmega, m_maxCorrectionOmega);
+        m_phase = wrap(predictedPhase + correction * dtSeconds);
+        m_lastError = error;
+        return status(true);
+    }
+
+    double phaseRadians() const noexcept { return m_phase; }
+    double nominalFrequencyHz() const noexcept { return m_nominalOmega / kPllTwoPi; }
+
+private:
+    static bool finitePositive(double x) noexcept { return std::isfinite(x) && x > 0.0; }
+    static double wrap(double x) noexcept {
+        double y = std::remainder(x, kPllTwoPi);
+        return y <= -kPllPi ? y + kPllTwoPi : y;
+    }
+    double estimatedOmega() const noexcept {
+        const double correction = std::clamp(m_kp * m_lastError + m_ki * m_integral,
+                                             -m_maxCorrectionOmega, m_maxCorrectionOmega);
+        return m_nominalOmega + correction;
+    }
+    PllStatus status(bool valid) const noexcept {
+        // The field is explicitly radians/second; do not convert it to Hz here.
+        // Callers/tests that need Hz can divide this value by 2*pi.
+        return {valid && m_initialized, m_phase, estimatedOmega(), m_lastError};
+    }
+
+    double m_nominalOmega = 0.0, m_kp = 0.0, m_ki = 0.0;
+    double m_maxCorrectionOmega = 0.0, m_phase = 0.0, m_integral = 0.0, m_lastError = 0.0;
+    bool m_configured = false, m_initialized = false;
+};
+} // namespace ivanna::gfe

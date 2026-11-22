@@ -1,0 +1,65 @@
+diff --git a/README.md b/README.md
+index e2339513..92b8faa3 100644
+--- a/README.md
++++ b/README.md
+@@ -505,7 +505,7 @@ The evolution motor (`tools/evolution/`) runs on the development side (where the
+ 
+ | Suite | Result | Evidence |
+ |:---|:---|:---|
+-| CTest (DSP host suite) | **1037/1037** | Host local, suite completa (1037/1037, v2.5.456; twiddles precalculados en el RIR + micro-opts exactas en HOLOS) |
++| CTest (DSP host suite) | **1038/1038** | Host local, suite completa (1038/1038, v2.5.456; twiddles precalculados en el RIR + micro-opts exactas en HOLOS + test_route_a_asrc cableado) |
+ | ASRC core | **25/25** | Host, v2.5.439 (see §05.4) |
+ | Daemon command responder | **28/28** | Host, v2.5.440 (real round-trip over abstract socket) |
+ | Council (multi-model) | **14/14** | Python unit tests, v2.5.445 (mocked LLM: verdicts, rounds, fail-closed) |
+diff --git a/app/src/main/cpp/tests/CMakeLists.txt b/app/src/main/cpp/tests/CMakeLists.txt
+index 1006e222..ffdbcea5 100644
+--- a/app/src/main/cpp/tests/CMakeLists.txt
++++ b/app/src/main/cpp/tests/CMakeLists.txt
+@@ -2167,3 +2167,30 @@ if(IVANNA_SAN_FLAGS)
+   target_link_options(test_stage_timings PRIVATE ${IVANNA_SAN_FLAGS})
+ endif()
+ gtest_discover_tests(test_stage_timings)
++
++# ── test_route_a_asrc: ASRC magistral Ruta A (v2.5.404+, Ψ viva) ─────────────
++# ivanna_route_a_asrc_test.cpp vivía en app/src/main/cpp/ SIN cablear en
++# tests/CMakeLists.txt: sus 14 grupos de checks (a)-(n) — tasa, THD+N,
++# continuidad, fail-closed, Ψ viva, coste por bloque — existían pero NUNCA
++# corrían en CTest/CI. Es un ejecutable standalone con su propio main()
++# (no gtest): se registra con add_test y CTest lo evalúa por código de
++# salida (main retorna 0 si todos pasan). Sin FAIL_REGULAR_EXPRESSION: bajo
++# ctest -j4 el regex compartido "FALLARON" marcaba fallos de OTRO binario
++# (ver test_adaptive_engine). Los include dirs son los mismos que
++# test_stage_timings (fir_v5_coeffs.h vive en hal_integration).
++# RUN_SERIAL: la sección (n) mide COSTE por bloque (umbral 500 µs) y es
++# sensible a contención de CPU — bajo ctest -j4 el coste medido sube a
++# 874/991 µs (vs 333/376 µs solo) y falla por timing, no por regresión.
++# Por eso corre serial, sin competir por CPU con otros tests.
++add_executable(test_route_a_asrc
++  ../ivanna_route_a_asrc_test.cpp
++  ../ivanna_route_a_asrc.cpp
++)
++target_include_directories(test_route_a_asrc PRIVATE .. ../include host_stubs ../../../../../hal_integration/moto_g85/pal_preload_probe)
++target_compile_options(test_route_a_asrc PRIVATE -Wall -Wextra)
++if(IVANNA_SAN_FLAGS)
++  target_compile_options(test_route_a_asrc PRIVATE ${IVANNA_SAN_FLAGS})
++  target_link_options(test_route_a_asrc PRIVATE ${IVANNA_SAN_FLAGS})
++endif()
++add_test(NAME test_route_a_asrc COMMAND test_route_a_asrc)
++set_tests_properties(test_route_a_asrc PROPERTIES RUN_SERIAL TRUE)
+diff --git a/telemetry/ctest_summary.json b/telemetry/ctest_summary.json
+index fce782f0..8a3cd094 100644
+--- a/telemetry/ctest_summary.json
++++ b/telemetry/ctest_summary.json
+@@ -1,8 +1,8 @@
+ {
+-  "passed": 1037,
++  "passed": 1038,
+   "failed": 0,
+-  "total": 1037,
++  "total": 1038,
+   "pass_rate_percent": 100,
+-  "duration_sec": 116.53,
+-  "badge_label": "1037/1037"
++  "duration_sec": 56.91,
++  "badge_label": "1038/1038"
+ }

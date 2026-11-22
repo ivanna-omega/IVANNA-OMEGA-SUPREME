@@ -1,0 +1,794 @@
+cmake_minimum_required(VERSION 3.30.3)
+project(ivanna_omega_supreme)
+
+set(CMAKE_CXX_STANDARD 26)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ── Compile flags ──────────────────────────────────────────────────────────
+# FIX v1.5: elimina -ffast-math (rompe NEON en SD8 Gen2/3, genera NaN)
+# FIX v1.5: añade -fno-fast-math, -fno-associative-math, -ffp-contract=off
+set(BASE_FLAGS
+    -O3
+    -fno-fast-math
+    -fno-associative-math
+    -ffp-contract=off
+    -Wall
+    -Werror=return-type
+    -Wno-unused-result
+    -Wno-unused-variable
+    # ── Endurecimiento anti-piratería (v2.5.369) ──────────────────────────
+    # -fvisibility=hidden: solo los símbolos JNIEXPORT (funciones JNI) y
+    # AELI (export explícito) quedan en .dynsym; el resto del DSP es
+    # invisible a dlsym/ingeniería inversa. Seguro: las 145 funciones JNI
+    # usan JNIEXPORT (visibilidad default forzada) y AELI se exporta por
+    # --export-dynamic-symbol. Las referencias intra-librería no se ven
+    # afectadas (se resuelven en tiempo de enlace).
+    # -fstack-protector-strong: canarios de pila en funciones con buffers.
+    # _FORTIFY_SOURCE lo activa ya el toolchain NDK en Release; no se
+    # redefine aquí para no chocar con su definición.
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+    -fstack-protector-strong
+)
+
+# ── ABI-specific flags ───────────────────────────────────────────────────────
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    list(APPEND BASE_FLAGS -march=armv8-a+fp+simd -funroll-loops -fno-exceptions -fno-rtti)
+elseif(ANDROID_ABI STREQUAL "armeabi-v7a")
+    list(APPEND BASE_FLAGS -march=armv7-a -mfpu=neon)
+endif()
+
+# ── LTO opt-in para las fuentes de seguridad (fase 2) ──────────────────────
+# IVANNA_SECURITY_LTO=ON añade -flto=thin a la compilación y el enlace de
+# ivanna_omega y omega_effect. Efecto: el linker puede inlinear y eliminar
+# código muerto de las fuentes de seguridad (y del resto), lo que endurece
+# la ofuscación (menos símbolos, menos estructura). Default OFF porque el
+# build NDK no se puede verificar en la VM de desarrollo (sin NDK/SDK) y
+# LTO cambia el tiempo de enlace; la CI debe verificarlo al activarlo.
+option(IVANNA_SECURITY_LTO "Enable thin LTO for the security sources (phase 2)" OFF)
+if(IVANNA_SECURITY_LTO)
+    message(STATUS "IVANNA: LTO thin habilitado para ivanna_omega y omega_effect")
+endif()
+
+# ── Definiciones globales ─────────────────────────────────────────────────────
+add_compile_definitions(OMEGA_LIMITER_ENABLED=1)
+# Flags reales de compilación → nativeGetBuildFlags() (el perfilador de la UI las muestra tal cual).
+string(REPLACE ";" " " IVANNA_NATIVE_FLAGS_STR "${BASE_FLAGS}")
+add_compile_definitions(IVANNA_NATIVE_FLAGS="${IVANNA_NATIVE_FLAGS_STR} -std=c++26")
+
+# ────────────────────────────────────────────────────────────────────────────
+# Target: libivanna_omega.so (APK NDK library)
+# ────────────────────────────────────────────────────────────────────────────
+add_library(ivanna_omega SHARED
+    # ── Seguridad anti-piratería (v2.5.369, módulo separado) ───────────────
+    # ivanna_integrity: pin de certificado, self-check de ruta, gate
+    # fail-closed. ivanna_integrity_jni: puente JNI para IntegrityGate.kt.
+    # No modifica FusionCore, HyperStateOperator ni RealAcousticSensor.
+    security/ivanna_integrity.cpp
+    security/ivanna_integrity_jni.cpp
+    # ── Seguridad anti-piratería fase 2 ────────────────────────────────────
+    # ivanna_antitamper: anti-debug (TracerPid), anti-hook (Frida/Xposed),
+    # root y emulador como señales informativas. El lockdown lo decide el
+    # llamador (Ruta A/B fail-closed: passthrough, audio sigue fluyendo).
+    security/ivanna_antitamper.cpp
+    # Bus SHM seqlock — reader del bus local del efecto (Ruta B,
+    # telemetría UI "SIN AUDIO"). Antes NO se enlazaba en este target:
+    # audioRouteBridgeLoop() no podía abrir OMEGA_EFFECT_LOCAL_BUS_PATH.
+    daemon/core/omega_control_bus.cpp
+    saf_phi_infinity.cpp
+    # Módulo 1 (Fase Cero): pronosticador LPC 5–10 ms (analysis-only, sin JNI aún)
+    predictive_audio_engine.cpp
+        neuromorphic/AntiDolbyAI.cpp
+        IvannaTinyMLKernel.cpp
+    saf_runtime.cpp
+    SaFOptimizer.cpp
+    SafGlobalBridge.cpp
+    SafPcaDecoder.cpp
+    SafSpatialModifier.cpp
+    # JNI bridge consolidado (libivanna_omega.so único)
+    jni/ivanna_omega_jni.cpp
+    jni/ivanna_visualizer_jni.cpp
+    jni/ivanna_adaptive_jni.cpp
+        # Φ_SAF-Room^∞ JNI bridge
+        jni/saf_room_jni.cpp
+    jni/ivanna_visualizer_v2_jni.cpp
+    jni/ivanna_visualizer_bark64_jni.cpp
+    jni/ivanna_npe_jni.cpp
+    jni/ivanna_predictive_jni.cpp
+    # ── FUSIÓN MAGISTRAL (2026-11-18) — núcleo C++ compartido Ruta A/Ruta B ──
+    # Los 7 operadores fusionados + la cadena. Los motores que ya estaban en
+    # este target NO se repiten (símbolo duplicado); solo se añaden los que
+    # faltaban para la fusión (IvannaAudioClassifier, IntelligentUpmixer,
+    # HoaBinauralDecoder, HrtfManager).
+    fused/fused_chain.cpp
+    fused/fused_spatial.cpp
+    fused/fused_field.cpp
+    fused/fused_listener_room.cpp
+    fused/fused_transducer.cpp
+    fused/fused_tonal.cpp
+    fused/fused_dynamics.cpp
+    fused/fused_brain.cpp
+    fused/perceptual_conservation.cpp  # 8. Árbitro de campo (2026-11-21)
+    fused/acoustic_twin/acoustic_twin.cpp  # gemelo + calibración P3 (call site, 2026-11-21)
+    # ── FÍSICA NUEVA (LGN, 2026-11-18) — cableada en HrtfManager::synthesizeHrtf.
+    # geodesic_pinna_model.cpp (Ley Geodésica del Notch) + physical_head_model.cpp
+    # (esfera rígida, que el operador unificado usa) + physical_propagation.cpp
+    # (Ley de Curvatura: SOLO la curva ITD cerrada curvatureLawItdSeconds; la
+    # inversión de distancia distanceFromItdExcess está REFUTADA y NO se usa).
+    fused/geodesic_pinna_model.cpp
+    fused/physical_head_model.cpp
+    fused/physical_propagation.cpp
+    IvannaAudioClassifier.cpp
+    spatial/IntelligentUpmixer.cpp
+    spatial/HoaBinauralDecoder.cpp
+    HrtfManager.cpp
+    # ── ASRC MAGISTRAL Ruta A (v2.5.404) ─────────────────────────────────
+    # FIR 287 taps + Catmull-Rom nativo en el proceso app (no HAL).
+    # La tabla de coeficientes es la ÚNICA del HAL (fir_v5_coeffs.h):
+    # se añade su directorio al include path abajo (target_include_directories).
+    ivanna_route_a_asrc.cpp
+    jni/ivanna_route_a_asrc_jni.cpp
+    # ── Downsampler sinc polifásico Kaiser (Fase 4) ──────────────────────
+    # 192k→48k con rechazo de alias >130 dB medido (MÚSICA). Header-only
+    # (include/polyphase_sinc_downsampler.hpp); solo el puente JNI va aquí.
+    jni/ivanna_sinc_downsampler_jni.cpp
+    jni/ivanna_jni_stub.cpp
+    pi_lstm_bridge_jni.cpp
+    spatial/spatial_jni.cpp
+    jni/ivanna_spatial_jni.cpp
+
+    # Spatial engine
+    spatial/PhysicalTargetDispatcher.cpp
+    spatial/spatial_engine.cpp
+    spatial/room_model.cpp
+    spatial/ivanna_head_tracker.cpp
+    spatial/ivanna_object_renderer.cpp
+    spatial/hrtf_convolver.cpp
+    spatial/RirDataset.cpp
+    spatial/RirConvolver.cpp
+    # v2.3.0: HRTFInterpolator real (antes era stub vacío — cero interpolación)
+    spatial/HRTFInterpolator.cpp
+    spatial/HRTFDatabase.cpp
+
+    # DSP core
+    dsp/ParametricEQ.cpp
+    dsp/Compressor.cpp
+    dsp/MultibandCompressor.cpp
+    dsp/HarmonicExciter.cpp
+    dsp/StereoWidener.cpp
+    dsp/GainStage.cpp
+    dsp/variable_asrc.cpp
+    dsp/SafetyLimiter.cpp
+
+    # SAF Phi_SAF_infinity HRTF adaptive bridge
+    SafModelLoader.cpp
+    # SAF Spatial Runtime (solo si existe en el checkout)
+    $<$<BOOL:${EXISTS_SAF_SPATIAL_RUNTIME}>:SafSpatialRuntime.cpp>
+    # SofaHRTFLoader.cpp y SafHRTFBridge.cpp se compilan en este target (líneas 51-52)
+    # y alimentan la etapa SofaSafAnalysisBridge / HeavyWorkerEngine (omega_wave_stages.hpp);
+    # la ruta binaria IHR1 -> HRTFBinLoader -> SafHRTFDatasetBridge -> hrtf_convolver
+    # opera en paralelo para convolución directa en tiempo real.
+    HRTFBinLoader.cpp
+    SafHRTFDatasetBridge.cpp
+    SaFStimulusRenderer.cpp
+    # FIX CRÍTICO (auditoría 2026-08-10): SaFJniBridge.cpp
+    # Es el ÚNICO archivo que define los símbolos JNI que SaFBridge.kt
+    # declara como external (nativeSaFInit/nativeSaFFeedback/nativeSaFGetParams/
+    # nativeSaFSaveState/nativeSaFLoadState/etc — verificado con grep en TODO
+    # el árbol, ninguna otra .cpp los define). Sin esta línea, cada llamada
+    # desde Kotlin lanzaba UnsatisfiedLinkError en runtime, silenciado por el
+    # runCatching{} de SaFEngine.kt — la pantalla de calibración SAF (y el fix
+    # de persistencia de esta misma sesión) nunca ejecutaba código nativo real
+    # en el dispositivo, pese a compilar y no dar ningún error visible.
+    SaFJniBridge.cpp
+    jni/saf_stimulus_jni.cpp
+
+    # FIX (build): undefined symbol ivanna_saf_apply_latent al linkear
+    # libivanna_omega.so. SaFJniBridge.cpp
+    # SaFJniBridge.cpp:40 mantiene la referencia extern pero la
+    # definición real vive en omega_effect.cpp (target libomega_effect.so —
+    # proceso audioserver), inaccesible desde este target. Este stub define
+    # el símbolo en el proceso app y publica el vector latente en un
+    # snapshot seqlock (ivanna_saf_get_latent_snapshot) sin duplicar el
+    # efecto. La definición de omega_effect.cpp queda intacta.
+    saf_latent_bridge.cpp
+
+    # Evolutionary (OFFLINE ONLY)
+    # con fitness psicoacústico multi-criterio (ISO 226 + resonance penalty +
+    # tonality consistency). Los símbolos JNI son 100% compatibles con la v1
+    # (mismo conjunto de funciones extern "C") — drop-in replacement.
+    evolutionary_kernel_v2.cpp
+    jni/evolutionary_kernel_jni.cpp
+    neuromorphic/ivanna_neural_upmixer.cpp
+
+    # Music Intelligence Engine (IME)
+    music_intelligence/MusicFeatureExtractor.cpp
+    music_intelligence/MusicIntelligenceEngine.cpp
+    music_intelligence/ImeBridge.cpp
+    jni/ivanna_ime_jni.cpp
+
+    # Cadena 4D de excitación — CABLEADO PUNTA A PUNTA (v2.5.47)
+    # Los 6 módulos 4D (ExcitationConductor, MultibandHapticMapper, CrosstalkCanceller,
+    # HeadTrackerFusion, ExposureDosimeter, FourDExcitationChain) existían y se probaban
+    # en host, pero NO se compilaban en libivanna_omega.so: sin esta línea el producto
+    # nunca los alcanzaba desde el dispositivo (no había símbolos, ni JNI, ni UI).
+    # FourDControlSurface posee UNA instancia global por proceso (el SceneTargetBus es
+    # singleton por proceso) y la alimenta desde los mismos puntos que el IME.
+    music_intelligence/FourDControlSurface.cpp
+    jni/ivanna_4d_jni.cpp
+
+    # System audio integration
+    shm_hyperplane.cpp
+    # FIX (auditoria 2026-08-07): omega_daemon.cpp SACADO de la libreria.
+    # El archivo define un `int main()` completo (socket AF_UNIX, listen,
+    # accept loop) — no es codigo de biblioteca, es el binario de un
+    # daemon standalone. Estaba entrando en libivanna_omega.so pegando su
+    # main() al .so de la app, junto con 3 helpers (set_realtime_priority,
+    # parse_json_field, update_parameters_smooth) que ninguna otra TU del
+    # arbol referencia (grep -rn confirma 0 callers cruzados). El binario
+    # real que corre en Magisk es daemon/ivanna_daemon.cpp, compilado por
+    # daemon/CMakeLists.txt como add_executable(ivanna_daemon
+    # daemon/OmegaShmManager.cpp) y stageado
+    # a magisk_module/system/bin/. Sacar este .cpp del target NO afecta el
+    # daemon en produccion — solo deja de arrastrar dead-code + un main()
+    # dentro de la shared library. Los otros dos daemons duplicados
+    # (daemon/omega_daemon.cpp, sin CMakeLists que lo enlace) se atacan en
+    # commits siguientes.
+
+    # Puente SHM real omega_daemon → proceso app.
+    # Define omega_daemon_get_shared_state() referenciado por
+    # jni/ivanna_omega_jni.cpp (audioRouteBridgeLoop): abre y mapea
+    # /data/adb/ivanna_omega/omega_shm con validación de ShmHeader
+    # (ivanna::validateShmHeader) y devuelve el puntero a OmegaSharedState.
+    omega_daemon_bridge.cpp
+
+    # FIX (build): undefined symbols g_upmixing_enabled /
+    # g_upmixing_immersivity en libivanna_omega.so. Las definiciones
+    # reales entran en libomega_effect.so por unity-include de
+    # IvannaFusionCore.cpp (address-space separado, audioserver).
+    # Este .cpp es la copia del proceso app — ver comentarios en el
+    # archivo. NO añade ODR conflict: cada SHARED library es unidad.
+    upmixing_controls_bridge.cpp
+    # FIX(build): wfs_controls_bridge.cpp define g_wfs_enabled/g_wfs_spread
+    # (extern en jni/ivanna_omega_jni.cpp) pero no estaba en ningún target
+    # → undefined symbols al enlazar libivanna_omega.so.
+    wfs_controls_bridge.cpp
+    # ORBE: atomics g_orbe_* del proceso app (extern en jni/ivanna_omega_jni.cpp
+    # e IvannaFusionCore.cpp). Solo en este target — el stub del efecto es
+    # orbe_globals_effect.cpp (ODR si se duplica).
+    orbe_controls_bridge.cpp
+    # CONSERVACIÓN PERCEPTUAL (2026-11-21): atomics g_consv_* del proceso
+    # app (mismo patrón que ORBE). Solo en este target — el stub del efecto
+    # es conservation_globals_effect.cpp (ODR si se duplica).
+    conservation_controls_bridge.cpp
+    # FÍSICA NUEVA (Fase 2, v2.5.472): atomics g_np_* del proceso app (mismo
+    # patrón que ORBE). Solo en este target — el stub del efecto es
+    # new_physics_globals_effect.cpp (ODR si se duplica).
+    new_physics_controls_bridge.cpp
+    # HOLOS: atomics g_holos_* del proceso app (mismo patrón que ORBE).
+    holos_controls_bridge.cpp
+    # Φ: atomics g_hyper_* del proceso app (mismo patrón que HOLOS).
+    hyper_controls_bridge.cpp
+    # IVANNA (v2.5.375): atomics g_omni_* del proceso app (mismo patrón).
+    # Solo en este target (Ruta A); la Ruta B es pendiente — NO duplicar en
+    # omega_effect (ODR). El operador es header-only (spatial/OmniField.hpp),
+    # así que no hay .cpp que listar.
+    omni_controls_bridge.cpp
+    # Ruta A reutiliza el renderer WFS real compartido con AudioFlinger.
+    spatial/RouteAWfsEngine.cpp
+    spatial/WfsRenderer.cpp
+    # ORBE: núcleo STFT de campo cercano (instancia g_orbeRouteA del JNI).
+    spatial/OrbeBinaural.cpp
+    # HOLOS: operador único de campo acústico (instancia g_holosRouteA del JNI).
+    spatial/HolosOperator.cpp
+    spatial/HolosVolterraKernel.cpp
+
+    # Audio orchestrator (JNI para AudioEngine.kt) — FIX v1.5
+    audio_orchestrator.cpp
+    anti_dolby.cpp
+
+    # Benchmark logger (JNI para benchmarking) — FIX v1.5
+    benchmark_logger.cpp
+    ivanna_benchmark_jni.cpp
+
+    # Phase oracle (JNI para prediction) — FIX v1.5
+    phase_oracle.cpp
+
+    # System audio capture (JNI para SystemAudioCapture.kt) — FIX v1.5
+    system_audio_capture.cpp
+
+    # USB Audio Pro Manager (JNI para UsbAudioProManager.kt) — FIX v1.5
+    usb_audio_pro_manager.cpp
+
+    # ════════════════════════════════════════════════════════════════════════
+    # NUEVA: Unified Engine Integration v2.0 (Fase 1-6)
+    # ════════════════════════════════════════════════════════════════════════
+
+    # Fase 1: Orquestador central (UnifiedControlFrame + control_apply_frame)
+    audio_control_plane.cpp
+
+    # Fase 4 / Oleada 6: NeuroCochlearManifold + VolterraH2Symmetric
+    neuromorphic/neuro_cochlear_manifold.cpp
+    neuromorphic/volterra_h2_symmetric.cpp
+    hexagon/ivanna_fastrpc_client.cpp
+
+    # Oleadas 2–5 (Prompt Maestro v3 — Cadena Declarativa Unificada)
+    Psychoacoustics.cpp
+    SofaHRTFLoader.cpp
+    SafHRTFBridge.cpp
+    IvannaVoiceProsodyEngine.cpp
+    EvolutionaryEQ.cpp
+    IvannaTinyML.cpp
+    IvannaNeuromorphicTinyML.cpp
+    IvannaSelfHealingEngine.cpp
+    IvannaSuperAgentMemory.cpp
+
+    # Fase H: loader FastRPC canonico del Hexagon cDSP (ivanna::hexagon::rt).
+    # La fachada NpeEngine de Fase H fue retirada (cero consumidores); la
+    # seleccion DSP/CPU vive en neuro_cochlear_manifold.cpp.
+    hexagon/ivanna_dsp.cpp
+
+    # Fase 3: Phase Oracle refinements (Kalman predictor + BiquadBank integration)
+    # (header-only, no .cpp necesario)
+
+    # Fase 5: Evolutionary Adapter (mapeo genoma → parámetros real-time)
+    # (header-only, no .cpp necesario)
+
+    # Fase 6: Kotlin integration (AudioPipeline, AudioEngine, OmegaEngineBridge)
+    # (lado Kotlin, no .cpp aquí)
+
+    # ============================================================================
+    # AdaptiveDecisionEngine — motor adaptativo de control lento (experimental).
+    # Wiring vigente: Ruta A (JNI/player) publica RawAudioMetrics y consume
+    # AdaptiveStateBus; Ruta B (omega_effect/audioserver) publica métricas y
+    # consume decisiones en su integración de efecto. El .cpp se compila por
+    # separado en ambos SHARED targets porque app y audioserver son procesos
+    # distintos y no comparten instancias ni memoria estática.
+    # La integración de código no sustituye pruebas de estabilidad, medición RT
+    # ni validación acústica en dispositivo.
+    # ============================================================================
+    experimental/adaptive_engine/adaptive_decision_engine.cpp
+
+    # ============================================================================
+    # IvannaLab — suite de medición de calidad (THD/IMD/LUFS/LRA/SNR/TP)
+    # Estado: mediciones reales (DFT+Hann para THD/IMD, K-weighting+gating
+    # (nativeLabReset/nativeLabFeed/nativeLabMeasure/nativeLabReport,
+    # expuestos en IvannaNativeLib.kt) — sin UI todavía que los invoque.
+    # ============================================================================
+    ivannalab/ivannalab.cpp
+    #     EvolutionaryEQ.cpp   # AVISO 2026-08-08: 3 copias en el repo divergieron entre si;
+    #                          # el kernel evolutivo real es evolutionary_kernel.cpp (API en C, distinta)
+)
+
+target_compile_options(ivanna_omega PRIVATE ${BASE_FLAGS})
+
+# LTO thin opt-in (fase 2): solo si IVANNA_SECURITY_LTO=ON.
+if(IVANNA_SECURITY_LTO)
+    target_compile_options(ivanna_omega PRIVATE -flto=thin)
+    target_link_options(ivanna_omega PRIVATE -flto=thin)
+endif()
+
+target_include_directories(ivanna_omega PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/neuromorphic
+    ${CMAKE_SOURCE_DIR}/spatial
+    ${CMAKE_SOURCE_DIR}/visualizer
+    ${CMAKE_SOURCE_DIR}/experimental/adaptive_engine
+    ${CMAKE_SOURCE_DIR}/ivannalab
+    # ASRC MAGISTRAL Ruta A: tabla FIR v6 (única fuente, no copia).
+    # CMAKE_SOURCE_DIR es app/src/main/cpp (top-level CMake); el repo
+    # está 4 niveles arriba.
+    ${CMAKE_SOURCE_DIR}/../../../../hal_integration/moto_g85/pal_preload_probe
+)
+
+if(ANDROID)
+    find_library(log-lib log)
+    find_library(aaudio-lib aaudio)
+    find_library(android-lib android)
+else()
+    set(log-lib "")
+    set(aaudio-lib "")
+    set(android-lib "")
+endif()
+
+# ABI: alineacion de segmentos LOAD a 16 KB (Android 15+ con paginas de 16 KB; requisito de Google Play).
+# Medido sobre el Release v2.5.177: p_align=0x1000 (4 KB) en libivanna_omega.so/libomega_effect.so/ivanna_daemon,
+# mientras libc++_shared.so ya iba a 0x4000. Un max-page-size mayor es valido tambien en dispositivos de 4 KB.
+# Endurecimiento anti-piratería (v2.5.369): RELRO + BIND_NOW + noexecstack y
+# -s (strip de .symtab; .dynsym se conserva para JNI). El .so que viaja en el
+# APK y el que se stagea al módulo Magisk ya no llevan símbolos de depuración.
+target_link_options(ivanna_omega PRIVATE
+    -Wl,-z,max-page-size=16384
+    -Wl,-z,relro,-z,now,-z,noexecstack
+    -Wl,-s
+)
+
+target_link_libraries(ivanna_omega
+    ${log-lib}
+    ${aaudio-lib}
+    dl
+)
+
+# ────────────────────────────────────────────────────────────────────────────
+# Target: libomega_effect.so (AudioFlinger GlobalEffect — Magisk module)
+# ────────────────────────────────────────────────────────────────────────────
+add_library(omega_effect SHARED
+    # ── Seguridad anti-piratería (v2.5.369, módulo separado) ───────────────
+    # ivanna_integrity: pin de certificado, self-check de ruta, gate
+    # fail-closed (omega_process lo usa para passthrough si la .so viene de
+    # una ruta no legítima). Sin JNI aquí (audioserver no usa JNI).
+    security/ivanna_integrity.cpp
+    # Fase 2: anti-debug/anti-hook en Ruta B (audioserver). omega_process
+    # hace passthrough si antitamper_should_lockdown() es true.
+    security/ivanna_antitamper.cpp
+    omega_effect.cpp
+    ivanna_hires_jni.cpp
+    # FIX(build): omega_effect.cpp incluye IvannaFusionCore.cpp via unity-build
+    # (#include "IvannaFusionCore.cpp" en línea 3), que a su vez instancia las
+    # 4 clases siguientes. Sus .cpp deben compilarse como unidades separadas
+    # para que el linker encuentre los símbolos que IvannaFusionCore necesita.
+    # IvannaFusionCore.cpp NO se lista aquí — ya entra por el unity-include;
+    # añadirlo aquí generaría ODR violation (símbolos duplicados al enlazar).
+
+    # FIX(build): g_hrtf_wet_dry / g_hrtf_flush_req son definidos en
+    # audio_orchestrator.cpp (target ivanna_omega, proceso app). libomega_effect.so
+    # corre en el proceso audioserver — address-space separado — así que el linker
+    # no puede resolverlos con --no-undefined. Este stub los define de forma
+    # independiente con los mismos valores iniciales (wet=1.0, flush=false).
+    # NO añadir a ivanna_omega: generaría ODR violation con audio_orchestrator.cpp.
+    hrtf_globals_effect.cpp
+
+    # FIX(build): g_wfs_enabled / g_wfs_spread — IvannaFusionCore.cpp (unity-
+    # include en omega_effect.cpp) los referencia con extern, pero su
+    # definicion real (wfs_controls_bridge.cpp) entra solo al target
+    # ivanna_omega (proceso app). libomega_effect.so corre en audioserver
+    # (address-space separado): sin este stub el linker con --no-undefined
+    # moria con 'undefined symbol: g_wfs_enabled / g_wfs_spread' (CI job
+    # 105835483985). Mismo patron que hrtf_globals_effect.cpp. NO anadir a
+    # ivanna_omega: ODR violation con wfs_controls_bridge.cpp.
+    wfs_globals_effect.cpp
+
+    # ORBE: stub de g_orbe_* para el proceso audioserver (mismo patrón que
+    # wfs_globals_effect.cpp; la definición real está en orbe_controls_bridge.cpp,
+    # target ivanna_omega). NO añadir a ivanna_omega: ODR violation.
+    orbe_globals_effect.cpp
+    # CONSERVACIÓN PERCEPTUAL (2026-11-21): stub de g_consv_* para el proceso
+    # audioserver (mismo patrón que ORBE; la definición real está en
+    # conservation_controls_bridge.cpp, target ivanna_omega). NO añadir a
+    # ivanna_omega: ODR violation.
+    conservation_globals_effect.cpp
+    # FÍSICA NUEVA (Fase 2, v2.5.472): stub de g_np_* para el proceso
+    # audioserver (mismo patrón que ORBE; la definición real está en
+    # new_physics_controls_bridge.cpp, target ivanna_omega). NO añadir a
+    # ivanna_omega: ODR violation.
+    new_physics_globals_effect.cpp
+
+    # HOLOS: stub de g_holos_* para el proceso audioserver (mismo patrón que
+    # ORBE; defaults off hasta ABI v10). NO añadir a ivanna_omega: ODR violation.
+    holos_globals_effect.cpp
+
+    # Φ: stub de g_hyper_* para el proceso audioserver (mismo patrón que
+    # HOLOS; defaults off hasta bump de ABI con campos hyper_*).
+    # NO añadir a ivanna_omega: ODR violation.
+    hyper_globals_effect.cpp
+
+    # IVANNA: stub de g_omni_* para el proceso audioserver (mismo patrón que
+    # ORBE/HOLOS; amount=0 por defecto hasta medir CPU en el G85 — directiva
+    # 2026-11-09; sin campos omni_* en el snapshot ABI v10).
+    # NO añadir a ivanna_omega: ODR violation con omni_controls_bridge.cpp.
+    omni_globals_effect.cpp
+
+    HrtfManager.cpp
+    EvolutionaryEQ.cpp
+    Psychoacoustics.cpp
+    IvannaAudioClassifier.cpp
+    IvannaVoiceProsodyEngine.cpp
+    IvannaSuperAgentMemory.cpp
+    IvannaSelfHealingEngine.cpp
+    IvannaTinyML.cpp
+    IvannaNeuromorphicTinyML.cpp
+    SofaHRTFLoader.cpp
+    SafHRTFBridge.cpp
+    saf_latent_bridge.cpp
+    SaFStimulusRenderer.cpp
+    audio_control_plane.cpp
+    neuromorphic/ivanna_neural_upmixer.cpp
+    neuromorphic/neuro_cochlear_manifold.cpp
+    spatial/IntelligentUpmixer.cpp
+    spatial/OrbeBinaural.cpp
+    spatial/HolosOperator.cpp
+    spatial/HolosVolterraKernel.cpp
+    spatial/WfsRenderer.cpp
+    spatial/HoaBinauralDecoder.cpp
+    hexagon/ivanna_fastrpc_client.cpp
+    hexagon/ivanna_dsp.cpp
+    neuromorphic/volterra_h2_symmetric.cpp
+    # v2.5.51: NpeStereoCore (BiquadEnvelopeBank) llama phase_oracle_tick; libomega_effect.so es otro proceso
+    # (audioserver), así que necesita su propia copia. No hay ODR: ivanna_omega la enlaza por separado.
+    phase_oracle.cpp
+    saf_phi_infinity.cpp
+        neuromorphic/AntiDolbyAI.cpp
+    anti_dolby.cpp
+    saf_runtime.cpp
+    SaFOptimizer.cpp
+    SafGlobalBridge.cpp
+    SafPcaDecoder.cpp
+    SafSpatialModifier.cpp
+    SafModelLoader.cpp
+    spatial/ivanna_object_renderer.cpp
+    spatial/hrtf_convolver.cpp
+    spatial/ivanna_head_tracker.cpp
+    # v2.3.0: HRTFInterpolator real (IDW bilinear)
+    spatial/HRTFInterpolator.cpp
+    spatial/HRTFDatabase.cpp
+    HRTFBinLoader.cpp
+    SafHRTFDatasetBridge.cpp
+    daemon/core/omega_control_bus.cpp
+    music_intelligence/MusicFeatureExtractor.cpp
+    music_intelligence/MusicIntelligenceEngine.cpp
+    music_intelligence/ImeBridge.cpp
+    # FIX(build): RirDataset y RirConvolver usados desde omega_apply_room()
+    # en omega_effect.cpp. Estaban listados sólo en ivanna_native (target del
+    # APK) pero no aquí → símbolos indefinidos al enlazar libomega_effect.so.
+    spatial/RirDataset.cpp
+    spatial/RirConvolver.cpp
+    experimental/adaptive_engine/adaptive_decision_engine.cpp
+    # FIX (distorsion digital Ruta B): omega_process expandia el canal side
+    # con s *= 1.2f (TinyML bloque 'Music') y pasaba por el RIR SIN limiter
+    # al final — con señal caliente eso clippea (distorsion digital dura).
+    # La Ruta A (ivanna_native) ya lo compila (linea dsp/SafetyLimiter.cpp
+    # del target ivanna_omega); se añade aqui para que la cadena system-wide
+    # tenga exactamente la misma proteccion anti-clip que la app.
+    dsp/SafetyLimiter.cpp
+
+    # ── ASRC del daemon (v2.5.439, magistral) ─────────────────────────────
+    # El puente ivanna_asrc_bridge::process se llama desde omega_process()
+    # (a la entrada, antes de toda la cadena y del passthrough). Núcleo
+    # Genspark v2.5.398 (25/25 en host: deriva ±0.01 ppm, THD+N -86 dB,
+    # underflow 0, lazo de nivel acotado a 0.1 ppm). Rutas relativas desde
+    # app/src/main/cpp/ hasta magisk_module/engine/ (raíz del repo).
+    # NO añadir a ivanna_omega: estos .cpp NO están en ese target (sin ODR);
+    # el RouteA de la app (ivanna_route_a_asrc.cpp) es otro resampleador.
+    ../../../../magisk_module/engine/asrc/ivanna_asrc_core.cpp
+    ../../../../magisk_module/engine/asrc/ivanna_asrc_ipc.cpp
+    ../../../../magisk_module/engine/effect/ivanna_asrc_bridge.cpp
+
+    # Cadena 4D también en Ruta B: superficie global por proceso (audioserver). Con 4D apagado
+    # (por defecto) no altera un solo bit.
+    music_intelligence/FourDControlSurface.cpp
+    # ── FUSIÓN MAGISTRAL (2026-11-18) — núcleo C++ compartido Ruta A/Ruta B ──
+    # Los 7 operadores fusionados + la cadena (el FusionEngine delega en el
+    # FusedChain en processStereo). IvannaTinyMLKernel era el único motor que
+    # faltaba en este target; el resto ya estaba.
+    fused/fused_chain.cpp
+    fused/fused_spatial.cpp
+    fused/fused_field.cpp
+    fused/fused_listener_room.cpp
+    fused/fused_transducer.cpp
+    fused/fused_tonal.cpp
+    fused/fused_dynamics.cpp
+    fused/fused_brain.cpp
+    fused/perceptual_conservation.cpp  # 8. Árbitro de campo (2026-11-21)
+    fused/acoustic_twin/acoustic_twin.cpp  # gemelo + calibración P3 (call site, 2026-11-21)
+    # ── FÍSICA NUEVA (LGN + Ley de Curvatura, 2026-11-18) ── ver comentario
+    # en ivanna_omega (mismo motivo: HrtfManager::synthesizeHrtf las usa en
+    # Ruta B). Solo la curva ITD cerrada; la inversión de distancia NO se usa.
+    fused/geodesic_pinna_model.cpp
+    fused/physical_head_model.cpp
+    fused/physical_propagation.cpp
+    IvannaTinyMLKernel.cpp
+    # FIX CI 465 (2026-11-18, 2º fallo del Build APK): fused_dynamics.cpp y
+    # fused_brain.cpp instancian 5 clases (MultibandCompressor, HarmonicExciter,
+    # StereoWidener, GainStage, PredictiveAudioEngine) cuyos .cpp solo estaban
+    # en el target ivanna_omega; libomega_effect.so fallaba al linkear con 21
+    # "undefined symbol". Se añaden aquí (son implementaciones de clases
+    # autocontenidas, sin globales; no hay ODR violation con ivanna_omega
+    # porque cada .so va en su propio proceso).
+    dsp/MultibandCompressor.cpp
+    dsp/HarmonicExciter.cpp
+    dsp/StereoWidener.cpp
+    dsp/GainStage.cpp
+    predictive_audio_engine.cpp
+    # FIX CI 466 (2026-11-18, 3er fallo del Build APK, run 44397890948):
+    # libomega_effect.so fallaba con 8 "undefined symbol" de ivanna::Compressor
+    # (ctor, reset, setParams, setThreshold, setRatio, setAttack, setRelease,
+    # process). Lo usan fused_dynamics.cpp, MultibandCompressor, StereoWidener
+    # y omega_effect.cpp, pero dsp/Compressor.cpp solo estaba en ivanna_omega.
+    # Misma justificación que el fix 0058 (clase autocontenida, sin globales).
+    dsp/Compressor.cpp
+)
+
+target_compile_options(omega_effect PRIVATE ${BASE_FLAGS})
+
+# LTO thin opt-in (fase 2): solo si IVANNA_SECURITY_LTO=ON.
+if(IVANNA_SECURITY_LTO)
+    target_compile_options(omega_effect PRIVATE -flto=thin)
+    target_link_options(omega_effect PRIVATE -flto=thin)
+endif()
+
+target_include_directories(omega_effect PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/spatial
+    ${CMAKE_SOURCE_DIR}/experimental/adaptive_engine
+    # ASRC del daemon (v2.5.439): omega_effect.cpp incluye
+    # "ivanna_asrc_bridge.h" (magisk_module/engine/effect/).
+    ${CMAKE_SOURCE_DIR}/../../../../magisk_module/engine/effect
+)
+
+target_link_options(omega_effect PRIVATE
+    -Wl,-z,max-page-size=16384
+    # Android EffectsFactory resolves the legacy library entry point with
+    # dlsym(handle, "AELI"). Keep it in .dynsym even if toolchain defaults or
+    # archive-export policies change; source visibility alone is not the
+    # runtime contract. The device audit found AELI in .symtab but no
+    # matching exported dynamic symbol.
+    -Wl,--export-dynamic-symbol=AELI
+    -Wl,-z,relro
+    -Wl,-z,now
+    -Wl,--enable-new-dtags
+    # Endurecimiento anti-piratería (v2.5.369): noexecstack + -s (strip de
+    # .symtab; .dynsym se conserva: JNI no aplica aquí, AELI se exporta
+    # explícito arriba). El .so stageado al módulo Magisk ya no lleva
+    # símbolos de depuración.
+    -Wl,-z,noexecstack
+    -Wl,-s
+    $<$<BOOL:${ANDROID}>:-nostdlib++>
+)
+
+target_link_libraries(omega_effect PRIVATE
+    ${log-lib}
+    # FIX (Ruta B, 2026-11-09): NO enlazar ${android-lib} (libandroid.so).
+    # El HAL corre en el namespace de linker vendor donde libandroid.so NO
+    # existe; dlopen de libomega_effect.so fallaba con "libandroid.so not
+    # found" y el efecto omega nunca se registraba (EffectFactoryHAL:
+    # "Error querying effect descriptor ... No such file or directory").
+    # omega_effect.cpp solo usa <android/log.h> (__android_log_print),
+    # que vive en liblog.so (ya enlazado); no usa ninguna otra API de
+    # libandroid.so.
+    m
+    dl
+)
+
+if(ANDROID)
+    target_link_libraries(omega_effect PRIVATE "-Wl,-Bstatic" c++_static c++abi "-Wl,-Bdynamic")
+endif()
+
+
+
+# Auto stage libomega_effect.so for Magisk
+# AUDIT FIX (staging path): el path era "${CMAKE_SOURCE_DIR}/../magisk_module"
+# que desde app/src/main/cpp resuelve a app/src/main/magisk_module (inexistente).
+# El daemon usa ../../../../magisk_module (raiz del repo) — se alinea el effect
+# al mismo path para que el zip del modulo lleve ambos binarios.
+add_custom_command(TARGET omega_effect POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+    "${CMAKE_SOURCE_DIR}/../../../../magisk_module/system/vendor/lib64/soundfx"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:omega_effect>
+    "${CMAKE_SOURCE_DIR}/../../../../magisk_module/system/vendor/lib64/soundfx/libomega_effect.so"
+    VERBATIM
+)
+add_custom_target(stage_omega_effect ALL DEPENDS omega_effect)
+
+# IVANNA daemon standalone (Magisk)
+add_subdirectory(tests/third_party/googletest)
+
+add_subdirectory(daemon)
+
+
+# OEM stability regression suite
+add_executable(test_spatial_perception_suite
+    tests/regression/test_spatial_perception_suite.cpp
+)
+target_include_directories(test_spatial_perception_suite PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest/include
+)
+target_link_libraries(test_spatial_perception_suite PRIVATE gtest gtest_main)
+add_test(NAME spatial_perception COMMAND test_spatial_perception_suite)
+
+add_executable(test_perception_quality_gate
+    tests/regression/test_perception_quality_gate.cpp
+)
+target_include_directories(test_perception_quality_gate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest/include
+)
+target_link_libraries(test_perception_quality_gate PRIVATE gtest gtest_main)
+add_test(NAME perception_quality_gate COMMAND test_perception_quality_gate)
+
+add_executable(test_daemon_shm_health
+    tests/regression/test_daemon_shm_health.cpp
+)
+target_include_directories(test_daemon_shm_health PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest/include
+)
+target_link_libraries(test_daemon_shm_health PRIVATE gtest gtest_main)
+add_test(NAME daemon_shm_health COMMAND test_daemon_shm_health)
+
+add_executable(test_bt_wfs_mastery
+    tests/regression/test_bt_wfs_mastery.cpp
+)
+target_include_directories(test_bt_wfs_mastery PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest/include
+)
+target_link_libraries(test_bt_wfs_mastery PRIVATE gtest gtest_main)
+add_test(NAME bt_wfs_mastery COMMAND test_bt_wfs_mastery)
+
+add_executable(test_wfs_activation_crossfade
+    tests/regression/test_wfs_activation_crossfade.cpp
+)
+target_include_directories(test_wfs_activation_crossfade PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest/include
+)
+target_link_libraries(test_wfs_activation_crossfade PRIVATE gtest gtest_main)
+add_test(NAME wfs_activation_crossfade COMMAND test_wfs_activation_crossfade)
+
+add_executable(test_oem_stability_suite
+    tests/regression/test_oem_stability_suite.cpp
+)
+
+target_include_directories(test_oem_stability_suite PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googlemock/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest
+)
+
+target_link_libraries(test_oem_stability_suite
+    PRIVATE
+    gtest
+    gtest_main
+)
+
+add_dependencies(test_oem_stability_suite gtest)
+
+add_executable(test_acoustic_reality_hyperengine
+    tests/regression/test_acoustic_reality_hyperengine.cpp
+    spatial/RirConvolver.cpp
+    spatial/HRTFInterpolator.cpp
+    spatial/HRTFDatabase.cpp
+)
+target_include_directories(test_acoustic_reality_hyperengine PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/spatial
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuromorphic
+    ${CMAKE_CURRENT_SOURCE_DIR}/supreme
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/adaptive_engine
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest/include
+)
+target_link_libraries(test_acoustic_reality_hyperengine PRIVATE gtest gtest_main ${log-lib})
+add_test(NAME acoustic_reality_hyperengine COMMAND test_acoustic_reality_hyperengine)
+
+add_executable(test_supreme_acoustic_continuity
+    tests/test_supreme_acoustic_continuity.cpp
+    spatial/RirConvolver.cpp
+    spatial/HRTFInterpolator.cpp
+    spatial/HRTFDatabase.cpp
+    spatial/WfsRenderer.cpp
+    neuromorphic/volterra_h2_symmetric.cpp
+)
+target_include_directories(test_supreme_acoustic_continuity PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/spatial
+    ${CMAKE_CURRENT_SOURCE_DIR}/neuromorphic
+    ${CMAKE_CURRENT_SOURCE_DIR}/supreme
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/adaptive_engine
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest/include
+)
+target_link_libraries(test_supreme_acoustic_continuity PRIVATE gtest gtest_main ${log-lib})
+add_test(NAME SupremeAcousticContinuityTest COMMAND test_supreme_acoustic_continuity)
+
+# Evolutionary EQ: regression of the calibrated frequency response (not just readiness).
+add_executable(test_evolutionary_eq_impact
+    tests/test_evolutionary_eq_impact.cpp
+    EvolutionaryEQ.cpp
+)
+target_include_directories(test_evolutionary_eq_impact PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/third_party/googletest/googletest/include
+)
+target_link_libraries(test_evolutionary_eq_impact PRIVATE gtest gtest_main)
+add_test(NAME evolutionary_eq_impact COMMAND test_evolutionary_eq_impact)

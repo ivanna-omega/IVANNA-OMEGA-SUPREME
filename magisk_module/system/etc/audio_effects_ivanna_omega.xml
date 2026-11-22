@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<audio_effects_conf version="2.0" xmlns="http://schemas.android.com/audio/audio_effects_conf/v2_0">
+  <libraries>
+    <library name="omega_effect" path="libomega_effect.so"/>
+  </libraries>
+  <effects>
+    <effect name="omega_effect" library="omega_effect"
+            uuid="4956414e-4e41-4f4d-4547-415355505245"/>
+  </effects>
+  <!-- Sin <postprocess>: la activación es por UUID por sesión desde la app.
+       Un <apply> global de omega bloquearía la creación por sesión
+       (Error -3, v2.5.373). -->
+</audio_effects_conf>

@@ -1,0 +1,92 @@
+# Puerta de Perfección (v3, L2) — CI desde clon limpio.
+#
+# Corre scripts/perfection_gate.py y publica perfection_gate_report.json
+# como artefacto. El job FALLA si la puerta falla: eso es lo correcto —
+# una puerta en rojo es la señal honesta, no un workflow roto.
+#
+# NO se marca como check requerido hasta que la puerta llegue a 0: mientras
+# tanto es veredicto informativo, no bloqueo de merges. Cambiar un umbral
+# requiere a Esse (ver scripts/perfection_gate_README.md).
+#
+# No requiere NDK/SDK: solo Python 3 + g++-14/cmake para CTest.
+# La puerta regenera telemetry/ctest_summary.json desde el log CTest (como
+# tests-host.yml) ANTES de verificar las afirmaciones de docs, para que el
+# conteo CTest verificado sea el de esta corrida y no una telemetría vieja.
+name: Puerta de Perfección
+
+on:
+  push:
+    paths:
+      - 'scripts/perfection_gate.py'
+      - 'scripts/perfection_gate_README.md'
+      - 'scripts/check_*.py'
+      - 'docs/capabilities/inventory.yaml'
+      - 'tools/evolution/tests/test_perfection_gate.py'
+      - 'app/src/main/cpp/**'
+      - 'app/src/main/java/**'
+      - 'magisk_module/**'
+      - 'README.md'
+      - '.github/workflows/perfection-gate.yml'
+  pull_request:
+    paths:
+      - 'scripts/perfection_gate.py'
+      - 'scripts/perfection_gate_README.md'
+      - 'scripts/check_*.py'
+      - 'docs/capabilities/inventory.yaml'
+      - 'tools/evolution/tests/test_perfection_gate.py'
+      - 'app/src/main/cpp/**'
+      - 'app/src/main/java/**'
+      - 'magisk_module/**'
+      - 'README.md'
+      - '.github/workflows/perfection-gate.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perfection-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  perfection-gate:
+    name: Puerta de Perfección
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      CMAKE_BUILD_PARALLEL_LEVEL: '4'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Instalar g++-14 y cmake (compilador CTest; ver tests-host.yml fix v2.5.411)
+        run: |
+          if ! command -v g++-14 >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq g++-14
+          fi
+          g++-14 --version | head -1
+          cmake --version || { sudo apt-get update -qq && sudo apt-get install -y -qq cmake; }
+          cmake --version | head -1
+
+      # Requisito de app/src/main/cpp/tests/CMakeLists.txt:1 — cmake >= 3.30.3.
+      # Si el runner trae uno más viejo, la puerta reportaría "CTest no
+      # ejecutado" (A_MEDIAS) en vez de verificar; se instala uno actual.
+      - name: CMake >= 3.30.3 (requisito de la suite CTest)
+        run: |
+          python3 -c "import subprocess,sys; v=subprocess.check_output(['cmake','--version'],text=True).split()[2]; sys.exit(0 if tuple(map(int,v.split('.'))) >= (3,30,3) else 1)" && echo "cmake OK" || python3 -m pip install --upgrade cmake
+          cmake --version | head -1
+
+      - name: Auditoría de la puerta (defecto sembrado debe ser atrapado)
+        run: python3 -m unittest tools.evolution.tests.test_perfection_gate -v
+
+      - name: Puerta de perfección (desde clon limpio)
+        run: python3 scripts/perfection_gate.py --regenerate-telemetry
+
+      - name: Publicar reporte JSON
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: perfection-gate-report
+          path: perfection_gate_report.json
+          if-no-files-found: error

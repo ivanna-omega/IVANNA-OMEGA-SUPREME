@@ -1,0 +1,368 @@
+/*
+ * audio_effect_compat.h
+ *
+ * Reemplazo local de <hardware/audio_effect.h>, eliminado del NDK r25+.
+ * Todos los layouts de struct están verificados contra el código fuente AOSP
+ * (platform/hardware/libhardware) en la rama correspondiente a API 29-34.
+ * Un solo byte fuera de lugar en cualquier struct corrompería la vtable que
+ * audioserver llama mediante dlopen().
+ *
+ * Valores de flags: AOSP platform/hardware/libhardware/include/hardware/audio_effect.h
+ * commit estable para Android 10–14 (API 29–34).
+ *
+ * © 2025 GORE TNS — Luis Uriel Pimentel Pérez.
+ */
+#pragma once
+#ifndef AUDIO_EFFECT_COMPAT_H
+#define AUDIO_EFFECT_COMPAT_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ── UUID (128 bits, layout IEEE 11578) ─────────────────────────────────────*/
+typedef struct effect_uuid_s {
+    uint32_t timeLow;
+    uint16_t timeMid;
+    uint16_t timeHiAndVersion;
+    uint16_t clockSeq;
+    uint8_t  node[6];
+} effect_uuid_t;
+
+#define EFFECT_STRING_LEN_MAX 64
+
+/* ── Descriptor del efecto ───────────────────────────────────────────────────*/
+typedef struct effect_descriptor_s {
+    effect_uuid_t type;
+    effect_uuid_t uuid;
+    uint32_t      apiVersion;
+    uint32_t      flags;
+    uint16_t      cpuLoad;       /* AOSP ABI: 16-bit, offset 40 */
+    uint16_t      memoryUsage;   /* AOSP ABI: 16-bit, offset 42 */
+    char          name[EFFECT_STRING_LEN_MAX];
+    char          implementor[EFFECT_STRING_LEN_MAX];
+} effect_descriptor_t;
+
+/* ── Buffer de audio ─────────────────────────────────────────────────────────*/
+typedef struct audio_buffer_s {
+    size_t frameCount;
+    union {
+        void    *raw;
+        int32_t *s32;
+        int16_t *s16;
+        uint8_t *u8;
+        float   *f32;
+    };
+} audio_buffer_t;
+
+/* ── Buffer config (por instancia de efecto) ─────────────────────────────────*/
+typedef struct buffer_provider_s {
+    int32_t (*getBuffer)(void *cookie, audio_buffer_t *buffer);
+    int32_t (*releaseBuffer)(void *cookie, audio_buffer_t *buffer);
+    void *cookie;
+} buffer_provider_t;
+
+typedef struct buffer_config_s {
+    audio_buffer_t   buffer;
+    uint32_t         samplingRate;
+    uint32_t         channels;
+    buffer_provider_t bufferProvider;
+    uint8_t          format;
+    uint8_t          accessMode;
+    uint16_t         mask;
+} buffer_config_t;
+
+typedef struct effect_config_s {
+    buffer_config_t inputCfg;
+    buffer_config_t outputCfg;
+} effect_config_t;
+
+/* ── Interfaz vtable (primer campo de cada instancia de efecto) ──────────────*/
+typedef struct effect_interface_s **effect_handle_t;
+
+struct effect_interface_s {
+    int32_t (*process)(effect_handle_t self,
+                       audio_buffer_t *inBuf, audio_buffer_t *outBuf);
+    int32_t (*command)(effect_handle_t self,
+                       uint32_t cmdCode, uint32_t cmdSize, void *pCmdData,
+                       uint32_t *replySize, void *pReplyData);
+    int32_t (*get_descriptor)(effect_handle_t self,
+                              effect_descriptor_t *pDescriptor);
+    int32_t (*process_reverse)(effect_handle_t self,
+                               audio_buffer_t *inBuf, audio_buffer_t *outBuf);
+};
+
+/* ── Comandos (enum value == índice real en AOSP API 29+) ────────────────────*/
+enum effect_command_e {
+    EFFECT_CMD_INIT             = 0,
+    EFFECT_CMD_SET_CONFIG       = 2,   /* también llamado CONFIGURE en versiones antiguas */
+    EFFECT_CMD_RESET            = 3,
+    EFFECT_CMD_ENABLE           = 4,
+    EFFECT_CMD_DISABLE          = 5,
+    EFFECT_CMD_SET_PARAM        = 6,
+    EFFECT_CMD_SET_PARAM_DEFERRED = 7,
+    EFFECT_CMD_SET_PARAM_COMMIT = 8,
+    EFFECT_CMD_GET_PARAM        = 9,
+    EFFECT_CMD_SET_DEVICE       = 10,
+    EFFECT_CMD_SET_VOLUME       = 11,
+    EFFECT_CMD_SET_AUDIO_MODE   = 12,
+    EFFECT_CMD_FIRST_PROPRIETARY = 0x10000
+};
+
+/* Alias de compatibilidad — omega_effect.cpp usa CONFIGURE, el valor es 2 */
+#define EFFECT_CMD_CONFIGURE    EFFECT_CMD_SET_CONFIG
+
+/* ── Flags de descriptor ─────────────────────────────────────────────────────
+ * Layout MODERNO (Android 10–15, AOSP system/audio_effect.h, confirmado
+ * contra android.hardware.audio.effect@4.0 — audio_effect-base.h generado
+ * por hidl-gen — y contra el dumpsys del Moto G85, donde el Equalizer
+ * stock reporta flags 0x48 = INSERT + INSERT_FIRST + VOLUME_CTRL solo con
+ * este layout).
+ *
+ * v2.5.374 — CORRECCIÓN: este header mezclaba el layout LEGACY (pre-API 29)
+ * con el moderno. Usaba INSERT_MASK 0x70 / EXCLUSIVE 0x30 (modernos) pero
+ * VOLUME_CTRL 0x400 / DEVICE_IND 0x800 / AUDIO_MODE_IND 0x80000 (legacy).
+ * En el layout moderno los campos están empaquetados de 3 en 3 bits:
+ *   tipo bits 0-2, inserción bits 3-5, volumen bits 6-8, dispositivo
+ *   bits 9-11, entrada bits 12-13, salida bits 14-15, HW_ACC bits 16-17,
+ *   modo bits 18-19, fuente bits 20-21, offload bit 22, no-process bit 23.
+ * Con los valores legacy, un efecto que pidiera VOLUME_CTRL (0x400) en
+ * realidad marcaba un bit del campo DEVICE (valor 2, reservado) y un
+ * INSERT_EXCLUSIVE legacy (0x40) se leía como VOLUME_CTRL moderno.
+ * Omega reporta flags=0 (INSERT_ANY, sin volumen ni offload), así que este
+ * bug NO causaba el -38 de Ruta B — es latente — pero cualquier efecto
+ * futuro que usara estas macros quedaba mal descrito ante AudioFlinger.
+ * Los static_assert de abajo fijan el layout para que no vuelva a derivar.
+ *
+ * Valores de referencia (hidl-gen, audio_effect-base.h):
+ *   TYPE:    shift 0, size 3 → mask 0x7
+ *   INSERT:  shift 3, size 3 → mask 0x38 (ANY 0, FIRST 0x08, LAST 0x10, EXCLUSIVE 0x18)
+ *   VOLUME:  shift 6, size 3 → mask 0x1C0 (CTRL 0x40, IND 0x80, MONITOR 0xC0)
+ *   DEVICE:  shift 9, size 3 → mask 0xE00 (IND 0x200)
+ *   INPUT:   shift 12, size 2 → mask 0x3000 (DIRECT 0x1000, PROVIDER 0x2000)
+ *   OUTPUT:  shift 14, size 2 → mask 0xC000 (DIRECT 0x4000, PROVIDER 0x8000)
+ *   HW_ACC:  shift 16, size 2 → mask 0x30000 (SIMPLE 0x10000, TUNNEL 0x20000)
+ *   A_MODE:  shift 18, size 2 → mask 0xC0000 (IND 0x40000)
+ *   A_SRC:   shift 20, size 2 → mask 0x300000 (IND 0x100000)
+ *   OFFLOAD: shift 22 → 0x400000
+ *   NO_PROC: shift 23 → 0x800000 */
+#define EFFECT_FLAG_TYPE_MASK       0x00000007U
+#define EFFECT_FLAG_TYPE_INSERT     0x00000000U   /* INSERT = 0 */
+#define EFFECT_FLAG_TYPE_AUXILIARY  0x00000001U
+#define EFFECT_FLAG_TYPE_REPLACE    0x00000002U
+#define EFFECT_FLAG_TYPE_PRE_PROC   0x00000003U
+#define EFFECT_FLAG_TYPE_POST_PROC  0x00000004U
+
+#define EFFECT_FLAG_INSERT_MASK     0x00000038U
+#define EFFECT_FLAG_INSERT_ANY      0x00000000U
+#define EFFECT_FLAG_INSERT_FIRST    0x00000008U
+#define EFFECT_FLAG_INSERT_LAST     0x00000010U
+#define EFFECT_FLAG_INSERT_EXCLUSIVE 0x00000018U
+
+#define EFFECT_FLAG_VOLUME_MASK     0x000001C0U
+#define EFFECT_FLAG_VOLUME_NONE     0x00000000U
+#define EFFECT_FLAG_VOLUME_CTRL     0x00000040U
+#define EFFECT_FLAG_VOLUME_IND      0x00000080U
+#define EFFECT_FLAG_VOLUME_MONITOR  0x000000C0U
+
+#define EFFECT_FLAG_DEVICE_MASK     0x00000E00U
+#define EFFECT_FLAG_DEVICE_NONE     0x00000000U
+#define EFFECT_FLAG_DEVICE_IND      0x00000200U
+
+#define EFFECT_FLAG_INPUT_MASK      0x00003000U
+#define EFFECT_FLAG_INPUT_DIRECT    0x00001000U
+#define EFFECT_FLAG_INPUT_PROVIDER  0x00002000U
+#define EFFECT_FLAG_INPUT_BOTH      0x00003000U
+
+#define EFFECT_FLAG_OUTPUT_MASK     0x0000C000U
+#define EFFECT_FLAG_OUTPUT_DIRECT   0x00004000U
+#define EFFECT_FLAG_OUTPUT_PROVIDER 0x00008000U
+#define EFFECT_FLAG_OUTPUT_BOTH     0x0000C000U
+
+#define EFFECT_FLAG_HW_ACC_MASK     0x00030000U
+#define EFFECT_FLAG_HW_ACC_SIMPLE   0x00010000U
+#define EFFECT_FLAG_HW_ACC_TUNNEL   0x00020000U
+
+#define EFFECT_FLAG_AUDIO_MODE_MASK 0x000C0000U
+#define EFFECT_FLAG_AUDIO_MODE_NONE 0x00000000U
+#define EFFECT_FLAG_AUDIO_MODE_IND  0x00040000U
+
+#define EFFECT_FLAG_AUDIO_SOURCE_MASK 0x00300000U
+#define EFFECT_FLAG_AUDIO_SOURCE_NONE 0x00000000U
+#define EFFECT_FLAG_AUDIO_SOURCE_IND  0x00100000U
+
+#define EFFECT_FLAG_OFFLOAD_SUPPORTED 0x00400000U
+#define EFFECT_FLAG_NO_PROCESS      0x00800000U
+
+#ifdef __cplusplus
+/* El layout de flags es ABI: si alguien vuelve a poner los valores legacy,
+ * estos asserts revientan en compilación en vez de describir mal el efecto
+ * ante AudioFlinger. */
+static_assert(EFFECT_FLAG_TYPE_MASK == 0x7u, "TYPE_MASK moderno = 0x7");
+static_assert(EFFECT_FLAG_INSERT_MASK == 0x38u, "INSERT_MASK moderno = 0x38");
+static_assert(EFFECT_FLAG_INSERT_EXCLUSIVE == 0x18u, "INSERT_EXCLUSIVE moderno = 0x18");
+static_assert(EFFECT_FLAG_VOLUME_CTRL == 0x40u, "VOLUME_CTRL moderno = 0x40 (no 0x400 legacy)");
+static_assert(EFFECT_FLAG_DEVICE_IND == 0x200u, "DEVICE_IND moderno = 0x200 (no 0x800 legacy)");
+static_assert(EFFECT_FLAG_AUDIO_MODE_IND == 0x40000u, "AUDIO_MODE_IND moderno = 0x40000");
+static_assert(EFFECT_FLAG_OFFLOAD_SUPPORTED == 0x400000u, "OFFLOAD_SUPPORTED moderno = 0x400000");
+#endif
+
+/* ── Versiones de API ────────────────────────────────────────────────────────*/
+#define EFFECT_MAKE_API_VERSION(M, m) (((M) << 16) | ((m) & 0xFFFFu))
+#define EFFECT_CONTROL_API_VERSION    EFFECT_MAKE_API_VERSION(2, 0)
+#define EFFECT_LIBRARY_API_VERSION    EFFECT_MAKE_API_VERSION(3, 0)
+
+/* ── Tabla de la librería (dlopen entry point) ───────────────────────────────*/
+/* FIX CRÍTICO #2 (orden de bytes invertido vs. AOSP real — hallazgo verificado
+ * contra el fuente genuino de hardware/libhardware/include/hardware/
+ * audio_effect.h): esta macro tenía los shifts en orden INVERSO al real.
+ *
+ *   AOSP genuino:  (('A')<<24) | (('E')<<16) | (('L')<<8) | ('T')  = 0x41454C54
+ *   Este archivo (antes de este fix): 'A' | ('E'<<8) | ('L'<<16) | ('T'<<24)
+ *                                     = 0x544C4541  (byte-swapped)
+ *
+ * EffectsXmlConfigLoader.cpp::loadLibrary() (AOSP real, frameworks/av) hace
+ * dlsym("AELI") y, ANTES de cualquier otra cosa — antes de query_effect,
+ * antes de create_effect, antes de que audio_effects.xml o SELinux importen
+ * en absoluto —, compara:
+ *     if (description->tag != AUDIO_EFFECT_LIBRARY_TAG) {
+ *         ALOGE("Bad tag %#08x ... expected %#08x for library %s", ...);
+ *         return false;  // dlclose() y la librería se descarta
+ *     }
+ * Con el valor viejo, ESTE check fallaba siempre, sin importar si el XML
+ * estaba en la partición correcta o si SELinux permitía dlopen/execute —
+ * la librería nunca pasaba de esta línea. Esto explica "el binario es
+ * válido, el hash es correcto, y aun así AudioFlinger nunca lo instancia"
+ * de forma más directa que cualquiera de los 3 candidatos de v2.5.138: con
+ * el tag equivocado, NINGUNO de esos 3 fixes podía importar — el rechazo
+ * ocurre antes de que SELinux o la partición del XML entren en juego.
+ */
+#define AUDIO_EFFECT_LIBRARY_TAG \
+    (((uint32_t)('A') << 24) | ((uint32_t)('E') << 16) | ((uint32_t)('L') << 8) | (uint32_t)('T'))
+
+/* FIX CRÍTICO (causa raíz del fallo real en dispositivo, Android 15):
+ * "EffectsFactoryConfigLoader: failed not find symbol 'AELI' ... undefined
+ * symbol: AELI".
+ *
+ * En el audio_effect.h GENUINO de AOSP (hardware/libhardware/include/
+ * hardware/audio_effect.h), AUDIO_EFFECT_LIBRARY_INFO_SYM NO es el nombre
+ * de un símbolo — es un MACRO que se expande al token AELI:
+ *
+ *     #define AUDIO_EFFECT_LIBRARY_INFO_SYM AELI
+ *     #define AUDIO_EFFECT_LIBRARY_INFO_SYM_AS_STR "AELI"
+ *     #define AUDIO_EFFECT_LIBRARY_INFO_SYM AELI
+#define AUDIO_EFFECT_LIBRARY_INFO_SYM_AS_STR "AELI"
+ *
+ * Este header de compatibilidad (reemplazo de <hardware/audio_effect.h>,
+ * eliminado del NDK r25+) nunca definió ese macro. Consecuencia real: en
+ * omega_effect.cpp, la línea
+ *
+ *     audio_effect_library_t AUDIO_EFFECT_LIBRARY_INFO_SYM = { ... };
+ *
+ * se compilaba usando el identificador LITERAL "AUDIO_EFFECT_LIBRARY_INFO_SYM"
+ * como nombre real del símbolo C exportado (28 caracteres), en vez de "AELI"
+ * (4 caracteres). El .so SÍ exporta un símbolo global — pero se llama mal.
+ * `EffectLoader.cpp` de audioserver hace dlsym(handle, AUDIO_EFFECT_LIBRARY_
+ * INFO_SYM_AS_STR), que en el sistema real se expande a dlsym(handle, "AELI")
+ * — y como "AELI" no existe en .dynsym, dlsym() falla y EffectsFactory
+ * descarta la librería antes de poder usarla.
+ *
+ * `readelf --dyn-syms | grep AUDIO_EFFECT_LIBRARY_INFO_SYM` "confirmaba" el
+ * símbolo — pero es el símbolo MAL NOMBRADO, no el que Android busca. Con
+ * este macro ya definido, la declaración de más abajo se expande en tiempo
+ * de preprocesado a `audio_effect_library_t AELI = { ... };` y el símbolo
+ * real exportado pasa a llamarse "AELI".
+ */
+#define AUDIO_EFFECT_LIBRARY_INFO_SYM AELI
+#define AUDIO_EFFECT_LIBRARY_INFO_SYM_AS_STR "AELI"
+
+/* FIX CRÍTICO #3 (corrupción de ABI del vtable de librería, más grave que el
+ * tag byte-swapped): este struct tenía DOS campos de función que NO EXISTEN
+ * en el audio_effect_library_s real de AOSP — query_num_effects y
+ * query_effect, insertados entre `implementor` y `create_effect`.
+ *
+ * Confirmado de forma independiente contra 3 fuentes (git.aicp-rom.com mirror
+ * del fuente real, source.android.com/reference/hal/structaudio__effect__
+ * library__s — la referencia oficial de Google — y una segunda consulta
+ * específica al mismo mirror contando campo por campo): el struct real tiene
+ * EXACTAMENTE 7 campos, en este orden:
+ *   tag, version, name, implementor, create_effect, release_effect,
+ *   get_descriptor
+ * — sin query_num_effects ni query_effect. En el modelo moderno de AOSP
+ * (audio_effects.xml con UUID explícito por efecto, API 29+), audioserver ya
+ * no necesita que la librería se auto-enumere; llama create_effect(uuid,...)
+ * directo por el UUID que el XML ya le dio.
+ *
+ * Con los 2 campos extra, el layout de memoria de ESTE struct (9 punteros)
+ * no coincidía con el que audioserver realmente usa para leerlo (7
+ * punteros). Resultado, una vez el tag pasara el chequeo (fix anterior,
+ * v2.5.139): audioserver, creyendo leer `create_effect` en el offset del
+ * 5.º campo, en realidad leía el puntero a `omega_query_num_effects` —
+ * una función de 1 argumento (uint32_t*) invocada como si tomara 4
+ * (uuid, sessionId, ioId, pHandle*). En AArch64 (x0=primer argumento),
+ * omega_query_num_effects escribiría `*pNumEffects=1` sobre la memoria que
+ * en realidad era el effect_uuid_t* que audioserver pasó — corrompiendo esa
+ * estructura — y devolvería 0 (éxito), dejando a AudioFlinger creyendo que
+ * creó el efecto con un effect_handle_t* nunca inicializado. El create_effect
+ * REAL de este archivo (offset del 7.º campo según el struct corrupto) nunca
+ * se llegaba a invocar. Esto es consistente con crash/corrupción de
+ * audioserver, no solo "el efecto no se aplica".
+ */
+typedef struct audio_effect_library_s {
+    uint32_t    tag;
+    uint32_t    version;
+    const char *name;
+    const char *implementor;
+    int32_t (*create_effect)(const effect_uuid_t *uuid,
+                             int32_t sessionId, int32_t ioId,
+                             effect_handle_t *pHandle);
+    int32_t (*release_effect)(effect_handle_t handle);
+    int32_t (*get_descriptor)(const effect_uuid_t *uuid,
+                              effect_descriptor_t *pDescriptor);
+} audio_effect_library_t;
+
+#ifdef __cplusplus
+/* Regresión del FIX CRÍTICO #3: 7 campos reales de AOSP (2 uint32_t + 5
+ * punteros de 8 bytes en destino de 64 bits, sin padding intermedio ya que
+ * tag+version ya suman 8). Si alguien vuelve a insertar query_num_effects/
+ * query_effect, este assert revienta en tiempo de compilación en vez de
+ * fallar en silencio dentro de audioserver. */
+static_assert(sizeof(audio_effect_library_t) ==
+                  2 * sizeof(uint32_t) + 5 * sizeof(void *),
+              "audio_effect_library_t debe tener EXACTO 7 campos "
+              "(tag,version,name,implementor,create_effect,release_effect,"
+              "get_descriptor) — ver FIX CRITICO #3 en este archivo");
+#endif
+
+/* UUID nulo de conveniencia */
+static const effect_uuid_t EFFECT_UUID_NULL_VAL = {0, 0, 0, 0, {0,0,0,0,0,0}};
+#define EFFECT_UUID_NULL (&EFFECT_UUID_NULL_VAL)
+
+/* ── Tipos de audio (los que usa omega_effect.cpp) ──────────────────────────*/
+#ifndef AUDIO_CHANNEL_OUT_STEREO
+#define AUDIO_CHANNEL_OUT_STEREO 0x00000003u
+#endif
+#ifndef AUDIO_FORMAT_PCM_FLOAT
+#define AUDIO_FORMAT_PCM_FLOAT   0x00000005u
+#endif
+#ifndef AUDIO_FORMAT_PCM_16_BIT
+#define AUDIO_FORMAT_PCM_16_BIT  0x00000001u
+#endif
+
+typedef uint32_t audio_channel_mask_t;
+typedef uint32_t audio_format_t;
+
+static inline int audio_channel_count_from_out_mask(uint32_t mask) {
+    int n = 0;
+    while (mask) { n += (int)(mask & 1u); mask >>= 1u; }
+    return n;
+}
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* AUDIO_EFFECT_COMPAT_H */

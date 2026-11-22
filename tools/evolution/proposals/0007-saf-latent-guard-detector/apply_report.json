@@ -1,0 +1,20 @@
+{
+  "proposal": "0007-saf-latent-guard-detector",
+  "status": "already_applied",
+  "applied": false,
+  "dry_run": true,
+  "council": {
+    "approved": false,
+    "evidence": "sin registro de aprobación del consejo en la propuesta"
+  },
+  "council_override": true,
+  "files": [
+    "tools/evolution/evolution_engine.py",
+    "tools/evolution/tests/test_scan_saf_guards.py"
+  ],
+  "already_applied": {
+    "state": "exact",
+    "detail": "git apply --check --reverse limpio"
+  },
+  "reason": "el cambio ya está en el árbol (exact): git apply --check --reverse limpio"
+}

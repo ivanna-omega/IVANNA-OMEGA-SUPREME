@@ -1,0 +1,582 @@
+package com.ivanna.omega.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.ivanna.omega.dsp.DSPBridge
+import com.ivanna.omega.magisk.MagiskBridge
+import com.ivanna.omega.magisk.OmegaEngineBridge
+import com.ivanna.omega.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/**
+ * MagiskStatusPanel — pantalla de estado del módulo Magisk + cliente daemon.
+ *
+ * FIX CRÍTICO (socket siempre desconectado con daemon "corriendo"):
+ *   - daemonConnected ahora refleja omegaBridge.isConnected que se actualiza
+ *     con un probe real en OmegaEngineBridge.connect().
+ *   - Se agregó botón RECONECTAR para disparar connect() manualmente desde IO.
+ *   - El polling cada 2s también dispara connect() si no está conectado
+ *     (descarga extra ligera: solo un probe de socket, no un comando completo).
+ *   - Estado SOCKET: muestra N/A cuando Magisk no está instalado (no error).
+ *   - FIX (UI, este commit): la advertencia "módulo instalado más viejo que
+ *     la app" existía como texto suelto atrapado dentro de ESTE MISMO
+ *     comentario KDoc desde hacía varios turnos — nunca fue código, nunca se
+ *     mostró a nadie. Se implementa de verdad más abajo, con comparación
+ *     semántica real (moduleVersion trae el prefijo "v" de module.prop,
+ *     BuildConfig.VERSION_NAME no — y "2.3.10" no debe leerse como menor
+ *     que "2.3.9" por comparación de texto plano).
+ */
+private fun parseSemver(raw: String): List<Int> =
+    raw.removePrefix("v").split(".").mapNotNull { it.trim().toIntOrNull() }
+
+/** true si [installed] es estrictamente menor que [current], por componentes numéricos. */
+private fun isOlderVersion(installed: String, current: String): Boolean {
+    val a = parseSemver(installed)
+    val b = parseSemver(current)
+    if (a.isEmpty() || b.isEmpty()) return false // no comparamos "unknown" ni formatos raros
+    for (i in 0 until maxOf(a.size, b.size)) {
+        val ai = a.getOrElse(i) { 0}
+        val bi = b.getOrElse(i) { 0 }
+        if (ai != bi) return ai < bi
+    }
+    return false
+}
+
+// ── Fichas magistrales · Entorno System (prototipo aprobado, Pantalla VII) ───
+// Texto exacto del prototipo; nada inventado.
+private val systemSpec = SpecInfo(
+    title = "System",
+    what = "El entorno de infraestructura: la ruta de audio (A dentro de la app, B en el mezclador del sistema), la salida Hi-Res por USB y el estado real de permisos y diagnóstico.",
+    purpose = "Para separar los problemas de sonido de los de sistema: la mitad de los «el efecto no suena» son una ruta equivocada, un permiso sin conceder o un daemon sin acoplar — no un fallo del DSP.",
+    whenUse = "Primera parada ante cualquier anomalía: verifica ruta, permisos y diagnóstico antes de tocar un solo control de los demás entornos.",
+    whenAvoid = "No cambies de ruta ni concedas superusuario en caliente tras un restablecimiento del teléfono: primero estabilidad durante días, después privilegios."
+)
+
+/** O · Ruta de audio · A / B: este panel ES el lado Ruta B del entorno. */
+private val routeABSpec = SpecInfo(
+    title = "O · Ruta de audio · A / B",
+    what = "Ruta A: el procesado vive dentro de la app (BridgePlayer con archivos y Tidal, o captura de la sesión). Solo procesa lo que IVANNA toca, pero un fallo suyo solo tumba la app. Ruta B: el efecto se inserta en el mezclador del sistema (AudioFlinger) vía módulo Magisk + daemon ivanna_asrcd: procesa todo el audio del teléfono, en el sitio, sin copia ni retardo.",
+    purpose = "Ruta A es la vía diaria y la de referencia (por BridgePlayer, los efectos son el 100 % de lo que oyes). Ruta B es la vía definitiva: llamadas, sistema y cualquier app, sin la copia con ~140 ms de retardo de la captura.",
+    whenUse = "Ruta B solo con el módulo instalado, teléfono estable durante días y recuperación a la mano (adb/recovery). Sin superusuario concedido, la Ruta B no se acopla: la app lo detecta y permanece en Ruta A.",
+    whenAvoid = "Ruta B jamás en un teléfono recién restablecido: un fallo suyo vive en el servicio de audio del sistema y puede impedir el arranque. Si hay cualquier duda de estabilidad, la respuesta correcta es Ruta A."
+)
+
+/** Q · Permisos y diagnóstico. */
+private val permissionsSpec = SpecInfo(
+    title = "Q · Permisos y diagnóstico",
+    what = "La vista de salud del sistema: permisos vigentes, capacidad de acople de cada ruta y un chequeo guiado que recorre cadena, reloj y daemon en orden.",
+    purpose = "Para diagnosticar con evidencia en vez de con sospechas: cada «no suena» tiene aquí su primera respuesta antes de tocar código o controles.",
+    whenUse = "Tras instalar una release nueva, tras conceder un permiso y ante cualquier anomalía de audio. El diagnóstico es de solo lectura: no reinicia servicios ni toca el sistema de audio.",
+    whenAvoid = "No concedas superusuario a ciegas para «que todo diga verde»: cada permiso se concede cuando su función lo necesita y el teléfono está estable, no antes."
+)
+
+@Composable
+fun MagiskStatusPanel(
+    omegaBridge: OmegaEngineBridge,
+    modifier: Modifier = Modifier,
+    onBack: () -> Unit = {}
+) {
+    var moduleActive    by remember { mutableStateOf(false) }
+    var moduleVersion   by remember { mutableStateOf("") }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var daemonRunning   by remember { mutableStateOf(false) }
+    // Senal REAL del efecto en audioserver (beacon de omega_effect), no solo "el daemon vive".
+    var effectState     by remember { mutableStateOf(DSPBridge.EffectState.UNAVAILABLE) }
+    // FIX 4 (v2.5.465) — telemetría VIVA de Ruta B: frames del beacon +
+    // evidencia del daemon, en el polling de 2 s (antes la telemetría solo
+    // existía bajo el botón TELEMETRY y el banner decía "sin confirmar"
+    // aunque el beacon avanzara). Se muestra SIEMPRE, sin condicionarla a
+    // la confirmación vieja (enabled_count/consumer_gen, que este HAL nunca
+    // manda): frames avanzando = Ruta B procesando.
+    var beaconFrames    by remember { mutableStateOf(-1L) }
+    var routeBEvidence  by remember { mutableStateOf<OmegaEngineBridge.ControlPlaneEvidence?>(null) }
+    var daemonConnected by remember { mutableStateOf(false) }
+    var lastCommandOutput by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+    var actionInFlight by remember { mutableStateOf(false) }
+    var connFailStreak by remember { mutableStateOf(0) }
+    var daemonProtoVerified by remember { mutableStateOf(false) }
+
+    // ── Polling + auto-reconexión ────────────────────────────────────────
+    LaunchedEffect(Unit) {
+        while (true) {
+            val (active, version, running) = withContext(Dispatchers.IO) {
+                Triple(
+                    MagiskBridge.isModuleActive,
+                    MagiskBridge.moduleVersion,
+                    MagiskBridge.isDaemonRunning
+                )
+            }
+
+            // FIX: si el daemon está corriendo pero el bridge no está conectado,
+            // intentar reconexión desde IO (probe real, no fake).
+            val rawConnected = withContext(Dispatchers.IO) {
+                if (!omegaBridge.isConnected && (running || active)) {
+                    omegaBridge.connect()
+                }
+                omegaBridge.isConnected
+            }
+            if (rawConnected) connFailStreak = 0 else connFailStreak++
+            val connected = rawConnected || (daemonConnected && connFailStreak < 2)
+            if (!daemonProtoVerified && connected && isOlderVersion(version, com.ivanna.omega.BuildConfig.VERSION_NAME)) {
+                daemonProtoVerified = withContext(Dispatchers.IO) { omegaBridge.handshake() }
+            }
+
+            effectState     = withContext(Dispatchers.IO) { DSPBridge.effectState() }
+            // FIX 4 (v2.5.465): frames del beacon + evidencia GET_STATUS en
+            // cada ciclo de 2 s, para la telemetría viva de Ruta B (no solo
+            // bajo el botón TELEMETRY). requestControlPlaneEvidence usa canal
+            // efímero: sin estado stale.
+            beaconFrames    = withContext(Dispatchers.IO) { DSPBridge.effectBeaconFrames() }
+            routeBEvidence  = withContext(Dispatchers.IO) {
+                runCatching { omegaBridge.requestControlPlaneEvidence() }.getOrNull()
+            }
+            moduleActive    = active
+            moduleVersion   = version
+            daemonRunning   = running || connected
+            daemonConnected = connected
+            delay(2000L)
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(MagistralVoid)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        // Botón de Regreso
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+            horizontalArrangement = Arrangement.Start
+        ) {
+            Text(
+                text = "◄ VOLVER AL PANEL PRINCIPAL",
+                color = AuroraCyan,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                letterSpacing = 1.sp,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable { onBack() }
+                    .padding(vertical = 8.dp, horizontal = 4.dp)
+            )
+        }
+
+        // Ficha del entorno · System (prototipo, Pantalla VII).
+        ScreenSpecCard(systemSpec)
+
+        // O · Ruta de audio · A / B: este panel es el lado Ruta B; no existe
+        // un selector A/B literal en el código.
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                "MÓDULO MAGISK",
+                color = MagistralGoldHi,
+                fontFamily = MagistralSerif,
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                letterSpacing = 2.sp
+            )
+            SpecInfoButton(routeABSpec)
+        }
+
+        StatusRow("MÓDULO",  moduleActive, "ACTIVO", "NO INSTALADO")
+        StatusRow("VERSIÓN",
+            moduleVersion.isNotEmpty() && moduleVersion != "unknown",
+            moduleVersion, "—")
+
+        // FIX (alerta de versión que no desaparece): la prop persist.ivanna.version
+        // queda obsoleta hasta el reinicio. Si el daemon ya reportó su versión real
+        // en el handshake HELLO, esa fuente viva manda — la alerta desaparece en
+        // cuanto el binario actualizado responde, sin esperar al reboot.
+        val effectiveModuleVersion =
+            if (omegaBridge.liveModuleVersion.isNotBlank()) omegaBridge.liveModuleVersion else moduleVersion
+        if (isOlderVersion(effectiveModuleVersion, com.ivanna.omega.BuildConfig.VERSION_NAME)) {
+            Surface(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                color = AmberSignal.copy(alpha = 0.12f),
+                shape = RoundedCornerShape(8.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, AmberSignal.copy(alpha = 0.4f))
+            ) {
+                // El aviso incluye la URL directa del ZIP de ESTA version
+                // (derivada de update.json, que es la fuente que Magisk usa
+                // para actualizar): antes decia "reinstala el ZIP actual" sin
+                // decir cual ni donde — el usuario tenia que adivinar la URL.
+                Text(
+                    "⚠ Módulo instalado ($effectiveModuleVersion) más viejo que la app " +
+                    "(${com.ivanna.omega.BuildConfig.VERSION_NAME}).\n\n" +
+                    "Si YA flasheaste el ZIP nuevo: Magisk carga el binario nuevo " +
+                    "solo tras REINICIAR — hasta entonces el daemon viejo sigue " +
+                    "corriendo y reporta su versión vieja (esta alerta). Reinicia " +
+                    "el teléfono y la alerta desaparece sola.\n\n" +
+                    "Si NO lo has flasheado, instala el ZIP de esta versión desde Magisk:\n" +
+                    "github.com/luisurielpimentelperez814-design/IVANNA-OMEGA-SUPREME" +
+                    "/releases/download/v${com.ivanna.omega.BuildConfig.VERSION_NAME}" +
+                    "/ivanna_omega_supreme_v${com.ivanna.omega.BuildConfig.VERSION_NAME}.zip",
+                    color = AmberSignal,
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 11.sp,
+                    modifier = Modifier.padding(10.dp)
+                )
+            }
+        }
+
+        StatusRow("DAEMON",  daemonRunning, "CORRIENDO", "DETENIDO")
+        // Solo se muestra si el beacon es legible: sin senal no se afirma nada (ni verde ni rojo).
+        if (effectState != DSPBridge.EffectState.UNAVAILABLE) {
+            StatusRow("EFECTO",
+                effectState != DSPBridge.EffectState.NO_EFFECT,
+                if (effectState == DSPBridge.EffectState.PROCESSING) "PROCESANDO AUDIO" else "INSERTADO (SIN AUDIO)",
+                "NO INSERTADO EN AUDIOSERVER")
+        }
+
+        // FIX 4 (v2.5.465) — TELEMETRÍA VIVA DE RUTA B: se muestra SIEMPRE,
+        // sin condicionarla a la confirmación vieja (enabled_count /
+        // consumer_gen, que este HAL Qualcomm nunca manda). Fuente de verdad:
+        // frames del beacon avanzando = el efecto procesa. Sin beacon legible
+        // se dice explícitamente (no se esconde la sección ni se inventa nada).
+        Text(
+            "RUTA B · TELEMETRÍA EN VIVO",
+            color = MagistralGoldHi,
+            fontFamily = MagistralSerif,
+            fontWeight = FontWeight.Bold,
+            fontSize = 13.sp,
+            letterSpacing = 2.sp
+        )
+        Text(
+            text = when {
+                beaconFrames < 0 ->
+                    "Beacon: no legible (sin archivo / DAC o SELinux lo bloquea)"
+                effectState == DSPBridge.EffectState.PROCESSING ->
+                    "Beacon: PROCESANDO · frames=$beaconFrames"
+                effectState == DSPBridge.EffectState.ENABLED_IDLE ->
+                    "Beacon: insertado, sin audio reciente · frames=$beaconFrames"
+                beaconFrames > 0 ->
+                    "Beacon: sin bloques recientes · frames=$beaconFrames (procesó antes)"
+                else ->
+                    "Beacon: sin bloques · frames=0"
+            },
+            color = when (effectState) {
+                DSPBridge.EffectState.PROCESSING -> PhosphorGreen
+                DSPBridge.EffectState.UNAVAILABLE -> TextMuted
+                else -> TextPrimary.copy(alpha = 0.85f)
+            },
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold
+        )
+        val ev = routeBEvidence
+        Text(
+            text = if (ev != null) {
+                "Sesión: " + (if (ev.discoveredSessionId > 0) ev.discoveredSessionId.toString() else "— (sin sesión descubierta)") +
+                    " · snapshotGen=" + ev.snapshotGeneration +
+                    " · dspAppliedGen=" + ev.dspAppliedGeneration +
+                    "\nConsumidor: " + (if (ev.effectConsumerPresent) "omega_effect" else "sin consumidor (secundario: no condiciona la telemetría)") +
+                    " · estado=" + ev.status
+            } else {
+                "Sesión: — · daemon sin evidencia GET_STATUS (socket caído o daemon viejo)"
+            },
+            color = TextSecondary,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp
+        )
+        Text(
+            text = "Regla: frames del beacon avanzando = Ruta B procesando. " +
+                "enabled_count / consumer_gen no aplican en este HAL.",
+            color = TextMuted,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp
+        )
+
+        Spacer(Modifier.height(6.dp))
+        DividerGlow()
+
+        Text(
+            "OMEGA DAEMON BRIDGE",
+            color = MagistralGoldHi,
+            fontFamily = MagistralSerif,
+            fontWeight = FontWeight.Bold,
+            fontSize = 14.sp,
+            letterSpacing = 2.sp
+        )
+
+        // FIX: cuando no hay módulo Magisk, mostrar N/A (no error) para el socket
+        if (!moduleActive && !daemonConnected) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("SOCKET", color = TextPrimary.copy(alpha = 0.5f),
+                    fontFamily = FontFamily.Monospace, fontSize = 11.sp,
+                    modifier = Modifier.width(82.dp))
+                Box(Modifier.size(8.dp).clip(CircleShape).background(TextMuted))
+                Text("N/A (sin módulo Magisk)", color = TextMuted,
+                    fontFamily = FontFamily.Monospace, fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold)
+            }
+        } else {
+            StatusRow("SOCKET", daemonConnected, "CONECTADO", "DESCONECTADO")
+        }
+
+        Text(
+            text = "Socket principal: @omega_daemon_socket\n" +
+                    "Fallback legacy:   /data/pf/pf.sock",
+            color = TextSecondary,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 10.sp
+        )
+
+        Spacer(Modifier.height(6.dp))
+        DividerGlow()
+
+        // Q · Permisos y diagnóstico: no existe un botón "Ejecutar diagnóstico"
+        // literal en el código; el equivalente más cercano son estas acciones
+        // de diagnóstico (STATUS / TELEMETRY) y la sonda de superusuario
+        // (ROOT PING), así que la ficha Q vive junto al título ACCIONES.
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                "ACCIONES", color = MagistralGoldHi, fontFamily = MagistralSerif,
+                fontWeight = FontWeight.Bold, fontSize = 13.sp, letterSpacing = 2.sp
+            )
+            SpecInfoButton(permissionsSpec)
+        }
+
+        // FIX (layout): 5 botones en un solo Row con spacedBy(8.dp) se
+        // comprimían en pantallas angostas hasta que "ROOT PING" se apilaba
+        // letra por letra (Text envuelve por carácter cuando el ancho < 1
+        // carácter). Se parte en dos filas 3+2: cada botón conserva su
+        // ancho natural y ningún label se corta.
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ActionButton("STATUS", daemonRunning && !actionInFlight,
+                modifier = Modifier.weight(1f)) {
+                actionInFlight = true
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) { MagiskBridge.getStatus() }
+                    lastCommandOutput = result
+                    actionInFlight = false
+                }
+            }
+            ActionButton("TELEMETRY", daemonConnected && !actionInFlight,
+                modifier = Modifier.weight(1f)) {
+                actionInFlight = true
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        val evidence = runCatching { omegaBridge.requestControlPlaneEvidence() }.getOrNull()
+                        if (evidence != null) {
+                            "Control plane: daemon=" + (if (evidence.daemonReachable) "OK" else "OFFLINE") +
+                                " snapshotGen=" + evidence.snapshotGeneration +
+                                " dspAppliedGen=" + evidence.dspAppliedGeneration +
+                                " frames=" + evidence.processedFrames +
+                                " effectState=" + evidence.effectState +
+                                " consumer=" + evidence.effectConsumerPresent +
+                                " status=" + evidence.status +
+                                " currentSnapshotApplied=" + evidence.dspHasAppliedCurrentSnapshot
+                        } else {
+                            val fromDaemon = runCatching { MagiskBridge.getTelemetry() }.getOrDefault("")
+                            if (fromDaemon.isNotBlank()) fromDaemon else omegaBridge.requestTelemetry()
+                        }
+                    }
+                    lastCommandOutput = result
+                    actionInFlight = false
+                }
+            }
+            ActionButton("RELOAD", moduleActive && !actionInFlight,
+                modifier = Modifier.weight(1f)) {
+                actionInFlight = true
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) { MagiskBridge.reloadParams() }
+                    lastCommandOutput = result
+                    actionInFlight = false
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ActionButton("RECONECTAR", !actionInFlight,
+                modifier = Modifier.weight(1f)) {
+                actionInFlight = true
+                scope.launch {
+                    lastCommandOutput = "Probando socket..."
+                    val ok = withContext(Dispatchers.IO) { omegaBridge.connect() }
+                    daemonConnected  = ok
+                    daemonRunning    = ok || MagiskBridge.isDaemonRunning
+                    lastCommandOutput = if (ok)
+                        "✅ Socket conectado. Latencia: ${omegaBridge.getLastLatencyMs()}ms"
+                    else {
+                        // FIX (diagnóstico ciego): el mensaje genérico no
+                        // distinguía daemon-sin-bind de SELinux denial.
+                        // diagnoseSocket() hace probe root real de
+                        // /proc/net/unix y dice la causa exacta.
+                        "⚪ " + withContext(Dispatchers.IO) { MagiskBridge.diagnoseSocket() }
+                    }
+                    actionInFlight = false
+                }
+            }
+            ActionButton("ROOT PING", !actionInFlight,
+                modifier = Modifier.weight(1f)) {
+                actionInFlight = true
+                scope.launch {
+                    lastCommandOutput = "Solicitando Root (Magisk)..."
+                    val rootOk = withContext(Dispatchers.IO) { com.ivanna.omega.core.RootAccess.probeSu(force = true) }
+                    lastCommandOutput = if (rootOk) {
+                        "✅ Root concedido. Reevaluando backend..."
+                    } else {
+                        "❌ Root denegado o Magisk no responde."
+                    }
+                    if (rootOk) {
+                        com.ivanna.omega.audio.AudioBackendSelector.start(context)
+                    }
+                    actionInFlight = false
+                }
+            }
+        }
+
+        if (lastCommandOutput.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Text("Última respuesta del daemon:", color = TextSecondary,
+                fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+            Text(
+                text = lastCommandOutput.take(400),
+                color = PhosphorGreen,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(ObsidianSoft.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                    .padding(8.dp)
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
+        if (!moduleActive) {
+            InstallHelp()
+        } else {
+            Text(
+                "✓ El módulo espeja la cadena DSP completa al audio de TODO el " +
+                        "sistema (Spotify, YouTube, Tidal) vía omega_daemon. " +
+                        "La app también procesa su propia salida local vía DSPBridge.",
+                color = TextSecondary,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 10.sp
+            )
+        }
+    }
+}
+
+@Composable
+private fun StatusRow(label: String, active: Boolean, activeText: String, inactiveText: String) {
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(label, color = TextPrimary.copy(alpha = 0.5f), fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp, modifier = Modifier.width(82.dp))
+        Box(Modifier.size(8.dp).clip(CircleShape)
+            .background(if (active) PhosphorGreen else CoralWarn))
+        Text(if (active) activeText else inactiveText,
+            color = if (active) PhosphorGreen else CoralWarn,
+            fontFamily = FontFamily.Monospace, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+private fun ActionButton(
+    label: String,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val containerColor = if (enabled) AuroraCyan.copy(alpha = 0.18f) else ObsidianEdge.copy(alpha = 0.4f)
+    val borderColor    = if (enabled) AuroraCyan else ObsidianEdge
+    val textColor      = if (enabled) AuroraCyan else TextMuted
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(8.dp))
+            .background(containerColor)
+            .border(1.dp, borderColor, RoundedCornerShape(8.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            color = textColor,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,                   // FIX: evita apilado vertical de letras
+            softWrap = false,               // FIX: nunca parte el label
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun InstallHelp() {
+    Column(
+        modifier = Modifier.fillMaxWidth()
+            .background(ObsidianSoft.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+            .border(1.dp, AmberSignal.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text("MÓDULO NO DETECTADO", color = AmberSignal, fontFamily = FontFamily.Monospace,
+            fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Text("Para procesar el audio de TODAS las apps del sistema:",
+            color = TextSecondary, fontSize = 11.sp)
+        Text(
+            "1. Flashea magisk_module/ desde Magisk Manager\n" +
+                    "2. Reinicia el dispositivo\n" +
+                    "3. Verifica persist.ivanna.magisk_active=1\n" +
+                    "   desde Termux: getprop persist.ivanna.magisk_active",
+            color = TextPrimary.copy(alpha = 0.8f), fontFamily = FontFamily.Monospace, fontSize = 10.sp
+        )
+        Text(
+            "⚠ Sin el módulo el socket muestra N/A — esto es normal.\n" +
+                    "El DSP local de la app sigue activo vía DSPBridge (AudioEffect sessions).",
+            color = TextSecondary, fontSize = 10.sp
+        )
+    }
+}
+
+@Composable
+private fun DividerGlow() {
+    Spacer(
+        Modifier.fillMaxWidth().height(1.dp)
+            .background(Brush.horizontalGradient(
+                listOf(Color.Transparent, MagistralLine, Color.Transparent)
+            ))
+    )
+}

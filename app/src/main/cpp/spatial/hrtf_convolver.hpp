@@ -1,0 +1,203 @@
+/*
+ * ============================================================================
+ * IVANNA-OMEGA-SUPREME — Motor de Audio Holográfico de Bajo Nivel
+ * ============================================================================
+ * Autoría Exclusiva y Propiedad Absoluta:
+ * Luis Uriel Pimentel Pérez (alias Gore TNS)
+ *
+ * Todos los modelos matemáticos, arquitecturas de sistema e implementaciones
+ * de código contenidos en este archivo son propiedad intelectual exclusiva
+ * del autor citado. Queda estrictamente prohibida la reproducción, distribución,
+ * modificación o uso comercial no autorizado.
+ *
+ * Este software NO se distribuye bajo licencia CC0 ni dominio público.
+ * Todos los derechos reservados. © 2026 Luis Uriel Pimentel Pérez.
+ * ============================================================================
+ */
+
+#pragma once
+
+#include "SafmusLatentGuard.hpp"
+
+#include <cstdint>
+#include <vector>
+#include <memory>
+#include <atomic>
+#include "synthetic_hrtf.hpp"
+#include "../SafHRTFDatasetBridge.hpp"
+#include "../SafSpatialModifier.hpp"
+
+namespace ivanna {
+
+// Constantes del motor
+constexpr int BLOCK                    = 256;
+constexpr int IR_LEN                   = 512;
+constexpr int RING_BUFFER_SIZE         = 16384;
+constexpr int XFADE_DURATION_SAMPLES   = 1024;
+// ITD (interaural time difference): la pista de localizacion lateral mas
+// fuerte (~0.7 ms max a 90 deg). El HRTF de magnitud sola no la transmite
+// con suficiente precision en medios tonos; se aplica como delay fraccional
+// explícito por oido, alineado con el modelo esferico de Woodworth.
+constexpr int   kMaxItdSamples         = 64;   // ~0.67 ms @ 96 kHz
+constexpr float kItdHeadRadiusM        = 0.0875f;
+constexpr float kItdSpeedOfSoundMps    = 343.0f;
+
+// Declaraciones adelantadas (F2/486: FFTRadix2 es ahora el alias de la
+// instancia float de la plantilla FFTRadix2T; el alias no admite
+// forward-declaración como clase, así que se adelanta la plantilla SIN
+// repetir el argumento por defecto — el default vive solo en la
+// definición de fft_radix2.hpp).
+template <typename Scalar>
+class FFTRadix2T;
+
+// F2/486 (labor grande, motor double): plantilla con default float +
+// alias. HRTFConvolver = float histórico bit-idéntico;
+// HRTFConvolverD = núcleo double (lo usa HoaBinauralDecoder en double).
+// El plano de SEÑAL (historiales, colas, espectros, HRTF, ITD) es Scalar;
+// SyntheticHRTF / SafSpatialModifier / dataset IHR1 quedan float (diseño
+// de filtros y datos medidos: se hornean a Scalar al cargar el IR).
+// Azimut/agresividad/latente SAF son control → float.
+template <typename Scalar = float>
+class HRTFConvolverT {
+public:
+    // FIX (build roto en CI: "invalid application of sizeof to an
+    // incomplete type FFTRadix2"): tanto el constructor como el
+    // destructor deben quedar declarados acá y DEFINIDOS en
+    // hrtf_convolver.cpp (donde fft_radix2.hpp da el tipo completo) —
+    // '= default' inline en CUALQUIERA de los dos, no solo el
+    // destructor, dispara la instanciación de
+    // std::unique_ptr<FFTRadix2>::~unique_ptr() en cada translation
+    // unit que incluya este header. Patrón pimpl completo, no parcial.
+    HRTFConvolverT();
+    ~HRTFConvolverT();
+
+    void init(uint32_t sampleRate);
+    void set_position(float azimuthDeg, float aggressiveness) noexcept;
+    void process(const Scalar* inputL, const Scalar* inputR,
+                 Scalar* outputL, Scalar* outputR,
+                 uint32_t numSamples) noexcept;
+    // Reinicia el estado del convolver (buffers, historial, crossfade) sin
+    // reasignar memoria ni recrear FFTRadix2 — usado al soltar/reasignar un
+    // virtual speaker en ObjectRenderer::reset().
+    void reset() noexcept;
+
+    // SAF adaptive spatial field update
+    void updateSafField(const std::array<float,7>& q, float azimuth);
+
+    // Carga un dataset HRTF personalizado (formato binario "IHR1").
+    // Propaga el dataset HRTF compartido a la capa SyntheticHRTF
+    void setSharedDataset(std::shared_ptr<ivanna::SyntheticHRTF::SharedDataset> ds) {
+        hrtf_.setSharedDataset(ds);
+        // Force crossfade on next block — mismo mecanismo que setLatentParams():
+        // targetAzimuth_ es std::atomic (no admite '+=' compuesto); el flag
+        // newTargetPending_ es el canal oficial de "recalcular filtros".
+        newTargetPending_.store(true, std::memory_order_release);
+    }
+
+    bool loadHrtfDatasetFromFile(const char* path) {
+        measuredDatasetLoaded_ = hrtf_.loadDatasetFromFile(path);
+        return measuredDatasetLoaded_;
+    }
+
+    // True solo cuando un dataset IHR1 medido se cargó correctamente; la base PCA
+    // sintética de fallback no debe presentarse como un dataset medido.
+    bool hasMeasuredDatasetLoaded() const noexcept { return measuredDatasetLoaded_; }
+
+    // Propaga el vector latente q_t del SAF al SyntheticHRTF subyacente
+    // y fuerza un reload de los filtros de frecuencia en el próximo bloque.
+    // Llamar desde el hilo de control (no durante process()).
+    void setLatentParams(const float q[7]) noexcept {
+        if (!ivanna::safmus::isFiniteLatent(q)) return;
+        hrtf_.setLatentParams(q);
+        // Marcar como pendiente de recalcular filtros en la próxima llamada a process()
+        newTargetPending_.store(true, std::memory_order_release);
+    }
+
+    void clearLatentParams() noexcept {
+        hrtf_.clearLatentParams();
+        newTargetPending_.store(true, std::memory_order_release);
+    }
+
+    // Inyecta un HRIR medido (p.ej. extraído de un archivo .sofa) directamente
+    // como filtro del convolver. El IR se copia a búferes propios y el
+    // crossfade lo absorbe en el próximo bloque vía newTargetPending_ — mismo
+    // mecanismo lock-free que setLatentParams()/setSharedDataset().
+    // Mientras customHrirActive_ sea true, updateFilterResponses() usa este IR
+    // en lugar de sintetizar con SyntheticHRTF. Llamar desde hilo de control.
+    bool loadCustomHrir(const float* irL, const float* irR, size_t len) noexcept;
+    void clearCustomHrir() noexcept {
+        customHrirActive_.store(false, std::memory_order_release);
+        newTargetPending_.store(true, std::memory_order_release);
+    }
+    bool hasCustomHrir() const noexcept {
+        return customHrirActive_.load(std::memory_order_acquire);
+    }
+
+private:
+    void updateFilterResponses(float azimuthDeg, float aggressiveness, bool immediate) noexcept;
+    // ITD: diferencia de tiempo interaural (Woodworth esferico) aplicada como
+    // delay fraccional (interp. lineal) por oido, con one-pole smoothing
+    // anti-zipper. La magnitud HRTF sola no transmite lateralizacion <1.5 kHz.
+    Scalar computeItdSamples(float azimuthDeg) const noexcept;
+    void  applyItd(Scalar* outputL, Scalar* outputR, uint32_t n) noexcept;
+    static uint32_t next_pow2(uint32_t v);
+
+    // Configuración
+    uint32_t sr_ = 0;
+    int fftSize_ = 0;
+    std::unique_ptr<FFTRadix2T<Scalar>> fft_;
+    SyntheticHRTF hrtf_;
+    Ivanna::SafSpatialModifier safModifier_;
+    bool measuredDatasetLoaded_ = false;
+
+    // Búferes de trabajo (solo usados en el hilo de audio)
+    std::vector<Scalar> histL_, histR_;
+    std::vector<Scalar> pendingIn_L_, pendingIn_R_;
+    std::vector<Scalar> outQueue_L_, outQueue_R_;
+    uint32_t inReadPtr_ = 0, inWritePtr_ = 0, inCount_ = 0;
+    uint32_t outReadPtr_ = 0, outWritePtr_ = 0, outCount_ = 0;
+
+    // Búferes para FFT
+    std::vector<Scalar> reL_, imL_, reR_, imR_;
+    std::vector<Scalar> monoRe_, monoIm_;
+    std::vector<Scalar> yReL_, yImL_, yReR_, yImR_;
+
+    // Filtros en dominio de frecuencia
+    std::vector<Scalar> hrir_L_current_, hrir_R_current_;
+    std::vector<Scalar> hrir_L_target_, hrir_R_target_;
+    std::vector<Scalar> H_ReL_curr_, H_ImL_curr_, H_ReR_curr_, H_ImR_curr_;
+    std::vector<Scalar> H_ReL_targ_, H_ImL_targ_, H_ReR_targ_, H_ImR_targ_;
+
+    // Variables compartidas (atómicas para el hilo de control)
+    std::atomic<float> targetAzimuth_{0.0f};
+    std::atomic<float> targetAggressiveness_{0.5f};
+    std::atomic<bool> newTargetPending_{false};
+    std::atomic<int> xfadeSamplesRemaining_{0};
+
+    // Variables locales al hilo de audio
+    float currentAzimuth_ = 0.0f;
+    float currentAggressiveness_ = 0.5f;
+    bool filterInitialized_ = false;
+
+    // HRIR custom (SOFA/medido): escrito por hilo de control, leído por el
+    // hilo de audio solo dentro de updateFilterResponses() (ya serializado
+    // por newTargetPending_ + xfade). customHrirActive_ es el flag atómico
+    // que conmuta la fuente; los búferes tienen tamaño fijo IR_LEN para no
+    // asignar en la ruta caliente.
+    std::vector<Scalar> customIrL_, customIrR_;
+    std::atomic<bool>  customHrirActive_{false};
+
+    // Estado ITD (solo hilo de audio): lineas de delay por oido + suavizado
+    std::vector<Scalar> itdLineL_, itdLineR_;
+    uint32_t itdWrite_   = 0;
+    Scalar   itdSmoothed_ = Scalar(0.0);  // muestras: >0 = fuente a la derecha (oido izq. retrasado)
+    Scalar   sampleRateF_ = Scalar(0.0);
+};
+
+// Alias de compat: el float histórico, bit-idéntico (HoaBinauralDecoder,
+// SaFStimulusRenderer, pd_engine, tests); el double es el núcleo de la
+// labor grande.
+using HRTFConvolver = HRTFConvolverT<float>;
+using HRTFConvolverD = HRTFConvolverT<double>;
+
+} // namespace ivanna

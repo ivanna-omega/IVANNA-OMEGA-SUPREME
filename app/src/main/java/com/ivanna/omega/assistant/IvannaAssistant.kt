@@ -1,0 +1,746 @@
+package com.ivanna.omega.assistant
+
+import android.content.Context
+import android.util.Log
+import com.ivanna.omega.VoiceController
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+
+/**
+ * IvannaAssistant — orquestador de la capa conversacional.
+ *
+ * Une las piezas sin tocar el audio thread:
+ *
+ *   Micrófono → SpeechInputProvider (ASR) → IvannaIntentMapper (intención)
+ *     → agentes existentes (AgentApi / VoiceController) → IvannaVoiceEngine (TTS)
+ *
+ * Mantiene el estado de la conversación en un StateFlow que el panel Compose
+ * observa directamente. Toda la ejecución de órdenes va a Dispatchers.IO;
+ * el reconocedor y el TTS son del sistema y no tocan el pipeline DSP.
+ *
+ * Ciclo de vida: init() desde la UI (el recognizer necesita hilo principal),
+ * release() al salir de la pantalla. start()/stop() controlan la escucha.
+ */
+class IvannaAssistant(
+    context: Context,
+    private val geminiAgent: com.ivanna.omega.ai.gemini.IvannaGeminiAgent
+) {
+
+    companion object { private const val TAG = "IvannaAssistant" }
+
+    data class ConversationTurn(
+        val userText: String,
+        val ivannaText: String,
+        val timestampMs: Long = System.currentTimeMillis()
+    )
+
+    data class AssistantUiState(
+        val listening: Boolean = false,
+        val speaking: Boolean = false,
+        val processing: Boolean = false,
+        val available: Boolean = true,
+        val statusLine: String = "Toca el micrófono y habla conmigo.",
+        val lastTurn: ConversationTurn? = null,
+        val voiceName: String = ""
+    )
+
+    private val appContext = context.applicationContext
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
+    private val _ui = MutableStateFlow(AssistantUiState())
+    val ui: StateFlow<AssistantUiState> = _ui.asStateFlow()
+
+    // ── Quién respondió de verdad (2026-11-14, reporte del propietario) ──
+    // El panel mostraba "IvannaStaticCore (bloqueó)" siempre que
+    // IvannaCognitiveCore devolvía execute=false — incluso cuando el LLM
+    // (OmniRoute/Gemini) SÍ había respondido (rama
+    // `!decision.execute && !agentReply.isNullOrBlank()`). La etiqueta
+    // mentía: el agente que contestó no era el núcleo estático. Este
+    // StateFlow lo registra el flujo real de onUserSaid() en cada rama;
+    // el ViewModel lo observa para el panel. "(bloqueó)" solo aparece
+    // cuando un comando DSP fue rechazado de verdad por seguridad
+    // (clipping/térmica) o no se reconoció la intención — nunca por
+    // responder una pregunta desde la base de conocimiento.
+    private val _lastResponder = MutableStateFlow<String?>(null)
+    val lastResponder: StateFlow<String?> = _lastResponder.asStateFlow()
+
+    /** Nombre del LLM activo: OmniRoute si el flag está prendido, si no Gemini. */
+    private fun llmName(): String =
+        if (com.ivanna.omega.assistant.core.OmniRoutePrefs.isOmniRouteEnabled(appContext)) "OmniRoute" else "Gemini"
+
+    private val speech: SpeechInputProvider = IvannaSpeechRecognizer(appContext)
+    private val voice = IvannaVoiceEngine(appContext)
+    private val memory = IvannaContextMemory(appContext)
+    private val voiceController: VoiceController = VoiceController(appContext)
+
+    // ── Nuevas capas de inteligencia acústica (FASE 1-5) ─────────────────────
+    private val dspOrchestrator = IvannaDSPOrchestrator(appContext, voiceController)
+
+    // Vigilante de estado de voz para reflejar SPEAKING en la UI.
+    private var voiceWatchStarted = false
+
+    // ── Modo manos-libres (autonomía de escucha) ──────────────────────────
+    // Objetivo del producto: IVANNA debe poder escuchar, responder y volver
+    // a escuchar sin que el usuario toque el botón de mic en cada turno.
+    // handsFreeActive se activa al primer startListening()/greet() y se
+    // desactiva SOLO con stopListening() explícito — así el usuario conserva
+    // control real para silenciarla, pero el ciclo por defecto es autónomo.
+    private var handsFreeActive = false
+    private var wasSpeaking = false
+
+    val speechState: StateFlow<SpeechState> = speech.state
+
+    /** Inicializa el vigilante de TTS (llamar una vez desde el primer uso). */
+    private fun watchVoice() {
+        if (voiceWatchStarted) return
+        voiceWatchStarted = true
+        scope.launch {
+            voice.state.collect { vs ->
+                _ui.value = _ui.value.copy(speaking = vs == VoiceState.SPEAKING)
+                val justFinishedSpeaking = wasSpeaking && vs != VoiceState.SPEAKING
+                wasSpeaking = vs == VoiceState.SPEAKING
+                if (justFinishedSpeaking && handsFreeActive && speech.isAvailable()) {
+                    // IVANNA acaba de terminar de hablar: retoma la escucha
+                    // sola, sin esperar un tap del usuario en el mic.
+                    startListening()
+                }
+            }
+        }
+    }
+
+    private val profile = IvannaListenerProfile(appContext)
+
+    /** Saludo contextual al abrir el panel (usa la memoria, sin exagerar). */
+    fun greet() {
+        watchVoice()
+        handsFreeActive = true
+        val text = "Hola cielo, soy IVANNA OMEGA SUPREME, tu arquitecta de audio. Este producto es un motor acústico de grado kernel para tu dispositivo. Estoy a tu entera disposición para reparar cualquier fallo, optimizar el sonido o configurar una masterización perfecta y magistral para lo que estés escuchando. ¿Qué quieres que hagamos hoy?"
+        _ui.value = _ui.value.copy(statusLine = text, voiceName = voice.selectedVoiceName ?: "")
+        voice.speak(text)
+    }
+
+    /** Empieza a escuchar al usuario (botón mic). */
+    fun startListening() {
+        watchVoice()
+        handsFreeActive = true
+        if (!speech.isAvailable()) {
+            val msg = "Este dispositivo no tiene reconocimiento de voz instalado."
+            _ui.value = _ui.value.copy(available = false, statusLine = msg)
+            voice.speak(msg)
+            return
+        }
+        voice.stop()  // si IVANNA estaba hablando, se calla al escuchar
+        _ui.value = _ui.value.copy(listening = true, statusLine = "Te escucho…")
+        speech.startListening(
+            onResult = { text -> onUserSaid(text) },
+            onError = { err ->
+                _ui.value = _ui.value.copy(listening = false, statusLine = err)
+                // Silencio/timeout (IvannaSpeechRecognizer deja el estado en
+                // IDLE, no en ERROR, para estos dos casos) es el resultado
+                // NORMAL de un ciclo manos-libres cuando el usuario no habló
+                // todavía — sin este reintento, la escucha autónoma moriría
+                // en el primer silencio y volvería a exigir tocar el mic.
+                // Errores reales (permiso, hardware no disponible) sí
+                // dejan el estado en ERROR/PERMISSION_DENIED/UNAVAILABLE y
+                // no se reintentan solos.
+                // Backoff corto (no bloquea UI, corre en Dispatchers.Main del
+                // scope): evita un tight-loop de reinicios del recognizer si
+                // el usuario deja el modo manos-libres activo en silencio
+                // prolongado — cada ciclo real de STT ya tarda >300ms, así
+                // que esto no introduce latencia perceptible en el turno
+                // normal, solo protege el caso de fallos consecutivos.
+                if (handsFreeActive && speech.state.value == SpeechState.IDLE) {
+                    scope.launch { delay(300); startListening() }
+                }
+            }
+        )
+    }
+
+    fun stopListening() {
+        handsFreeActive = false
+        speech.stopListening()
+        _ui.value = _ui.value.copy(listening = false, statusLine = "Escucha detenida.")
+    }
+
+    /**
+     * Mapeo canónico comando-DSP → intención acústica. Una sola fuente de
+     * verdad para los dos productores de comandos: Gemini (agentCommand) y
+     * el router léxico local (VoiceController.processCommand). Los comandos
+     * musicales de VoiceController (epic/abbey_road/vinyl/...) no tienen
+     * intención propia: caen a MUSICAL_INTENT para que el motor de presets
+     * los resuelva desde el texto crudo.
+     */
+    private fun commandToIntent(cmd: String): IvannaLanguageCore.AcousticIntent? = when (cmd) {
+        "voice_clarity" -> IvannaLanguageCore.AcousticIntent.VOICE_CLARITY
+        "cinema_mode"   -> IvannaLanguageCore.AcousticIntent.MOVIE_IMMERSION
+        "music_mode"    -> IvannaLanguageCore.AcousticIntent.MUSIC_FULLNESS
+        "concert_mode"  -> IvannaLanguageCore.AcousticIntent.CONCERT_LIVE
+        "spatial_mode"  -> IvannaLanguageCore.AcousticIntent.SPATIAL_EXPANSION
+        "gentle_mode"   -> IvannaLanguageCore.AcousticIntent.GENTLE_MODE
+        "flat_mode"     -> IvannaLanguageCore.AcousticIntent.FLAT_NEUTRAL
+        "volume_up"     -> IvannaLanguageCore.AcousticIntent.VOLUME_UP
+        "volume_down"   -> IvannaLanguageCore.AcousticIntent.VOLUME_DOWN
+        "bass_boost"    -> IvannaLanguageCore.AcousticIntent.BASS_BOOST
+        "treble_reduce" -> IvannaLanguageCore.AcousticIntent.TREBLE_REDUCE
+        "optimize"      -> IvannaLanguageCore.AcousticIntent.OPTIMIZE
+        "auto_optimize" -> IvannaLanguageCore.AcousticIntent.OPTIMIZE
+        "self_heal"     -> IvannaLanguageCore.AcousticIntent.SELF_HEAL
+        "diagnose"      -> IvannaLanguageCore.AcousticIntent.DIAGNOSE
+        "musical_intent",
+        "epic_mode", "abbey_road_mode", "vinyl_mode", "concert_massive",
+        "cinematic_mode", "analog_mode", "studio_pro_mode",
+        "microdetail_mode" -> IvannaLanguageCore.AcousticIntent.MUSICAL_INTENT
+        else -> null
+    }
+
+    /** También acepta texto escrito (pruebas / accesibilidad). */
+    fun onUserSaid(text: String) {
+        _ui.value = _ui.value.copy(listening = false, processing = true, statusLine = "Procesando…")
+        scope.launch(Dispatchers.IO) {
+            val scene = memory.lastScene
+
+            // ── Memoria de sesión: escritura ANTES del motor cognitivo ───────
+            // El texto del usuario puede contener preferencias persistentes de
+            // sesión ("no me gustan los bajos", "prefiero escuchar suave").
+            // Se actualizan aquí, antes de processQuery(), porque
+            // IvannaGeminiAgent.buildSystemPrompt() lee
+            // IvannaConversationalCore.contextSummary() — que ya incluye
+            // preferencesSummary() — para construir el prompt de este mismo
+            // turno. Si se actualizaran después, la preferencia solo influiría
+            // a partir del turno siguiente.
+            IvannaConversationalCore.updateTemporalPreferences(text)
+            IvannaConversationalCore.extractSongContext(text)
+
+            // ── v2.5.445 — ORDEN 2: CONTROL POR VOZ DE AJUSTES ─────────────
+            // El parseo corre ANTES de la pregunta abierta y del clasificador
+            // local: si el texto es una orden de ajuste ("pon el ORBE a
+            // 1.0", "sube el HOLOS", "apaga el Phi", "pon el kernel GENEZI"),
+            // se aplica de verdad vía VoiceSettingsControl (persist + JNI
+            // en vivo) y se confirma el cambio. Si el parseo no reconoce
+            // la orden (None), el flujo sigue normal: pregunta abierta →
+            // LLM, resto → núcleo local. NUNCA se inventa un ajuste ni se
+            // confirma lo que no se aplicó.
+            // Negación ("no subas el ORBE") y ambigüedad ("sube el ORBE y
+            // el HOLOS") NO se ejecutan: se responde sin cambiar nada.
+            when (val outcome = VoiceSettingsControl.parseDetailed(text)) {
+                is VoiceSettingsControl.ParseOutcome.Command -> {
+                    val result = VoiceSettingsControl.apply(appContext, outcome.command)
+                    val tag = if (result.applied) "VOICE_SETTINGS" else "VOICE_SETTINGS_FAIL"
+                    IvannaConversationalCore.recordTurn(text, tag, null, result.confirmation)
+                    // El ajuste lo aplicó el núcleo de acción (voz o texto:
+                    // el mismo parseo sirve a ambos — el usuario pidió que
+                    // lo escrito aplique igual que lo hablado).
+                    _lastResponder.value = "IvannaAgentCore"
+                    launch(Dispatchers.Main) {
+                        _ui.value = _ui.value.copy(
+                            processing = false,
+                            statusLine = result.confirmation,
+                            lastTurn = ConversationTurn(userText = text, ivannaText = result.confirmation)
+                        )
+                        voice.speak(result.confirmation)
+                    }
+                    return@launch
+                }
+                VoiceSettingsControl.ParseOutcome.Negated -> {
+                    val reply = "Entendido, no cambio nada."
+                    IvannaConversationalCore.recordTurn(text, "VOICE_SETTINGS_NEGATED", null, reply)
+                    // Negación honrada: respuesta local, no un bloqueo.
+                    _lastResponder.value = "IvannaStaticCore"
+                    launch(Dispatchers.Main) {
+                        _ui.value = _ui.value.copy(
+                            processing = false,
+                            statusLine = reply,
+                            lastTurn = ConversationTurn(userText = text, ivannaText = reply)
+                        )
+                        voice.speak(reply)
+                    }
+                    return@launch
+                }
+                is VoiceSettingsControl.ParseOutcome.Ambiguous -> {
+                    val names = outcome.targets.joinToString(" o ") { it.labelEs }
+                    val reply = "¿Cuál cambio primero, $names? Solo puedo hacer un ajuste por vez."
+                    IvannaConversationalCore.recordTurn(text, "VOICE_SETTINGS_AMBIGUOUS", null, reply)
+                    _lastResponder.value = "IvannaStaticCore"
+                    launch(Dispatchers.Main) {
+                        _ui.value = _ui.value.copy(
+                            processing = false,
+                            statusLine = reply,
+                            lastTurn = ConversationTurn(userText = text, ivannaText = reply)
+                        )
+                        voice.speak(reply)
+                    }
+                    return@launch
+                }
+                VoiceSettingsControl.ParseOutcome.None -> {
+                    // No es una orden de ajuste: sigue el flujo normal.
+                }
+            }
+
+            // ── v2.5.445 — PREGUNTA ABIERTA → SOLO AL LLM ──────────────────
+            // Hallazgo verificado en el teléfono (444): "¿Qué es la
+            // holofonía y por qué se siente diferente al estéreo normal?"
+            // recibió la frase enlatada "He dejado el sonido neutro, sin
+            // coloración" porque el clasificador local la interceptó por
+            // substring ("normal" → FLAT_NEUTRAL) y su respuesta pisó la
+            // del LLM. Las preguntas abiertas ya no tocan el núcleo local:
+            // van al LLM (OmniRoute si el flag está prendido, si no
+            // Gemini) y se devuelve su respuesta REAL con streaming vivo.
+            // Si el LLM falla, se dice claro (sin frase enlatada como si
+            // respondiera y sin ejecutar ningún comando DSP por una
+            // pregunta). Las órdenes de ajustes las resuelve
+            // VoiceSettingsControl antes de llegar aquí.
+            if (OpenQuestionRouter.isOpenQuestion(text)) {
+                val llmResponse = geminiAgent.processQuery(text) { partial ->
+                    _ui.value = _ui.value.copy(statusLine = partial)
+                }
+                val llmText = (llmResponse as? com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Success)?.text
+                val reply: String = when (llmResponse) {
+                    is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Success ->
+                        if (llmText.isNullOrBlank()) OpenQuestionRouter.LLM_EMPTY_MESSAGE else llmText
+                    is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Offline ->
+                        OpenQuestionRouter.LLM_UNAVAILABLE_MESSAGE
+                    is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Error ->
+                        OpenQuestionRouter.llmErrorMessage(llmResponse.message)
+                }
+                val tag = if (llmResponse is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Success && !llmText.isNullOrBlank())
+                    "OPEN_QUESTION_LLM" else "OPEN_QUESTION_LLM_FAIL"
+                IvannaConversationalCore.recordTurn(text, tag, null, reply)
+                // La pregunta abierta la responde el LLM (OmniRoute/Gemini),
+                // falle o no: el panel muestra quién la atendió.
+                _lastResponder.value = llmName()
+                launch(Dispatchers.Main) {
+                    _ui.value = _ui.value.copy(
+                        processing = false,
+                        statusLine = reply,
+                        lastTurn = ConversationTurn(userText = text, ivannaText = reply)
+                    )
+                    voice.speak(reply)
+                }
+                return@launch
+            }
+
+            // ── Súper ÑLM (Agentic Gemini LLM) Interceptor ────────
+            // FIX (CI rojo): processQuery() devuelve AgentResponse (sealed class),
+            // no un Pair — el destructuring y el 2º argumento String no existen.
+            // Se extrae texto y primer comando DSP validado desde Success.
+            // v2.5.443 — Streaming vivo: el onPartial muestra la respuesta
+            // creciendo en statusLine mientras llega (SSE por OmniRoute o
+            // Gemini). Sin onPartial el stream jamás se usaba (código muerto).
+            val agentResponse = geminiAgent.processQuery(text) { partial ->
+                _ui.value = _ui.value.copy(statusLine = partial)
+            }
+            val agentReply: String? = when (agentResponse) {
+                is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Success -> agentResponse.text
+                // No reutilizar una respuesta vieja como si contestara a la
+                // pregunta actual: la caché offline no está asociada a la query.
+                is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Offline -> null
+                is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Error -> null
+            }
+            val agentCommand: String? = (agentResponse as? com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Success)
+                ?.commands?.firstOrNull()
+            
+            // Si el agente resuelve la petición con un comando conocido, lo inyectamos al pipeline nativo
+            val simulatedIntent = agentCommand?.let { commandToIntent(it) }
+
+            // ── IVANNA Language Core → intención acústica estructurada ────────
+            var parsed = if (simulatedIntent != null) {
+                IvannaLanguageCore.ParsedIntent(text, simulatedIntent, 0.99f, true, "")
+            } else {
+                IvannaLanguageCore.parse(text, scene ?: "UNKNOWN")
+            }
+
+            // ── Fallback léxico local (VoiceController) ───────────────────────
+            // El diccionario de sinónimos en español de VoiceController
+            // ("subir volumen", "modo cine", "vinilo", "abbey road", "válvulas"...)
+            // existía pero NADIE lo consultaba: processCommand() no tenía
+            // ningún caller. Solo se intenta si Gemini no dio comando y el
+            // parse local devolvió UNKNOWN — así un falso positivo del matcher
+            // por substring nunca pisa una intención real. Confianza 0.85
+            // (menor que 0.99 de Gemini): es un match léxico, no semántico.
+            // Los comandos musicales caen a MUSICAL_INTENT para que el motor
+            // de presets (IvannaMusicalIntentEngine.detect) los resuelva
+            // desde el texto crudo, igual que en la rama Gemini.
+            if (parsed.acousticIntent == IvannaLanguageCore.AcousticIntent.UNKNOWN && simulatedIntent == null) {
+                val lexicalCmd = runCatching { voiceController.processCommand(text) }.getOrNull()
+                val lexicalIntent = lexicalCmd?.takeIf { it != "none" }?.let { commandToIntent(it) }
+                if (lexicalIntent != null) {
+                    parsed = IvannaLanguageCore.ParsedIntent(
+                        text, lexicalIntent, 0.85f, true,
+                        "Comando reconocido por sinónimos locales"
+                    )
+                }
+            }
+
+            // ── Verificación proactiva de fatiga ──────────────────────────────
+            val fatigueOverride = IvannaCognitiveCore.proactiveFatigueCheck(profile)
+
+            // ── Rama de inteligencia musical avanzada (FASE 1-5) ─────────────
+            val musicalReply: String? = when (parsed.acousticIntent) {
+
+                IvannaLanguageCore.AcousticIntent.SONG_PROFILE_REQUEST -> {
+                    // "Pon Frankenstein de Edgar Winter y configúralo magistralmente"
+                    val songCtx = IvannaConversationalCore.extractSongContext(text, userGoal = text)
+                    val result = dspOrchestrator.createSongProfile(
+                        song = songCtx ?: IvannaConversationalCore.SongContext(
+                            title = "la canción actual", artist = null, userGoal = text),
+                        musicalGoal = text
+                    )
+                    profile.recordAdjustment(result.presetName, scene ?: "UNKNOWN")
+                    memory.recordAdjustment(result.presetName, "perfil musical para: $text", applied = result.applied)
+                    IvannaConversationalCore.recordTurn(text, "SONG_PROFILE", result.presetName, result.spokenReply)
+                    result.spokenReply
+                }
+
+                IvannaLanguageCore.AcousticIntent.MUSICAL_INTENT -> {
+                    // "Hazla más épica", "vinilo premium", "como Abbey Road"
+                    val songCtx = IvannaConversationalCore.extractSongContext(text)
+                    val musicalPreset = IvannaMusicalIntentEngine.detect(text)
+                    if (musicalPreset != null) {
+                        // FIX (hueco real de seguridad térmica): este flujo
+                        // nunca consultaba IvannaCognitiveCore.reason() —
+                        // iba directo a applyMusicalPreset() sin ninguna
+                        // verificación térmica propia. El diseño original
+                        // (ver el comentario de reason() para este mismo
+                        // AcousticIntent) esperaba sustituir por un preset
+                        // analógico más ligero ante temperatura crítica,
+                        // pero esa rama era código muerto: nunca se
+                        // ejecutaba porque este flujo real la evitaba por
+                        // completo. Mismo umbral (0.85), verificado aquí.
+                        val thermal = com.ivanna.omega.agent.IvannaAgentCore.state.value.health.thermalLoad
+                        val effectivePreset = if (thermal >= 0.85f) {
+                            IvannaMusicalIntentEngine.detect("analógico suave") ?: musicalPreset
+                        } else musicalPreset
+                        val result = dspOrchestrator.applyMusicalPreset(effectivePreset, songCtx)
+                        profile.recordAdjustment(result.presetName, scene ?: "UNKNOWN")
+                        memory.recordAdjustment(result.presetName, "musical: ${effectivePreset.technicalDetail}", applied = result.applied)
+                        IvannaConversationalCore.recordTurn(text, "MUSICAL_INTENT", result.presetName, result.spokenReply)
+                        val spokenWithWarning = if (thermal >= 0.85f)
+                            "El dispositivo está caliente. He aplicado el perfil analógico, más suave para el SoC, en vez de '${musicalPreset.name}'."
+                        else result.spokenReply
+                        spokenWithWarning
+                    } else null
+                }
+
+                IvannaLanguageCore.AcousticIntent.SESSION_REPORT -> {
+                    // "Muéstrame qué hiciste con Frankenstein"
+                    val report = IvannaConversationalCore.generateVoiceReport()
+                    IvannaConversationalCore.recordTurn(text, "SESSION_REPORT", null, report)
+                    report
+                }
+
+                IvannaLanguageCore.AcousticIntent.PROFILE_LIST -> {
+                    val list = IvannaMusicalIntentEngine.availablePresetsDescription()
+                    IvannaConversationalCore.recordTurn(text, "PROFILE_LIST", null, list)
+                    list
+                }
+
+                else -> null  // intenciones estándar siguen el flujo original
+            }
+
+            // ── Si la rama musical produjo respuesta, la usamos directamente ──
+            if (musicalReply != null) {
+                memory.lastScene = "MUSIC"
+                _lastResponder.value = "IvannaAgentCore"
+                launch(Dispatchers.Main) {
+                    _ui.value = _ui.value.copy(
+                        processing = false,
+                        statusLine = musicalReply,
+                        lastTurn   = ConversationTurn(userText = text, ivannaText = musicalReply)
+                    )
+                    voice.speak(musicalReply)
+                }
+                return@launch
+            }
+
+            // ── Si la rama LLM produjo respuesta conversacional sin comando ──
+            if (agentReply != null && agentCommand == null && simulatedIntent == null) {
+                // Persistir también las respuestas generales del LLM en la
+                // memoria conversacional: antes solo se registraban ramas
+                // musicales y órdenes, por lo que las preguntas abiertas no
+                // alimentaban el historial que Gemini recibe en el siguiente turno.
+                IvannaConversationalCore.recordTurn(
+                    text,
+                    if (agentResponse is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Success)
+                        "GENERAL_CHAT_LLM" else "OFFLINE_FALLBACK",
+                    null,
+                    agentReply
+                )
+                // La respuesta general la dio el LLM (no el núcleo local).
+                _lastResponder.value = llmName()
+                launch(Dispatchers.Main) {
+                    _ui.value = _ui.value.copy(
+                        processing = false,
+                        statusLine = agentReply,
+                        lastTurn   = ConversationTurn(userText = text, ivannaText = agentReply)
+                    )
+                    voice.speak(agentReply)
+                }
+                return@launch
+            }
+
+            // ── Intenciones conversacionales (no-audio) ─────────────────────
+            val conversationalReply: String? = when (parsed.acousticIntent) {
+                IvannaLanguageCore.AcousticIntent.TELL_JOKE -> {
+                    val joke = IvannaJokeBank.random()
+                    IvannaConversationalCore.recordTurn(text, "JOKE", null, joke)
+                    joke
+                }
+                IvannaLanguageCore.AcousticIntent.OPTIMIZE -> {
+                    // FIX (mismo tipo de hallazgo que DIAGNOSE, ver arriba):
+                    // OPTIMIZE se detectaba correctamente por el clasificador
+                    // pero sin manejo real en el flujo conversacional directo
+                    // por voz — AgentApi.requestOptimization() ya existe y
+                    // es funcional.
+                    val j = runCatching { com.ivanna.omega.agent.AgentApi.requestOptimization() }.getOrNull()
+                    val reply = when {
+                        j == null -> "No pude aplicar la optimización ahora mismo."
+                        j.optString("action") == "none" -> "El sistema ya está sano; no hizo falta corregir nada."
+                        j.optBoolean("ok") -> "He aplicado una optimización: ${j.optString("reason")}."
+                        else -> "No pude aplicar la optimización ahora mismo."
+                    }
+                    IvannaConversationalCore.recordTurn(text, "OPTIMIZE", null, reply)
+                    reply
+                }
+                IvannaLanguageCore.AcousticIntent.DIAGNOSE -> {
+                    // FIX (autodiagnóstico real, no texto genérico): antes
+                    // caía al flujo estándar sin ejecutar ningún diagnóstico
+                    // — AgentApi.diagnose() ya existe, real y funcional
+                    // (delega a IvannaAgentCore.HealthMonitoringAgent.check(),
+                    // confirmado en esta misma auditoría), pero nunca se
+                    // consultaba desde la conversación por voz.
+                    val j = runCatching { com.ivanna.omega.agent.AgentApi.diagnose() }.getOrNull()
+                    val reply = if (j != null && j.optBoolean("ok")) {
+                        if (j.optBoolean("healthy")) {
+                            "Todo va bien: el motor está estable y sin problemas."
+                        } else {
+                            val issues = j.optJSONArray("issues")
+                            if (issues != null && issues.length() > 0) {
+                                "Detecté esto: ${issues.getString(0)}."
+                            } else "No pude leer el diagnóstico completo."
+                        }
+                    } else "No pude ejecutar el diagnóstico ahora mismo."
+                    IvannaConversationalCore.recordTurn(text, "DIAGNOSE", null, reply)
+                    reply
+                }
+                IvannaLanguageCore.AcousticIntent.GREETING -> {
+                    val reply = IvannaSmallTalk.greetingResponse()
+                    IvannaConversationalCore.recordTurn(text, "GREETING", null, reply)
+                    reply
+                }
+                IvannaLanguageCore.AcousticIntent.SELF_INTRO -> {
+                    val reply = "Soy IVANNA, tu asistente de audio inteligente. Proceso el sonido en tiempo real, entiendo música, ajusto el procesador de señal y aprendo tus preferencias."
+                    IvannaConversationalCore.recordTurn(text, "SELF_INTRO", null, reply)
+                    reply
+                }
+                IvannaLanguageCore.AcousticIntent.HOW_ARE_YOU -> {
+                    val reply = IvannaSmallTalk.howAreYouResponse()
+                    IvannaConversationalCore.recordTurn(text, "HOW_ARE_YOU", null, reply)
+                    reply
+                }
+                IvannaLanguageCore.AcousticIntent.COMPLIMENT -> {
+                    val reply = IvannaSmallTalk.complimentResponse()
+                    IvannaConversationalCore.recordTurn(text, "COMPLIMENT", null, reply)
+                    reply
+                }
+                IvannaLanguageCore.AcousticIntent.GENERAL_CHAT -> {
+                    val reply = if (agentResponse is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Offline) {
+                        IvannaSmallTalk.generalChatResponse()
+                    } else {
+                        IvannaSmallTalk.generalChatResponse()
+                    }
+                    IvannaConversationalCore.recordTurn(
+                        text,
+                        if (agentResponse is com.ivanna.omega.ai.gemini.IvannaGeminiAgent.AgentResponse.Offline) "OFFLINE_FALLBACK" else "GENERAL_CHAT",
+                        null,
+                        reply
+                    )
+                    reply
+                }
+                else -> null
+            }
+
+            if (conversationalReply != null) {
+                _lastResponder.value = "IvannaAgentCore"
+                launch(Dispatchers.Main) {
+                    _ui.value = _ui.value.copy(
+                        processing = false,
+                        statusLine = conversationalReply,
+                        lastTurn   = ConversationTurn(userText = text, ivannaText = conversationalReply)
+                    )
+                    voice.speak(conversationalReply)
+                }
+                return@launch
+            }
+
+                        // ── Flujo estándar para intenciones no musicales ──────────────────
+            val decision = fatigueOverride ?: IvannaCognitiveCore.reason(parsed)
+
+            // FIX (reporte del propietario con captura, 2026-09-15): ante una
+            // intención desconocida o una decisión no ejecutable, IVANNA caía al
+            // catálogo estrecho ("Eso aún no lo sé hacer. Puedo mejorar las
+            // voces, dar más espacio...") aunque Gemini estuviera CONECTADO —
+            // el LLM de amplio contexto existía pero su respuesta solo se
+            // usaba si coincidía con un comando DSP. Ahora, cuando la capa
+            // acústica no tiene respuesta y Gemini sí respondió, la respuesta
+            // de Gemini (amplio contexto: cualquier tema) ES la respuesta de
+            // voz; la capa acústica queda como contexto en el panel, no como
+            // sustituto. Solo sin Gemini se usa el catálogo estático.
+            if (!decision.execute && !agentReply.isNullOrBlank()) {
+                profile.recordAdjustment("general_chat", scene ?: "UNKNOWN")
+                memory.recordAdjustment("general_chat", "usuario: \"$text\"", applied = false)
+                IvannaConversationalCore.recordTurn(text, "general_chat", null, agentReply)
+                // Aunque execute=false, quien respondió fue el LLM: el panel
+                // debe decir OmniRoute/Gemini, NO "IvannaStaticCore (bloqueó)".
+                _lastResponder.value = llmName()
+                launch(Dispatchers.Main) {
+                    _ui.value = _ui.value.copy(
+                        processing = false,
+                        statusLine = agentReply,
+                        lastTurn   = ConversationTurn(userText = text, ivannaText = agentReply)
+                    )
+                    voice.speak(agentReply)
+                }
+                return@launch
+            }
+
+            val reply: String = when {
+                parsed.acousticIntent == IvannaLanguageCore.AcousticIntent.EXPLAIN -> {
+                    IvannaCognitiveCore.explainLastDecision()
+                }
+                !decision.execute -> {
+                    decision.warningForUser ?: IvannaLanguageCore.spokenResponse(parsed)
+                }
+                else -> {
+                    val command = decision.commandOverride
+                        ?: IvannaLanguageCore.toCommand(parsed.acousticIntent)
+                    // agentReply es una respuesta no-null por diseño (Pair<String, String?>):
+                    // solo tiene sentido como texto hablado aquí si el LLM realmente detectó
+                    // este mismo comando (simulatedIntent != null); si no, es un texto de OTRA
+                    // rama y no debe pisar la respuesta específica de IvannaLanguageCore.
+                    // FIX (CI rojo): agentReply es String? tras el cambio a
+                    // AgentResponse — se resuelve con fallback determinista para
+                    // que baseReply sea String no-nulo en todo el flujo.
+                    val baseReply: String = if (simulatedIntent != null)
+                        agentReply ?: IvannaLanguageCore.spokenResponse(parsed)
+                    else
+                        IvannaLanguageCore.spokenResponse(parsed)
+                    val applied = runCatching { dspOrchestrator.executeCommand(command) }.getOrDefault(false)
+                    profile.recordAdjustment(command, scene ?: "UNKNOWN")
+                    memory.recordAdjustment(command, "usuario: \"$text\"", applied = applied)
+                    memory.lastExplanation = if (applied) baseReply else "No pude confirmar que el comando '$command' se aplicara al DSP."
+                    memory.lastScene = when (parsed.acousticIntent) {
+                        IvannaLanguageCore.AcousticIntent.VOICE_CLARITY,
+                        IvannaLanguageCore.AcousticIntent.DIALOG_ENHANCEMENT -> "VOICE"
+                        IvannaLanguageCore.AcousticIntent.MUSIC_FULLNESS,
+                        IvannaLanguageCore.AcousticIntent.CONCERT_LIVE       -> "MUSIC"
+                        else -> scene
+                    }
+                    val spokenResult = if (applied) baseReply else "No pude confirmar la aplicación de '$command' al DSP; no lo marcaré como aplicado."
+                    IvannaConversationalCore.recordTurn(text, command, command, spokenResult)
+                    decision.warningForUser ?: spokenResult
+                }
+            }
+
+            // Quién respondió (panel): solo "(bloqueó)" si un comando DSP
+            // fue rechazado de verdad (seguridad / intención no reconocida).
+            // Una pregunta técnica respondida desde la base local NO es un
+            // bloqueo: es "IvannaStaticCore" sin el sufijo.
+            _lastResponder.value = when {
+                parsed.acousticIntent == IvannaLanguageCore.AcousticIntent.EXPLAIN -> "IvannaAgentCore"
+                decision.execute -> "IvannaAgentCore"
+                parsed.acousticIntent == IvannaLanguageCore.AcousticIntent.TECHNICAL_QUESTION -> "IvannaStaticCore"
+                else -> "IvannaStaticCore (bloqueó)"
+            }
+            launch(Dispatchers.Main) {
+                _ui.value = _ui.value.copy(
+                    processing = false,
+                    statusLine = reply,
+                    lastTurn   = ConversationTurn(userText = text, ivannaText = reply)
+                )
+                voice.speak(reply)
+            }
+        }
+    }
+
+    /**
+     * Comprobación proactiva de fatiga auditiva (IvannaAcousticBrain).
+     *
+     * Disparada por el ViewModel desde el ciclo de IvannaAgentCore (~1 Hz),
+     * NO por algo que el usuario dijo — a diferencia de onUserSaid(), aquí
+     * no hay texto de entrada. Reutiliza exactamente la misma decisión que
+     * produce IvannaCognitiveCore.proactiveFatigueCheck() (que a su vez
+     * consulta IvannaAcousticBrain.fuse()): no hay lógica de decisión nueva
+     * en este método, solo un canal de disparo distinto — tiempo real de
+     * escucha en vez de una orden hablada.
+     */
+    fun checkProactiveFatigue() {
+        watchVoice()
+        val decision = IvannaCognitiveCore.proactiveFatigueCheck(profile) ?: return
+        if (!decision.execute) return
+        val command = decision.commandOverride ?: return
+        val scene = memory.lastScene ?: "UNKNOWN"
+        scope.launch(Dispatchers.IO) {
+            val applied = runCatching { dspOrchestrator.executeCommand(command) }.getOrDefault(false)
+            profile.recordAdjustment(command, scene)
+            memory.recordAdjustment(command, decision.reason, applied = applied)
+            memory.lastExplanation = if (applied) decision.reason else "Decisión '$command' generada, pero el DSP no confirmó su aplicación."
+            launch(Dispatchers.Main) {
+                val text = if (applied) decision.warningForUser ?: decision.reason
+                    else "Detecté una necesidad de ajuste, pero no pude confirmar que '$command' se aplicara al DSP."
+                _ui.value = _ui.value.copy(processing = false, statusLine = text)
+                voice.speak(text)
+            }
+        }
+    }
+
+    /**
+     * Limpia toda la memoria conversacional (FASE 13).
+     *
+     * Borra:
+     *  - IvannaListenerProfile (preferencias aprendidas, historial de ajustes)
+     *  - IvannaCognitiveCore (escena, explicaciones, preferencias de sesión)
+     *  - IvannaLanguageCore.intentHistory (contexto de la conversación)
+     *  - IvannaCognitiveCore.lastDecision (estado de la UI de inteligencia)
+     *  - IvannaAcousticBrain (cronómetro de sesión + última recomendación
+     *    fusionada, limpiado en cascada por IvannaCognitiveCore.clearDecision())
+     *
+     * NO borra:
+     *  - Configuración permanente de audio (DSP, perfiles de EQ, HRTF)
+     *  - Preferencias de la app (tema, idioma, ajustes del sistema)
+     */
+    fun clearMemory() {
+        memory.clearAll()
+        profile.clearAll()
+        IvannaLanguageCore.clearHistory()
+        IvannaCognitiveCore.clearDecision()
+        IvannaConversationalCore.clear()
+        IvannaVoiceRecorder.clear()
+        val msg = "He olvidado mis notas de esta y otras sesiones. La configuración de audio permanece intacta."
+        _ui.value = _ui.value.copy(statusLine = msg, lastTurn = null)
+        voice.speak(msg)
+    }
+
+    fun release() {
+        speech.release()
+        voice.release()
+        // El GeminiOrchestrator interno de geminiAgent corre su health-check
+        // loop en el CoroutineScope propio del agente — sin shutdown() aquí,
+        // cada vez que esta pantalla se recrea (rotación, navegación) queda
+        // otro loop más corriendo para siempre, además del anterior.
+        geminiAgent.shutdown()
+        // Leak de lifecycle real: watchVoice() deja un collect infinito sobre
+        // voice.state dentro de este scope. Sin cancelarlo, cada recreación de
+        // la pantalla dejaba un collector vivo reteniendo el IvannaAssistant
+        // (y con él Context de aplicación, TTS y recognizer) para siempre.
+        handsFreeActive = false
+        voiceWatchStarted = false
+        scope.cancel()
+    }
+}

@@ -1,0 +1,126 @@
+diff --git a/README.md b/README.md
+index d4e222b..b81b692 100644
+--- a/README.md
++++ b/README.md
+@@ -505,7 +505,7 @@ The evolution motor (`tools/evolution/`) runs on the development side (where the
+ 
+ | Suite | Result | Evidence |
+ |:---|:---|:---|
+-| CTest (DSP host suite) | **1044/1044** | Host local, suite completa (1044/1044, v2.5.456; twiddles precalculados en el RIR + micro-opts exactas en HOLOS + test_route_a_asrc cableado + test_pi_lstm_bridge_jni) |
++| CTest (DSP host suite) | **1046/1046** | Host local, suite completa (1046/1046, v2.5.456; twiddles precalculados en el RIR + micro-opts exactas en HOLOS + test_route_a_asrc cableado + test_pi_lstm_bridge_jni + test_benchmark_jni) |
+ | ASRC core | **25/25** | Host, v2.5.439 (see §05.4) |
+ | Daemon command responder | **28/28** | Host, v2.5.440 (real round-trip over abstract socket) |
+ | Council (multi-model) | **14/14** | Python unit tests, v2.5.445 (mocked LLM: verdicts, rounds, fail-closed) |
+diff --git a/app/src/main/cpp/tests/CMakeLists.txt b/app/src/main/cpp/tests/CMakeLists.txt
+index 1c0af5e..6778bb9 100644
+--- a/app/src/main/cpp/tests/CMakeLists.txt
++++ b/app/src/main/cpp/tests/CMakeLists.txt
+@@ -1583,6 +1583,31 @@ if(IVANNA_SAN_FLAGS)
+ endif()
+ gtest_discover_tests(test_pi_lstm_bridge_jni)
+ 
++# ── test_benchmark_jni: latencia round-trip Ruta A (0016) ────────────────────
++# ivanna_benchmark_jni.cpp (72 líneas) estaba entre los 19 módulos sin tests:
++# nativeMeasureRoundTripLatencyUs mide la cadena DSP real in-process
++# (ParametricEQ → Compressor → HarmonicExciter → StereoWidener → GainStage
++# → SafetyLimiter) con un pulso. Los 6 módulos ya están en
++# ivanna_dsp_under_test; aquí solo se compila el bridge JNI con el stub
++# de host. El umbral del test es de cordura (0, 10000] µs, 100× el valor
++# medido ~100 µs: un test de timing ajustado fallaría bajo ctest -j4.
++add_executable(test_benchmark_jni
++  test_benchmark_jni.cpp
++  ../ivanna_benchmark_jni.cpp
++)
++target_link_libraries(test_benchmark_jni PRIVATE GTest::gtest_main ivanna_dsp_under_test)
++target_include_directories(test_benchmark_jni PRIVATE
++  ..
++  ../include
++  host_stubs
++)
++target_compile_options(test_benchmark_jni PRIVATE -Wall -Wextra)
++if(IVANNA_SAN_FLAGS)
++  target_compile_options(test_benchmark_jni PRIVATE ${IVANNA_SAN_FLAGS})
++  target_link_options(test_benchmark_jni PRIVATE ${IVANNA_SAN_FLAGS})
++endif()
++gtest_discover_tests(test_benchmark_jni)
++
+ # ── FASE 3: 41 external fun conectadas con llamadores reales en Kotlin ─────────
+ add_executable(test_phase3_jni_callers
+   test_phase3_jni_callers.cpp
+diff --git a/app/src/main/cpp/tests/test_benchmark_jni.cpp b/app/src/main/cpp/tests/test_benchmark_jni.cpp
+new file mode 100644
+index 0000000..d52484e
+--- /dev/null
++++ b/app/src/main/cpp/tests/test_benchmark_jni.cpp
+@@ -0,0 +1,54 @@
++// test_benchmark_jni.cpp — Tests de host del benchmark JNI de latencia
++// (propuesta 0016, coordinador del Plan Omnipotencia).
++//
++// ivanna_benchmark_jni.cpp (72 líneas) estaba entre los 19 módulos sin
++// tests: una sola función JNI, nativeMeasureRoundTripLatencyUs, que mide
++// clock_gettime(CLOCK_MONOTONIC) alrededor de la cadena DSP real de la
++// Ruta A in-process (ParametricEQ → Compressor → HarmonicExciter →
++// StereoWidener → GainStage → SafetyLimiter) con un pulso unitario.
++// Es la métrica honesta de la Ruta A: mide el código que el usuario
++// oye cuando el motor corre in-process.
++//
++// Lo que se verifica:
++// - La función corre en host con el stub JNI (JNIEnv{} vacío) y no
++//   crashea.
++// - Devuelve una latencia positiva y razonable: (0, 10000] µs para
++//   256 frames. Medido en host 2026-11-16: ~94–120 µs. El umbral
++//   10000 µs es 100× el valor medido: es un guard de cordura, no un
++//   benchmark de rendimiento (un test de timing ajustado fallaría bajo
++//   ctest -j4 por contención de CPU — lección de test_route_a_asrc).
++// - Dos llamadas consecutivas devuelven valores en rango (la cadena
++//   corre de forma repetible, sin estado corrupto entre llamadas).
++#include <gtest/gtest.h>
++#include <jni.h>
++
++extern "C" {
++JNIEXPORT jlong JNICALL
++Java_com_ivanna_omega_core_IvannaNativeLib_nativeMeasureRoundTripLatencyUs(
++    JNIEnv*, jclass);
++}
++
++TEST(BenchmarkJniTest, RoundTripLatencyIsPositiveAndSane) {
++    JNIEnv env{};
++    const jlong us =
++        Java_com_ivanna_omega_core_IvannaNativeLib_nativeMeasureRoundTripLatencyUs(
++            &env, nullptr);
++    // 256 frames por 6 módulos DSP: ~100 µs en host. El umbral 10 ms
++    // es 100× el valor medido (guard de cordura, no benchmark).
++    EXPECT_GT(us, 0);
++    EXPECT_LE(us, 10000);
++}
++
++TEST(BenchmarkJniTest, RepeatedCallsAreRepeatable) {
++    JNIEnv env{};
++    const jlong us1 =
++        Java_com_ivanna_omega_core_IvannaNativeLib_nativeMeasureRoundTripLatencyUs(
++            &env, nullptr);
++    const jlong us2 =
++        Java_com_ivanna_omega_core_IvannaNativeLib_nativeMeasureRoundTripLatencyUs(
++            &env, nullptr);
++    EXPECT_GT(us1, 0);
++    EXPECT_LE(us1, 10000);
++    EXPECT_GT(us2, 0);
++    EXPECT_LE(us2, 10000);
++}
+diff --git a/telemetry/ctest_summary.json b/telemetry/ctest_summary.json
+index c27db84..a4c89af 100644
+--- a/telemetry/ctest_summary.json
++++ b/telemetry/ctest_summary.json
+@@ -1,8 +1,8 @@
+ {
+-  "passed": 1044,
++  "passed": 1046,
+   "failed": 0,
+-  "total": 1044,
++  "total": 1046,
+   "pass_rate_percent": 100,
+-  "duration_sec": 58.33,
+-  "badge_label": "1044/1044"
++  "duration_sec": 58.21,
++  "badge_label": "1046/1046"
+ }

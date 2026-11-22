@@ -1,0 +1,554 @@
+diff --git a/tools/evolution/evolution_engine.py b/tools/evolution/evolution_engine.py
+index 78416813..caefb4bd 100644
+--- a/tools/evolution/evolution_engine.py
++++ b/tools/evolution/evolution_engine.py
+@@ -322,26 +322,304 @@ def repo_state():
+ 
+ 
+ # ── Fase 2+3: conocimiento + detección ──────────────────────────────────────
++# --- Detector de guardas SAF por DEFINICIÓN (0007, 2026-11-16) ---------------
++# Una "guarda" es una FUNCIÓN cuya definición tiene `std::isfinite` en el
++# cuerpo. No un substring en el archivo: el nombre de la guarda
++# (`isFiniteLatent`) no contiene el literal `isfinite` y un substring
++# tampoco distingue una guarda real de una mención en un comentario.
++# El extractor usa brace-matching (no regex de firmas) para soportar
++# firmas multilínea, inline/static/constexpr, noexcept, trailing return
++# y llaves anidadas en el cuerpo. La resolución de #include es transitiva
++# con normalización de paths. Sin fallback legacy de substring.
++_CPP_KEYWORDS = frozenset({
++    "if", "for", "while", "switch", "catch", "return", "sizeof",
++    "decltype", "else", "do", "case", "default", "try",
++})
++
++
++def _strip_cpp_noise(text):
++    """Quita comentarios y literales de cadena/caracter, reemplazándolos
++    por espacios (preserva saltos de línea y longitud) para que el
++    extractor no vea llaves ni paréntesis falsos."""
++    out = []
++    i, n = 0, len(text)
++    while i < n:
++        c = text[i]
++        two = text[i:i + 2]
++        if two == "//":
++            j = text.find("\n", i)
++            if j == -1:
++                j = n
++            out.append(" " * (j - i))
++            i = j
++        elif two == "/*":
++            j = text.find("*/", i + 2)
++            if j == -1:
++                j = n
++            else:
++                j += 2
++            seg = text[i:j]
++            out.append("".join("\n" if ch == "\n" else " " for ch in seg))
++            i = j
++        elif c == '"':
++            j = i + 1
++            while j < n:
++                if text[j] == "\\":
++                    j += 2
++                    continue
++                if text[j] == '"':
++                    j += 1
++                    break
++                j += 1
++            seg = text[i:j]
++            out.append("".join("\n" if ch == "\n" else " " for ch in seg))
++            i = j
++        elif c == "'":
++            # Separador de dígitos C++14 (1'000) no es un literal.
++            if i > 0 and (text[i - 1].isdigit() or text[i - 1] == "_"):
++                out.append(c)
++                i += 1
++                continue
++            j = i + 1
++            while j < n:
++                if text[j] == "\\":
++                    j += 2
++                    continue
++                if text[j] == "'":
++                    j += 1
++                    break
++                j += 1
++            seg = text[i:j]
++            out.append("".join("\n" if ch == "\n" else " " for ch in seg))
++            i = j
++        else:
++            out.append(c)
++            i += 1
++    return "".join(out)
++
++
++def _matching_paren(text, open_idx):
++    """Índice del ')' que cierra el '(' en open_idx, o -1."""
++    depth = 0
++    i, n = open_idx, len(text)
++    while i < n:
++        c = text[i]
++        if c == "(":
++            depth += 1
++        elif c == ")":
++            depth -= 1
++            if depth == 0:
++                return i
++        i += 1
++    return -1
++
++
++def _matching_brace(text, open_idx):
++    """Índice del '}' que cierra el '{' en open_idx, o -1."""
++    depth = 0
++    i, n = open_idx, len(text)
++    while i < n:
++        c = text[i]
++        if c == "{":
++            depth += 1
++        elif c == "}":
++            depth -= 1
++            if depth == 0:
++                return i
++        i += 1
++    return -1
++
++
++_NAME_PAREN_RE = re.compile(r"([A-Za-z_~][\w:]*)\s*\(")
++_WORD_RE = re.compile(r"[A-Za-z_~][\w:]*")
++_POST_QUALIFIERS = ("const", "noexcept", "override", "final")
++
++
++def _skip_post_param_qualifiers(text, j):
++    """Tras el ')' de los parámetros, avanza hasta el '{' del cuerpo.
++    Salta const, noexcept(...), override/final, ref-qualifiers (&/&&),
++    trailing return type (-> ...) y lista de inicializadores (: ...).
++    Devuelve el índice del '{' o -1 si no hay cuerpo."""
++    n = len(text)
++    while True:
++        while j < n and text[j].isspace():
++            j += 1
++        if j >= n:
++            return -1
++        matched = False
++        for qual in _POST_QUALIFIERS:
++            if text.startswith(qual, j):
++                after = j + len(qual)
++                if after < n and (text[after].isalnum() or text[after] == "_"):
++                    continue
++                j = after
++                matched = True
++                if qual == "noexcept":
++                    while j < n and text[j].isspace():
++                        j += 1
++                    if j < n and text[j] == "(":
++                        j = _matching_paren(text, j)
++                        if j == -1:
++                            return -1
++                        j += 1
++                break
++        if matched:
++            continue
++        if text.startswith("&&", j) or text[j] == "&":
++            j += 2 if text.startswith("&&", j) else 1
++            continue
++        if text.startswith("->", j):
++            j += 2
++            while j < n and text[j] not in "{;":
++                j += 1
++            if j >= n or text[j] != "{":
++                return -1
++            return j
++        if text[j] == ":":
++            j += 1
++            while True:
++                while j < n and text[j].isspace():
++                    j += 1
++                if j >= n:
++                    return -1
++                if text[j] == "{":
++                    return j
++                m = _WORD_RE.match(text, j)
++                if not m:
++                    return -1
++                j = m.end()
++                while j < n and text[j].isspace():
++                    j += 1
++                if j < n and text[j] == "(":
++                    j = _matching_paren(text, j)
++                    if j == -1:
++                        return -1
++                    j += 1
++                elif j < n and text[j] == "{":
++                    j = _matching_brace(text, j)
++                    if j == -1:
++                        return -1
++                    j += 1
++                while j < n and text[j].isspace():
++                    j += 1
++                if j < n and text[j] == ",":
++                    j += 1
++                    continue
++                if j < n and text[j] == "{":
++                    return j
++                return -1
++        if text[j] == "{":
++            return j
++        return -1
++
++
++def _extract_function_definitions(text):
++    """Extrae definiciones de función C++ con brace-matching.
++
++    Devuelve una lista de dicts {name, body, start, end}. Maneja firmas
++    multilínea, inline/static/constexpr, noexcept, trailing return type,
++    ref-qualifiers, listas de inicializadores y llaves anidadas.
++    Las llamadas (sin '{' tras los parámetros y calificadores) y las
++    palabras de control (if/for/while/...) no son definiciones.
++    """
++    clean = _strip_cpp_noise(text)
++    defs = []
++    for m in _NAME_PAREN_RE.finditer(clean):
++        name = m.group(1)
++        last = name.split("::")[-1]
++        if last in _CPP_KEYWORDS:
++            continue
++        open_paren = m.end() - 1
++        close_paren = _matching_paren(clean, open_paren)
++        if close_paren == -1:
++            continue
++        brace = _skip_post_param_qualifiers(clean, close_paren + 1)
++        if brace == -1:
++            continue
++        close_brace = _matching_brace(clean, brace)
++        if close_brace == -1:
++            continue
++        defs.append({
++            "name": name,
++            "body": clean[brace + 1:close_brace],
++            "start": m.start(),
++            "end": close_brace + 1,
++        })
++    return defs
++
++
++_INCLUDE_RE = re.compile(
++    r'^\s*#\s*include\s*(?P<delim>[<"])(?P<name>[^>"]+)[>"]', re.MULTILINE)
++
++
++def _resolve_include_target(name, quoted, including_file, cpp_root):
++    """Resuelve un #include a un archivo existente, con normalización.
++    "..." se busca relativo al archivo que incluye, luego en cpp_root y
++    cpp_root/include. <...> solo en cpp_root y cpp_root/include.
++    Devuelve un Path o None (p. ej. headers del sistema como <cmath>)."""
++    bases = []
++    if quoted:
++        bases.append(including_file.parent)
++    bases.append(cpp_root)
++    bases.append(cpp_root / "include")
++    for base in bases:
++        cand = Path(os.path.normpath(str(base / name)))
++        if cand.is_file():
++            return cand
++    return None
++
++
++def _resolve_includes(entry, cpp_root):
++    """Resolución transitiva de #include con normalización de paths.
++    Devuelve el conjunto de archivos alcanzados (sin el entry).
++    Evita ciclos con un conjunto de visitados."""
++    reached = set()
++    queue = [Path(entry)]
++    seen = set()
++    while queue:
++        cur = queue.pop(0)
++        if cur in seen:
++            continue
++        seen.add(cur)
++        try:
++            text = cur.read_text(errors="ignore")
++        except OSError:
++            continue
++        for m in _INCLUDE_RE.finditer(text):
++            target = _resolve_include_target(
++                m.group("name"), m.group("delim") == '"', cur, cpp_root)
++            if target is None or target in reached:
++                continue
++            reached.add(target)
++            queue.append(target)
++    reached.discard(Path(entry))
++    return reached
++
++
++def _is_guard_function(defn):
++    """Una guarda es una función cuya DEFINICIÓN contiene std::isfinite
++    en el cuerpo (semántica por definición, 0007)."""
++    return "std::isfinite" in defn["body"]
++
++
+ def scan_saf_guards():
+     """Detecta módulos SAF sin guarda isfinite con trazabilidad de origen.
+ 
+-    Reglas corregidas tras falsos positivos medidos el 2026-11-14
+-    (propuesta 0002, redactada por el LLM vía OmniRoute):
+-    1) Un archivo sin funciones detectadas no es hit, aunque tampoco tenga
+-       guarda (saf_stimulus_jni.cpp: solo JNIEXPORT jboolean, el regex no
+-       casa ninguna función; antes se listaba con "functions": []).
+-    2) Los nombres de función se deduplican preservando el orden de aparición
+-       (ivanna_saf_apply_latent salía dos veces: declaración + definición).
+-    3) Para cada saf_*.cpp se revisa el header hermano
+-       app/src/main/cpp/include/<base>.h y, junto al .cpp, <base>.h / <base>.hpp.
+-       Si el .cpp o cualquiera de esos headers contiene "isfinite", el módulo
+-       se considera guardado y no es hit (saf_runtime.cpp: su guarda vive en
+-       include/saf_runtime.h, donde está SAFUpdate, el patrón de referencia).
+-    4) Cada hit incluye "guard_source" ("cpp" | "header" | "none") y
+-       "header_checked" (ruta relativa del header donde se encontró la
+-       guarda, o del header existente revisado; null si no existe ningún
+-       header hermano), además de conservar "file", "functions" y
+-       "has_isfinite_guard".
++    Guarda por DEFINICIÓN (0007, 2026-11-16): una guarda es una función
++    cuyo cuerpo contiene `std::isfinite`, identificada con el extractor
++    de definiciones por brace-matching (no por substring del archivo).
++    Un módulo está guardado si una guarda está definida en:
++      1) el propio .cpp (guard_source "cpp"), o
++      2) cualquier archivo de su grafo de #include transitivo, con
++         normalización de paths (guard_source "include"), o
++      3) un header hermano (include/<base>.h, <base>.h, <base>.hpp)
++         (guard_source "header", regla 3 histórica).
++    Sin fallback legacy de substring "isfinite": el nombre de la guarda
++    (`isFiniteLatent`) no contiene ese literal y un substring tampoco
++    distingue una guarda real de una mención en un comentario.
++    Cada hit conserva "file", "functions", "has_isfinite_guard" (False),
++    "guard_source" ("none") y "header_checked" (primer header hermano
++    existente revisado, o null).
+     """
+     hits = []
+     cpp_root = REPO / "app/src/main/cpp"
+@@ -357,6 +635,24 @@ def scan_saf_guards():
+         if not funcs:
+             continue
+ 
++        # 1) Guarda definida en el propio .cpp.
++        if any(_is_guard_function(d)
++               for d in _extract_function_definitions(src)):
++            continue
++        # 2) Guarda en el grafo de includes (transitivo, normalizado).
++        guard_in_include = None
++        for inc_path in sorted(_resolve_includes(path, cpp_root)):
++            try:
++                inc_text = inc_path.read_text(errors="ignore")
++            except OSError:
++                continue
++            if any(_is_guard_function(d)
++                   for d in _extract_function_definitions(inc_text)):
++                guard_in_include = inc_path
++                break
++        if guard_in_include is not None:
++            continue
++        # 3) Guarda en header hermano (regla 3 histórica, por definición).
+         base = path.stem
+         header_candidates = [
+             cpp_root / "include" / f"{base}.h",
+@@ -364,29 +660,27 @@ def scan_saf_guards():
+             path.with_suffix(".hpp"),
+         ]
+         header_checked = None
+-        guard_source = "none"
+-        has_isfinite_guard = False
+-        if "isfinite" in src:
+-            has_isfinite_guard = True
+-            guard_source = "cpp"
+-        else:
+-            for header in header_candidates:
+-                if not header.exists():
+-                    continue
+-                header_checked = str(header.relative_to(REPO))
+-                if "isfinite" in header.read_text(errors="ignore"):
+-                    has_isfinite_guard = True
+-                    guard_source = "header"
+-                    break
+-
+-        if has_isfinite_guard:
++        guarded_by_header = False
++        for header in header_candidates:
++            if not header.exists():
++                continue
++            header_checked = str(header.relative_to(REPO))
++            try:
++                h_text = header.read_text(errors="ignore")
++            except OSError:
++                continue
++            if any(_is_guard_function(d)
++                   for d in _extract_function_definitions(h_text)):
++                guarded_by_header = True
++                break
++        if guarded_by_header:
+             continue
+ 
+         hits.append({
+             "file": str(path.relative_to(REPO)),
+             "functions": funcs,
+             "has_isfinite_guard": False,
+-            "guard_source": guard_source,
++            "guard_source": "none",
+             "header_checked": header_checked,
+         })
+     return hits
+diff --git a/tools/evolution/tests/test_scan_saf_guards.py b/tools/evolution/tests/test_scan_saf_guards.py
+index 565fec0d..387e4466 100644
+--- a/tools/evolution/tests/test_scan_saf_guards.py
++++ b/tools/evolution/tests/test_scan_saf_guards.py
+@@ -13,6 +13,18 @@ Casos (falsos positivos medidos 2026-11-14):
+   hermano -> NO es hit (regla 3).
+ - .cpp con función repetida (declaración + definición), sin guarda en .cpp
+   ni header -> UN solo hit, función una sola vez (reglas 1-4).
++
++Casos 0007 (2026-11-16, guarda por DEFINICIÓN, extractor brace-matching):
++- .cpp que incluye un header donde se define isFiniteLatent (cuerpo con
++  std::isfinite) y la llama -> NO es hit (el falso positivo real).
++- Guarda en include TRANSITIVO (a incluye b, b incluye el header de la
++  guarda) -> NO es hit.
++- Header incluido con función SIN std::isfinite en el cuerpo -> SÍ es hit
++  (negativo: definir una función no basta, debe ser guarda).
++- Guarda definida en el propio .cpp -> NO es hit.
++- Extractor: firmas multilínea, inline/static/constexpr, noexcept,
++  llaves anidadas; `std::isfinite` en comentario o en literal de cadena
++  NO es guarda.
+ """
+ import sys
+ import tempfile
+@@ -67,6 +79,134 @@ class TestScanSafGuards(unittest.TestCase):
+         self.assertEqual(hit["guard_source"], "none")
+         self.assertIsNone(hit["header_checked"])
+ 
++    def test_0007_guard_in_included_header_is_not_a_hit(self):
++        """El falso positivo real: isFiniteLatent vive en un header
++        incluido (spatial/SafmusLatentGuard.hpp) y el .cpp la llama."""
++        (self.repo / "app/src/main/cpp/spatial").mkdir(parents=True, exist_ok=True)
++        (self.repo / "app/src/main/cpp/spatial/SafmusLatentGuard.hpp").write_text(
++            "#pragma once\n"
++            "#include <cmath>\n"
++            "namespace ivanna::safmus {\n"
++            "inline bool isFiniteLatent(const float* q) noexcept {\n"
++            "    if (!q) return false;\n"
++            "    for (int i = 0; i < 7; ++i) {\n"
++            "        if (!std::isfinite(q[i])) return false;\n"
++            "    }\n"
++            "    return true;\n"
++            "}\n"
++            "} // namespace ivanna::safmus\n",
++            encoding="utf-8",
++        )
++        (self.repo / "app/src/main/cpp/saf_latent_bridge.cpp").write_text(
++            '#include "spatial/SafmusLatentGuard.hpp"\n'
++            "void ivanna_saf_apply_latent(const float* q) {\n"
++            "    if (!ivanna::safmus::isFiniteLatent(q)) return;\n"
++            "}\n",
++            encoding="utf-8",
++        )
++        hits = evolution_engine.scan_saf_guards()
++        self.assertEqual(hits, [])
++
++    def test_0007_transitive_include_guard_is_not_a_hit(self):
++        """La guarda vive a dos niveles: el .cpp incluye a.h, a.h incluye
++        el header de la guarda."""
++        (self.repo / "app/src/main/cpp/spatial").mkdir(parents=True, exist_ok=True)
++        (self.repo / "app/src/main/cpp/spatial/Guard.hpp").write_text(
++            "#pragma once\n"
++            "inline bool guard_fn(double x) { return std::isfinite(x); }\n",
++            encoding="utf-8",
++        )
++        (self.repo / "app/src/main/cpp/saf_mid.h").write_text(
++            '#pragma once\n#include "spatial/Guard.hpp"\n',
++            encoding="utf-8",
++        )
++        (self.repo / "app/src/main/cpp/saf_transitive.cpp").write_text(
++            '#include "saf_mid.h"\n'
++            "void work(double x) {\n"
++            "    if (!guard_fn(x)) return;\n"
++            "}\n",
++            encoding="utf-8",
++        )
++        hits = evolution_engine.scan_saf_guards()
++        self.assertEqual(hits, [])
++
++    def test_0007_included_function_without_isfinite_is_a_hit(self):
++        """Negativo: el header incluido define una función, pero su cuerpo
++        NO contiene std::isfinite -> el módulo sigue sin guarda."""
++        (self.repo / "app/src/main/cpp/saf_plain.h").write_text(
++            "#pragma once\n"
++            "inline bool not_a_guard(double x) { return x > 0.0; }\n",
++            encoding="utf-8",
++        )
++        (self.repo / "app/src/main/cpp/saf_plain.cpp").write_text(
++            '#include "saf_plain.h"\n'
++            "void work(double x) {\n"
++            "    double y = x * 2.0;\n"
++            "    (void)y;\n"
++            "}\n",
++            encoding="utf-8",
++        )
++        hits = evolution_engine.scan_saf_guards()
++        self.assertEqual(len(hits), 1)
++        self.assertEqual(hits[0]["file"], "app/src/main/cpp/saf_plain.cpp")
++        self.assertEqual(hits[0]["guard_source"], "none")
++
++    def test_0007_guard_defined_in_cpp_is_not_a_hit(self):
++        """Guarda definida en el propio .cpp (firma multilínea,
++        static, noexcept, llaves anidadas)."""
++        (self.repo / "app/src/main/cpp/saf_local.cpp").write_text(
++            "static bool local_guard(\n"
++            "    double x,\n"
++            "    double y) noexcept {\n"
++            "    if (x > 0.0) {\n"
++            "        if (!std::isfinite(y)) { return false; }\n"
++            "    }\n"
++            "    return std::isfinite(x);\n"
++            "}\n"
++            "void work(double x) {\n"
++            "    if (!local_guard(x, x)) return;\n"
++            "}\n",
++            encoding="utf-8",
++        )
++        hits = evolution_engine.scan_saf_guards()
++        self.assertEqual(hits, [])
++
++    def test_0007_isfinite_in_comment_or_string_is_not_a_guard(self):
++        """`std::isfinite` en un comentario o en un literal de cadena NO
++        es una guarda: el módulo sigue siendo hit."""
++        (self.repo / "app/src/main/cpp/saf_fake.cpp").write_text(
++            "// usa std::isfinite aqui (mentira: solo es un comentario)\n"
++            'const char* s = "std::isfinite";\n'
++            "void work(double x) {\n"
++            "    double y = x * 2.0;\n"
++            "    (void)y; (void)s;\n"
++            "}\n",
++            encoding="utf-8",
++        )
++        hits = evolution_engine.scan_saf_guards()
++        self.assertEqual(len(hits), 1)
++        self.assertEqual(hits[0]["file"], "app/src/main/cpp/saf_fake.cpp")
++
++    def test_0007_extractor_handles_qualifiers_and_nested_braces(self):
++        """El extractor no confunde llamadas ni control con definiciones,
++        y casa cuerpos con llaves anidadas."""
++        defs = evolution_engine._extract_function_definitions(
++            "inline bool guard_fn(double x) noexcept {\n"
++            "    if (x > 0.0) { return std::isfinite(x); }\n"
++            "    return false;\n"
++            "}\n"
++            "void work(double x) {\n"
++            "    if (guard_fn(x)) { int a = 1; (void)a; }\n"
++            "    for (int i = 0; i < 3; ++i) { int b = i; (void)b; }\n"
++            "}\n"
++        )
++        names = [d["name"] for d in defs]
++        self.assertEqual(names, ["guard_fn", "work"])
++        guard = next(d for d in defs if d["name"] == "guard_fn")
++        self.assertTrue(evolution_engine._is_guard_function(guard))
++        work = next(d for d in defs if d["name"] == "work")
++        self.assertFalse(evolution_engine._is_guard_function(work))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

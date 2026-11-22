@@ -1,0 +1,368 @@
+package com.ivanna.omega.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.ivanna.omega.audio.AudioClockTelemetry
+import com.ivanna.omega.audio.AudioEngine
+import com.ivanna.omega.audio.AudioTrackRouteReadback
+import com.ivanna.omega.audio.OmegaMetrics
+import com.ivanna.omega.audio.RouteAAsrc
+import com.ivanna.omega.core.IvannaNativeLib
+import com.ivanna.omega.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
+
+/** Features de CPU reales del dispositivo (línea "Features" de /proc/cpuinfo); null si no se puede leer. */
+private fun readCpuFeatures(): Set<String>? = runCatching {
+    java.io.File("/proc/cpuinfo").useLines { lines ->
+        lines.firstOrNull { it.startsWith("Features") }
+            ?.substringAfter(':')?.trim()?.split(' ')?.filter { it.isNotEmpty() }?.toSet()
+    }
+}.getOrNull()
+
+private fun mb(bytes: Long) = "%.1f MB".format(bytes / 1048576.0)
+
+@Composable
+internal fun NeonProfilerPanel(modifier: Modifier = Modifier) {
+    val metrics by OmegaMetrics.shared.collectAsState()
+    var latencyUs   by remember { mutableLongStateOf(0L) }
+    var appCpuPct   by remember { mutableStateOf<Float?>(null) }
+    var nativeHeap  by remember { mutableLongStateOf(0L) }
+    var javaHeap    by remember { mutableLongStateOf(0L) }
+    var effectClockTelemetry by remember { mutableStateOf(AudioClockTelemetry()) }
+    var routeSnapshot by remember { mutableStateOf(AudioTrackRouteReadback.current()) }
+
+    // Todo lo de abajo es medición real: nada de cifras fijas ni modelos estimados.
+    val cpuFeatures = remember { readCpuFeatures() }
+    val buildFlags = remember {
+        if (IvannaNativeLib.isLoaded) runCatching { IvannaNativeLib.nativeGetBuildFlags() }.getOrNull() else null
+    }
+
+    LaunchedEffect(Unit) {
+        var lastCpu  = android.os.Process.getElapsedCpuTime()
+        var lastWall = android.os.SystemClock.elapsedRealtime()
+        while (isActive) {
+            if (IvannaNativeLib.isLoaded) {
+                val us = withContext(Dispatchers.Default) {
+                    runCatching { IvannaNativeLib.nativeMeasureRoundTripLatencyUs() }.getOrDefault(0L)
+                }
+                latencyUs = us
+            }
+            effectClockTelemetry = withContext(Dispatchers.IO) {
+                AudioEngine.getClockTelemetryStatic()
+            }
+            routeSnapshot = AudioTrackRouteReadback.current()
+            val cpu = android.os.Process.getElapsedCpuTime()
+            val wall = android.os.SystemClock.elapsedRealtime()
+            val dw = wall - lastWall
+            if (dw > 0L) appCpuPct = ((cpu - lastCpu).toFloat() / dw * 100f).coerceAtLeast(0f)
+            lastCpu = cpu; lastWall = wall
+            nativeHeap = android.os.Debug.getNativeHeapAllocatedSize()
+            val rt = Runtime.getRuntime()
+            javaHeap = rt.totalMemory() - rt.freeMemory()
+            delay(1000L)
+        }
+    }
+
+    val dispUs = if (latencyUs > 0L) latencyUs else (metrics.latencyMs * 1000f).toLong()
+    val dspLoad: Float? = if (metrics.dspActive && metrics.dspLoadPercent > 0f) metrics.dspLoadPercent else null
+    val neon = cpuFeatures?.contains("asimd")
+
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ProfilerStat("LATENCIA IDA Y VUELTA",
+                if (dispUs <= 0L) "—" else "${dispUs} μs",
+                "${metrics.sampleRate / 1000} kHz", AuroraCyan, Modifier.weight(1f))
+            ProfilerStat("CPU DE LA APP",
+                appCpuPct?.let { "%.0f %%".format(it) } ?: "—",
+                "de 1 núcleo · ${Runtime.getRuntime().availableProcessors()} núcleos", PhosphorGreen, Modifier.weight(1f))
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ProfilerStat("HEAP NATIVO", if (nativeHeap > 0L) mb(nativeHeap) else "—",
+                "asignado por el proceso", AmberSignal, Modifier.weight(1f))
+            ProfilerStat("HEAP JAVA", if (javaHeap > 0L) mb(javaHeap) else "—",
+                "ART en uso", AuroraCyan, Modifier.weight(1f))
+        }
+
+        GlassCard("CPU DEL DISPOSITIVO", AuroraCyan, "Detectado en tiempo de ejecución (/proc/cpuinfo)") {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                if (cpuFeatures == null) {
+                    FlagRow("Features", "no disponible · sin publicacion del daemon")
+                } else {
+                    FlagRow("NEON / ASIMD", if (neon == true) "sí" else "no")
+                    FlagRow("FP16 aritmético (asimdhp)", if (cpuFeatures.contains("asimdhp")) "sí" else "no")
+                    FlagRow("Dot product int8 (asimddp)", if (cpuFeatures.contains("asimddp")) "sí" else "no")
+                    FlagRow("Int8 matmul (i8mm)", if (cpuFeatures.contains("i8mm")) "sí" else "no")
+                    FlagRow("BFloat16 (bf16)", if (cpuFeatures.contains("bf16")) "sí" else "no")
+                }
+                FlagRow("ABI", android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "—")
+            }
+        }
+
+        GlassCard("FLAGS DE COMPILACIÓN", AuroraCyan, "Leídos del binario nativo cargado") {
+            Text(
+                buildFlags?.takeIf { it.isNotBlank() && it != "unknown" } ?: "no disponible (motor nativo sin cargar)",
+                color = TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace
+            )
+        }
+
+        GlassCard("NEON INTRINSICS EN EL CÓDIGO", AuroraCyan, "Módulos que los usan (verificado en el fuente)") {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                IntrinsicRow("vmlaq_f32(a,b,c)", "Multiplicar-acumular vectorial (a + b·c)", AuroraCyan, "TinyML · Cochlear · Gammatone")
+                IntrinsicRow("vrecpeq_f32", "Estimación de recíproco", PhosphorGreen, "AntiDolbyAI · FusionCore")
+                IntrinsicRow("vld1q_f32 / vst1q_f32", "Carga/almacén de 128 bits", AmberSignal, "HRTF · room_model · spatial")
+                IntrinsicRow("vdupq_n_s16", "Difusión de escalar int16 a vector", NeonMagenta, "Psychoacoustics")
+            }
+        }
+
+        GlassCard("MOTOR EN VIVO", PhosphorGreen, "Telemetría del hilo de audio") {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text("Presupuesto del hilo de audio (DSP)", color = TextSecondary, fontSize = 11.sp)
+                    Text(dspLoad?.let { "%.0f %%".format(it) } ?: "—", color = PhosphorGreen,
+                        fontSize = 11.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                }
+                LinearProgressIndicator(
+                    progress = { ((dspLoad ?: 0f) / 100f).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                    color = PhosphorGreen, trackColor = ObsidianEdge
+                )
+                LiveRow("Salud del buffer", if (metrics.dspActive) "%.0f %%".format(metrics.bufferHealthPercent) else "—")
+                LiveRow("Jitter", if (metrics.dspActive && metrics.jitterMs > 0f) "%.2f ms".format(metrics.jitterMs) else "—")
+                LiveRow("Underruns", if (metrics.dspActive) metrics.underrunCount.toString() else "—")
+                LiveRow("Bypass por presupuesto", if (metrics.dspActive) metrics.budgetBypasses.toString() else "—")
+                LiveRow("Eventos anti-pop", if (metrics.dspActive) metrics.antiPopEvents.toString() else "—")
+                LiveRow("Resincronizaciones", if (metrics.dspActive) metrics.resyncCount.toString() else "—")
+                LiveRow("Códec / ruta", if (metrics.activeCodec != "—") "${metrics.activeCodec} · ${metrics.audioRoute}" else metrics.audioRoute)
+            }
+        }
+
+        GlassCard(
+            "SALIDA REAL · USB-C DAC / AUX / BLUETOOTH", AuroraCyan,
+            "Lectura del AudioTrack que reproduce IVANNA; no demuestra control del reloj físico del DAC ni del audio de otras aplicaciones"
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LiveRow("Estado de ruta", routeSnapshot.status)
+                LiveRow("Dispositivo solicitado", routeSnapshot.requestedDevice)
+                LiveRow("Dispositivo enroutado", routeSnapshot.actualDevice)
+                LiveRow("Tasa del AudioTrack", if (routeSnapshot.sampleRateHz > 0) "${routeSnapshot.sampleRateHz} Hz" else "—")
+                Text(
+                    "Audífonos: prueba HRTF/binaural con volumen moderado. Estéreo por AUX o DAC USB-C: empieza con EQ neutra y evita realce de graves excesivo. Bluetooth: la ruta y el códec dependen de Android y del receptor. Sistemas 5.1/7.1: confirma que el receptor acepta esos canales; esta lectura solo confirma la salida de la reproducción propia de IVANNA.",
+                    color = TextSecondary, fontSize = 10.sp
+                )
+            }
+        }
+        GlassCard(
+            "BEACON DEL EFECTO GLOBAL", AuroraCyan,
+            "Callback = cadencia software; hardware = válido solo con productor PCM correlacionado"
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LiveRow("Callback", if (effectClockTelemetry.callbackValid) "disponible" else "sin datos (efecto no activo en audioserver o daemon sin conexión)")
+                LiveRow(
+                    "Cadencia callback",
+                    if (effectClockTelemetry.callbackValid) "%.2f Hz".format(effectClockTelemetry.callbackRateHz) else "—"
+                )
+                LiveRow(
+                    "Deriva callback",
+                    if (effectClockTelemetry.callbackValid) "%+.1f ppm".format(effectClockTelemetry.callbackDriftPpm) else "—"
+                )
+                LiveRow("Reloj hardware", if (effectClockTelemetry.hardwareClockValid) "medición correlacionada disponible" else "sin productor validado · nadie abrio el PCM")
+                LiveRow(
+                    "Tasa hardware",
+                    if (effectClockTelemetry.hardwareClockValid) "%.2f Hz".format(effectClockTelemetry.hardwareRateHz) else "—"
+                )
+                LiveRow(
+                    "Deriva hardware",
+                    if (effectClockTelemetry.hardwareClockValid) "%+.1f ppm".format(effectClockTelemetry.hardwareDriftPpm) else "—"
+                )
+            }
+        }
+
+        // CORE ASRC SOFTWARE — cableado a Ruta A (v2.5.427). Antes leía el
+        // dump del daemon (AsrcSoftwareTelemetry, ruta Magisk/HAL), muerto
+        // tras los resets: siempre "no disponible". El servo que corre es
+        // el de Ruta A (AudioTrackBufferPll + RouteAAsrc) y sus valores ya
+        // viven en OmegaMetrics (los mismos que la tarjeta RELOJ DE AUDIO).
+        // 470: el ASRC NATIVO está en BYPASS (0033) por defecto — el servo
+        // PLL sigue corriendo (lleva el resampler Kotlin), pero el FIR 319
+        // taps NO. El Estado muestra explícitamente el bypass; sin esto la
+        // tarjeta decía "corrigiendo activamente" con el nativo apagado.
+        GlassCard(
+            "CORE ASRC SOFTWARE", PhosphorGreen,
+            "Servo software sobre el resampler (Ruta A · BridgePlayer); NO un actuador físico del DAC"
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LiveRow(
+                    "Estado",
+                    when {
+                        !RouteAAsrc.asrcEnabled -> RouteAAsrc.statusLabel(false)
+                        !metrics.clockTimestampAvailable -> "sin AudioTrack propio activo (reproductor puente inactivo)"
+                        metrics.clockServoLocked -> "corrigiendo activamente (Ruta A)"
+                        else -> "adquiriendo muestras"
+                    }
+                )
+                LiveRow(
+                    "Deriva medida",
+                    if (metrics.clockServoLocked) "%+.1f ppm".format(metrics.clockMeasuredDriftPpm) else "—"
+                )
+                LiveRow(
+                    "Corrección aplicada",
+                    if (metrics.clockServoLocked) "%+.1f ppm (ratio %.6f)".format(
+                        metrics.clockCorrectionPpm,
+                        1.0 + metrics.clockCorrectionPpm / 1_000_000.0
+                    ) else "—"
+                )
+            }
+        }
+
+        // WRITE-STAGE ASRC — repropósito a Ruta A (v2.5.427). El write-stage
+        // del HAL (v5, pal_stream_write) está retirado y no se resucita;
+        // la tarjeta ahora muestra el resampler de escritura de Ruta A
+        // (RouteAAsrc nativo: FIR 319 taps minimum-phase + Catmull-Rom +
+        // Ψ 64 taps/oído), alimentado por el mismo servo.
+        // 470: con el bypass 0033 el nativo NO corre; el Estado dice
+        // "ASRC: BYPASS (0033)" y la fila de reloj no anuncia el FIR 319
+        // taps (lo lleva el resampler Kotlin).
+        GlassCard(
+            "WRITE-STAGE ASRC · RUTA A", PhosphorGreen,
+            "Resampler de escritura de Ruta A (RouteAAsrc nativo) en el BridgePlayer. El write-stage del HAL (v5) está retirado tras los resets; no se resucita."
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LiveRow(
+                    "Estado",
+                    when {
+                        !RouteAAsrc.asrcEnabled -> RouteAAsrc.statusLabel(false)
+                        !metrics.clockTimestampAvailable -> "sin AudioTrack propio activo (reproductor puente inactivo)"
+                        metrics.clockServoLocked -> "corrigiendo en la ruta viva (Ruta A)"
+                        else -> "adquiriendo muestras"
+                    }
+                )
+                LiveRow(
+                    "Ratio / deriva",
+                    if (metrics.clockServoLocked) "%.9f · %+.1f ppm".format(
+                        1.0 + metrics.clockCorrectionPpm.toDouble() / 1_000_000.0,
+                        metrics.clockMeasuredDriftPpm
+                    ) else "—"
+                )
+                LiveRow(
+                    "Reloj / streams",
+                    if (metrics.clockServoLocked) "%.2f Hz · %s".format(
+                        metrics.clockMeasuredRateHz,
+                        if (RouteAAsrc.asrcEnabled) "FIR 319 taps · Catmull-Rom · Ψ 64 taps"
+                        else "resampler Kotlin (bypass 0033)"
+                    ) else "—"
+                )
+            }
+        }
+
+        GlassCard(
+            "RELOJ DE AUDIO · AUDIOTrack", AuroraCyan,
+            "Medición del AudioTrack propio; no equivale al reloj físico del DAC"
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LiveRow(
+                    "Estado",
+                    when {
+                        !metrics.clockTimestampAvailable -> "sin AudioTrack propio activo (reproductor puente inactivo) o timestamp no disponible"
+                        metrics.clockServoLocked -> "seguimiento estable"
+                        else -> "adquiriendo muestras"
+                    }
+                )
+                LiveRow(
+                    "Frecuencia medida",
+                    if (metrics.clockServoLocked) "%.2f Hz".format(metrics.clockMeasuredRateHz) else "—"
+                )
+                LiveRow(
+                    "Deriva medida",
+                    if (metrics.clockServoLocked) "%+.1f ppm".format(metrics.clockMeasuredDriftPpm) else "—"
+                )
+                LiveRow(
+                    "Corrección del remuestreador",
+                    if (metrics.clockServoLocked) "%+.1f ppm".format(metrics.clockCorrectionPpm) else "0.0 ppm (seguro)"
+                )
+            }
+        }
+        GlassCard(
+            "MOTOR PREDICTIVO · LPC", AuroraCyan,
+            "Observador de solo lectura sobre la salida del reproductor; no modifica el audio"
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                LiveRow("Modelo", if (metrics.predictiveValid) "fiable" else "sin modelo fiable (requiere reproductor puente activo)")
+                LiveRow("Confianza", if (metrics.predictiveValid) "%.0f %%".format(metrics.predictiveConfidence * 100f) else "—")
+                LiveRow("Ganancia de predicción", if (metrics.predictiveValid) "%.1f dB".format(metrics.predictiveGainDb) else "—")
+                LiveRow("Transitorio", if (metrics.predictiveValid && metrics.predictiveTransient) "detectado" else "—")
+            }
+        }
+    }
+}
+
+@Composable
+private fun LiveRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, color = TextSecondary, fontSize = 11.sp)
+        Text(value, color = AuroraCyan, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+    }
+}
+
+@Composable
+private fun ProfilerStat(title: String, value: String, sub: String,
+                          accent: Color, modifier: Modifier) {
+    Column(modifier = modifier
+        .clip(RoundedCornerShape(12.dp))
+        .background(ObsidianSoft)
+        .border(1.dp, accent.copy(alpha = 0.22f), RoundedCornerShape(12.dp))
+        .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(title, color = TextMuted, fontSize = 9.sp, fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.Medium)
+        Text(value, color = accent, fontSize = 17.sp, fontWeight = FontWeight.ExtraBold,
+            fontFamily = FontFamily.Monospace)
+        Text(sub, color = TextMuted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+    }
+}
+
+@Composable
+private fun FlagRow(label: String, value: String) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Text(label, color = TextSecondary, fontSize = 10.sp, modifier = Modifier.weight(0.42f))
+        Text(value, color = AuroraCyan, fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+            modifier = Modifier.weight(0.58f))
+    }
+    HorizontalDivider(color = ObsidianEdge.copy(alpha = 0.4f), thickness = 0.5.dp)
+}
+
+@Composable
+private fun IntrinsicRow(name: String, desc: String, accent: Color, tag: String) {
+    Row(Modifier.fillMaxWidth()
+        .clip(RoundedCornerShape(6.dp))
+        .background(ObsidianVoid)
+        .padding(8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(name, color = TextPrimary, fontSize = 10.sp,
+                fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+            Text(desc, color = TextMuted, fontSize = 9.sp)
+        }
+        Box(Modifier.clip(RoundedCornerShape(4.dp))
+            .background(accent.copy(0.15f))
+            .border(1.dp, accent.copy(0.35f), RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp)) {
+            Text(tag, color = accent, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+        }
+    }
+}

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    IVANNA OMEGA SUPREME — vendor/etc/audio_effects.xml
+    ============================================================
+    AUDIT FIX (crítico / bloqueante):
+      El archivo previo contenía el código C/C++ crudo de
+      `audio_effect_compat.h`. audioserver hacía parse del XML y,
+      al no encontrar un documento válido, rechazaba la carga
+      entera de la configuración vendor de efectos. Resultado
+      real en dispositivo: se perdía la config AOSP + OEM (Dolby,
+      Dirac, MaxxAudio, etc.) hasta el próximo boot con módulo
+      desinstalado.
+
+    Política de este archivo:
+      - Registra la librería y el UUID de IVANNA. SOLO registro: sin
+        <postprocess> ni <apply> globales de omega (Error -3, v2.5.373).
+        Un <apply> en postprocess crea una instancia GLOBAL del efecto en
+        la cadena del output; cuando la app crea OTRA instancia del mismo
+        UUID por sesión, AudioFlinger la rechaza como duplicado
+        (createEffect() BAD_VALUE -22 → la app lo ve como Error -3).
+        La activación real es por UUID por sesión desde la app
+        (IvannaGlobalEffectManager.createOmegaEffect).
+      - Cuando customize.sh puede leer la configuración OEM real,
+        fusiona el registro en una copia de esa base, preservando las
+        declaraciones OEM existentes.
+      - La presencia del XML no demuestra por sí sola que el HAL lo
+        haya cargado ni que esté procesando PCM; eso requiere evidencia
+        de ejecución en el dispositivo.
+      - No fuerza priority="1000": IVANNA debe coexistir con los OEM.
+      - audio_effects_ivanna.xml es legado, no la fuente canónica
+        del overlay vendor.
+============================================================ -->
+<audio_effects_conf version="2.0"
+                    xmlns="http://schemas.android.com/audio/audio_effects_conf/v2_0">
+
+    <libraries>
+        <library name="omega_effect" path="libomega_effect.so"/>
+    </libraries>
+
+    <effects>
+        <!-- UUID propio del efecto IVANNA Omega (mismo que
+             OMEGA_EFFECT_UUID en omega_effect.cpp). -->
+        <effect name="omega_effect"
+                library="omega_effect"
+                uuid="4956414e-4e41-4f4d-4547-415355505245"/>
+    </effects>
+
+    <!-- Sin <postprocess>: la activación es por UUID por sesión desde la
+         app. Un <apply effect="omega_effect"/> aquí crearía una instancia
+         global en la cadena del output y bloquearía la creación por sesión
+         (Error -3, v2.5.373). -->
+
+</audio_effects_conf>

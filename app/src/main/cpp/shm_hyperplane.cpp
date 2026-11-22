@@ -1,0 +1,113 @@
+/*
+ * IVANNA-FUSION TRASCENDENTAL - OPTIMIZADO
+ * SHM Hyperplane - usa Android SharedMemory desde Kotlin; aquí solo mlock
+ */
+#include <jni.h>
+#include <android/log.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <errno.h>
+
+#define LOG_TAG "IVANNA-SHM-NATIVE"
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+static inline int mlockAddr(void* addr, jlong len) {
+    if (__builtin_expect(addr == nullptr || len <= 0, 0)) {
+        LOGE("mlock: parámetros inválidos addr=%p len=%lld", addr, (long long)len);
+        return -1;
+    }
+    int ret = mlock(addr, static_cast<size_t>(len));
+    if (__builtin_expect(ret != 0, 0)) {
+        LOGE("mlock falló addr=%p: errno=%d", addr, errno);
+    }
+    return ret;
+}
+
+extern "C" {
+
+// FIX (bug real): el símbolo JNI apuntaba a com.ivanna.omega.ShmManager,
+// paquete que no existe — la clase real vive en com.ivanna.omega.magisk.
+// Con el nombre viejo, ningún llamador real habría podido enlazar este
+// método nativo (UnsatisfiedLinkError en runtime). Corregido al paquete
+// real.
+__attribute__((hot))
+JNIEXPORT jint JNICALL
+Java_com_ivanna_omega_magisk_ShmManager_nativeMlock(JNIEnv *, jobject, jlong addr, jlong len) {
+    return mlockAddr(reinterpret_cast<void*>(addr), len);
+}
+
+// NUEVO: variante segura que recibe el ByteBuffer directo mapeado desde
+// android.os.SharedMemory (Kotlin) en vez de exigirle a Kotlin extraer y
+// pasar un puntero crudo (jlong) — Kotlin no tiene forma segura de obtener
+// esa dirección sin reflexión. GetDirectBufferAddress() hace ese trabajo
+// aquí, dentro del JNI, donde corresponde.
+JNIEXPORT jint JNICALL
+Java_com_ivanna_omega_magisk_ShmManager_nativeMlockBuffer(JNIEnv* env, jobject, jobject buffer) {
+    if (!buffer) {
+        LOGE("mlockBuffer: buffer nulo");
+        return -1;
+    }
+    void* addr = env->GetDirectBufferAddress(buffer);
+    jlong len = env->GetDirectBufferCapacity(buffer);
+    if (!addr || len <= 0) {
+        LOGE("mlockBuffer: GetDirectBufferAddress/Capacity inválido (¿buffer no-direct?)");
+        return -1;
+    }
+    return mlockAddr(addr, len);
+}
+
+// ── NUEVO (fix "SHM nunca conecta"): mapear el fd que el daemon entrega por
+// el backing file por ruta (nunca hubo sendmsg en el daemon — referencia
+// histórica obsoleta). Antes ShmManager.kt creaba su PROPIA region con
+// android.os.SharedMemory: dos regiones distintas, cero memoria compartida con
+// el daemon. android.os.SharedMemory no puede envolver un fd ajeno, asi que el
+// mmap() tiene que hacerse aqui y devolverse como DirectByteBuffer.
+JNIEXPORT jobject JNICALL
+Java_com_ivanna_omega_magisk_ShmManager_nativeMapSharedFd(JNIEnv* env, jobject, jint fd, jint size) {
+    // Este JNI consume la propiedad de fd (Kotlin usa detachFd()).
+    // Cerrar también en los caminos de error para no filtrar descriptores.
+    if (fd < 0 || size <= 0) {
+        LOGE("mapSharedFd: parametros invalidos fd=%d size=%d", fd, size);
+        if (fd >= 0) close(fd);
+        return nullptr;
+    }
+    void* addr = mmap(nullptr, static_cast<size_t>(size), PROT_READ | PROT_WRITE,
+                      MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED) {
+        const int map_errno = errno;
+        LOGE("mapSharedFd: mmap fallo fd=%d errno=%d", fd, map_errno);
+        close(fd);
+        return nullptr;
+    }
+    // El fd ya no hace falta: el mapeo mantiene viva la referencia al inode.
+    close(fd);
+    mlockAddr(addr, size);
+    jobject buffer = env->NewDirectByteBuffer(addr, size);
+    if (buffer == nullptr) {
+        // Si JNI no puede crear el wrapper, liberar el mmap para no filtrar
+        // memoria virtual en cada intento fallido de handshake.
+        munlock(addr, static_cast<size_t>(size));
+        munmap(addr, static_cast<size_t>(size));
+        // El JNI real de Android expone ExceptionCheck/Clear como métodos de JNIEnv.
+        // El stub JNI de las pruebas host no los implementa; mantener esta limpieza
+        // solo en Android permite probar la misma fuente sin debilitar el camino de producción.
+#if defined(__ANDROID__)
+        if (env->ExceptionCheck()) env->ExceptionClear();
+#endif
+        LOGE("mapSharedFd: NewDirectByteBuffer fallo; mmap liberado");
+        return nullptr;
+    }
+    return buffer;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_ivanna_omega_magisk_ShmManager_nativeUnmapSharedFd(JNIEnv* env, jobject, jobject buffer) {
+    if (!buffer) return -1;
+    void* addr = env->GetDirectBufferAddress(buffer);
+    jlong len = env->GetDirectBufferCapacity(buffer);
+    if (!addr || len <= 0) return -1;
+    munlock(addr, static_cast<size_t>(len));
+    return munmap(addr, static_cast<size_t>(len));
+}
+
+} // extern "C"

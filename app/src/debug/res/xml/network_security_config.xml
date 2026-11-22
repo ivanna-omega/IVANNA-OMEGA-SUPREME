@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Network Security Config SOLO PARA DEBUG (v2.5.471, Repair 2).
+  La build de desarrollo permite cleartext para poder probar un
+  gateway OmniRoute HTTP en red privada (la URL la escribe el usuario
+  en ajustes; aquí NO se hardcodea ninguna IP ni dominio).
+  ESTE ARCHIVO NO SE EMPAQUETA EN RELEASE: es solo res de debug y el
+  merge de recursos lo usa únicamente para la variante debug. Release
+  sigue con cleartext bloqueado (ver src/main/res/xml/...).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

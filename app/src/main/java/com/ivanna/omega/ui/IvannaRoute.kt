@@ -1,0 +1,80 @@
+package com.ivanna.omega.ui
+
+/**
+ * IvannaRoute — centraliza las rutas usadas por la navegación para evitar
+ * literales esparcidas que provocan errores y dificultan refactors.
+ */
+object IvannaRoute {
+
+    const val SPLASH = "splash"
+    const val INTRO = "intro"
+    const val DASHBOARD = "dashboard"
+
+    // Sonido
+    const val SOUND = "sound"
+    const val OPE = "ope"
+    const val BINAURAL = "binaural"
+
+    // Cerebro / Perceptual
+    const val BRAIN = "perceptual_brain"
+    const val PERCEPTUAL = "perceptual_brain"
+    const val ADAPTIVE = "adaptive"
+    // FIX (pantalla muerta): PerceptualBrainDashboard (461 lineas, motor real +
+    // sliders interactivos) estaba importada en MainActivity pero SIN destino en
+    // el NavHost: era inalcanzable. Ruta propia, distinta de BRAIN (BrainScreen).
+    const val PERCEPTUAL_CORTEX = "perceptual_cortex"
+    // MAGISTRAL — dashboard cognitivo (MagistralDashboardScreen). Ruta propia:
+    // BRAIN ("perceptual_brain") ya la ocupa BrainScreen y no se toca.
+    const val MAGISTRAL = "magistral"
+    // FUSIÓN MAGISTRAL (7 operadores): pantalla propia (FusedOperatorsScreen).
+    // FIX (pantalla huérfana, 2026-11-18): existía pero sin ruta ni destino:
+    // nadie la abría. Ruta propia, distinta de MAGISTRAL (dashboard).
+    const val FUSED_OPERATORS = "fused_operators"
+    const val ADAPTIVE_DASH = "adaptive_dash"
+    const val ADAPTIVE_PROFILES = "adaptive_profiles"
+    const val LAB = "lab"
+
+    // Espacio / Auditory
+    const val SPACE = "space"
+    const val AUDITORY = "auditory"
+    const val VISUALIZER = "visualizer"
+
+    // Sistema
+    const val SYSTEM = "system"
+    const val MAGISK = "magisk"
+    const val PROFILES = "profiles"
+    const val TELEMETRY = "telemetry"
+    // VISTA DE DIOS · FLOTA (v2.5.471 Repair 4): ciclos reales del consejo
+    // leídos del puente (FleetViewScreen). Sin ciclos muestra la verdad.
+    const val FLEET_VIEW = "fleet_view"
+
+    // Legacy / aliases
+    const val OPE_ALIAS = "ope"
+    const val BINAURAL_ALIAS = "binaural"
+    const val ABX_TEST = "abx_test"
+    const val AUDIO_CONTROL_HUB = "audio_control_hub"  // SOFA · AF · RIR · SAF panel
+
+    // IVANNA Conversational Acoustic Intelligence (FASE 12–19)
+    const val IVANNA_ASSISTANT = "ivanna_assistant"
+
+    // Ψ (v2.5.389): medición de cabeza por foto + tarjeta de referencia
+    // (HeadMeasureScreen). Alimenta el radio personalizado de ORBE.
+    const val HEAD_MEASURE = "head_measure"
+
+    // Panel de conectividad WiFi / datos / Gemini Agent
+    const val NETWORK = "network_status"
+
+    // Colección de los 30 mejores conciertos de rock (v2.5.372)
+    const val ROCK_CONCERTS = "rock_concerts"
+
+    // TIDAL dentro de IVANNA (v2.5.416): reproductor propio, sin redirecciones.
+    const val TIDAL = "tidal"
+
+    // ── 5 Ejes de Supremacía Cuántico-Neuromórfica (Prompt Maestro 2026) ─────
+    const val SUPREME_AXES_HUB       = "supreme_axes_hub"
+    const val SUPREME_AXIS_1_LATTICE = "supreme_axis_1_lattice"
+    const val SUPREME_AXIS_2_CVNN    = "supreme_axis_2_cvnn"
+    const val SUPREME_AXIS_3_SNN_HOA = "supreme_axis_3_snn_hoa"
+    const val SUPREME_AXIS_4_PINNA_INR  = "supreme_axis_4_pinna_inr"
+    const val SUPREME_AXIS_5_SHM_FARROW = "supreme_axis_5_shm_farrow"
+}

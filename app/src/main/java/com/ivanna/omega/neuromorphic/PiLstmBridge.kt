@@ -1,0 +1,314 @@
+package com.ivanna.omega.neuromorphic
+
+import android.util.Log
+import android.content.Context
+import com.ivanna.omega.audio.AudioRouteManager
+import com.ivanna.omega.audio.SystemWideHrtfPolicy
+import com.ivanna.omega.core.IvannaNativeLib
+import com.ivanna.omega.core.NativeLibraryLoader
+
+/**
+ * Kotlin bridge for PI-LSTM Milenio v2.0 (from IVANNA-ULTRA).
+ * Signal path: Input (96kHz) → 4x Upsample → CT-LSTM RK4 → HRTF → 4x Downsample → Output
+ */
+object PiLstmBridge {
+    private const val TAG = "IVANNA_OMEGA_LSTM"
+    private var ready = false
+
+    init {
+        try {
+            if (NativeLibraryLoader.ensureLoaded()) {
+                nativeInit()
+                ready = true
+                Log.i(TAG, "PI-LSTM Milenio initialized")
+            }
+        } catch (t: Throwable) {
+            ready = false
+            Log.e(TAG, "PI-LSTM init failed", t)
+        }
+    }
+
+    val isReady: Boolean get() = ready
+
+    private var lastAlpha = 0.8f
+    private var lastBeta = 0.25f
+    private var lastGamma = 1.0f
+    private var lastDelta = 0.5f
+    private var lastEta = 0.5f
+
+    private fun syncNpeParameters() {
+        runCatching {
+            IvannaNpeEngine.setParameters(
+                alpha = lastAlpha,
+                beta = lastBeta,
+                gamma = lastGamma,
+                delta = lastDelta,
+                eta = lastEta,
+                zeta = 0.3f,
+                nonlinearity = lastHarmonicGain
+            )
+        }
+    }
+
+    // Estado del NPE en el módulo (Ruta B). Antes el módulo no tenía NPE: ahora omega_effect aplica NpeStereoCore con
+    // estos valores (mismo mapeo que la Ruta A: alpha = compresión OHC, beta = inhibición lateral).
+    @Volatile private var moduleBypass = false
+    @Volatile private var moduleMasterDb = 0f
+
+    /**
+     * Prueba de NULL del NPE (mismo núcleo que corre en el módulo, señal sintética): cuánto AÑADE el motor con estos
+     * parámetros. null si el motor nativo no está cargado. Ver IvannaNativeLib.nativeNpeAbNull.
+     */
+    fun measureContribution(harmonic: Float, lateral: Float, ohc: Float, masterDb: Float): FloatArray? {
+        if (!IvannaNativeLib.isLoaded) return null
+        return runCatching { IvannaNativeLib.nativeNpeAbNull(harmonic, lateral.coerceIn(0f, 1f), ohc.coerceIn(0f, 1f), masterDb.coerceIn(-24f, 12f)) }
+            .getOrNull()?.takeIf { it.size >= 9 }
+    }
+
+    /** Arranque: fija solo el estado de bypass del módulo y lo publica (sin tocar los demás parámetros del motor). */
+    fun restoreModuleNpe(bypass: Boolean) { moduleBypass = bypass; pushModuleNpe() }
+
+    /** Estado del enlace app → daemon del NPE en Ruta B. CONFIRMED = el daemon aceptó el último comando. */
+    enum class ModuleLink { UNKNOWN, CONFIRMED, NO_DAEMON }
+    @Volatile var moduleLink: ModuleLink = ModuleLink.UNKNOWN
+        private set
+    private val moduleRetrying = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Mismo estado, aplicado tambien en la cadena nativa de la app (Ruta A). No depende del daemon. */
+    private fun applyLocalNpe() {
+        runCatching {
+            IvannaNativeLib.nativeSetNpeLocal(!moduleBypass, lastHarmonicGain, lastBeta.coerceIn(0f, 1f), lastAlpha.coerceIn(0f, 1f), moduleMasterDb)
+        }
+    }
+
+    private fun sendModuleNpe(): Boolean = runCatching {
+        applyLocalNpe()
+        IvannaNativeLib.nativeSetNpeModule(!moduleBypass, lastBeta.coerceIn(0f, 1f), lastAlpha.coerceIn(0f, 1f), moduleMasterDb)
+    }.getOrDefault(false)
+
+    /**
+     * Publica el estado actual del NPE al módulo vía daemon. Seguro llamarlo sin módulo instalado.
+     * Antes el resultado se ignoraba: si el daemon aún no estaba listo al arrancar, el módulo se quedaba con sus
+     * valores por defecto y la app lo daba por enviado. Ahora se confirma y, si falla, se reintenta en segundo plano.
+     */
+    fun pushModuleNpe() {
+        if (!IvannaNativeLib.isLoaded) return
+        if (sendModuleNpe()) { moduleLink = ModuleLink.CONFIRMED; return }
+        moduleLink = ModuleLink.NO_DAEMON
+        if (!moduleRetrying.compareAndSet(false, true)) return
+        Thread({
+            try {
+                var waitMs = 1_000L
+                var attempts = 0
+                var done = false
+                while (!done && attempts < 8) {
+                    Thread.sleep(waitMs)
+                    attempts++
+                    // Siempre manda el estado MÁS RECIENTE (puede haber cambiado mientras se esperaba).
+                    if (sendModuleNpe()) { moduleLink = ModuleLink.CONFIRMED; done = true }
+                    waitMs = (waitMs * 2).coerceAtMost(15_000L)
+                }
+            } catch (_: InterruptedException) {
+            } finally {
+                moduleRetrying.set(false)
+            }
+        }, "IvannaNpeModuleRetry").apply { isDaemon = true; start() }
+    }
+
+    fun setAlpha(v: Float) {
+        lastAlpha = v
+        pushModuleNpe()
+        if (ready) {
+            nativeSetAlpha(v)
+            runCatching { IvannaNativeLib.nativeSetAlpha(v) }
+            runCatching { IvannaNpeEngine.setOhcParams(lastAlpha, lastBeta) }
+            syncNpeParameters()
+        }
+    }
+    fun setBeta(v: Float) {
+        lastBeta = v
+        pushModuleNpe()
+        if (ready) {
+            nativeSetBeta(v)
+            runCatching { IvannaNativeLib.nativeSetBeta(v) }
+            runCatching { IvannaNpeEngine.setOhcParams(lastAlpha, lastBeta) }
+            syncNpeParameters()
+        }
+    }
+    fun setGamma(v: Float) {
+        lastGamma = v
+        if (ready) {
+            nativeSetGamma(v)
+            runCatching { IvannaNativeLib.nativeSetGamma(v) }
+            syncNpeParameters()
+        }
+    }
+    private var lastHarmonicGain = 0.2f
+    fun setHarmonicGain(v: Float) {
+        if (ready) {
+            lastHarmonicGain = v
+            nativeSetHarmonicGain(v)
+            runCatching { IvannaNativeLib.nativeSetHarmonicGain(v) }
+            runCatching { IvannaNpeEngine.setHarmonicGain(v) }
+            runCatching { com.ivanna.omega.magisk.OmegaEngineBridge.setHarmonicGain(v.toDouble()) }
+        }
+    }
+    fun setHrtfEnabled(en: Boolean, context: Context) {
+        if (ready) {
+            nativeSetHrtfEnabled(en)
+            runCatching { IvannaNativeLib.nativeSetHRTFEnabled(en) }
+            runCatching { IvannaNpeEngine.setBinauralEnabled(en) }
+            // Keep the AudioFlinger effect synchronized under the same output-route policy.
+            runCatching {
+                val route = AudioRouteManager.detectOutputRoute()
+                val routeAllowed = SystemWideHrtfPolicy.allow(context, en, route)
+                com.ivanna.omega.magisk.OmegaEngineBridge.queueSystemWideHrtfEnabled(routeAllowed)
+            }
+        }
+    }
+    fun getNpSat(): Float = if (ready) nativeGetNpSat() else 0f
+    fun getError(): Float = if (ready) nativeGetError() else 0f
+
+    // FIX (huérfano JNI): pi_lstm_bridge_jni.cpp:223 implementa
+    // Java_com_ivanna_omega_neuromorphic_PiLstmBridge_nativeResetTelemetry
+    // (reset de g_residual_ema + g_prev_h/g_prev_c/g_prev_ns) pero ninguna
+    // declaracion JNI lo exponía — 0 callers posibles desde Kotlin. El propio
+    // comentario C++ (líneas 218-221) documenta el caso de uso: al cambiar
+    // de pista o reinicializar el motor, la EMA del residual arrastra el
+    // transitorio anterior y contamina getError(). Se expone como wrapper
+    // público con guard de ready, idéntico patrón al resto del objeto.
+    fun resetTelemetry() { if (ready) nativeResetTelemetry() }
+
+    private external fun nativeInit()
+    private external fun nativeSetAlpha(v: Float)
+    private external fun nativeSetBeta(v: Float)
+    private external fun nativeSetGamma(v: Float)
+    private external fun nativeSetHarmonicGain(v: Float)
+    private external fun nativeSetHrtfEnabled(en: Boolean)
+    private external fun nativeGetNpSat(): Float
+    private external fun nativeGetError(): Float
+    private external fun nativeResetTelemetry()
+
+    // === NUEVOS PARÁMETROS NEURO-COCHLEAR ===
+    // ── NPE completo ────────────────────────────────────────────────
+    /**
+     * FIX (semántica cruzada): antes enrutaba el master gain (dB) a
+     * nativeSetEta, que es el AMORTIGUAMIENTO η de la ODE (rango 0..5) —
+     * el slider de ganancia maestra estaba deformando la dinámica del
+     * integrador, no el volumen. El motor PI-LSTM no expone ganancia de
+     * salida; la ruta honesta es el escalado de salida del player
+     * (mismo mecanismo que setAgc): gain_lin = 10^(dB/20).
+     * η queda expuesto con su nombre real en setOdeDamping().
+     */
+    fun setMasterGain(db: Float) {
+        if (!ready) return
+        val safeDb = if (db.isFinite()) db.coerceIn(-18f, 18f) else 0f
+        val gainLin = Math.pow(10.0, safeDb / 20.0).toFloat()
+        moduleMasterDb = safeDb
+        pushModuleNpe()
+        val inst = com.ivanna.omega.audio.IvannaBridgePlayer.activeInstance
+        if (inst != null) {
+            runCatching { inst.updateNpeKotlinParams(outputScaling = gainLin) }
+                .onFailure { Log.w(TAG, "setMasterGain updateNpe: ${it.message}") }
+        }
+        runCatching { IvannaNpeEngine.setMasterGain(safeDb) }
+        lastMasterGainLin = gainLin
+    }
+
+    /** Amortiguamiento η de la ODE (rango 0..5) — su propósito REAL. */
+    fun setOdeDamping(eta: Float) {
+        lastEta = eta.coerceIn(0f, 5f)
+        if (ready) {
+            nativeSetEta(lastEta)
+            runCatching { IvannaNativeLib.nativeSetEta((lastEta / 5f).coerceIn(0f, 1f)) }
+            syncNpeParameters()
+        }
+    }
+
+    /** Techo neuroplástico NP_max (rango 0.1..10) — invalida la semilla residual. */
+    fun setNeuroplasticityMax(npMax: Float) {
+        if (ready) {
+            nativeSetNPMax(npMax.coerceIn(0.1f, 10f))
+            runCatching { IvannaNativeLib.nativeSetNPMax((npMax / 10f).coerceIn(0.05f, 1f)) }
+        }
+    }
+    fun setAgc(targetDb: Float, rate: Float) {
+        if (!ready) return
+        try {
+            val safeTarget = if (targetDb.isFinite()) targetDb.coerceIn(-36f, 0f) else -18f
+            val safeRate   = if (rate.isFinite()) rate.coerceIn(0f, 1f) else 0.5f
+            val gain = (safeTarget / -36f).coerceIn(0f, 1f)
+            val inst = com.ivanna.omega.audio.IvannaBridgePlayer.activeInstance
+            if (inst != null) {
+                runCatching { inst.updateNpeKotlinParams(outputScaling = gain * 0.5f) }
+                    .onFailure {
+                        android.util.Log.w(TAG, "AGC updateNpe: ${it.message}")
+                    }
+            }
+            runCatching { IvannaNpeEngine.setAgcParams(safeTarget, safeRate) }
+            setNeuroplasticityMax((gain * 10f).coerceIn(0.1f, 10f))
+            // setDelta(safeRate) eliminado: delta es el ancho espacial del PDEngine;
+            // la velocidad del AGC ya entra por IvannaNpeEngine.setAgcParams arriba.
+        } catch (t: Throwable) {
+            android.util.Log.e("IVANNA_OMEGA_LSTM", "setAgc safe fallback error", t)
+        }
+    }
+
+    fun setAdaptEnabled(en: Boolean) {
+        if (ready) IvannaNativeLib.nativeSetAdaptEnabled(en)
+    }
+    fun setCochlearEnabled(en: Boolean) {
+        // Eje Supremo: delega en la ruta canónica única (NativeBridge / IvannaNativeLib)
+        // que sincroniza g_cochlearEngine (Ruta A/C) y el daemon SHM (Ruta B) sin doble procesado.
+        if (ready) {
+            com.ivanna.omega.core.NativeBridge.safeSetCochlearInverseEnabled(en)
+            runCatching { IvannaNativeLib.nativeSetCochlearEnabled(en) }
+        }
+    }
+    // Estado para restaurar tras bypass (FIX: antes harmonicGain se ponía a 0
+    // al entrar en bypass y JAMÁS se restauraba al salir — el ajuste del
+    // usuario se perdía en silencio tras un ciclo bypass on→off).
+    private var savedHarmonicGain = 0.2f
+    private var lastMasterGainLin = 1.0f
+
+    fun setBypass(bypass: Boolean) {
+        // Bypass NPE: deshabilita motor adaptativo y fuerza ganancia neutra
+        moduleBypass = bypass
+        pushModuleNpe()
+        if (ready) {
+            IvannaNativeLib.nativeSetAdaptEnabled(!bypass)
+            runCatching { IvannaNpeEngine.setBypass(bypass) }
+            if (bypass) {
+                savedHarmonicGain = lastHarmonicGain
+                nativeSetHarmonicGain(0f)
+                runCatching { IvannaNativeLib.nativeSetHarmonicGain(0f) }
+            } else {
+                nativeSetHarmonicGain(savedHarmonicGain)
+                runCatching { IvannaNativeLib.nativeSetHarmonicGain(savedHarmonicGain) }
+            }
+        }
+    }
+
+    private external fun nativeSetEta(v: Float)
+    private external fun nativeSetNPMax(v: Float)
+
+    fun setClarity(clarity: Float) {
+        // FIX (UnsatisfiedLinkError latente): llamaba al metodo nativo sin guard
+        // 'ready' — crasheaba si la librería nativa no cargó.
+        if (!ready) return
+        // Mapear claridad (0-1) a ganancia de armónicos y lateral inhibition
+        val c = clarity.coerceIn(0f, 1f)
+        setHarmonicGain(0.1f + c * 0.8f)
+        setBeta(0.2f + c * 0.6f)
+    }
+
+    fun setWarmth(warmth: Float) {
+        // FIX: mismo guard 'ready' que el resto del objeto.
+        if (!ready) return
+        // Mapear calidez (0-1) a compresión OHC y gamma
+        val w = warmth.coerceIn(0f, 1f)
+        val ohcComp = 0.1f + w * 0.7f
+        setGamma(0.5f + w * 0.5f)
+        setAlpha(ohcComp)
+    }
+}

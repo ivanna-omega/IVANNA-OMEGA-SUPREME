@@ -1,0 +1,478 @@
+package com.ivanna.omega.audio
+
+import android.content.Context
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import com.ivanna.omega.safmus.SafmusAdapterPolicy
+import com.ivanna.omega.safmus.SafmusHardwareCoordinator
+import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * AudioRouteManager — detecta la ruta de salida de audio activa
+ * (Bluetooth A2DP / AUX cableado / USB-C / altavoz interno) y aplica
+ * un perfil de compensación real vía AudioEngine.nativeSetRouteProfile(),
+ * que se funde en el pipeline DSP a través de UnifiedControlFrame
+ * (ver audio_control_plane.hpp: control_set_route_profile()).
+ *
+ * Motivación: los codecs Bluetooth lossy (SBC/AAC) colapsan la banda
+ * 2-4kHz y el estéreo se degrada al recodificar; el AUX cableado sufre
+ * rolloff de graves por impedancia de salida en muchos dispositivos
+ * Android de gama media. Ninguna de las dos rutas se corrige sola.
+ */
+enum class OutputRoute { BLUETOOTH, WIRED_AUX, USB, SPEAKER, UNKNOWN }
+
+data class RouteProfile(
+    val bassBoostDb: Float,
+    val dialogBoostDb: Float,
+    val widenerMult: Float
+)
+
+object AudioRouteManager {
+    private const val TAG = "AudioRouteManager"
+
+    private var audioManager: AudioManager? = null
+    private var deviceCallback: AudioDeviceCallback? = null
+    @Volatile private var currentRoute: OutputRoute = OutputRoute.UNKNOWN
+    // Invalidates asynchronous codec lookups when the output route changes.
+    private val routeGeneration = AtomicLong(0L)
+    // Application context (no la Activity) para BluetoothCodecDetector —
+    // se guarda una sola vez en start(), nunca una referencia de Activity,
+    // para no filtrar memoria en este singleton de vida larga.
+    private var appContextRef: Context? = null
+
+    // Handler unico del hilo main + generacion monotona para invalidar el
+    // callback de "restaurar wet=1" si la ruta cambia antes de que expire la
+    // ventana de 150ms. Sin esto: si el usuario desconecta el DAC dentro de
+    // esos 150ms, el postDelayed anterior seguia vivo y pisaba wet=1 sobre un
+    // history recien flusheado de una ruta que ya no era USB — tronido audible.
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val hrtfRestoreToken = AtomicLong(0L)
+    private var pendingHrtfRestore: Runnable? = null
+
+    @Synchronized
+    fun start(context: Context) {
+        appContextRef = context.applicationContext
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        // Idempotente: un segundo start() no debe dejar el callback anterior vivo
+        // (duplicaría applyRoute en cada hotplug y filtraría la instancia).
+        deviceCallback?.let { runCatching { am.unregisterAudioDeviceCallback(it) } }
+        deviceCallback = null
+        audioManager = am
+
+        applyRoute(detectOutputRoute(am))
+
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                applyRoute(detectOutputRoute(am))
+            }
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                applyRoute(detectOutputRoute(am))
+            }
+        }
+        am.registerAudioDeviceCallback(callback, null)
+        deviceCallback = callback
+    }
+
+    @Synchronized
+    fun stop() {
+        // Invalidate any outstanding codec lookup before releasing route ownership.
+        routeGeneration.incrementAndGet()
+        currentRoute = OutputRoute.UNKNOWN
+        appContextRef?.let { syncTransauralRoute(it, OutputRoute.UNKNOWN) }
+        BluetoothAudioProfiler.invalidate()
+        // Un restore HRTF diferido no debe dispararse tras detener el manager.
+        pendingHrtfRestore?.let { mainHandler.removeCallbacks(it) }
+        pendingHrtfRestore = null
+        val am = audioManager ?: return
+        deviceCallback?.let { am.unregisterAudioDeviceCallback(it) }
+        deviceCallback = null
+        audioManager = null
+        appContextRef = null
+    }
+
+    fun detectOutputRoute(): OutputRoute {
+        val am = audioManager ?: return OutputRoute.UNKNOWN
+        return detectOutputRoute(am)
+    }
+
+    /**
+     * Re-evalúa inmediatamente la ruta de salida activa y aplica su perfil
+     * en el pipeline unificado (AudioEngine + OmegaEngineBridge + HRTF).
+     * Llamado por UsbAudioProManager / UsbDacAttachReceiver al conectar o
+     * desconectar un DAC Tipo-C para que use exactamente el mismo path.
+     */
+    fun refreshRoute() {
+        val am = audioManager ?: return
+        applyRoute(detectOutputRoute(am))
+    }
+
+    /** Re-apply only the SAFMUS-adjusted DSP profile; do not reset route histories. */
+    fun refreshResourceBudgetProfile() {
+        val route = currentRoute
+        if (route == OutputRoute.UNKNOWN) return
+        if (route == OutputRoute.BLUETOOTH) {
+            // Never block the caller on A2DP proxy acquisition or vendor parameters.
+            applyProfileFor(route, BluetoothRouteProfilePolicy.fallback())
+            val generation = routeGeneration.incrementAndGet()
+            appContextRef?.let { refreshBluetoothCodecProfileAsync(it, generation) }
+        } else {
+            applyProfileFor(route)
+        }
+    }
+
+    fun detectOutputRoute(am: AudioManager): OutputRoute {
+        val outputs = runCatching { am.getDevices(AudioManager.GET_DEVICES_OUTPUTS) }
+            .getOrNull().orEmpty()
+        return OutputRoutePolicy.select(
+            usbConnected = outputs.any {
+                it.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+                    it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
+            },
+            bluetoothConnected = outputs.any {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_BLE_SPEAKER
+            },
+            wiredConnected = outputs.any {
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_AUX_LINE
+            },
+            speakerConnected = outputs.any { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+        )
+    }
+
+    fun profileFor(route: OutputRoute): RouteProfile = when (route) {
+        // SBC/AAC pierden presencia 2-4kHz y el estéreo se degrada al
+        // recodificar; se compensa diálogo y se reduce ancho.
+        // Public profile query must stay non-blocking; async lookup refines this fallback.
+        OutputRoute.BLUETOOTH -> BluetoothRouteProfilePolicy.fallback()
+        // Genezi Spatial (beta): conservar el centro y la polaridad, sin boost
+        // de graves ni diálogo; anchura diferencial muy moderada antes del upmix
+        // externo. El widener nativo protege la banda baja y suaviza cambios.
+        // No genera canales discretos: Surround/sub siguen bajo control del Sony.
+        OutputRoute.WIRED_AUX -> RouteProfile(
+            bassBoostDb = 0f,
+            dialogBoostDb = 0f,
+            widenerMult = AtomicSpatialPolicy.geneziSpatialMultiplier()
+        )
+        // USB-C DAC: ruta de línea limpia, sin boost de graves.
+        OutputRoute.USB -> RouteProfile(bassBoostDb = 0f, dialogBoostDb = 0.5f, widenerMult = 1.0f)
+        // Altavoz integrado: no forzar graves (evita excursion/limitacion en
+        // transductores pequeños); realce moderado de presencia y anchura
+        // conservadora para conservar inteligibilidad sin empujar el clipping.
+        OutputRoute.SPEAKER -> RouteProfile(bassBoostDb = 0f, dialogBoostDb = 1.5f, widenerMult = 0.85f)
+        OutputRoute.UNKNOWN -> RouteProfile(bassBoostDb = 0f, dialogBoostDb = 0f, widenerMult = 1.0f)
+    }
+
+    // Umbral de bitrate bajo (kbps) por debajo del cual SBC degrada
+    // audiblemente banda 2-4kHz y separación estéreo.
+    private const val BT_LOW_BITRATE_KBPS = 200
+
+    private fun currentBtBitrateKbps(): Int? {
+        val am = audioManager ?: return null
+        return try {
+            // API no pública/vendor-specific (sin garantía en todos los OEM);
+            // se envuelve en try/catch y se degrada a null sin romper nada.
+            val raw = am.getParameters("bt_codec_bitrate")
+            raw.substringAfter("=", "").trim().toIntOrNull()
+        } catch (e: Exception) {
+            Log.w(TAG, "No se pudo leer bt_codec_bitrate: ${e.message}")
+            null
+        }
+    }
+
+    /** Conservative profile used until the real A2DP codec is resolved off-thread. */
+    private fun fallbackBluetoothProfile(): RouteProfile =
+        BluetoothRouteProfilePolicy.fallback(currentBtBitrateKbps())
+
+    /**
+     * A2DP proxy acquisition is asynchronous and may wait up to the detector timeout.
+     * Resolve it on a worker, then publish only if this is still the active route generation.
+     */
+    private fun refreshBluetoothCodecProfileAsync(context: Context, generation: Long) {
+        Thread({
+            // getDevices() lists connected endpoints, not the active system route.
+            // Only one A2DP candidate allows a codec query; multiple headsets must use fallback.
+            // Missing/ambiguous identity must not borrow codec OR vendor-bitrate metadata.
+            val a2dpAddresses = runCatching {
+                val manager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                manager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                    ?.filter { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
+                    ?.map { it.address }
+                    .orEmpty()
+            }.getOrDefault(emptyList())
+            val selectedAddress = BluetoothOutputRatePolicy.selectUnambiguousAddress(a2dpAddresses)
+            val info = if (selectedAddress == null) {
+                // Without a reliable address, do not borrow another connected headset's codec.
+                BluetoothCodecDetector.CodecInfo(BluetoothCodecDetector.RealCodec.UNAVAILABLE, 0, 0)
+            } else runCatching {
+                BluetoothCodecDetector.detectActiveCodec(context, selectedAddress)
+            }.getOrElse {
+                    Log.w(TAG, "BT codec lookup failed; keeping conservative route profile", it)
+                    BluetoothCodecDetector.CodecInfo(
+                        BluetoothCodecDetector.RealCodec.UNAVAILABLE, 0, 0
+                    )
+                }
+            val profile = if (
+                info.codec != BluetoothCodecDetector.RealCodec.UNAVAILABLE &&
+                info.codec != BluetoothCodecDetector.RealCodec.UNKNOWN
+            ) {
+                Log.i(TAG, "BT codec resolved asynchronously: ${info.codec} @ ${info.sampleRateHz}Hz/${info.bitsPerSample}bit")
+                BluetoothRouteProfilePolicy.forCodec(info.codec)
+            } else if (selectedAddress == null) {
+                // A vendor-global bitrate cannot safely identify which of multiple headsets it describes.
+                BluetoothRouteProfilePolicy.fallback()
+            } else {
+                fallbackBluetoothProfile()
+            }
+            if (routeGeneration.get() == generation && currentRoute == OutputRoute.BLUETOOTH) {
+                applyProfileFor(OutputRoute.BLUETOOTH, profile)
+            } else {
+                Log.d(TAG, "Discarding stale BT codec result for route generation $generation")
+            }
+        }, "BtCodecProfileRefresh").start()
+    }
+
+    private fun syncTransauralRoute(context: Context, route: OutputRoute) {
+        val ctx = context.applicationContext
+        runCatching {
+            val declaredLineOut = com.ivanna.omega.ui.SpatialAudioPrefs.load(ctx).externalStereoLineOut
+            val store = com.ivanna.omega.core.ParameterStore(ctx)
+            val allowed = ExternalStereoPolicy.allowTransauralXtc(
+                route, declaredLineOut, store.is4dCrosstalkOn()
+            )
+            if (com.ivanna.omega.core.Ivanna4DNative.isAvailable) {
+                com.ivanna.omega.core.Ivanna4DNative.nativeFourDSetCrosstalk(allowed)
+            }
+            com.ivanna.omega.core.FourDRouteB.push(ctx, store, route)
+        }.onFailure {
+            // If route/prefs evaluation fails, actively force both output paths to bypass.
+            runCatching {
+                if (com.ivanna.omega.core.Ivanna4DNative.isAvailable) {
+                    com.ivanna.omega.core.Ivanna4DNative.nativeFourDSetCrosstalk(false)
+                }
+            }
+            runCatching {
+                com.ivanna.omega.core.FourDRouteB.push(
+                    ctx, com.ivanna.omega.core.ParameterStore(ctx), OutputRoute.UNKNOWN
+                )
+            }
+            Log.w(TAG, "Transaural route gate failed closed: ${it.message}")
+        }
+    }
+
+    private fun applyProfileFor(route: OutputRoute, profileOverride: RouteProfile? = null) {
+        val baseProfile = profileOverride ?: profileFor(route)
+        val load = when (SafmusHardwareCoordinator.lastSnapshot?.budget) {
+            SafmusHardwareCoordinator.Budget.CONSERVATIVE -> SafmusAdapterPolicy.Load.CONSERVATIVE
+            SafmusHardwareCoordinator.Budget.SAFE -> SafmusAdapterPolicy.Load.SAFE
+            else -> SafmusAdapterPolicy.Load.NORMAL
+        }
+        val p = SafmusAdapterPolicy.optimizeRouteProfile(baseProfile, load)
+        val localDispatched = AudioEngine.nativeSetRouteProfileStatic(
+            p.bassBoostDb, p.dialogBoostDb, p.widenerMult
+        )
+        val daemonSendResult = com.ivanna.omega.magisk.OmegaEngineBridge.setRouteProfile(
+            p.bassBoostDb, p.dialogBoostDb, p.widenerMult
+        )
+        Log.i(
+            TAG,
+            "Ruta de salida: $route SAFMUS=$load -> perfil solicitado; " +
+                "localDispatched=$localDispatched daemonSendResult=$daemonSendResult; " +
+                "IPC no equivale a ACK/read-back DSP; aplicación no confirmada"
+        )
+    }
+
+    private fun refreshBluetoothLatencyProfileAsync(context: Context, expectedRouteGeneration: Long) {
+        val expectedProfileGeneration = BluetoothAudioProfiler.invalidate()
+        Thread({
+            // AudioManager enumera endpoints conectados, no garantiza cuál está activo.
+            // Solo perfilar cuando hay una única dirección A2DP inequívoca.
+            val selectedAddress = runCatching {
+                val manager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                val addresses = manager?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                    ?.filter { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP }
+                    ?.map { it.address }
+                    .orEmpty()
+                BluetoothOutputRatePolicy.selectUnambiguousAddress(addresses)
+            }.getOrNull()
+            if (routeGeneration.get() != expectedRouteGeneration || currentRoute != OutputRoute.BLUETOOTH) {
+                return@Thread
+            }
+            runCatching {
+                BluetoothAudioProfiler.refresh(context, selectedAddress, expectedProfileGeneration)
+            }
+        }, "BtAudioProfilerRefresh").start()
+    }
+
+    private fun applyRoute(route: OutputRoute) {
+        // 0032 — Re-enviar el estado binaural de Ruta B al cambiar la
+        // salida. Va ANTES del early-return de abajo: un cambio
+        // DAC USB_DEVICE → audífono USB_HEADSET no cambia la categoría
+        // (sigue USB) pero sí el gate, y sin este re-envío el daemon se
+        // quedaría en neutro con audífonos puestos. En hilo propio: el
+        // envío es socket con timeout 500 ms y este callback corre en el
+        // hilo principal; no bloquearlo. Idempotente (mismo estado → el
+        // daemon lo re-aplica sin cambio audible).
+        appContextRef?.let { ctx ->
+            Thread({
+                runCatching {
+                    com.ivanna.omega.core.PersistedStateRestorer.pushRouteBState(ctx)
+                }
+            }, "RouteBStatePush").start()
+        }
+        // A physical route change immediately gates XTC before applying route DSP.
+        appContextRef?.let { ctx -> syncTransauralRoute(ctx, route) }
+        if (route == currentRoute) {
+            // El endpoint Bluetooth puede cambiar sin que cambie la categoría BLUETOOTH.
+            // Invalida el resultado anterior y actualiza ambos perfiles sin bloquear el callback.
+            if (route == OutputRoute.BLUETOOTH) {
+                val generation = routeGeneration.incrementAndGet()
+                applyProfileFor(route, BluetoothRouteProfilePolicy.fallback())
+                appContextRef?.let { ctx ->
+                    refreshBluetoothLatencyProfileAsync(ctx, generation)
+                    refreshBluetoothCodecProfileAsync(ctx, generation)
+                }
+            }
+            return
+        }
+        val previousRoute = currentRoute
+        val generation = routeGeneration.incrementAndGet()
+        currentRoute = route
+        appContextRef?.let { ctx ->
+            runCatching { AudioPipeline.syncHardwareSampleRate(ctx) }
+            if (route == OutputRoute.BLUETOOTH) {
+                refreshBluetoothLatencyProfileAsync(ctx, generation)
+            } else {
+                // Never retain an A2DP codec/latency profile while USB, AUX or speaker owns output.
+                BluetoothAudioProfiler.invalidate()
+            }
+        }
+        if (route == OutputRoute.BLUETOOTH) {
+            // Apply immediately with a bounded fallback; do not block the device callback.
+            applyProfileFor(route, BluetoothRouteProfilePolicy.fallback())
+            appContextRef?.let { refreshBluetoothCodecProfileAsync(it, generation) }
+        } else {
+            applyProfileFor(route)
+        }
+        // §0.1: Activar inmediatamente las etapas exigidas por el perfil de ruta
+        // ANTES del primer bloque de audio (y en cada cambio de salida física).
+        appContextRef?.let { ctx ->
+            runCatching { RouteDspCalibrator.onRouteChanged(ctx, route) }
+            // Re-apply an explicitly locked AR room prior after route-specific DSP
+            // selection, so Bluetooth/AUX/USB-C/speaker all use the same live route.
+            runCatching {
+                com.ivanna.omega.fotoholo.RoomAcousticRouteBridge.applySaved(ctx, route)
+            }.onFailure { Log.w(TAG, "AR room calibration route apply failed: ${it.message}") }
+        }
+
+        // FIX DAC USB-C: al conectar un DAC USB-C, el historial de convolución
+        // HRTF (m_histL/m_histR) contiene muestras de la ruta anterior. La
+        // siguiente llamada a processBinauralScene() las convoluciona y produce
+        // el ruido "tssss" (canal de TV sin señal). Secuencia de fix:
+        //   1. setWetDry(0) → bypass inmediato, sin convolución esta iteración
+        //   2. flushHistory() → memset(0) del historial: corta la fuente de ruido
+        //   3. postDelayed(150ms) → restaurar wet=1.0 cuando el history esté limpio
+        //      (2–3 frames a 48kHz son ~16ms; 150ms es margen amplio para cualquier SR)
+        // Al salir del USB: restaurar wet=1.0 inmediatamente (history ya tiene
+        // muestras limpias del nuevo dispositivo de salida).
+        if (route == OutputRoute.USB) {
+            // Cancela cualquier restore pendiente de una rotacion previa (p.ej.
+            // usuario que hace USB->AUX->USB rapido) y adquiere token nuevo:
+            // solo el runnable que porte este token podra restaurar wet=1.
+            cancelPendingHrtfRestore()
+            val myToken = hrtfRestoreToken.incrementAndGet()
+            AudioEngine.nativeSetHrtfWetDryStatic(0f)
+            AudioEngine.nativeFlushHrtfHistoryStatic()
+            val r = Runnable {
+                // Doble guard: seguimos en USB Y el token no fue invalidado por
+                // una rotacion posterior (dentro de la ventana de 150ms).
+                if (currentRoute == OutputRoute.USB &&
+                    hrtfRestoreToken.get() == myToken) {
+                    AudioEngine.nativeSetHrtfWetDryStatic(requestedHrtfWet(route))
+                    Log.i(TAG, "HRTF restaurado según destino declarado tras flush USB (token=$myToken)")
+                }
+                pendingHrtfRestore = null
+            }
+            pendingHrtfRestore = r
+            mainHandler.postDelayed(r, 150L)
+        } else if (previousRoute == OutputRoute.USB) {
+            // Saliendo de USB: cancelar el restore pendiente antes de tocar
+            // wet=1 en la nueva ruta — evita doble escritura y elimina la
+            // ventana en la que el runnable viejo podria haberse ejecutado
+            // *entre* este set y una siguiente rotacion.
+            cancelPendingHrtfRestore()
+            AudioEngine.nativeSetHrtfWetDryStatic(requestedHrtfWet(route))
+            Log.i(TAG, "HRTF restaurado según destino declarado al salir de USB")
+        }
+
+        // v2.5.451 Φ CALIBRADO (DAC sin micrófono): al entrar a USB, Φ usa
+        // el perfil medido guardado; al salir, se quita.
+        syncDacCalibratedProfile(route)
+    }
+
+    /**
+     * Sincroniza el perfil CALIBRADO de Φ con la ruta de salida (v2.5.451).
+     * Con DAC USB conectado y perfil de sala guardado (barrido), empuja el
+     * perfil (10 ganancias → 24 errores ERB) al operador; en cualquier
+     * otra ruta, o sin perfil guardado, lo quita y Φ vuelve a su
+     * comportamiento actual (MEDIDO con el mic / APROXIMADO). Idempotente
+     * y fail-safe: cualquier fallo deja a Φ como estaba. También se llama
+     * tras una medición de sala exitosa, para que el perfil nuevo aplique
+     * de inmediato sin reconectar el DAC.
+     */
+    fun syncDacCalibratedProfile(route: OutputRoute = currentRoute) {
+        if (!com.ivanna.omega.core.IvannaNativeLib.isLoaded) return
+        if (route != OutputRoute.USB) {
+            runCatching {
+                com.ivanna.omega.core.IvannaNativeLib.nativeClearHyperCalibratedProfile()
+            }
+            return
+        }
+        val ctx = appContextRef ?: return
+        val gains = runCatching {
+            com.ivanna.omega.core.ParameterStore(ctx).getRoomCorrectionGains()
+        }.getOrNull()
+        if (gains == null) {
+            runCatching {
+                com.ivanna.omega.core.IvannaNativeLib.nativeClearHyperCalibratedProfile()
+            }
+            Log.i(TAG, "DAC conectado sin perfil de sala guardado: Φ en APROXIMADO (mide la sala con el DAC conectado para calibrar)")
+            return
+        }
+        val errDb = DacCalibratedProfile.roomGainsToErbError(gains) ?: return
+        runCatching {
+            com.ivanna.omega.core.IvannaNativeLib.nativeSetHyperCalibratedProfile(errDb)
+        }.onSuccess {
+            Log.i(TAG, "Φ CALIBRADO con perfil guardado (DAC USB, ${gains.size} bandas de sala)")
+        }.onFailure {
+            Log.w(TAG, "No se pudo empujar el perfil calibrado a Φ: ${it.message}")
+        }
+    }
+
+    private fun requestedHrtfWet(route: OutputRoute): Float {
+        val prefs = appContextRef?.let { com.ivanna.omega.ui.SpatialAudioPrefs.load(it) }
+        return ExternalStereoPolicy.hrtfWetForRoute(
+            route, prefs?.externalStereoLineOut == true, prefs?.hrtfEnabled ?: true)
+    }
+
+    /**
+     * Cancela el restore pendiente de wet=1 tras un flush por rotacion a USB.
+     * Se llama tanto al entrar de nuevo a USB (nueva secuencia empieza limpia)
+     * como al salir de USB (evita que un runnable atrasado pise el wet=1 que
+     * ya escribio la rama de salida). Ademas invalida el token monotono para
+     * que un runnable ya encolado que consiga entrar antes del removeCallbacks
+     * detecte la invalidacion y no toque el motor.
+     */
+    private fun cancelPendingHrtfRestore() {
+        pendingHrtfRestore?.let { mainHandler.removeCallbacks(it) }
+        pendingHrtfRestore = null
+        hrtfRestoreToken.incrementAndGet()
+    }
+}

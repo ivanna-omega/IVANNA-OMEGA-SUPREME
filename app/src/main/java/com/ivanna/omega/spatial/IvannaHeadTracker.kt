@@ -1,0 +1,201 @@
+package com.ivanna.omega.spatial
+
+import com.ivanna.omega.core.IvannaNativeLib
+import com.ivanna.omega.saf.SaFRoomBridge
+import kotlin.math.abs
+
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+
+/**
+ * IvannaHeadTracker — Rastreo de cabeza 6DoF para audio holográfico.
+ *
+ * [MAJESTY-HT-1.0] Usa el giroscopio + acelerómetro del dispositivo para
+ * rastrear la orientación de la cabeza del usuario. Cuando el usuario gira
+ * la cabeza, el sonido se queda "fijo en el espacio" — como si los
+ * instrumentos estuvieran físicamente alrededor de ti.
+ *
+ * Esto es algo que NI Dolby NI Sony ofrecen en dispositivos Android
+ * genéricos. Solo funciona con hardware propietario (AirPods Pro,
+// WH-1000XM4, etc.). IVANNA lo hace con CUALQUIER dispositivo Android.
+ *
+ * Uso:
+ *   val tracker = IvannaHeadTracker(context)
+ *   tracker.start()
+ *   // El tracker actualiza automáticamente el motor espacial C++
+ *   tracker.stop()
+ */
+class IvannaHeadTracker(private val context: Context) : SensorEventListener {
+
+    // FIX (crash de inicialización): getSystemService() y getDefaultSensor()
+    // se ejecutaban en la declaración del campo, es decir, en el CONSTRUCTOR
+    // de la clase. Si quien lo crea lo hace con un contexto de Activity que
+    // luego el sistema destruye/recrea (rotación, low memory, process death),
+    // el SensorManager queda atado a un contexto muerto y el primer
+    // registerListener revienta con NPE / Resources.NotFoundException.
+    //
+    // Solución: perezoso. Solo se resuelve cuando alguien llama a start(),
+    // momento en el que el contexto ya está garantizado vivo. Además se
+    // usa applicationContext para que el SensorManager sobreviva a la
+    // Activity que lo creó.
+    private val appContext = context.applicationContext
+    private val sensorManager: SensorManager by lazy {
+        appContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    }
+    private val rotationSensor: Sensor? by lazy {
+        sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+    }
+
+    internal var nativeHandle: Long = 0
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile private var isRunning = false
+    @Volatile private var lastGoodSensorTimestampNs = 0L
+
+    /** True only when the Android sensor subscription is registered and recent data reached JNI. */
+    val isTrackingFresh: Boolean
+        get() {
+            val last = lastGoodSensorTimestampNs
+            val age = SystemClock.elapsedRealtimeNanos() - last
+            return isRunning && nativeHandle != 0L && last > 0L && age in 0L..250_000_000L
+        }
+
+    val isTrackingRegistered: Boolean get() = isRunning && nativeHandle != 0L
+
+    // Callback para notificar a la UI de cambios de orientación
+    var onOrientationChanged: ((pitch: Float, yaw: Float, roll: Float) -> Unit)? = null
+
+    fun init() {
+        if (nativeHandle != 0L) return
+        // Guard JNI: si libivanna_omega no cargó, UnsatisfiedLinkError aquí
+        // tumba el hilo del sensor. Handle 0 = modo degradado (sin head tracking).
+        nativeHandle = runCatching { IvannaSpatialNative.nativeHeadTrackerCreate() }.getOrDefault(0L)
+    }
+
+    fun start() {
+        if (isRunning) return
+        init()
+        if (nativeHandle == 0L) return
+
+        val sensor = rotationSensor ?: return
+        // 100Hz = 10ms nominal sensor interval. Android can still refuse registration.
+        isRunning = runCatching {
+            sensorManager.registerListener(this, sensor, 10000, mainHandler)
+        }.getOrDefault(false)
+        if (!isRunning) lastGoodSensorTimestampNs = 0L
+    }
+
+    fun stop() {
+        if (!isRunning) return
+        sensorManager.unregisterListener(this)
+        isRunning = false
+        lastGoodSensorTimestampNs = 0L
+    }
+
+    fun reset() {
+        if (nativeHandle != 0L) {
+            runCatching { IvannaSpatialNative.nativeHeadTrackerReset(nativeHandle) }
+        }
+    }
+
+    fun release() {
+        stop()
+        if (nativeHandle != 0L) {
+            runCatching { IvannaSpatialNative.nativeHeadTrackerDestroy(nativeHandle) }
+            nativeHandle = 0
+        }
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
+        if (nativeHandle == 0L) return
+
+        // rotationVector[0..2] = x,y,z; [3] = scalar (cos(theta/2))
+        // [4] = accuracy (opcional)
+        val x = event.values[0]
+        val y = event.values[1]
+        val z = event.values[2]
+        // [FIX-CRASH] TYPE_ROTATION_VECTOR puede reportar solo 3 elementos
+        // (sin el componente escalar) en algunos HALs/dispositivos —
+        // Motorola incluido. Leer values[3] directo revienta con
+        // ArrayIndexOutOfBoundsException en cuanto llega el primer evento,
+        // justo al encender el head tracker. Si falta, se deriva w.
+        val w = if (event.values.size > 3) event.values[3]
+                else {
+                    val sq = 1f - (x * x + y * y + z * z)
+                    if (sq > 0f) kotlin.math.sqrt(sq) else 0f
+                }
+        val timestampMs = event.timestamp / 1_000_000f  // ns → ms
+
+        val accepted = runCatching {
+            IvannaSpatialNative.nativeHeadTrackerUpdate(nativeHandle, x, y, z, w, timestampMs)
+        }.isSuccess
+        // v2.5.471 (F2, parte segura): alimentar TAMBIÉN la cadena fusionada
+        // de Ruta A (FusedSpatial.feedRotationVector vía JNI). Sin esto el
+        // trackerFusion nunca recibe pose, el yaw queda en 0 y el flag
+        // headTracking no tiene efecto audible en Ruta A. Se alimenta siempre
+        // (el C++ solo aplica el yaw cuando headTracking está activo), así el
+        // tracker queda caliente y el flag responde al instante al encenderlo.
+        if (IvannaNativeLib.isLoaded) {
+            runCatching {
+                IvannaNativeLib.nativeFeedFusedRotationVector(x, y, z, w, timestampMs)
+            }
+        }
+        if (accepted) {
+            lastGoodSensorTimestampNs = event.timestamp
+        } else {
+            nativeHandle = 0L  // JNI muerto → desactivar para no reintentar
+            isRunning = false
+            lastGoodSensorTimestampNs = 0L
+            sensorManager.unregisterListener(this)
+        }
+
+        // FIX: alimentar SaFRoomBridge con el estado del campo sonoro S_t.
+        // SaFRoomBridge.setSoundFieldState() usaba diffuseness=0 (constante)
+        // porque nadie lo actualizaba desde el sensor de cabeza.
+        //
+        // Difusividad del campo ≈ velocidad angular normalizada:
+        //   · Cabeza inmóvil (movimiento < 2°/s) → campo casi plano (D≈0)
+        //   · Cabeza girando rápido (> 30°/s)   → campo más difuso (D→1)
+        // Esto hace que α*(R,H,S) se amortigüe durante movimiento rápido
+        // (incertidumbre espacial alta) — paso más conservador en M_t.
+        val angularSpeedNorm = (abs(x) + abs(y) + abs(z))  // magnitud quaternion imaginaria
+        val diffuseness = (angularSpeedNorm * 5f).coerceIn(0f, 1f)
+        runCatching {
+            SaFRoomBridge.setSoundFieldState(
+                diffuseness = diffuseness,
+                complexity  = diffuseness * 0.5f   // complejidad espectral aproximada
+            )
+        }
+
+        // [FIX-CRASH] getRotationMatrixFromVector puede lanzar IllegalArgumentException
+        // en algunos HALs cuando event.values tiene formato inesperado. La UI se
+        // limita a mostrar orientación — no crítico para audio — así que un fallo
+        // aquí nunca debe tumbar el hilo de sensor. Se envuelve en try/catch y solo
+        // se emite el callback si la conversión tuvo éxito.
+        val listener = onOrientationChanged
+        if (listener != null) {
+            try {
+                val rotationMatrix = FloatArray(9)
+                SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+                val orientation = FloatArray(3)
+                SensorManager.getOrientation(rotationMatrix, orientation)
+                // orientation[0] = azimuth (yaw), [1] = pitch, [2] = roll
+                listener(orientation[1], orientation[0], orientation[2])
+            } catch (_: Throwable) {
+                // silencioso — el hilo debe seguir procesando frames del giroscopio
+            }
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) {}
+
+    companion object {
+        const val TAG = "IvannaHeadTracker"
+    }
+}

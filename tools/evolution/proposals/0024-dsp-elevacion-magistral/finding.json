@@ -1,0 +1,14 @@
+{
+  "kind": "dsp-elevacion-magistral",
+  "title": "DSP basico: el bucle cerrado neural y el modelo coclear (NPE) estan apagados en la cadena viva de Ruta A; la dinamica es monobanda",
+  "evidence": "Cadena viva Ruta A = DSPBridge.nativeProcess (ivanna_omega_jni.cpp:1776). VERIFICADO EN CODIGO: (1) g_neuroLoopEnabledA{false} (linea 263, 'Apagado por defecto') -> neuroLoopRouteAUpdate (358-368) devuelve identidad; setNeuroLoopEnabled existe (4108) pero nada lo enciende por defecto. En FusionCore igual: m_neuroLoopEnabled_=false (IvannaFusionCore.h:551). El bucle cerrado neural NO aporta nada al sonido. (2) g_npeAOn{false} (linea 611, 'apagado hasta que la app lo publique') -> routeAApplyNpe (615-622) llama setParams(false,...) -> NPE bypass bit-exacto. Los parametros SEGUROS ya existen por defecto (harm 0.2, lat 0.2, ohc 0.3, master 0.0). El NPE esta probado en host (test_npe_core.cpp: apagado=bit-exacto, encendido=efecto medible y neuronas LIF disparan, salida finita y acotada con entrada caliente, encendido sin clic, null test). (3) g_cochlearEnabled{false} -> CochlearActiveInverseEngine apagado. (4) g_holos_harmonics{0.0f} (holos_globals_effect.cpp:20) -> generacion de armonicos de HOLOS apagada. (5) g_omni_amount{0.0f} -> Omni apagado. CONTRASTE (lo que SI esta activo y bien): compresor g_comp ratio 2.4 threshold -16 dB (PERO monobanda, un solo detector de pico); SafetyLimiter con true-peak 4x (truePeak4x) y soft-ceil (THD 0.00% a 0 dBFS medido); Volterra H2 encendido (g_volterra_enabled{true}); 5 Ejes Supremos encendidos por prefs (pinna wet 0.65, transharmonic, SNN/HOA, MSO, warped lattice); ORBE 1.0 / HOLOS 0.5 / Phi 0.5 activos; RIR de HOLOS wet 1.0. CONCLUSION: la cadena es densa pero los dos modulos titulares 'neural/coclear' estan apagados y la dinamica es monobanda. La elevacion debe ACTIVARLOS a niveles seguros y MEDIDOS (THD+N con ThdMeter, respuesta en frecuencia, coste por bloque) y fallar cerrado si degradan. No se acepta narrativa sin medida.",
+  "files": [
+    "app/src/main/cpp/jni/ivanna_omega_jni.cpp",
+    "app/src/main/cpp/neuromorphic/NpeStereoCore.hpp",
+    "app/src/main/cpp/tests/test_npe_core.cpp",
+    "app/src/main/cpp/IvannaFusionCore.h",
+    "app/src/main/cpp/holos_globals_effect.cpp",
+    "app/src/main/cpp/dsp/ThdMeter.hpp",
+    "tools/measure/thd_analyze.cpp"
+  ]
+}

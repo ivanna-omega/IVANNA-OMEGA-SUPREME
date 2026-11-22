@@ -1,0 +1,81 @@
+package com.ivanna.omega.ui
+
+import android.content.Context
+import com.ivanna.omega.audio.UsbDacTarget
+
+/** Estado persistente del panel Spatial Audio (HRTF + RIR + SAF). */
+data class SpatialAudioState(
+    val hrtfEnabled: Boolean = true,
+    val externalStereoLineOut: Boolean = false,
+    // FASE 2: qué alimenta el DAC USB (JieLi). SPEAKERS = Genezi (default,
+    // fail-closed = comportamiento vigente); HEADPHONES = audífonos en el
+    // mismo adaptador. Solo decide cuando hay DAC USB (RouteBDeviceGate).
+    val usbDacTarget: UsbDacTarget = UsbDacTarget.SPEAKERS,
+    val hrtfSubject: String = "kemar",
+    val rirEnabled: Boolean = true,
+    val rirRt60: Float = 0.34f,
+    val rirWet: Float = 0.22f,
+    val objectReverbLevel: Float = 0.25f,
+    val safEnabled: Boolean = true,
+    val safIntensity: Float = 0.78f,
+    val safAutoMode: Boolean = true,
+    val cochlearInverseEnabled: Boolean = false,
+    val cochlearIntensity: Float = 0.35f
+)
+
+object SpatialAudioPrefs {
+    private const val PREFS = "ivanna_spatial_audio"
+
+    // FIX (build 2026-08-29): SpatialAudioPanel leía SpatialAudioPrefs.stateFlow
+    // y un tipo SpatialState que nunca existieron (el panel fue escrito contra
+    // una API planificada distinta). Se añade el StateFlow observable sin
+    // romper load/save: init() siembra el flujo desde disco y save() publica.
+    private val _stateFlow = kotlinx.coroutines.flow.MutableStateFlow(SpatialAudioState())
+    val stateFlow: kotlinx.coroutines.flow.StateFlow<SpatialAudioState> = _stateFlow
+
+    /** Siembra el StateFlow desde SharedPreferences. Idempotente. */
+    fun init(context: Context) {
+        _stateFlow.value = load(context)
+    }
+
+    fun load(context: Context): SpatialAudioState {
+        val p = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val d = SpatialAudioState()
+        return SpatialAudioState(
+            hrtfEnabled       = p.getBoolean("hrtfEnabled", d.hrtfEnabled),
+            externalStereoLineOut = p.getBoolean("externalStereoLineOut", false),
+            usbDacTarget      = runCatching {
+                UsbDacTarget.valueOf(p.getString("usbDacTarget", d.usbDacTarget.name) ?: d.usbDacTarget.name)
+            }.getOrDefault(d.usbDacTarget),
+            hrtfSubject       = p.getString("hrtfSubject", d.hrtfSubject) ?: d.hrtfSubject,
+            rirEnabled        = p.getBoolean("rirEnabled", d.rirEnabled),
+            rirRt60           = p.getFloat("rirRt60", d.rirRt60),
+            rirWet            = p.getFloat("rirWet", d.rirWet),
+            objectReverbLevel = p.getFloat("objectReverbLevel", d.objectReverbLevel),
+            safEnabled        = p.getBoolean("safEnabled", d.safEnabled),
+            safIntensity      = p.getFloat("safIntensity", d.safIntensity),
+            safAutoMode       = p.getBoolean("safAutoMode", d.safAutoMode),
+            cochlearInverseEnabled = p.getBoolean("cochlearInverseEnabled", d.cochlearInverseEnabled),
+            cochlearIntensity = p.getFloat("cochlearIntensity", d.cochlearIntensity)
+        )
+    }
+
+    fun save(context: Context, s: SpatialAudioState) {
+        _stateFlow.value = s
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean("hrtfEnabled", s.hrtfEnabled)
+            .putBoolean("externalStereoLineOut", s.externalStereoLineOut)
+            .putString("usbDacTarget", s.usbDacTarget.name)
+            .putString("hrtfSubject", s.hrtfSubject)
+            .putBoolean("rirEnabled", s.rirEnabled)
+            .putFloat("rirRt60", s.rirRt60)
+            .putFloat("rirWet", s.rirWet)
+            .putFloat("objectReverbLevel", s.objectReverbLevel)
+            .putBoolean("safEnabled", s.safEnabled)
+            .putFloat("safIntensity", s.safIntensity)
+            .putBoolean("safAutoMode", s.safAutoMode)
+            .putBoolean("cochlearInverseEnabled", s.cochlearInverseEnabled)
+            .putFloat("cochlearIntensity", s.cochlearIntensity)
+            .apply()
+    }
+}

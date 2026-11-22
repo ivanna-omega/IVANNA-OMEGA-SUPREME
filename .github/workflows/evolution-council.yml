@@ -1,0 +1,87 @@
+# Consejo como activo versionado (v2.5.471, ítem 3 — Repair 3 del plan corona).
+#
+# El Consejo Supremo (tools/evolution/council.py, 6 roles) es código del
+# repo, no un artefacto externo: si council.py falta en un clon limpio, la
+# puerta de evolución no existe y este job FALLA. La auditoría de
+# 2026-11-16 reportó council.py sin versionar; el fix 74337b5a lo versionó
+# junto a su test (tools/evolution/tests/test_council.py). Este workflow
+# es el candado que impide que vuelva a perderse: checkout limpio,
+# verificación explícita de que council.py está trackeado en git, y la
+# suite completa de evolución (python3 -m unittest discover).
+#
+# La suite corre en ~3 min y no requiere NDK/SDK ni secretos: solo
+# Python 3 de la stdlib. NO toca el árbol (los tests que validan
+# propuestas usan worktrees desechables en /tmp).
+#
+# Estado conocido a 2026-11-18 (HEAD b54b113e, v2.5.470): la suite corre
+# 171 tests con 2 fallos PREEXISTENTES en main, ajenos al consejo:
+#  - test_0011_check_passes_on_real_repo: 2 headers huérfanos de la
+#    fusión (fused_measure.hpp, unified_field_kernel.hpp).
+#  - test_0019_real_repo_reports_one: el TODO de route-arbiter-v2 se
+#    movió de la línea 1848 a la 1956.
+# Mientras esos 2 fallos vivan, este job es ROJO: eso es lo correcto —
+# un candado en rojo es la señal honesta, no un workflow roto. No se
+# marca como check requerido hasta que la suite llegue a 0 fallos.
+name: Consejo versionado — suite de evolución
+
+on:
+  push:
+    paths:
+      - 'tools/evolution/**'
+      - '.github/workflows/evolution-council.yml'
+  pull_request:
+    paths:
+      - 'tools/evolution/**'
+      - '.github/workflows/evolution-council.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evolution-council-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evolution-council:
+    name: Consejo versionado + suite de evolución
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Candado 1 — council.py debe existir Y estar trackeado en git.
+      # Un archivo presente pero sin versionar (o ausente) tumba el job:
+      # git ls-files --error-unmatch falla si el path no está en el índice.
+      - name: council.py versionado (falla si falta)
+        run: |
+          test -f tools/evolution/council.py || { echo "FALTA tools/evolution/council.py en el clon limpio"; exit 1; }
+          git ls-files --error-unmatch tools/evolution/council.py
+          test -f tools/evolution/tests/test_council.py || { echo "FALTA tools/evolution/tests/test_council.py en el clon limpio"; exit 1; }
+          git ls-files --error-unmatch tools/evolution/tests/test_council.py
+          echo "council.py + test_council.py versionados OK"
+
+      # Candado 2 — la suite completa de evolución. El exit code de
+      # unittest es distinto de cero si UN SOLO test falla: el job es
+      # rojo hasta que la suite esté a 0 fallos (ver cabecera).
+      - name: Suite de evolución (unittest, clon limpio)
+        run: python3 -m unittest discover -s tools/evolution/tests -v 2>&1 | tee evolution-tests.log
+
+      # Candado 3 — la suite no debe encogerse en silencio: si mañana
+      # corre menos tests que los 117 declarados en la reestructura del
+      # consejo (2026-11-16), algo se perdió y el job falla. A
+      # 2026-11-18 la suite corre 171 tests.
+      - name: La suite no se encoge (mínimo 117 tests)
+        run: |
+          N=$(grep -oP '^Ran \K[0-9]+(?= tests)' evolution-tests.log | tail -1)
+          echo "tests corridos: $N"
+          test -n "$N" || { echo "no se encontró el conteo 'Ran N tests' en el log"; exit 1; }
+          test "$N" -ge 117 || { echo "la suite se encogió: $N < 117 tests declarados"; exit 1; }
+
+      - name: Publicar log de la suite
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: evolution-tests-log
+          path: evolution-tests.log
+          if-no-files-found: error
