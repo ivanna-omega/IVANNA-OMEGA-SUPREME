@@ -9,6 +9,7 @@
 // vería un campo que no corresponde a la generación leída.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <thread>
 
@@ -160,6 +161,22 @@ TEST(AudioState, ConcurrentReaderNeverSeesTornState) {
     AudioState s = StateForGeneration(static_cast<uint64_t>(i));
     s.generation = 0;  // el publicador asigna gen = última + 1 == i
     pub.publish(s);
+  }
+  // Dar a los lectores la oportunidad de observar la generación final
+  // antes de parar: sin esto, el escritor puede poner stop=true antes de
+  // que ningún lector lea la última generación (maxGenerationSeen quedaría
+  // en 19999, o en 0 si los lectores nunca fueron planificados en un
+  // runner de 2 núcleos) y el test fallaría por una condición de carrera
+  // del propio test, no del seqlock. Se espera con yield para no
+  // acaparar el núcleo; el plazo es solo red de seguridad (en la
+  // práctica los lectores la observan en milisegundos, porque el estado
+  // final es estable).
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (maxGenerationSeen.load(std::memory_order_relaxed) <
+             static_cast<uint64_t>(kPublishes) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
   }
   stop.store(true, std::memory_order_release);
   readerA.join();
