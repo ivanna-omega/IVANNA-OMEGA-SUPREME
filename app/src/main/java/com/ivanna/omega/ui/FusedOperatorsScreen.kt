@@ -93,7 +93,7 @@ import kotlinx.coroutines.launch
  * la telemetría muestra "—" hasta que exista. Nada se inventa.
  */
 @Composable
-fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {}) {
+fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {}, onOpenFisicaNueva: () -> Unit = {}, onOpenAprende: () -> Unit = {}) {
     // 470: los controles FUSIÓN se persisten (ParameterStore, claves
     // "fused_*") y se cargan al abrir la pantalla; antes vivían solo en
     // memoria (remember) y un reinicio los revertía a los legacy.
@@ -134,9 +134,57 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
         }
     }
 
-    fun update(next: FusedControls) {
+    // A/B por operador (Fase 2): B = ese operador en neutro (los mismos
+    // campos que FusedControls.setNeutral() toca para su sección); A = los
+    // valores que tenía al pulsar B. Los demás operadores no se tocan.
+    // La B guarda solo la sección (no toda la cadena): si mientras tanto se
+    // mueve otro operador, al volver a A no se pierde ese cambio.
+    var abNeutralOps by remember { mutableStateOf(setOf<String>()) }
+    var abStash by remember { mutableStateOf<Map<String, FusedControls>>(emptyMap()) }
+
+    fun update(next: FusedControls, keepAb: Boolean = false) {
+        if (!keepAb) {
+            // Tocar un slider de un operador en B vuelve a A con el valor
+            // nuevo (la B guardada queda obsoleta y se descarta).
+            val changed = buildSet {
+                if (next.spatial != controls.spatial) add("orbe")
+                if (next.field != controls.field) add("holos")
+                if (next.listenerRoom != controls.listenerRoom) add("sala")
+                if (next.transducer != controls.transducer) add("volterra")
+                if (next.tonal != controls.tonal) add("armonia")
+                if (next.dynamics != controls.dynamics) add("pulso")
+                if (next.brain != controls.brain) add("neuro")
+            }
+            if (changed.isNotEmpty()) {
+                abNeutralOps = abNeutralOps - changed
+                abStash = abStash - changed
+            }
+        }
         controls = next.clamp()
         pushSoon(controls)
+    }
+
+    fun toggleOperatorAb(key: String, toNeutral: (FusedControls) -> FusedControls) {
+        if (key in abNeutralOps) {
+            val stashed = abStash[key] ?: return
+            val restored = when (key) {
+                "orbe" -> controls.copy(spatial = stashed.spatial)
+                "holos" -> controls.copy(field = stashed.field)
+                "sala" -> controls.copy(listenerRoom = stashed.listenerRoom)
+                "volterra" -> controls.copy(transducer = stashed.transducer)
+                "armonia" -> controls.copy(tonal = stashed.tonal)
+                "pulso" -> controls.copy(dynamics = stashed.dynamics)
+                "neuro" -> controls.copy(brain = stashed.brain)
+                else -> controls
+            }
+            abNeutralOps = abNeutralOps - key
+            abStash = abStash - key
+            update(restored, keepAb = true)
+        } else {
+            abStash = abStash + (key to controls)
+            abNeutralOps = abNeutralOps + key
+            update(toNeutral(controls), keepAb = true)
+        }
     }
 
     // ── Telemetría en vivo (poll 500 ms, como EnginesStatusScreen) ───────
@@ -221,6 +269,8 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                     modifier = Modifier.weight(1f)
                 ) {
                     pushJob?.cancel()
+                    abNeutralOps = emptySet()
+                    abStash = emptyMap()
                     val neutral = controls.setNeutral()
                     controls = neutral
                     FusedControlsBridge.safeSetFusedNeutral()
@@ -232,11 +282,28 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                     modifier = Modifier.weight(1f)
                 ) {
                     pushJob?.cancel()
+                    abNeutralOps = emptySet()
+                    abStash = emptyMap()
                     controls = FusedControls()
                     FusedControlsBridge.safeSetFusedControls(controls)
                     fusedStore.saveFusedControls(controls)
                 }
                 SpecInfoButtonSmall(spec = FusedControlSpecs.neutralReset)
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FusedActionButton(
+                    label = "FÍSICA NUEVA",
+                    enabled = true,
+                    modifier = Modifier.weight(1f)
+                ) { onOpenFisicaNueva() }
+                FusedActionButton(
+                    label = "APRENDE · GUÍA",
+                    enabled = true,
+                    modifier = Modifier.weight(1f)
+                ) { onOpenAprende() }
             }
 
             // ── Fila 1: ORBE·Ω + HOLOS·Ω ─────────────────────────────────
@@ -248,7 +315,17 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                     title = "ORBE·Ω",
                     subtitle = "Espacial único",
                     neutral = controls.spatial.isNeutral(),
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    abActive = "orbe" in abNeutralOps,
+                    onAbToggle = {
+                        toggleOperatorAb("orbe") { c ->
+                            c.copy(spatial = c.spatial.copy(
+                                amount = 0.0f, wfsSpread = 0.0f, width = 1.0f,
+                                hrtfWet = 0.0f, xtcEnabled = false, upmixEnabled = false,
+                                upmixImmersivity = 0.0f,
+                            ))
+                        }
+                    }
                 ) {
                     val s = controls.spatial
                     FusedSliderRow(
@@ -338,7 +415,13 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                     title = "HOLOS·Ω",
                     subtitle = "Campo unificado",
                     neutral = controls.field.isNeutral(),
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    abActive = "holos" in abNeutralOps,
+                    onAbToggle = {
+                        toggleOperatorAb("holos") { c ->
+                            c.copy(field = c.field.copy(amount = 0.0f, phiAmount = 0.0f))
+                        }
+                    }
                 ) {
                     val f = controls.field
                     FusedSliderRow(
@@ -415,7 +498,16 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                     title = "SALA VIVA",
                     subtitle = "Oyente + sala",
                     neutral = controls.listenerRoom.isNeutral(),
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    abActive = "sala" in abNeutralOps,
+                    onAbToggle = {
+                        toggleOperatorAb("sala") { c ->
+                            c.copy(listenerRoom = c.listenerRoom.copy(
+                                roomWet = 0.0f, hearingProfile = FusedHearingProfile.FLAT,
+                                signatureRoom = 0, roomCorrDb = List(10) { 0.0f },
+                            ))
+                        }
+                    }
                 ) {
                     val r = controls.listenerRoom
                     FusedSliderRow(
@@ -465,7 +557,13 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                     title = "VOLTERRA·Ω",
                     subtitle = "Corrector de transductor",
                     neutral = controls.transducer.isNeutral(),
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    abActive = "volterra" in abNeutralOps,
+                    onAbToggle = {
+                        toggleOperatorAb("volterra") { c ->
+                            c.copy(transducer = c.transducer.copy(correction = 0.0f, temporalAmount = 0.0f))
+                        }
+                    }
                 ) {
                     val t = controls.transducer
                     FusedSliderRow(
@@ -496,7 +594,16 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                     title = "ARMONÍA",
                     subtitle = "Balance tonal único",
                     neutral = controls.tonal.isNeutral(),
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    abActive = "armonia" in abNeutralOps,
+                    onAbToggle = {
+                        toggleOperatorAb("armonia") { c ->
+                            c.copy(tonal = c.tonal.copy(
+                                curve = FusedTonalCurve.FLAT, trimDb = 0.0f,
+                                lowDb = 0.0f, midDb = 0.0f, highDb = 0.0f, presenceDb = 0.0f,
+                            ))
+                        }
+                    }
                 ) {
                     val t = controls.tonal
                     FusedOptionRow(
@@ -546,7 +653,16 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                     title = "PULSO",
                     subtitle = "Dinámica maestra",
                     neutral = controls.dynamics.isNeutral(),
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    abActive = "pulso" in abNeutralOps,
+                    onAbToggle = {
+                        toggleOperatorAb("pulso") { c ->
+                            c.copy(dynamics = c.dynamics.copy(
+                                punch = 0.0f, width = 1.0f, compRatio = 1.0f,
+                                exciter = 0.0f, voice = 0.0f, safety = 0.0f, upmixImmersivity = 0.0f,
+                            ))
+                        }
+                    }
                 ) {
                     val d = controls.dynamics
                     FusedSliderRow(
@@ -599,7 +715,13 @@ fun FusedOperatorsScreen(onBack: () -> Unit, onOpenHeadMeasure: () -> Unit = {})
                 title = "NEURO·Ω",
                 subtitle = "Cerebro neural · observa y gobierna, no procesa la señal",
                 neutral = controls.brain.isNeutral(),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                abActive = "neuro" in abNeutralOps,
+                onAbToggle = {
+                    toggleOperatorAb("neuro") { c ->
+                        c.copy(brain = c.brain.copy(mode = FusedBrainMode.MANUAL, adaptation = 0.0f))
+                    }
+                }
             ) {
                 val b = controls.brain
                 FusedOptionRow(
@@ -679,6 +801,9 @@ private fun OperatorCard(
     subtitle: String,
     neutral: Boolean,
     modifier: Modifier = Modifier,
+    // A/B por operador (Fase 2): null = sin A/B en esta tarjeta.
+    abActive: Boolean = false,
+    onAbToggle: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     var expanded by remember { mutableStateOf(true) }
@@ -714,6 +839,32 @@ private fun OperatorCard(
                     fontSize = 9.sp, fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold
                 )
+                // A/B: A = tus valores, B = este operador en neutro.
+                if (onAbToggle != null) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(
+                                if (abActive) AmberSignal.copy(alpha = 0.18f)
+                                else AuroraCyan.copy(alpha = 0.12f)
+                            )
+                            .border(
+                                1.dp,
+                                if (abActive) AmberSignal else AuroraCyan,
+                                RoundedCornerShape(6.dp)
+                            )
+                            .clickable { onAbToggle() }
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            if (abActive) "B · NEUTRO" else "A/B",
+                            color = if (abActive) AmberSignal else AuroraCyan,
+                            fontSize = 9.sp, fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
                 Icon(
                     if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
                     contentDescription = null, tint = TextMuted, modifier = Modifier.size(18.dp)

@@ -176,7 +176,9 @@ fun MainScaffold(
             composable(TABS[2].route) {
                 FusedOperatorsScreen(
                     onBack = { tabNav.navigate(TABS[0].route) { launchSingleTop = true } },
-                    onOpenHeadMeasure = { outerNav.navigate(IvannaRoute.HEAD_MEASURE) }
+                    onOpenHeadMeasure = { outerNav.navigate(IvannaRoute.HEAD_MEASURE) },
+                    onOpenFisicaNueva = { outerNav.navigate(IvannaRoute.FISICA_NUEVA) },
+                    onOpenAprende = { outerNav.navigate(IvannaRoute.APRENDE) }
                 )
             }
 
@@ -238,6 +240,15 @@ fun SystemHubScreen(
         // ya se entregan al teléfono (filesDir/fleet_cycles), así que la
         // pantalla muestra ciclos reales, no "Sin ciclos todavía".
         HubCard("VISTA DE DIOS · FLOTA", "Ciclos del consejo · Rondas · Veredictos", AuroraCyan) { onOpenDevRoute(IvannaRoute.FLEET_VIEW) }
+        // ── Magistral (Fase 2): las 6 pantallas nuevas, a la vista ────────
+        // Son escucha diaria, no diagnóstico interno: no piden Modo desarrollador.
+        HubHeader("MAGISTRAL", "Escucha · Física Nueva · Mi sala · Mi equipo · Salud · Aprende", PhosphorGreen)
+        HubCard("ESCUCHA MAGISTRAL", "Orbe vivo · Archivo IVANNA · 4 maestros", AuroraCyan) { onOpenDevRoute(IvannaRoute.ESCUCHA_MAGISTRAL) }
+        HubCard("FÍSICA NUEVA", "Ω · Σ · LGN · GENEZI por secciones", PhosphorGreen) { onOpenDevRoute(IvannaRoute.FISICA_NUEVA) }
+        HubCard("MI SALA", "Medición · Corrección · Barrido Genezi · RIR", AuroraCyan) { onOpenDevRoute(IvannaRoute.MI_SALA) }
+        HubCard("MI EQUIPO", "Salida · Bocinas · Perfil Genezi · Hi-Res", AuroraCyan) { onOpenDevRoute(IvannaRoute.MI_EQUIPO) }
+        HubCard("SALUD DEL SISTEMA", "Magisk · Ruta B · Térmica · Latencia", AmberSignal) { onOpenDevRoute(IvannaRoute.SALUD_SISTEMA) }
+        HubCard("APRENDE", "La guía en español · Glosario · Qué es cada control", PhosphorGreen) { onOpenDevRoute(IvannaRoute.APRENDE) }
         // Acerca de / versión: 7 toques activan o desactivan el Modo desarrollador.
         HubCard(
             "ACERCA DE · IVANNA v$versionName ($versionCode)",

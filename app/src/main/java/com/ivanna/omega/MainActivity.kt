@@ -559,6 +559,65 @@ fun OmegaApp() {
                     onBack = { nav.popBackStack() }
                 )
             }
+            // ── Pantallas nuevas magistrales (Fase 2, §3 Fase 4) ──────────
+            // FUSIÓN también como ruta externa: la constante FUSED_OPERATORS
+            // existía pero nunca se montó (solo la pestaña la abría); ahora
+            // los botones "ABRIR FUSIÓN" llegan de verdad. La instancia de la
+            // pestaña sigue existiendo; ambas leen el mismo estado guardado.
+            composable(IvannaRoute.FUSED_OPERATORS) {
+                com.ivanna.omega.ui.FusedOperatorsScreen(
+                    onBack = { nav.popBackStack() },
+                    onOpenHeadMeasure = { nav.navigate(IvannaRoute.HEAD_MEASURE) },
+                    onOpenFisicaNueva = { nav.navigate(IvannaRoute.FISICA_NUEVA) },
+                    onOpenAprende = { nav.navigate(IvannaRoute.APRENDE) }
+                )
+            }
+            composable(IvannaRoute.MUSICA_LOCAL) {
+                com.ivanna.omega.ui.LocalMusicScreen(
+                    player = bridgePlayer,
+                    onBack = { nav.popBackStack() }
+                )
+            }
+            composable(IvannaRoute.ESCUCHA_MAGISTRAL) {
+                com.ivanna.omega.ui.EscuchaMagistralScreen(
+                    player = bridgePlayer,
+                    onBack = { nav.popBackStack() },
+                    onOpenMusic = { nav.navigate(IvannaRoute.MUSICA_LOCAL) },
+                    onOpenFusion = { nav.navigate(IvannaRoute.FUSED_OPERATORS) }
+                )
+            }
+            composable(IvannaRoute.FISICA_NUEVA) {
+                com.ivanna.omega.ui.FisicaNuevaScreen(onBack = { nav.popBackStack() })
+            }
+            composable(IvannaRoute.MI_SALA) {
+                com.ivanna.omega.ui.MiSalaScreen(
+                    onBack = { nav.popBackStack() },
+                    onOpenRirSaf = { nav.navigate(IvannaRoute.AUDIO_CONTROL_HUB) },
+                    onOpenControl = { nav.navigate("dashboard") }
+                )
+            }
+            composable(IvannaRoute.MI_EQUIPO) {
+                com.ivanna.omega.ui.MiEquipoScreen(
+                    onBack = { nav.popBackStack() },
+                    onOpenHiRes = { nav.navigate("hires") },
+                    onOpenControl = { nav.navigate("dashboard") }
+                )
+            }
+            composable(IvannaRoute.SALUD_SISTEMA) {
+                com.ivanna.omega.ui.SaludSistemaScreen(
+                    omegaBridge = OmegaEngineBridge,
+                    onBack = { nav.popBackStack() },
+                    onOpenTelemetry = { nav.navigate("oem_telemetry") },
+                    onOpenThermal = { nav.navigate("oem_thermal") }
+                )
+            }
+            composable(IvannaRoute.APRENDE) {
+                com.ivanna.omega.ui.AprendeScreen(
+                    onBack = { nav.popBackStack() },
+                    onOpenFusion = { nav.navigate(IvannaRoute.FUSED_OPERATORS) },
+                    onOpenFisicaNueva = { nav.navigate(IvannaRoute.FISICA_NUEVA) }
+                )
+            }
             composable("profiles") {
                 val context = LocalContext.current
                 val profiles = remember { ProfilesLoader.load(context) }

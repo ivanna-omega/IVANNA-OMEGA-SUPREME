@@ -54,6 +54,22 @@ object IvannaRoute {
     // TIDAL dentro de IVANNA (v2.5.416): reproductor propio, sin redirecciones.
     const val TIDAL = "tidal"
 
+    // ── Pantallas nuevas magistrales (Fase 2, §3 Fase 4 del inventario) ───
+    // Escucha magistral · Física Nueva por secciones · Mi sala · Mi equipo ·
+    // Salud del sistema · Aprende. Todas montadas en el NavHost y con tarjeta
+    // visible en SYSTEM (sin Modo desarrollador: son escucha diaria, no
+    // diagnóstico interno).
+    // Música local como ruta externa: la pestaña MÚSICA vive dentro del
+    // NavHost interno de MainScaffold (sin deep-link desde fuera); esta ruta
+    // permite abrirla desde Escucha magistral y demás pantallas nuevas.
+    const val MUSICA_LOCAL = "musica_local"
+    const val ESCUCHA_MAGISTRAL = "escucha_magistral"
+    const val FISICA_NUEVA      = "fisica_nueva"
+    const val MI_SALA           = "mi_sala"
+    const val MI_EQUIPO         = "mi_equipo"
+    const val SALUD_SISTEMA     = "salud_sistema"
+    const val APRENDE           = "aprende"
+
     // ── 5 Ejes de Supremacía Cuántico-Neuromórfica (Prompt Maestro 2026) ─────
     const val SUPREME_AXES_HUB       = "supreme_axes_hub"
     const val SUPREME_AXIS_1_LATTICE = "supreme_axis_1_lattice"
