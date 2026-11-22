@@ -2,6 +2,8 @@ package com.ivanna.omega.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -39,7 +41,9 @@ fun IvannaLabScreen(modifier: Modifier = Modifier) {
     val autoActive by IvannaLabMonitor.autoMeasureActive.collectAsState()
 
     Column(
+        // Fase 2: scroll para que quepa el panel CMA-ES re-hospedado abajo.
         modifier = modifier.fillMaxSize().background(ObsidianVoid).padding(16.dp)
+            .verticalScroll(rememberScrollState())
     ) {
         Text("IVANNA LAB", color = AuroraCyan, fontSize = 20.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
         Text("THD · IMD · LUFS · SNR · Peak · True Peak", color = TextMuted, fontSize = 11.sp)
@@ -100,6 +104,22 @@ fun IvannaLabScreen(modifier: Modifier = Modifier) {
                 }
             }
         }
+
+        // ── EQ evolutivo CMA-ES (Fase 2: re-hospedado aquí) ───────────────
+        // Antes solo BrainScreen lo usaba (huérfana borrada): el panel es el
+        // monitor del ecualizador FIR evolutivo de 512 bandas — su sitio es
+        // el laboratorio, junto a las mediciones de la cadena.
+        Spacer(Modifier.height(16.dp))
+        Text("EQ EVOLUTIVO · CMA-ES", color = AuroraCyan, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "El motor genoma evolutivo (LM-CMA-ES) prueba muchas soluciones y se " +
+                "queda con la mejor. El paso σ es la distancia de mutación por " +
+                "generación: menor valor = calibración de mayor precisión.",
+            color = TextSecondary, fontSize = 11.sp, lineHeight = 15.sp
+        )
+        Spacer(Modifier.height(8.dp))
+        CmaEsFitnessPanel()
     }
 }
 
