@@ -222,7 +222,7 @@ fun AbxTestScreen(onBack: () -> Unit) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("Ensayos válidos del protocolo v2", style = MaterialTheme.typography.titleMedium)
-                    Text("Trials: $totalTrials · Aciertos: $totalHits " +
+                    Text("Ensayos: $totalTrials · Aciertos: $totalHits " +
                          "(${if (totalTrials>0) (100.0*totalHits/totalTrials).toInt() else 0}%)")
                     Text("p-valor (binomial exacto, H0=0.5): ${"%.4f".format(p)}")
                     Text("IC 95%: [${"%.2f".format(ciLo)}, ${"%.2f".format(ciHi)}]")

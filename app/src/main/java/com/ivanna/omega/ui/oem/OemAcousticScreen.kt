@@ -79,7 +79,7 @@ fun OemAcousticScreen(state: OemState, onBack: () -> Unit) {
                 Spacer(Modifier.height(8.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     AcousticGauge("REVERB", state.reverbLevel, "nivel",      PhosphorGreen, Modifier.weight(1f))
-                    AcousticGauge("PERCUS", state.percussiveness, "transitnt", NeonMagenta,  Modifier.weight(1f))
+                    AcousticGauge("PERCUS", state.percussiveness, "transitorio", NeonMagenta,  Modifier.weight(1f))
                     AcousticGauge("TONAL",  state.tonality, "armónica",        AuroraCyan,  Modifier.weight(1f))
                     AcousticGauge("DYN",    (state.dynRange/30f).coerceIn(0f,1f), "${state.dynRange.toInt()}dB", AmberSignal, Modifier.weight(1f))
                 }

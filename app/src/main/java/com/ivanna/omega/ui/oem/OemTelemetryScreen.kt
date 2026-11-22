@@ -187,7 +187,7 @@ fun OemTelemetryScreen(
                 Text("SPATIAL · HRTF · SOFA", color = TextMuted, fontSize = 8.sp,
                     fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                 Spacer(Modifier.height(8.dp))
-                TelRow("IvannaSpatialManager", if (state.hrtfReady) "Ready" else "No inicializado", if (state.hrtfReady) PhosphorGreen else AmberSignal)
+                TelRow("IvannaSpatialManager", if (state.hrtfReady) "Listo" else "No inicializado", if (state.hrtfReady) PhosphorGreen else AmberSignal)
                 TelRow("Sujeto HRTF activo", state.hrtfSubject, AuroraCyan)
                 TelRow("USB Pro streaming", if (state.usbStreaming) "Activo · 384kHz/32bit" else "En espera", if (state.usbStreaming) PhosphorGreen else TextMuted)
                 TelRow("Evo EQ generación", "${state.evoGeneration}", AuroraCyan)

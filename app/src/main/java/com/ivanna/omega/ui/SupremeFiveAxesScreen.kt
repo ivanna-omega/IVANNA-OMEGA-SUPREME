@@ -218,7 +218,7 @@ fun TransharmonicCvnnAxisCard(
                 modifier = Modifier.weight(1f)
             )
             StatBlock(
-                label = "IMD CANCEL",
+                label = "CANCELACIÓN IMD",
                 value = "%.0f %%".format(state.transharmonicImdCancel * 100f),
                 accent = AuroraCyan,
                 modifier = Modifier.weight(1f)
@@ -296,7 +296,7 @@ fun SnnNmfHoaAxisCard(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             StatBlock(
-                label = "LIF SPIKES",
+                label = "PULSOS LIF",
                 value = if (telemetry.snnActiveSpikes >= 0) "${telemetry.snnActiveSpikes} / 4" else "N/D",
                 accent = PhosphorGreen,
                 modifier = Modifier.weight(1f)
@@ -395,7 +395,7 @@ fun PinnaManifoldAxisCard(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             StatBlock(
-                label = "NOTCH PINNA",
+                label = "MUESCA PINNA",
                 value = if (telemetry.pinnaNotchFreqHz.isFinite()) "%.0f Hz".format(telemetry.pinnaNotchFreqHz) else "N/D",
                 accent = AmberSignal,
                 modifier = Modifier.weight(1f)
@@ -519,7 +519,7 @@ fun ShmFarrowArbitratorAxisCard(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             StatBlock(
-                label = "OWNER PID",
+                label = "PID DUEÑO",
                 value = when (telemetry.shmOwnerPid) { -1 -> "N/D"; 0 -> "LIBRE (0)"; else -> "PID ${telemetry.shmOwnerPid}" },
                 accent = if (telemetry.shmOwnerPid > 0) PhosphorGreen else TextMuted,
                 modifier = Modifier.weight(1f)
@@ -532,7 +532,7 @@ fun ShmFarrowArbitratorAxisCard(
             )
             StatBlock(
                 label = "eBPF XDP",
-                value = if (state.ebpfBypassActive) "BYPASS ON" else "HAL STD",
+                value = if (state.ebpfBypassActive) "BYPASS ACTIVO" else "HAL ESTÁNDAR",
                 accent = if (state.ebpfBypassActive) CoralWarn else TextMuted,
                 modifier = Modifier.weight(1f)
             )
@@ -593,7 +593,7 @@ fun ShmFarrowArbitratorAxisCard(
                 modifier = Modifier.weight(1f),
                 border = BorderStroke(1.dp, CoralWarn)
             ) {
-                Text("LIBERAR LEASE SHM", color = CoralWarn, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Text("LIBERAR MEMORIA SHM", color = CoralWarn, fontSize = 10.sp, fontWeight = FontWeight.Bold)
             }
         }
 
@@ -776,7 +776,7 @@ fun SupremeFiveAxesHubScreen(
                         modifier = Modifier.weight(1f),
                         border = BorderStroke(1.dp, AuroraCyan)
                     ) {
-                        Text("MASTERING STUDIO", color = AuroraCyan, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                        Text("ESTUDIO DE MASTERIZACIÓN", color = AuroraCyan, fontSize = 9.sp, fontWeight = FontWeight.Bold)
                     }
                     OutlinedButton(
                         onClick = {
@@ -1315,19 +1315,19 @@ fun ShmFarrowArbitratorAxisScreen(onBack: () -> Unit) {
             ) {
                 StatBlock(
                     label = "RUTA A (JNI)",
-                    value = if (NativeBridge.isLoaded) "ONLINE" else "STUB",
+                    value = if (NativeBridge.isLoaded) "EN LÍNEA" else "SIMULADO",
                     accent = PhosphorGreen,
                     modifier = Modifier.weight(1f)
                 )
                 StatBlock(
                     label = "RUTA B (DAEMON)",
-                    value = if (telemetry.daemonRutaBConnected) "CONECTADO" else "LOCAL BUS",
+                    value = if (telemetry.daemonRutaBConnected) "CONECTADO" else "BUS LOCAL",
                     accent = if (telemetry.daemonRutaBConnected) PhosphorGreen else AmberSignal,
                     modifier = Modifier.weight(1f)
                 )
                 StatBlock(
                     label = "MMAP SHM",
-                    value = if (telemetry.shmCrossProcessMapped) "MAP_SHARED" else "LOCAL RAM",
+                    value = if (telemetry.shmCrossProcessMapped) "COMPARTIDA" else "RAM LOCAL",
                     accent = if (telemetry.shmCrossProcessMapped) PhosphorGreen else AuroraCyan,
                     modifier = Modifier.weight(1f)
                 )

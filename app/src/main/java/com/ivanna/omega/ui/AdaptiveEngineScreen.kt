@@ -39,7 +39,7 @@ import kotlin.math.abs
 
 /** Ficha del entorno · Adaptive. */
 private val AdaptiveScreenSpec = SpecInfo(
-    title = "Adaptive",
+    title = "Adaptativo",
     what = "El entorno de auto-corrección continua: el ASRC magistral que doma la deriva de reloj, el kernel Volterra que pre-distorciona contra la no-linealidad real de tu salida, y la compensación ISO 226 que restaura el balance a volumen bajo.",
     purpose = "Para eliminar las tres causas invisibles de que algo «suene mal sin saber por qué»: relojes que no coinciden (micro-cortes), transductores que deforman (aspereza) y un oído que a bajo volumen pierde graves y agudos (sonido delgado).",
     whenUse = "Como capa siempre activa. Tu trabajo aquí es elegir el kernel correcto para tu DAC y el nivel de ISO 226 según tu volumen habitual; el servo ASRC no tiene perilla porque trabaja solo.",
@@ -156,13 +156,13 @@ internal fun AdaptiveEngineScreen(
                     modifier = Modifier.weight(1f)
                 )
                 StatBlock(
-                    label = "Peak dBFS",
+                    label = "Pico dBFS",
                     value = "%.1f".format(telemetry.peakDb),
                     accent = if (telemetry.peakDb > -3f) AmberSignal else AuroraCyan,
                     modifier = Modifier.weight(1f)
                 )
                 StatBlock(
-                    label = "GR dB",
+                    label = "Reducción GR dB",
                     value = "%.1f".format(telemetry.grDb),
                     accent = if (abs(telemetry.grDb) > 6f) NeonMagenta else AuroraCyan,
                     modifier = Modifier.weight(1f)
@@ -174,7 +174,7 @@ internal fun AdaptiveEngineScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
                 StatBlock(
-                    label = "Comp",
+                    label = "Compresor",
                     value = "%.2f".format(telemetry.compAmount),
                     accent = AuroraCyan,
                     modifier = Modifier.weight(1f)
@@ -222,7 +222,7 @@ internal fun AdaptiveEngineScreen(
         // 3I: score en vivo del clasificador (0..1, EMA suavizado)
         val voiceScoreLive by VoiceProtectionController.sharedVoiceScore.collectAsState()
         GlassCard(
-            title = "Voice Protection",
+            title = "Protección de voz",
             accent = NeonMagenta,
             subtitle = if (voiceActive)
                 "Voces protegidas — exciter reducido automáticamente"
@@ -242,7 +242,7 @@ internal fun AdaptiveEngineScreen(
             if (voiceActive && voiceScoreLive > 0f) {
                 Spacer(Modifier.height(6.dp))
                 StatBlock(
-                    label = "Voice Score",
+                    label = "Puntuación de voz",
                     value = "%.0f%%".format(voiceScoreLive * 100f),
                     accent = if (voiceScoreLive > 0.6f) NeonMagenta else AuroraCyan
                 )
@@ -361,7 +361,7 @@ internal fun AdaptiveEngineScreen(
             if (manualModeEnabled) {
                 // Compresor
                 AuroraSlider(
-                    label = "Threshold (dB)",
+                    label = "Umbral (dB)",
                     value = audioState.compressorThreshold,
                     range = CanonicalRanges.compressorThresholdDb,
                     displayValue = { "%.0f dB".format(it) },
@@ -381,7 +381,7 @@ internal fun AdaptiveEngineScreen(
                     }
                 )
                 AuroraSlider(
-                    label = "Attack (ms)",
+                    label = "Ataque (ms)",
                     value = audioState.compressorAttack,
                     range = CanonicalRanges.compressorAttackMs,
                     displayValue = { "%.0f ms".format(it) },
@@ -391,7 +391,7 @@ internal fun AdaptiveEngineScreen(
                     }
                 )
                 AuroraSlider(
-                    label = "Release (ms)",
+                    label = "Liberación (ms)",
                     value = audioState.compressorRelease,
                     range = CanonicalRanges.compressorReleaseMs,
                     displayValue = { "%.0f ms".format(it) },

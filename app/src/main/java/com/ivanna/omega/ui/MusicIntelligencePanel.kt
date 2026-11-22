@@ -97,7 +97,7 @@ fun MusicIntelligencePanel(modifier: Modifier = Modifier) {
                         )
                         Spacer(Modifier.width(8.dp))
                         Text(
-                            text = if (snap.manualStyle >= 0) "[MANUAL]" else "[AUTO BAYES]",
+                            text = if (snap.manualStyle >= 0) "[MANUAL]" else "[AUTO BAYESIANO]",
                             color = if (snap.manualStyle >= 0) gold else cyan,
                             fontSize = 10.sp,
                             fontFamily = FontFamily.Monospace
@@ -212,10 +212,10 @@ fun MusicIntelligencePanel(modifier: Modifier = Modifier) {
                     .padding(8.dp),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                MetricCell("WFS Spread", String.format(Locale.US, "%.2f", snap.wfsSpread), cyan)
-                MetricCell("HRTF Depth", String.format(Locale.US, "%.2f", snap.hrtfDepth), cyan)
-                MetricCell("Env Depth", String.format(Locale.US, "%.2f", snap.envDepth), emerald)
-                MetricCell("Warmth T2/T3", String.format(Locale.US, "%.2f", snap.warmth), gold)
+                MetricCell("Apertura WFS", String.format(Locale.US, "%.2f", snap.wfsSpread), cyan)
+                MetricCell("Profundidad HRTF", String.format(Locale.US, "%.2f", snap.hrtfDepth), cyan)
+                MetricCell("Profundidad de entorno", String.format(Locale.US, "%.2f", snap.envDepth), emerald)
+                MetricCell("Calidez T2/T3", String.format(Locale.US, "%.2f", snap.warmth), gold)
                 MetricCell("Elevación Z", String.format(Locale.US, "+%.2fm", snap.stageElevation), coral)
             }
 
@@ -235,10 +235,10 @@ fun MusicIntelligencePanel(modifier: Modifier = Modifier) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                MetricCell("C_t Trans", String.format(Locale.US, "%.2f", snap.cTransient), emerald)
-                MetricCell("C_s IACC", String.format(Locale.US, "%.2f", snap.cSpatial), cyan)
-                MetricCell("C_d Crest", String.format(Locale.US, "%.2f", snap.cDynamic), gold)
-                MetricCell("Q Global", String.format(Locale.US, "%.2f", snap.qScore), emerald)
+                MetricCell("C. transitorios", String.format(Locale.US, "%.2f", snap.cTransient), emerald)
+                MetricCell("C. espacial (IACC)", String.format(Locale.US, "%.2f", snap.cSpatial), cyan)
+                MetricCell("C. dinámica (cresta)", String.format(Locale.US, "%.2f", snap.cDynamic), gold)
+                MetricCell("Calidad global", String.format(Locale.US, "%.2f", snap.qScore), emerald)
                 MetricCell(
                     "Guarda M10",
                     if (snap.guardActive) String.format(Locale.US, "ACTIVA x%.2f", snap.guardScale) else "NOMINAL 1.0",

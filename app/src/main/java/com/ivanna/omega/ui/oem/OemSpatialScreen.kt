@@ -85,6 +85,12 @@ fun OemSpatialScreen(
                         TelRow("Ancho actual", "${"%.2f".format(state.spatialWidth)}", AuroraCyan)
                     }
                 }
+                OemGlossaryNote(
+                    "HRTF = cómo tu cabeza y tus orejas cambian el sonido según de dónde viene (sonido 3D con audífonos) · " +
+                    "SOFA = el archivo que guarda mediciones de HRTF de cabezas reales · " +
+                    "ITD / ILD = la diferencia de tiempo / de volumen entre tus dos oídos: así sabes de dónde viene un sonido · " +
+                    "VBAP = repartir el sonido entre bocinas virtuales según su dirección."
+                )
             }
 
             // 3D Position Map

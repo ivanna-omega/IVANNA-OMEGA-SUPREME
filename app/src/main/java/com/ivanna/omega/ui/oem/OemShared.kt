@@ -25,6 +25,19 @@ fun TelRow(label: String, value: String, color: Color) {
     }
 }
 
+/**
+ * Glosario de siglas en palabras simples (inventario Apéndice B): se muestra
+ * JUNTO a los medidores/chips que usan las siglas, no en otra pantalla.
+ * Nada que memorizar: cada sigla dice qué significa en una línea.
+ */
+@Composable
+fun OemGlossaryNote(text: String) {
+    Text(
+        text, color = TextMuted, fontSize = 8.sp, lineHeight = 12.sp,
+        modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+    )
+}
+
 @Composable
 fun OemSliderRow(
     label: String,

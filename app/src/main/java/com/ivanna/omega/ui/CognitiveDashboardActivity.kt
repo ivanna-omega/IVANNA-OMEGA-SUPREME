@@ -87,7 +87,7 @@ fun CognitiveDashboardScreen(vm: PerceptualViewModel = viewModel()) {
                     fontFamily = FontFamily.Monospace
                 )
                 Text(
-                    text = "Cognitive Neural Audio Cortex",
+                    text = "Córtex de audio neuronal cognitivo",
                     color = AuroraCyan,
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace
@@ -96,7 +96,7 @@ fun CognitiveDashboardScreen(vm: PerceptualViewModel = viewModel()) {
 
             Text(
                 text = when {
-                    state.isMagiskConnected -> "● MAGISK IPC ONLINE"
+                    state.isMagiskConnected -> "● MAGISK IPC EN LÍNEA"
                     state.isBridgeConnected -> "● MOTOR NATIVO (sin módulo)"
                     else                    -> "○ SIN MOTOR"
                 },
@@ -118,7 +118,7 @@ fun CognitiveDashboardScreen(vm: PerceptualViewModel = viewModel()) {
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
-                    text = "Perceptual Dynamics (Fatigue vs. Immersion)",
+                    text = "Dinámica perceptual (fatiga frente a inmersión)",
                     color = TextSecondary,
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace
@@ -172,15 +172,15 @@ fun CognitiveDashboardScreen(vm: PerceptualViewModel = viewModel()) {
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column {
-                    Text("Neural Confidence", color = TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                    Text("Confianza neuronal", color = TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
                     Text("${state.neuralConfidencePercent}%", color = PhosphorGreen, fontSize = 16.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                 }
                 Column {
-                    Text("Decision Time (medido)", color = TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                    Text("Tiempo de decisión (medido)", color = TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
                     Text(if (dspDecision.executionLatencyMs > 0f) "%.3f ms".format(dspDecision.executionLatencyMs) else "—", color = AuroraCyan, fontSize = 16.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                 }
                 Column {
-                    Text("Spatial Mode", color = TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                    Text("Modo espacial", color = TextSecondary, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
                     Text(dspDecision.spatialMode ?: "STEREO", color = AmberSignal, fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                 }
             }
@@ -196,7 +196,7 @@ fun CognitiveDashboardScreen(vm: PerceptualViewModel = viewModel()) {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Text("Cortex Aggressiveness Level", color = TextPrimary, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                    Text("Nivel de agresividad del córtex", color = TextPrimary, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
                     Text("${(userProfile.aggressiveness * 100).toInt()}%", color = AuroraCyan, fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
                 }
                 Slider(
@@ -215,7 +215,7 @@ fun CognitiveDashboardScreen(vm: PerceptualViewModel = viewModel()) {
             colors = ButtonDefaults.buttonColors(containerColor = ObsidianGlass),
             shape = RoundedCornerShape(8.dp)
         ) {
-            Text("Reset to Neutral Profile", color = TextPrimary, fontFamily = FontFamily.Monospace)
+            Text("Volver al perfil neutro", color = TextPrimary, fontFamily = FontFamily.Monospace)
         }
     }
 }

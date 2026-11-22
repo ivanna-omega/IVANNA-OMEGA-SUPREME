@@ -265,6 +265,11 @@ private fun SignalMetersCard(state: OemState) {
             DspChiplet("HRTF", state.hrtfOn, AuroraCyan)
             DspChiplet("LIM",  state.safetyMargin < 0.1f, CoralWarn)
         }
+        OemGlossaryNote(
+            "RMS = nivel promedio, lo que se siente fuerte · PEAK = el pico más alto, lo que puede saturar · " +
+            "GR = cuánto está reduciendo el compresor en ese momento · SAF = el sistema que aprende de tu sala · " +
+            "HRTF = cómo tu cabeza y tus orejas ponen los sonidos en 3D con audífonos · LIM = limitador de seguridad."
+        )
     }
 }
 
