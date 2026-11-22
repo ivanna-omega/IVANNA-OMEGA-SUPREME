@@ -307,6 +307,13 @@ class OemViewModel(app: Application) : AndroidViewModel(app) {
         val route = AudioRouteManager.detectOutputRoute()
         val routeAllowed = SystemWideHrtfPolicy.allow(getApplication<Application>(), en, route)
         OmegaEngineBridge.queueSystemWideHrtfEnabled(routeAllowed)
+        // FIX Fase 2: hrtfOn se deriva de SpatialControlStore.hrtfEnabled —
+        // si no se persiste aquí, el siguiente poll() relee el valor viejo
+        // y el chip parece no apagar nada (el toggle no se quedaba).
+        val ctx = getApplication<Application>()
+        val cur = com.ivanna.omega.spatial.SpatialControlStore.load(ctx)
+        com.ivanna.omega.spatial.SpatialControlStore.save(ctx, cur.copy(hrtfEnabled = en))
+        poll()
     }
 
     fun setHrtfSubject(subject: String) = runCatching {
@@ -354,6 +361,9 @@ class OemViewModel(app: Application) : AndroidViewModel(app) {
                 IvannaNativeLib.nativeSetSpatialAngleRad(Math.toRadians(deg.toDouble()).toFloat())
             }
         }
+        // FIX Fase 2: el ángulo no se persistía en ningún sitio — al reabrir
+        // la pantalla volvía a 0° local. Se guarda en grados (ParameterStore).
+        runCatching { com.ivanna.omega.core.ParameterStore(getApplication()).setSpatialAngle(deg) }
     }
 
     fun setSpatialWidth(w: Float) {

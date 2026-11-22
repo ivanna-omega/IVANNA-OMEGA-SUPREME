@@ -17,6 +17,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.ivanna.omega.ui.CanonicalRanges
 import com.ivanna.omega.ui.theme.*
 import kotlin.math.*
 
@@ -59,12 +60,17 @@ fun OemSpatialScreen(
                     verticalAlignment = Alignment.CenterVertically) {
                     Text("HRTF · SOFA", color = TextMuted, fontSize = 8.sp,
                         fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    // FIX Fase 2: el chip conmutaba con !hrtfReady (listo) en vez
+                    // de !hrtfOn (encendido): tocarlo con el motor listo lo
+                    // APAGABA cuando el usuario creía encenderlo, y viceversa.
+                    // Ahora conmuta el encendido real; "LISTO" solo dice que el
+                    // motor lo tiene cargado, no que esté sonando.
                     Surface(shape = RoundedCornerShape(4.dp),
-                        modifier = Modifier.clickable { onSetHrtfEnabled(!state.hrtfReady) },
-                        color = if (state.hrtfReady) PhosphorGreen.copy(0.15f) else CoralWarn.copy(0.15f)) {
+                        modifier = Modifier.clickable { onSetHrtfEnabled(!state.hrtfOn) },
+                        color = if (state.hrtfOn) PhosphorGreen.copy(0.15f) else if (state.hrtfReady) AuroraCyan.copy(0.15f) else CoralWarn.copy(0.15f)) {
                         Text(
-                            if (state.hrtfReady) "CARGADO ✓" else "NO INICIALIZADO",
-                            color = if (state.hrtfReady) PhosphorGreen else CoralWarn,
+                            if (state.hrtfOn) "ENCENDIDO ✓" else if (state.hrtfReady) "LISTO · APAGADO" else "NO INICIALIZADO",
+                            color = if (state.hrtfOn) PhosphorGreen else if (state.hrtfReady) AuroraCyan else CoralWarn,
                             fontSize = 8.sp, fontWeight = FontWeight.Bold,
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                         )
@@ -123,8 +129,14 @@ fun OemSpatialScreen(
                 }
 
                 if (expertMode) {
-                    var angle by remember { mutableFloatStateOf(0f) }
-                    OemSliderRow("Ángulo (°)", angle, -180f, 180f, "${"%.0f".format(angle)}°") {
+                    // FIX Fase 2: el ángulo empezaba en 0° local aunque el motor
+                    // tuviera otro: se lee del motor (nativeGetSpatialAngleRad)
+                    // y, si no hay lectura, del valor guardado en grados.
+                    val ctx = androidx.compose.ui.platform.LocalContext.current
+                    var angle by remember {
+                        mutableFloatStateOf(readSavedAngleDeg(ctx))
+                    }
+                    OemSliderRow("Ángulo (°)", angle, CanonicalRanges.binauralAzimuthDeg.start, CanonicalRanges.binauralAzimuthDeg.endInclusive, "${"%.0f".format(angle)}°") {
                         angle = it; onSetAngle(it)
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -170,6 +182,22 @@ fun OemSpatialScreen(
             }
         }
     }
+}
+
+/**
+ * Ángulo espacial guardado, en grados. Primero el motor en vivo
+ * (nativeGetSpatialAngleRad, protegido: si la lib no cargó devuelve NaN);
+ * si no hay lectura, el valor persistido en grados (OemViewModel lo guarda
+ * en cada cambio). El default histórico 0.5 de ParameterStore se lee como
+ * 0.5°, prácticamente centrado.
+ */
+private fun readSavedAngleDeg(context: android.content.Context): Float {
+    val fromEngine = com.ivanna.omega.core.IvannaNativeLib.guardedNative(Float.NaN) {
+        Math.toDegrees(com.ivanna.omega.core.IvannaNativeLib.nativeGetSpatialAngleRad().toDouble()).toFloat()
+    }
+    if (fromEngine.isFinite()) return fromEngine.coerceIn(-180f, 180f)
+    return runCatching { com.ivanna.omega.core.ParameterStore(context).getSpatialAngle() }
+        .getOrDefault(0f).takeIf { it.isFinite() }?.coerceIn(-180f, 180f) ?: 0f
 }
 
 private fun DrawScope.drawSpatialMap(width: Float) {

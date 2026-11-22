@@ -87,11 +87,18 @@ fun OemAcousticScreen(state: OemState, onBack: () -> Unit) {
                 TelRow("Centroide espectral", "${state.spectralCentroid.toInt()} Hz", AuroraCyan)
             }
 
-            // Controles de sala
+            // Controles de sala — Fase 2: los sliders LEEN el valor guardado
+            // al entrar (antes eran 0.3/0.5/0.5 locales y mentían al abrir).
+            // Nivel = rirWet guardado (SpatialAudioPrefs, el que restaura el
+            // arranque); tamaño = rirRt60 guardado (0.1–1.5 s -> 0–1);
+            // difusión = orbeDiffuse guardado (ParameterStore, ya se reescribía
+            // al mover el slider). Cada cambio se vuelve a guardar, así al
+            // reabrir se ve lo último que se puso. El envío al motor no cambia.
             val appContext = androidx.compose.ui.platform.LocalContext.current
-            var roomWet   by remember { mutableFloatStateOf(0.3f) }
-            var roomSize  by remember { mutableFloatStateOf(0.5f) }
-            var diffusion by remember { mutableFloatStateOf(0.5f) }
+            val savedRoom = remember(appContext) { com.ivanna.omega.ui.SpatialAudioPrefs.load(appContext) }
+            var roomWet   by remember { mutableFloatStateOf(savedRoom.rirWet.coerceIn(0f, 1f)) }
+            var roomSize  by remember { mutableFloatStateOf(((savedRoom.rirRt60 - 0.1f) / 1.4f).coerceIn(0f, 1f)) }
+            var diffusion by remember { mutableFloatStateOf(runCatching { com.ivanna.omega.core.ParameterStore(appContext).getOrbeDiffuse() }.getOrDefault(0.5f).coerceIn(0f, 1f)) }
             OemCard(Modifier.fillMaxWidth()) {
                 Text("CONTROLES DE SALA", color = TextMuted, fontSize = 8.sp,
                     fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
@@ -99,6 +106,7 @@ fun OemAcousticScreen(state: OemState, onBack: () -> Unit) {
                 OemSliderRow("Nivel de sala", roomWet, 0f, 1f, "${"%.0f".format(roomWet*100)}%") {
                     roomWet = it
                     runCatching { IvannaNativeLib.nativeSetSpatialWet(it) }
+                    runCatching { com.ivanna.omega.ui.SpatialAudioPrefs.save(appContext, savedRoom.copy(rirWet = it)) }
                 }
                 OemSliderRow("Tamaño", roomSize, 0f, 1f, "${"%.0f".format(roomSize*100)}%") {
                     roomSize = it
@@ -108,6 +116,7 @@ fun OemAcousticScreen(state: OemState, onBack: () -> Unit) {
                         com.ivanna.omega.magisk.OmegaEngineBridge.setRoom(
                             rt60S = 0.1f + it * 1.4f, wet = roomWet, roomIdx = -1)
                     }
+                    runCatching { com.ivanna.omega.ui.SpatialAudioPrefs.save(appContext, savedRoom.copy(rirRt60 = 0.1f + it * 1.4f)) }
                 }
                 OemSliderRow("Difusión", diffusion, 0f, 1f, "${"%.0f".format(diffusion*100)}%") {
                     diffusion = it
