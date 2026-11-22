@@ -32,7 +32,7 @@ data class SaFOptimizerState(
  *
  * IVANNAApplication.onCreate() llama a init(context) en el arranque.
  * IvannaAppShell.SpatialTab observa state como StateFlow.
- * SaFCalibrationScreen llama a runCalibrationStep() al completar la calibración.
+ * SaFEngine llama a runCalibrationStep() al completar la calibración.
  */
 object SaFOptimizer {
 

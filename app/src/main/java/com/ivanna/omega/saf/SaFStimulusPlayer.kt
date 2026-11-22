@@ -26,7 +26,7 @@ import kotlin.math.sin
  * SaFStimulusPlayer — reproductor de tonos binaurales de calibración HRTF.
  *
  * PROBLEMA QUE RESUELVE (auditoría del propietario, 2026-09-10):
- *   La pantalla `SaFCalibrationScreen` anuncia "Escucharás 5 tonos de prueba"
+ *   La calibración SaF anuncia "Escucharás 5 tonos de prueba"
  *   y avanza las 5 direcciones sin reproducir NINGÚN estímulo. El usuario ve
  *   la flecha y el hint pero no oye nada, así que CORRECTO/INCORRECTO se
  *   convierte en encuesta ciega y `Φ_SAF^∞` converge sobre ruido humano en

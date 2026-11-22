@@ -103,7 +103,8 @@ object AudioStateManager {
             spatialWidth = validated.spatialWidth.coerceIn(0f, 2f),
             exciterAmount = validated.exciterAmount.coerceIn(0f, 1f),
             masterGain = validated.masterGain.coerceIn(0.1f, 2f),
-            // Mismos rangos que los sliders de SoundScreen: un valor persistido
+            // Mismos rangos que CanonicalRanges (antes en los sliders de
+            // SoundScreen, borrada en la Fase 2): un valor persistido
             // corrupto o un modulador adaptativo no pueden empujar el DSP fuera de rango.
             eqBass = validated.eqBass.coerceIn(-18f, 18f),
             eqMid = validated.eqMid.coerceIn(-18f, 18f),

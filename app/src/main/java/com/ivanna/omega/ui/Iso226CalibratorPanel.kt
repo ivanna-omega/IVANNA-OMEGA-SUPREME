@@ -58,7 +58,7 @@ private val Iso226Spec = SpecInfo(
  *   - Botón APLICAR → Iso226Calibrator.applyAll() → EQ + DSPBridge + OmegaBridge
  *   - Estado de cada capa (checkmarks de aplicación)
  *
- * Se puede incrustar en SoundScreen o usarse como pantalla standalone.
+ * Se puede incrustar en una pantalla de control o usarse como pantalla standalone.
  */
 @Composable
 fun Iso226CalibratorPanel(

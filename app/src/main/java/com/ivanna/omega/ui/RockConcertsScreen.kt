@@ -64,7 +64,7 @@ import com.ivanna.omega.ui.theme.TextSecondary
  * - Lista completa: artista, título, recinto + ciudad + año, género, por qué
  *   es legendario y los servicios donde escucharlo.
  * - Al tocar un servicio se abre su buscador con el [RockConcert.searchTitle]
- *   exacto (Intent ACTION_VIEW, patrón ya usado en AuditoryExperienceScreen);
+ *   exacto (Intent ACTION_VIEW);
  *   si no hay navegador/app que lo abra, el título se copia al portapapeles.
  *
  * Ruta: [IvannaRoute.ROCK_CONCERTS] ("rock_concerts"), con acceso desde el

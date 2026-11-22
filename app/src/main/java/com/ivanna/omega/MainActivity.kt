@@ -81,9 +81,6 @@ import android.net.Uri
 import com.ivanna.omega.audio.IvannaBridgePlayer
 import com.ivanna.omega.audio.VolterraSwitch
 import com.ivanna.omega.ui.IvannaRoute
-import com.ivanna.omega.ui.SoundScreen
-import com.ivanna.omega.ui.BrainScreen
-import com.ivanna.omega.ui.SystemScreen
 import com.ivanna.omega.ui.BridgePlayerCard
 import kotlin.math.log10
 import kotlinx.coroutines.Dispatchers
@@ -98,8 +95,6 @@ import com.ivanna.omega.ai.RealtimeLearningController
 import com.ivanna.omega.audio.AudioPipeline
 import com.ivanna.omega.ai.PerceptualBrainEngine
 import com.ivanna.omega.ai.PerceptualSnapshot
-import com.ivanna.omega.ui.PerceptualBrainDashboard
-import com.ivanna.omega.ui.SaFCalibrationScreen
 import com.ivanna.omega.ui.SpatialControlPanel
 import com.ivanna.omega.ui.MainScaffold
 import com.ivanna.omega.ui.Bark64VisualizerPanel
@@ -721,11 +716,6 @@ fun OmegaApp() {
                                 )
                 }
             }
-            // ── MAGISTRAL DASHBOARD ───────────────────────────────────────
-            // FIX (pantalla huérfana): MagistralDashboardScreen estaba
-            // implementada pero sin destino en el NavHost — el usuario nunca
-            // la veía. Se le da ruta propia ("magistral"); BRAIN sigue siendo
-            // BrainScreen y se alcanza desde el CTA "PERCEPTUAL BRAIN CORTEX".
             // FUSIÓN MAGISTRAL (7 operadores, 2026-11-18): FusedOperatorsScreen
             // existía pero sin destino en el NavHost — el usuario nunca la veía.
             // Ruta propia; el tab FUSIÓN navega aquí.
@@ -994,5 +984,6 @@ fun StatusDot(active: Boolean, label: String) {
 
 // Nota de auditoria: DspSection/FaderControl/EqFader vivian aqui (50 lineas)
 // sin un solo call-site en todo el repo — sliders muertos que nadie renderizaba.
-// Los faders reales de la UI son IvannaSliderRow (SoundScreen) y los paneles
-// de BrainScreen. Eliminados para que no vuelvan a confundir la auditoria.
+// Los faders reales de la UI viven en los paneles vivos (IvannaControlPanel,
+// FusedOperatorsScreen, AdaptiveEngineScreen); los rangos canónicos están en
+// CanonicalRanges. SoundScreen/BrainScreen se borraron en la Fase 2 (2026-11-22).

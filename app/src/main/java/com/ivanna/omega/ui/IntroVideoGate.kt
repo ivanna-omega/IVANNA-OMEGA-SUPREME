@@ -45,7 +45,7 @@ import android.content.Context
  * }
  * ```
  *
- * "Ver intro de nuevo" (opcional, p. ej. desde SystemScreen o Acerca de):
+ * "Ver intro de nuevo" (opcional, p. ej. desde Acerca de):
  * `IntroVideoGate.resetIntroVideo(context)` y navegar a "introVideo".
  */
 object IntroVideoGate {

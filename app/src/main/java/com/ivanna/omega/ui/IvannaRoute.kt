@@ -3,54 +3,38 @@ package com.ivanna.omega.ui
 /**
  * IvannaRoute — centraliza las rutas usadas por la navegación para evitar
  * literales esparcidas que provocan errores y dificultan refactors.
+ *
+ * Nota (Fase 2, 2026-11-22): las rutas sin destino (splash, intro, sound,
+ * ope, binaural, perceptual_brain, perceptual_cortex, magistral,
+ * adaptive_dash, adaptive_profiles, space, auditory, system, telemetry y
+ * sus alias) se borraron junto con las 9 pantallas huérfanas: ninguna
+ * estaba montada en el NavHost ni se navegaba a ella. Solo quedan las
+ * rutas vivas (montadas o navegadas) y TIDAL, que se conserva como
+ * const legacy documentada aunque su pantalla ya no existe.
  */
 object IvannaRoute {
 
-    const val SPLASH = "splash"
-    const val INTRO = "intro"
     const val DASHBOARD = "dashboard"
 
-    // Sonido
-    const val SOUND = "sound"
-    const val OPE = "ope"
-    const val BINAURAL = "binaural"
-
     // Cerebro / Perceptual
-    const val BRAIN = "perceptual_brain"
-    const val PERCEPTUAL = "perceptual_brain"
     const val ADAPTIVE = "adaptive"
-    // FIX (pantalla muerta): PerceptualBrainDashboard (461 lineas, motor real +
-    // sliders interactivos) estaba importada en MainActivity pero SIN destino en
-    // el NavHost: era inalcanzable. Ruta propia, distinta de BRAIN (BrainScreen).
-    const val PERCEPTUAL_CORTEX = "perceptual_cortex"
-    // MAGISTRAL — dashboard cognitivo (MagistralDashboardScreen). Ruta propia:
-    // BRAIN ("perceptual_brain") ya la ocupa BrainScreen y no se toca.
-    const val MAGISTRAL = "magistral"
     // FUSIÓN MAGISTRAL (7 operadores): pantalla propia (FusedOperatorsScreen).
     // FIX (pantalla huérfana, 2026-11-18): existía pero sin ruta ni destino:
     // nadie la abría. Ruta propia, distinta de MAGISTRAL (dashboard).
     const val FUSED_OPERATORS = "fused_operators"
-    const val ADAPTIVE_DASH = "adaptive_dash"
-    const val ADAPTIVE_PROFILES = "adaptive_profiles"
     const val LAB = "lab"
 
     // Espacio / Auditory
-    const val SPACE = "space"
-    const val AUDITORY = "auditory"
     const val VISUALIZER = "visualizer"
 
     // Sistema
-    const val SYSTEM = "system"
     const val MAGISK = "magisk"
     const val PROFILES = "profiles"
-    const val TELEMETRY = "telemetry"
     // VISTA DE DIOS · FLOTA (v2.5.471 Repair 4): ciclos reales del consejo
     // leídos del puente (FleetViewScreen). Sin ciclos muestra la verdad.
     const val FLEET_VIEW = "fleet_view"
 
     // Legacy / aliases
-    const val OPE_ALIAS = "ope"
-    const val BINAURAL_ALIAS = "binaural"
     const val ABX_TEST = "abx_test"
     const val AUDIO_CONTROL_HUB = "audio_control_hub"  // SOFA · AF · RIR · SAF panel
 

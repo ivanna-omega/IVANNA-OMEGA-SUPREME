@@ -110,7 +110,7 @@ fun SofaAfRirSafPanelScreen(
     var nativeLoaded by remember { mutableStateOf(IvannaNativeLib.isLoaded) }
     var daemonConnected by remember { mutableStateOf(OmegaEngineBridge.isConnected) }
 
-    // Estado híbrido compartido con SoundScreen y SpatialAudioPanel.
+    // Estado híbrido compartido con SpatialAudioPanel.
     // Si falta telemetría, recuperar preferencias reales; nunca asumir OFF/defaults sintéticos.
     var adaptivePrefs by remember { mutableStateOf(AdaptiveControlsPrefs.load(ctx)) }
     val initHybrid = remember { com.ivanna.omega.core.NativeBridge.safeGetHybridMagistralTelemetry() }

@@ -102,7 +102,7 @@ object PersistedStateRestorer {
         // 1. Restaurar AdaptiveControlsPrefs
         val acPrefs = AdaptiveControlsPrefs.load(ctx)
         // El motor híbrido es estado global nativo compartido por varias pantallas.
-        // Restaurarlo aquí evita que dependa de abrir SoundScreen/SpatialAudioPanel.
+        // Restaurarlo aquí evita que dependa de abrir ninguna pantalla.
         NativeBridge.safeSetHybridMagistralParams(
             enabled = acPrefs.hybridMagistralEnabled,
             binauralWet = if (hrtfAllowed) acPrefs.hybridBinauralWet * hrtfWet else 0f,
