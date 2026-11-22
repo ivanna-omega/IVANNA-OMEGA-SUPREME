@@ -1062,12 +1062,12 @@ fun IvannaControlPanel(
         SectionLabel("CADENA DSP", MagistralGold)
 
         GlassCard(title = "DSP CORE", accent = AuroraCyan, subtitle = "EQ · Exciter · Widener · Gain") {
-            AuroraSlider("EXCITER", exciter, 0f..1f, unit = "×", spec = FusedControlSpecs.dynExciter) { exciter = it; onExciterChange(it) }
-            AuroraSlider("GRAVES", tonalLow, CanonicalRanges.eqBandDb, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalLow = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
-            AuroraSlider("MEDIOS", tonalMid, CanonicalRanges.eqBandDb, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalMid = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
-            AuroraSlider("AGUDOS", tonalHigh, CanonicalRanges.eqBandDb, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalHigh = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
-            AuroraSlider("PRESENCIA", tonalPresence, CanonicalRanges.eqPresenceDb, unit = "dB", spec = FusedControlSpecs.tonalEq) { tonalPresence = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
-            AuroraSlider("TRIM · CIERRE LUFS", tonalTrim, -6f..6f, unit = "dB", spec = FusedControlSpecs.tonalTrim) { tonalTrim = it; onTonalTrimChange(it) }
+            AuroraSlider("EXCITER", exciter, 0f..1f, unit = "×", spec = FusedControlSpecs.dynExciter, showSpecInline = true) { exciter = it; onExciterChange(it) }
+            AuroraSlider("GRAVES", tonalLow, CanonicalRanges.eqBandDb, unit = "dB", spec = FusedControlSpecs.tonalEq, showSpecInline = true) { tonalLow = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
+            AuroraSlider("MEDIOS", tonalMid, CanonicalRanges.eqBandDb, unit = "dB", spec = FusedControlSpecs.tonalEq, showSpecInline = true) { tonalMid = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
+            AuroraSlider("AGUDOS", tonalHigh, CanonicalRanges.eqBandDb, unit = "dB", spec = FusedControlSpecs.tonalEq, showSpecInline = true) { tonalHigh = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
+            AuroraSlider("PRESENCIA", tonalPresence, CanonicalRanges.eqPresenceDb, unit = "dB", spec = FusedControlSpecs.tonalEq, showSpecInline = true) { tonalPresence = it; onTonalEqChange(tonalLow, tonalMid, tonalHigh, tonalPresence) }
+            AuroraSlider("TRIM · CIERRE LUFS", tonalTrim, -6f..6f, unit = "dB", spec = FusedControlSpecs.tonalTrim, showSpecInline = true) { tonalTrim = it; onTonalTrimChange(it) }
             AuroraSlider("STEREO WIDTH", width, 0f..1.5f, unit = "γ", spec = FusedControlSpecs.dynWidth) { width = it; onWidthChange(it) }
             // MEZCLA CAPTURA (v2.5.412): cuánto del procesado se reinyecta
             // frente al original de Tidal, que suena al 100% (no hay API
@@ -1095,11 +1095,11 @@ fun IvannaControlPanel(
             // Compresor en dB canónicos (−60…0 dB, ratio 1…20): el valor
             // guardado (dB fusionado) no cambia, solo el rango del control.
             // El alpha/beta normalizado legacy se deriva en el llamador.
-            AuroraSlider("THRESHOLD", compThresholdDb, CanonicalRanges.compressorThresholdDb, spec = FusedControlSpecs.dynComp,
+            AuroraSlider("THRESHOLD", compThresholdDb, CanonicalRanges.compressorThresholdDb, spec = FusedControlSpecs.dynComp, showSpecInline = true,
                 displayValue = { "%.1f dB".format(it) }) {
                 compThresholdDb = it; onCompThresholdChange(it)
             }
-            AuroraSlider("RATIO", compRatioValue, CanonicalRanges.compressorRatio, spec = FusedControlSpecs.dynComp,
+            AuroraSlider("RATIO", compRatioValue, CanonicalRanges.compressorRatio, spec = FusedControlSpecs.dynComp, showSpecInline = true,
                 displayValue = { "%.1f:1".format(it) }) {
                 compRatioValue = it; onCompRatioChange(it)
             }

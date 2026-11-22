@@ -770,6 +770,9 @@ private fun FusedSliderRow(
             )
         )
         Text(hint, color = TextMuted, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+        // Fase 2: la explicación visible junto al control (antes solo vivía
+        // detrás del botón ⓘ). La ficha no se reescribe: se muestra spec.what.
+        if (spec != null) SpecInline(spec = spec)
     }
 }
 
@@ -802,6 +805,8 @@ private fun FusedSwitchRow(
             )
         )
     }
+    // Fase 2: explicación visible junto al interruptor (ver FusedSliderRow).
+    if (spec != null) SpecInline(spec = spec)
 }
 
 /** Fila de opciones excluyentes (modo, curva, perfil, preset, modo cerebro). */
@@ -818,6 +823,8 @@ private fun FusedOptionRow(
             Text(label, color = TextPrimary, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
             if (spec != null) SpecInfoButtonSmall(spec = spec)
         }
+        // Fase 2: explicación visible junto a las opciones (ver FusedSliderRow).
+        if (spec != null) SpecInline(spec = spec)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp)

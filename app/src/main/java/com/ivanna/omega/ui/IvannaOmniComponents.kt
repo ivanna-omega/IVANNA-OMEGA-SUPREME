@@ -424,6 +424,10 @@ internal fun AuroraSlider(
     unit: String = "",
     displayValue: ((Float) -> String)? = null,
     spec: SpecInfo? = null, // v2.5.473 §6: "i" junto al control
+    // Fase 2: true = la ficha (spec.what) se ve bajo el control, no solo
+    // detrás del botón ⓘ. Por defecto apagado: las pantallas densas lo
+    // encienden solo en sus controles principales.
+    showSpecInline: Boolean = false,
     onValueChange: (Float) -> Unit
 ) {
     val safeValue = com.ivanna.omega.safmus.SafmusUniversalKernel
@@ -481,6 +485,9 @@ internal fun AuroraSlider(
         }
         // Toda barra compartida muestra una explicación específica del control, no solo el valor.
         ControlHelpText(label)
+        // Fase 2: además, la ficha de 4 partes (FusedControlSpecs) visible:
+        // su "qué es" bajo el control cuando el llamador lo pide.
+        if (showSpecInline && spec != null) SpecInline(spec = spec)
     }
 }
 

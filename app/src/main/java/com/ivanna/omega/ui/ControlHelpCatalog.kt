@@ -132,8 +132,10 @@ private val controlHelpGroups = listOf(
 )
 
 @Composable
-fun ControlHelpCatalogPanel() {
-    var expanded by remember { mutableStateOf(false) }
+// Fase 2: startExpanded = true muestra la guía completa al entrar (la
+// pantalla Aprende la abre así); por defecto sigue colapsada como antes.
+fun ControlHelpCatalogPanel(startExpanded: Boolean = false) {
+    var expanded by remember { mutableStateOf(startExpanded) }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
         Text("GUÍA EN ESPAÑOL · TODOS LOS CONTROLES", style = MaterialTheme.typography.titleMedium,
             fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)

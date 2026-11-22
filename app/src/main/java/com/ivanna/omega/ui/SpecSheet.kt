@@ -114,6 +114,23 @@ fun SpecInfoButtonSmall(spec: SpecInfo, modifier: Modifier = Modifier) {
 }
 
 
+/**
+ * Ficha VISIBLE junto al control (Fase 2): el "qué es" de la ficha ya
+ * existente, en texto pequeño bajo el control — no detrás del botón ⓘ.
+ * No reescribe nada: muestra spec.what tal cual. El botón ⓘ sigue abriendo
+ * el diálogo completo (qué es / para qué sirve / cuándo sí / cuándo no).
+ */
+@Composable
+fun SpecInline(spec: SpecInfo, modifier: Modifier = Modifier) {
+    Text(
+        text = spec.what,
+        color = MagistralMuted,
+        fontSize = 11.sp,
+        lineHeight = 15.sp,
+        modifier = modifier.fillMaxWidth().padding(top = 2.dp)
+    )
+}
+
 /** Diálogo con las cuatro partes de la especificación de un control. */
 @Composable
 fun SpecDialog(spec: SpecInfo, onDismiss: () -> Unit) {
