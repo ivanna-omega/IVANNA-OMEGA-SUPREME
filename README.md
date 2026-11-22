@@ -6,9 +6,9 @@
 
 **Escucha la música como si estuvieras ahí.**
 
-[![Version](https://img.shields.io/badge/version-2.5.494-c8a96b?style=flat-square)](https://github.com/luisurielpimentelperez814-design/IVANNA-OMEGA-SUPREME/releases/tag/v2.5.494)
-[![Android](https://img.shields.io/badge/Android-13%2B-83c6b0?style=flat-square)](https://github.com/luisurielpimentelperez814-design/IVANNA-OMEGA-SUPREME/releases/latest)
-[![CI](https://img.shields.io/github/actions/workflow/status/luisurielpimentelperez814-design/IVANNA-OMEGA-SUPREME/build.yml?branch=main&label=CI%20main&style=flat-square)](https://github.com/luisurielpimentelperez814-design/IVANNA-OMEGA-SUPREME/actions/workflows/build.yml)
+[![Version](https://img.shields.io/badge/version-2.5.495-c8a96b?style=flat-square)](https://github.com/golozotns-art/IVANNA-OMEGA-SUPREME/releases/tag/v2.5.495)
+[![Android](https://img.shields.io/badge/Android-13%2B-83c6b0?style=flat-square)](https://github.com/golozotns-art/IVANNA-OMEGA-SUPREME/releases/latest)
+[![CI](https://img.shields.io/github/actions/workflow/status/golozotns-art/IVANNA-OMEGA-SUPREME/build.yml?branch=main&label=CI%20main&style=flat-square)](https://github.com/golozotns-art/IVANNA-OMEGA-SUPREME/actions/workflows/build.yml)
 
 </div>
 
@@ -28,7 +28,7 @@ En cualquier Android 13 o más nuevo.
 
 Descarga la última versión aquí:
 
-👉 **[Descargar IVANNA — última versión](https://github.com/luisurielpimentelperez814-design/IVANNA-OMEGA-SUPREME/releases/latest)**
+👉 **[Descargar IVANNA — última versión](https://github.com/golozotns-art/IVANNA-OMEGA-SUPREME/releases/latest)**
 
 ---
 
@@ -36,7 +36,7 @@ Descarga la última versión aquí:
 
 **IVANNA** is an audio app for Android that makes your music sound like you are inside a real space: sound surrounds you in 360°, feels alive, and adapts to you and your room. No expensive headphones or special equipment needed. Works on any Android 13 or newer.
 
-👉 **[Download IVANNA — latest release](https://github.com/luisurielpimentelperez814-design/IVANNA-OMEGA-SUPREME/releases/latest)**
+👉 **[Download IVANNA — latest release](https://github.com/golozotns-art/IVANNA-OMEGA-SUPREME/releases/latest)**
 
 ---
 
