@@ -148,8 +148,11 @@ class TestPerfectionGateThresholds(unittest.TestCase):
         # 2026-11-22 (fix no-determinismo NEURO): la suite crece de 1628
         # a 1631 con test_neuro_determinism (3 TESTs: op_neuro bit-idéntico,
         # sonda clasificador+guardián, IVANNA dentro de tolerancia).
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1631)
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1631)
+        # 2026-11-22 (v2.5.498, fix del tronido): la suite crece de 1631
+        # a 1634 con test_tronidos_layer_step (3 TESTs: AllLayers,
+        # FixEngageNoStepAndModeNoSilence, ApexOffProbe).
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1634)
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1634)
         self.assertEqual(gate.THRESHOLDS["sofa_expected_total"], 694)
         self.assertTrue(gate.THRESHOLDS_VERSION)
 

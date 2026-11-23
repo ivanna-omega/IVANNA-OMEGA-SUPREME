@@ -117,9 +117,12 @@ THRESHOLDS_VERSION = "perfection-gate-thresholds-v1"
 # 2026-11-22 (fix no-determinismo NEURO): la suite crece de 1628 a 1631
 # con test_neuro_determinism (3 TESTs: OpNeuroTwoFreshChainsBitIdentical,
 # ClassifierGuardianTiming, IvannaTwoFreshChainsWithinTolerance).
+# 2026-11-22 (v2.5.498, fix del tronido): la suite crece de 1631 a 1634
+# con test_tronidos_layer_step (3 TESTs: AllLayers,
+# FixEngageNoStepAndModeNoSilence, ApexOffProbe).
 THRESHOLDS = {
-    "ctest_expected_total": 1631,
-    "ctest_expected_passed": 1631,
+    "ctest_expected_total": 1634,
+    "ctest_expected_passed": 1634,
     "sofa_expected_total": 694,
 }
 
