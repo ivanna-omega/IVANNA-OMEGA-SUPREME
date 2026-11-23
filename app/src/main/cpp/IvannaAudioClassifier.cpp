@@ -90,6 +90,11 @@ void IvannaAudioClassifier::initFilterbankAndWindow() noexcept {
         m_fftTwiddleReal[i] = std::cos(-2.f * PI_F * i / CLASSIFIER_FRAME_SIZE);
         m_fftTwiddleImag[i] = std::sin(-2.f * PI_F * i / CLASSIFIER_FRAME_SIZE);
     }
+    // STUB: el banco mel queda en cero y NADA lo llena nunca (no hay
+    // construcción de filtros triangulares). extractLogMelFilterbank()
+    // devuelve por tanto log(1e-10) en las 64 bandas, siempre, y la
+    // clasificación es constante. No es un bug de inicialización: es
+    // funcionalidad no implementada (ver nota STUB en el .hpp).
     std::memset(m_melFilterbank, 0, sizeof(m_melFilterbank));
 }
 
@@ -127,7 +132,11 @@ void IvannaAudioClassifier::computeSTFT(const float* frame) noexcept {
         m_windowedFrame[i] = frame[i] * m_hanningWindow[i];
     }
 #endif
-    // Stub radix-2 bit reversal & FFT to keep it fast
+    // STUB: NO se calcula FFT. El "espectro" de abajo es
+    // |muestra ventaneada| x 0.5; las tablas de bit-reversal y twiddles
+    // precalculadas en initFilterbankAndWindow() no se usan aquí. La salida
+    // de esta función no es un espectro real: es un placeholder rápido que
+    // alimenta un banco mel que además está en cero (ver nota STUB en el .hpp).
     std::memset(m_powerSpectrum, 0, sizeof(m_powerSpectrum));
     for (size_t i = 0; i < FFT_SPECTRUM_SIZE; ++i) {
         m_powerSpectrum[i] = std::abs(m_windowedFrame[i]) * 0.5f; 
@@ -135,6 +144,10 @@ void IvannaAudioClassifier::computeSTFT(const float* frame) noexcept {
 }
 
 void IvannaAudioClassifier::extractLogMelFilterbank() noexcept {
+    // STUB (consecuencia): m_melFilterbank está en cero (ver
+    // initFilterbankAndWindow), así que `sum` es 0 en todas las bandas y
+    // esta función devuelve log(1e-10) constante. No hay nada que
+    // "arreglar" aquí sin implementar el banco mel real.
 #if defined(__ARM_NEON)
     for (size_t m = 0; m < MEL_BANDS; ++m) {
         float32x4_t v_sum = vdupq_n_f32(0.0f);
@@ -207,6 +220,10 @@ void IvannaAudioClassifier::runInt8Inference() noexcept {
 #endif
 
     // 2. Conv1D: Simulating quantized weights pre-loaded in m_qWeights
+    // STUB: sin loadWeights() (en producción nadie lo llama; solo un test)
+    // los pesos son placeholder sintético ((f+k)%15-7 / (c+i)%11-5), no
+    // pesos entrenados. La "inferencia" es determinista pero sin contenido
+    // real: con el frontend en cero, su salida es constante.
     // For structural proof-of-concept, we do a simplistic 3-tap filter per band
     for (size_t i = 0; i < 32; ++i) {
         for (size_t f = 0; f < 8; ++f) {

@@ -11,6 +11,20 @@
  *   - Extracción de Mel-Spectrogram optimizada con ARM NEON Intrinsics.
  *   - Clasificación en 6 categorías (Music, Movie, Game, Voice, Ambient, Unknown).
  *   - Uso de punteros atómicos para evitar Malloc/Free en tiempo de ejecución (Zero-Copy).
+ *
+ * STUB (2026-11-23) — este clasificador NO clasifica contenido real hoy:
+ *   1. El banco mel (m_melFilterbank) se pone a cero en
+ *      initFilterbankAndWindow() y nada lo llena nunca → extractLogMelFilterbank()
+ *      devuelve log(1e-10) en las 64 bandas, siempre.
+ *   2. computeSTFT() NO calcula FFT: el espectro es |muestra| x 0.5.
+ *   3. Los pesos INT8 son placeholder sintético salvo que alguien llame
+ *      loadWeights(); en producción nadie lo llama (solo un test) →
+ *      la salida es constante (siempre MUSIC en la práctica).
+ * Consecuencia: el guardián AntiDolby corre sobre un objetivo FIJO, no
+ * adaptativo al contenido, en host Y en el teléfono (mismo código).
+ * Arreglar el frontend cambiaría el sonido: queda fuera de este commit por
+ * decisión explícita; el cableado real (CRNN TFLite + frontend idéntico al
+ * entrenamiento) es trabajo de laboratorio detrás de flag + ABX.
  */
 
 #include "IvannaFusionCore.hpp"
@@ -151,6 +165,8 @@ private:
     ALIGN_NEON float m_fftTwiddleReal[CLASSIFIER_FRAME_SIZE / 2];
     ALIGN_NEON float m_fftTwiddleImag[CLASSIFIER_FRAME_SIZE / 2];
     uint16_t m_bitRevTable[CLASSIFIER_FRAME_SIZE];
+    // STUB: siempre a cero (ver initFilterbankAndWindow) — nunca se llena
+    // con filtros triangulares reales.
     ALIGN_NEON float m_melFilterbank[MEL_BANDS][FFT_SPECTRUM_SIZE];
 
     // Decimador FIR state
@@ -159,6 +175,8 @@ private:
     size_t m_decimBufPos;
 
     // TinyML Quantized INT8 Weights Arrays
+    // STUB: sin loadWeights() estos pesos son placeholder sintético
+    // (ver runInt8Inference); en producción loadWeights() no se llama.
     ALIGN_NEON int8_t m_qWeights[8192];
     bool m_weightsLoaded;
 

@@ -28,6 +28,11 @@ struct OrchestratorState {
 
     std::atomic<bool> manifoldEnabled{false};
 
+    // STUB (2026-11-23): estos tres atómicos son SOLO escritura — se
+    // almacenan en update_anti_dolby() y NADIE los lee (ni en este archivo
+    // ni fuera). La vía viva de los scores es control_set_yamnet_scores(),
+    // llamada justo después de los stores. Si un día se cablea un
+    // consumidor, que lea de aquí o se borre este almacenamiento muerto.
     std::atomic<float> anti_dolby_speech{0.f};
     std::atomic<float> anti_dolby_music{0.f};
     std::atomic<float> anti_dolby_bass{0.f};
