@@ -157,6 +157,35 @@ STANDALONE_HEADERS = {
     # puente futuro (estilo twin_bridge), no este módulo. NO se borra.
     # Se QUITA de esta lista cuando un caller de producción lo instancie.
     "fused/universal_hearing/universal_hearing.hpp",
+    # --- Salto / control cerrado (2026-11-22, v2.5.494): 7 huérfanos
+    # clasificados. ---
+    # Módulos del sistema de control cerrado (M0 contrato AudioState,
+    # M3 gemelo, M5 simulador, M6 MPC sombra, M8 supervisor + telemetría
+    # y confianza del gemelo), probados en host (suite 1607/1607 con el
+    # salto, luego 1619 con P1). Sus únicos consumidores hoy son los
+    # tests host test_audio_state.cpp, test_twin_estimator.cpp,
+    # test_telemetry.cpp, test_action_simulator.cpp, test_mpc_shadow.cpp,
+    # test_uncertainty_supervisor.cpp y test_closed_loop_adversarial.cpp
+    # (TUs de tests/, excluidas del grafo por diseño) y sus propios .cpp,
+    # que SOLO están en tests/CMakeLists.txt (el módulo no se compila en
+    # el APK). Verificado: ningún .cpp de producción incluye estos
+    # headers, ninguna de sus clases se usa en producción (la única
+    # mención de AudioState en producción es un comentario en
+    # ivanna_omega_jni.cpp:1919) y no aparecen en CMakeLists.txt ni en
+    # daemon/CMakeLists.txt. NO están cableados a la ruta PCM todavía:
+    # el MPC es solo sombra y el gemelo se alimenta por la conservación
+    # (W3), no por estos módulos. NO se borran. Se QUITA cada uno de
+    # esta lista cuando un caller de producción lo instancie y alimente
+    # con estado real. (Medido en worktree 6707684: el fallo ya existía
+    # ANTES de la Fase 2 — no lo causó el borrado de las 9 pantallas,
+    # lo causó el aterrizaje del salto sin cableado de producción.)
+    "fused/closed_loop/action_simulator.hpp",
+    "fused/closed_loop/audio_state.hpp",
+    "fused/closed_loop/mpc_shadow.hpp",
+    "fused/closed_loop/telemetry.hpp",
+    "fused/closed_loop/twin_confidence.hpp",
+    "fused/closed_loop/twin_estimator.hpp",
+    "fused/closed_loop/uncertainty_supervisor.hpp",
 }
 
 INCLUDE_DIRS = [
