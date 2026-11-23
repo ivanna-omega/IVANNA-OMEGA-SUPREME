@@ -281,4 +281,65 @@ class PerceptualStateThrottleTest {
             )
         )
     }
+
+    // ── Tronidos 493 (c): SET_HEAD_POSE por el mismo throttle ─────────────
+    // La pose publicaba hasta 20/s por MagiskBridge directo, sin throttle;
+    // cada envío ensucia la generación del snapshot y el efecto re-aplica
+    // todo. El throttle la capa a 1/100 ms para cambios pequeños (el giro
+    // rápido pasa inmediato como cambio grande) y el diferido garantiza
+    // que la última pose llegue en ≤100 ms. Estos tests fijan la decisión
+    // del throttle sobre un payload de pose real (yawRad/pitchRad).
+
+    // Campos reales de SET_HEAD_POSE (IvannaSpatialEngine).
+    private fun poseFields(
+        yawRad: Double = 0.5,
+        pitchRad: Double = 0.1,
+    ): Map<String, Any?> = mapOf(
+        "yawRad" to yawRad,
+        "pitchRad" to pitchRad,
+    )
+
+    @Test
+    fun `pose pequena dentro de la ventana se suprime`() {
+        val clock = FakeClock()
+        val t = throttle(clock)
+        assertTrue(t.shouldSend("SET_HEAD_POSE", poseFields()))
+        // yaw 0.5 → 0.51 rad (+2%): cambio pequeño, se suprime.
+        assertFalse(t.shouldSend("SET_HEAD_POSE", poseFields(yawRad = 0.51)))
+        // Al vencer la ventana (100 ms), el mismo valor se envía.
+        clock.advance(100)
+        assertTrue(t.shouldSend("SET_HEAD_POSE", poseFields(yawRad = 0.51)))
+    }
+
+    @Test
+    fun `giro rapido de pose pasa inmediato`() {
+        val clock = FakeClock()
+        val t = throttle(clock)
+        assertTrue(t.shouldSend("SET_HEAD_POSE", poseFields()))
+        // yaw 0.5 → 0.6 rad (+20%): giro rápido, cambio grande.
+        assertTrue(t.shouldSend("SET_HEAD_POSE", poseFields(yawRad = 0.6)))
+    }
+
+    @Test
+    fun `pose y perceptual tienen ventanas independientes`() {
+        val clock = FakeClock()
+        val t = throttle(clock)
+        assertTrue(t.shouldSend("SET_PERCEPTUAL_STATE", setFields()))
+        assertTrue(t.shouldSend("SET_HEAD_POSE", poseFields()))
+        // El throttle es por acción: un cambio pequeño se suprime en su
+        // propia ventana, sin afectar a la otra acción.
+        assertFalse(t.shouldSend("SET_HEAD_POSE", poseFields(yawRad = 0.51)))
+        assertFalse(t.shouldSend("SET_PERCEPTUAL_STATE", setFields(orbeAmount = 0.40)))
+    }
+
+    @Test
+    fun `trailing de pose entrega el ultimo valor al vencer la ventana`() {
+        val clock = FakeClock()
+        val t = throttle(clock)
+        assertTrue(t.shouldSend("SET_HEAD_POSE", poseFields()))
+        assertFalse(t.shouldSend("SET_HEAD_POSE", poseFields(yawRad = 0.51)))
+        assertEquals(100L, t.delayUntilFlushMs("SET_HEAD_POSE"))
+        clock.advance(100)
+        assertTrue(t.noteFlushed("SET_HEAD_POSE", poseFields(yawRad = 0.51)))
+    }
 }

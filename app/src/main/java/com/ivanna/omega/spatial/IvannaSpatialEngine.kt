@@ -2,7 +2,8 @@ package com.ivanna.omega.spatial
 
 import kotlin.math.*
 import com.ivanna.omega.core.IvannaNativeLib
-import com.ivanna.omega.magisk.MagiskBridge
+import com.ivanna.omega.magisk.OmegaEngineBridge
+import org.json.JSONObject
 
 class IvannaSpatialEngine private constructor() {
 
@@ -25,7 +26,11 @@ class IvannaSpatialEngine private constructor() {
         fun setAzimuth(rad: Float) {
             if (!rad.isFinite()) return
             shared.azimuthRad = rad.coerceIn(-Math.PI.toFloat(), Math.PI.toFloat())
-            publishHeadPoseToSystemWide()
+            // Tronidos 493 (c): también el deslizador de azimut pasa por
+            // el throttle de pose (antes publicaba sin throttle a cada
+            // movimiento). El retardo máximo es 50 ms / 0.5° (inaudible
+            // para head tracking; el sensor lo corrige en el próximo evento).
+            publishHeadPoseThrottled()
             // Apply to the production object renderer too; legacy Kotlin state alone
             // is not enough when PlaybackCaptureService is using native HRTF.
             runCatching {
@@ -38,28 +43,42 @@ class IvannaSpatialEngine private constructor() {
             val yaw = shared.azimuthRad
             val pitch = shared.elevationRad
             if (!yaw.isFinite() || !pitch.isFinite()) return
-            // Socket IPC se invoca desde controles de app, nunca desde el callback de audio.
+            // Tronidos 493 (c): la pose pasa por la vía única de envío
+            // (OmegaEngineBridge.sendCommand: dedup + throttle para
+            // SET_HEAD_POSE + coalescencia + reintento), no directo por
+            // MagiskBridge. Socket IPC se invoca desde controles de app,
+            // nunca desde el callback de audio.
             runCatching {
-                MagiskBridge.sendCommand("""{"action":"SET_HEAD_POSE","yawRad":$yaw,"pitchRad":$pitch}""")
+                OmegaEngineBridge.sendCommand(
+                    JSONObject("""{"action":"SET_HEAD_POSE","yawRad":$yaw,"pitchRad":$pitch}""")
+                )
             }
         }
         // v2.5.471 (F2, parte segura): envío throttled de la pose al daemon
         // (Ruta B) desde el sensor. El sensor corre a ~100 Hz; mandar un
         // comando de socket por evento saturaría el IPC. Se envía solo cuando
-        // el yaw cambió >0.5° desde el último envío Y pasaron ≥50 ms. El
-        // daemon solo aplica la pose cuando headTracking está activo, así que
-        // enviarla siempre es seguro (el flag la puerta).
+        // el yaw o el pitch cambió >0.5° desde el último envío Y pasaron
+        // ≥50 ms. El daemon solo aplica la pose cuando headTracking está
+        // activo, así que enviarla siempre es seguro (el flag la puerta).
+        // Tronidos 493 (c): también el pitch se compara (antes solo el
+        // yaw: un cambio solo de elevación se tragaba). El deslizador de
+        // azimut/elevación también pasa por aquí (setAzimuth/setElevation).
         @Volatile private var lastPoseSentYawRad: Float = Float.NaN
+        @Volatile private var lastPoseSentPitchRad: Float = Float.NaN
         @Volatile private var lastPoseSentMs: Long = 0L
         private fun publishHeadPoseThrottled() {
             val yaw = shared.azimuthRad
-            if (!yaw.isFinite()) return
+            val pitch = shared.elevationRad
+            if (!yaw.isFinite() || !pitch.isFinite()) return
             val now = android.os.SystemClock.elapsedRealtime()
             val lastYaw = lastPoseSentYawRad
+            val lastPitch = lastPoseSentPitchRad
             val yawChanged = lastYaw.isNaN() || kotlin.math.abs(yaw - lastYaw) > 0.0087f
-            if (!yawChanged) return
+            val pitchChanged = lastPitch.isNaN() || kotlin.math.abs(pitch - lastPitch) > 0.0087f
+            if (!yawChanged && !pitchChanged) return
             if (now - lastPoseSentMs < 50L) return
             lastPoseSentYawRad = yaw
+            lastPoseSentPitchRad = pitch
             lastPoseSentMs = now
             publishHeadPoseToSystemWide()
         }
@@ -92,7 +111,8 @@ class IvannaSpatialEngine private constructor() {
         // con JSON {elevation_rad: v} que el motor HRTF ya acepta.
         fun setElevation(rad: Float) {
             shared.elevationRad = rad.coerceIn(-Math.PI.toFloat() / 4f, Math.PI.toFloat() / 4f)
-            publishHeadPoseToSystemWide()
+            // Tronidos 493 (c): como setAzimuth, por el throttle de pose.
+            publishHeadPoseThrottled()
             if (IvannaNativeLib.isLoaded) runCatching {
                 IvannaNativeLib.nativeSetSpatialParams(
                     """{"azimuth_rad":${shared.azimuthRad},"elevation_rad":${shared.elevationRad}}"""

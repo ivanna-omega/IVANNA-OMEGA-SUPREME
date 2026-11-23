@@ -17,6 +17,7 @@ import com.ivanna.omega.spatial.IvannaSpatialEngine
 import com.ivanna.omega.spatial.IvannaSpatialManager
 import com.ivanna.omega.ui.AdaptiveControlsPrefs
 import com.ivanna.omega.ui.SpatialAudioPrefs
+import org.json.JSONObject
 
 object PersistedStateRestorer {
     private const val TAG = "PersistedStateRestorer"
@@ -151,7 +152,10 @@ object PersistedStateRestorer {
             val routeBProfile = profileForMode(routeBMode, paramStore)
             runCatching { IvannaNativeLib.nativeSetIntelligentUpmixingEnabled(paramStore.isHoaUpmixingEnabled() && hrtfAllowed) }
             runCatching { IvannaNativeLib.nativeSetUpmixingImmersivity(paramStore.getHoaImmersivity()) }
-            runCatching { com.ivanna.omega.magisk.MagiskBridge.sendCommand("{\"action\":\"SET_PERCEPTUAL_STATE\",\"upmixingEnabled\":${if (paramStore.isHoaUpmixingEnabled() && hrtfAllowed) 1.0f else 0.0f},\"upmixingImmersivity\":${paramStore.getHoaImmersivity()}}") }
+            // Tronidos 493 (c): el upmix también pasa por el throttle
+            // compartido (OmegaEngineBridge.sendCommand: puerta + dedup +
+            // throttle), no directo por MagiskBridge.
+            runCatching { OmegaEngineBridge.sendCommand(JSONObject("{\"action\":\"SET_PERCEPTUAL_STATE\",\"upmixingEnabled\":${if (paramStore.isHoaUpmixingEnabled() && hrtfAllowed) 1.0f else 0.0f},\"upmixingImmersivity\":${paramStore.getHoaImmersivity()}}")) }
 
             // Wave Field Synthesis (WFS) & SPSC Ring Buffer
             runCatching { IvannaNativeLib.nativeSetWfsEnabled(paramStore.isWfsEnabled() && !externalStereo) }
@@ -209,8 +213,9 @@ object PersistedStateRestorer {
             }
             // 0032/483: el amount pasa por el gate (0 en bocinas planas;
             // del usuario en audífonos y en GENEZI); el resto de
-            // parámetros es inerte con amount 0.
-            sendOrbeToDaemon(paramStore, routeBProfile)
+            // parámetros es inerte con amount 0. (El envío al daemon es
+            // atómico y va abajo, tras hyper/Volterra/aux: ver
+            // sendRouteBStateAtomic, tronidos 493.)
             // HOLOS — Operador Único de Campo Acústico (v2.5.364): restaura los 13
             // parámetros (amount 0 = apagado por defecto) en la Ruta A por JNI y en
             // la Ruta B por SET_PERCEPTUAL_STATE al daemon (snapshot ABI v10).
@@ -239,8 +244,8 @@ object PersistedStateRestorer {
             runCatching { OmegaEquipment.applyToNative(paramStore) }
             // 0032/483: el amount pasa por el gate (0 en bocinas planas;
             // del usuario en audífonos y en GENEZI); el resto de
-            // parámetros es inerte con amount 0.
-            sendHolosToDaemon(paramStore, routeBProfile)
+            // parámetros es inerte con amount 0. (El envío al daemon es
+            // atómico y va abajo, tras hyper/Volterra/aux.)
             // IVANNA (v2.5.375): restaura amount/scenePull/distanceM/
             // headTracking en la Ruta A por JNI. ACTIVO por defecto
             // (amount 1.0). Sin Ruta B todavía (sin snapshot ABI). El
@@ -287,8 +292,9 @@ object PersistedStateRestorer {
             // sin esto, en el arranque el daemon corría con el perfil
             // viejo hasta el primer cambio de ruta. Y el kernel sigue al
             // modo (Genezi → genezy_mhc_pz1d.ivk1; audífonos → pz1d).
-            sendHyperVolterraToDaemon(routeBProfile)
-            sendAuxFieldToDaemon(routeBProfile)
+            // Tronidos 493 (d): orbe+holos+hyper/aux en UN solo comando
+            // atómico (sendRouteBStateAtomic), no en 4 envíos separados.
+            sendRouteBStateAtomic(paramStore, routeBProfile)
             applyTransducerVolterraKernel(ctx, routeBMode)
             // Sensor acústico real (v2.5.369): arranca la captura del
             // micrófono por defecto para que Φ corra en MEDIDO (el operador
@@ -303,7 +309,10 @@ object PersistedStateRestorer {
             // Háptica de graves (4D): vive en Kotlin (ruta A), no depende de la librería nativa.
             runCatching { com.ivanna.omega.audio.BassHaptics.configure(ctx, paramStore.isBassHapticEnabled(), paramStore.getBassHapticStrength(), paramStore.getBassHapticRumble(), paramStore.getBassHapticTrimMs().toInt()) }
             runCatching { IvannaNativeLib.nativeSetSpscRingFactor(acPrefs.spscRingFactor) }
-            runCatching { com.ivanna.omega.magisk.MagiskBridge.sendCommand("{\"action\":\"SET_SPSC_RING_FACTOR\",\"factor\":${acPrefs.spscRingFactor}}") }
+            // Tronidos 493 (c): el factor SPSC pasa por la vía única de
+            // envío (OmegaEngineBridge.sendCommand: chequeo de finitud +
+            // coalescencia + reintento), no directo por MagiskBridge.
+            runCatching { OmegaEngineBridge.sendCommand(JSONObject("{\"action\":\"SET_SPSC_RING_FACTOR\",\"factor\":${acPrefs.spscRingFactor}}")) }
         }
 
         // 2. Restaurar HarmonicExciterPrefs (perceptual state — Calibración Magistral activa por defecto)
@@ -435,18 +444,50 @@ object PersistedStateRestorer {
     private fun outputModeFor(mode: TransducerMode): Int =
         if (mode == TransducerMode.HEADPHONES) 1 else 2
 
-    private fun sendOrbeToDaemon(store: ParameterStore, profile: TransducerProfile) {
-        runCatching {
-            com.ivanna.omega.magisk.MagiskBridge.sendCommand(
-                """{"action":"SET_PERCEPTUAL_STATE","outputMode":${outputModeFor(profile.mode)},"orbeAmount":${profile.orbeAmount},"orbeDistanceM":${store.getOrbeDistanceM()},"orbeSpread":${store.getOrbeSpread()},"orbeProximityDb":${store.getOrbeProximityDb()},"orbeDiffuse":${store.getOrbeDiffuse()},"orbeHeadTracking":${if (store.isOrbeHeadTrackingEnabled()) 1.0f else 0.0f}}"""
-            )
+    // Tronidos 493 (d): ORBE y HOLOS viajan en UN SOLO comando atómico.
+    // Antes eran 2 SET_PERCEPTUAL_STATE separados (cada uno con su
+    // runCatching que tragaba el fallo): si el de holos fallaba o el
+    // restore se interrumpía entre ambos, orbe quedaba en 1.0 y holos en
+    // su valor viejo (0 envenenado por el gate de SPEAKERS, que pone
+    // holosAmount a 0), y el merge pegajoso del daemon lo re-sembraba en
+    // cada cambio de sesión (ivanna_daemon.cpp, copyDesiredPerceptual).
+    // Ahora pushRouteBState funde los 4 grupos (orbe/holos/hyper/aux) en
+    // un solo JSONObject y lo envía una vez por OmegaEngineBridge
+    // .sendCommand (puerta + dedup + throttle). O el estado entero llega,
+    // o no llega nada; el restore es idempotente (se re-corre al cambiar
+    // de ruta), así que un fallo se autocorrige en el próximo cambio.
+    private fun orbeJson(store: ParameterStore, profile: TransducerProfile): String =
+        """{"action":"SET_PERCEPTUAL_STATE","outputMode":${outputModeFor(profile.mode)},"orbeAmount":${profile.orbeAmount},"orbeDistanceM":${store.getOrbeDistanceM()},"orbeSpread":${store.getOrbeSpread()},"orbeProximityDb":${store.getOrbeProximityDb()},"orbeDiffuse":${store.getOrbeDiffuse()},"orbeHeadTracking":${if (store.isOrbeHeadTrackingEnabled()) 1.0f else 0.0f}}"""
+
+    private fun holosJson(store: ParameterStore, profile: TransducerProfile): String =
+        """{"action":"SET_PERCEPTUAL_STATE","outputMode":${outputModeFor(profile.mode)},"holosAmount":${profile.holosAmount},"holosDistanceM":${store.getHolosDistanceM()},"holosSpread":${store.getHolosSpread()},"holosProximityDb":${store.getHolosProximityDb()},"holosDiffuse":${store.getHolosDiffuse()},"holosHarmonics":${store.getHolosHarmonics()},"holosWarmth":${store.getHolosWarmth()},"holosDynamics":${store.getHolosDynamics()},"holosWidth":${store.getHolosWidth()},"holosGamma":${store.getHolosGamma()},"holosRoomRt60":${store.getHolosRoomRt60()},"holosHeadTracking":${if (store.isHolosHeadTrackingEnabled()) 1.0f else 0.0f},"holosBandCount":${store.getHolosBandCount()},"holosEqLow":${store.getHolosEqLow()},"holosEqMid":${store.getHolosEqMid()},"holosEqHigh":${store.getHolosEqHigh()},"holosEqPresence":${store.getHolosEqPresence()},"holosEqTiltDb":${store.getHolosEqTiltDb()},"holosEqFreq":${store.getHolosEqFreq()}}"""
+
+    // Funde varios JSONObject parciales en uno (las claves repetidas —
+    // "action" y "outputMode" — llevan el mismo valor en todos los grupos).
+    private fun mergePerceptualJson(vararg parts: JSONObject): JSONObject {
+        val out = JSONObject()
+        for (part in parts) {
+            val keys = part.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                out.put(key, part.opt(key))
+            }
         }
+        return out
     }
 
-    private fun sendHolosToDaemon(store: ParameterStore, profile: TransducerProfile) {
+    // Tronidos 493 (c+d): UN solo SET_PERCEPTUAL_STATE atómico
+    // (orbe+holos+hyper/Volterra+aux) por el throttle compartido. Lo usan
+    // el restore de arranque y pushRouteBState (cambio de ruta).
+    private fun sendRouteBStateAtomic(store: ParameterStore, profile: TransducerProfile) {
         runCatching {
-            com.ivanna.omega.magisk.MagiskBridge.sendCommand(
-                """{"action":"SET_PERCEPTUAL_STATE","outputMode":${outputModeFor(profile.mode)},"holosAmount":${profile.holosAmount},"holosDistanceM":${store.getHolosDistanceM()},"holosSpread":${store.getHolosSpread()},"holosProximityDb":${store.getHolosProximityDb()},"holosDiffuse":${store.getHolosDiffuse()},"holosHarmonics":${store.getHolosHarmonics()},"holosWarmth":${store.getHolosWarmth()},"holosDynamics":${store.getHolosDynamics()},"holosWidth":${store.getHolosWidth()},"holosGamma":${store.getHolosGamma()},"holosRoomRt60":${store.getHolosRoomRt60()},"holosHeadTracking":${if (store.isHolosHeadTrackingEnabled()) 1.0f else 0.0f},"holosBandCount":${store.getHolosBandCount()},"holosEqLow":${store.getHolosEqLow()},"holosEqMid":${store.getHolosEqMid()},"holosEqHigh":${store.getHolosEqHigh()},"holosEqPresence":${store.getHolosEqPresence()},"holosEqTiltDb":${store.getHolosEqTiltDb()},"holosEqFreq":${store.getHolosEqFreq()}}"""
+            OmegaEngineBridge.sendCommand(
+                mergePerceptualJson(
+                    JSONObject(orbeJson(store, profile)),
+                    JSONObject(holosJson(store, profile)),
+                    JSONObject(hyperVolterraJson(profile)),
+                    JSONObject(auxFieldJson(profile)),
+                )
             )
         }
     }
@@ -463,11 +504,10 @@ object PersistedStateRestorer {
     private fun hyperVolterraJson(profile: TransducerProfile): String =
         """{"action":"SET_PERCEPTUAL_STATE","hyperAmount":${profile.hyperAmount},"hyperPreset":${profile.hyperPreset},"hyperXtcEnabled":${if (profile.hyperXtcEnabled) 1.0f else 0.0f},"volterraEnabled":${if (profile.volterraEnabled) 1.0f else 0.0f}}"""
 
-    private fun sendHyperVolterraToDaemon(profile: TransducerProfile) {
-        runCatching {
-            com.ivanna.omega.magisk.MagiskBridge.sendCommand(hyperVolterraJson(profile))
-        }
-    }
+    // (sendHyperVolterraToDaemon ya no existe: el grupo hyper/Volterra
+    // viaja dentro del comando atómico de pushRouteBState; el envío en
+    // caliente usa pushHyperVolterraToDaemon, abajo.)
+
 
     /**
      * FASE A (2026-11-18) — comando Φ/Volterra en caliente para el modo
@@ -495,8 +535,10 @@ object PersistedStateRestorer {
      * responde (el restore del arranque lo re-envía de todos modos).
      */
     fun pushHyperVolterraToDaemon(context: Context) {
+        // Tronidos 493 (c): el envío en caliente de Φ/Volterra también
+        // pasa por el throttle compartido (no directo por MagiskBridge).
         runCatching {
-            com.ivanna.omega.magisk.MagiskBridge.sendCommand(hyperVolterraCommand(context))
+            OmegaEngineBridge.sendCommand(JSONObject(hyperVolterraCommand(context)))
         }
     }
 
@@ -505,13 +547,8 @@ object PersistedStateRestorer {
     // 0–1, encode a snapshot.flags), pero nadie se lo mandaba: solo
     // nativeSetAuxField en Ruta A. En Genezi, graves en fase coherente
     // bajo el cruce; en audífonos/bocina genérica, apagado.
-    private fun sendAuxFieldToDaemon(profile: TransducerProfile) {
-        runCatching {
-            com.ivanna.omega.magisk.MagiskBridge.sendCommand(
-                """{"action":"SET_PERCEPTUAL_STATE","auxEnabled":${if (profile.auxFieldEnabled) 1.0f else 0.0f},"auxXoverHz":${profile.auxXoverHz},"auxCoherence":${profile.auxCoherence}}"""
-            )
-        }
-    }
+    private fun auxFieldJson(profile: TransducerProfile): String =
+        """{"action":"SET_PERCEPTUAL_STATE","auxEnabled":${if (profile.auxFieldEnabled) 1.0f else 0.0f},"auxXoverHz":${profile.auxXoverHz},"auxCoherence":${profile.auxCoherence}}"""
 
     private fun sendGeneralToDaemon(harmonicGain: Float, antiDolby: Float, output: RouteBOutput) {
         if (!OmegaEngineBridge.isConnected) return
@@ -564,10 +601,9 @@ object PersistedStateRestorer {
         // genérico: neutro).
         val (output, mode) = resolveRouteBMode(ctx)
         val profile = profileForMode(mode, store)
-        sendOrbeToDaemon(store, profile)
-        sendHolosToDaemon(store, profile)
-        sendHyperVolterraToDaemon(profile)
-        sendAuxFieldToDaemon(profile)
+        // Tronidos 493 (c+d): el estado de Ruta B viaja en UN solo
+        // SET_PERCEPTUAL_STATE atómico (ver sendRouteBStateAtomic).
+        sendRouteBStateAtomic(store, profile)
         applyTransducerVolterraKernel(ctx, mode)
         val hePrefs = ctx.getSharedPreferences("harmonic_exciter_prefs", Context.MODE_PRIVATE)
         val exciterEnabled = hePrefs.getBoolean("exciterEnabled", true)

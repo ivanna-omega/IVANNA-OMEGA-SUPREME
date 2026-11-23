@@ -345,7 +345,11 @@ object OmegaEngineBridge {
         // post-puerta y debe enviarse. Fail-closed: si la conversión o la
         // comparación falla, se envía como antes. Si se suprime un duplicado,
         // se devuelve isConnected: el daemon ya tiene ese estado.
-        if (action == "SEND_PERCEPTUAL_STATE" || action == "SET_PERCEPTUAL_STATE") {
+        // Tronidos 493 (c): SET_HEAD_POSE también se deduplica. La pose
+        // publicaba hasta 20/s por MagiskBridge directo; cada envío
+        // ensucia la generación del snapshot y el efecto re-aplica todo.
+        if (action == "SEND_PERCEPTUAL_STATE" || action == "SET_PERCEPTUAL_STATE" ||
+            action == "SET_HEAD_POSE") {
             val comparable = runCatching { perceptualPayloadToMap(gatedPayload) }.getOrNull()
             if (comparable != null && !perceptualDedup.shouldSend(action, comparable)) {
                 return isConnected
@@ -359,7 +363,8 @@ object OmegaEngineBridge {
         // >5% relativo, flip 0↔no-cero). Si se suprime, el último payload
         // queda para envío diferido al cierre de la ventana (≤100 ms de
         // retraso). Fail-closed: ante fallo de comparación, se envía.
-        if (action == "SEND_PERCEPTUAL_STATE" || action == "SET_PERCEPTUAL_STATE") {
+        if (action == "SEND_PERCEPTUAL_STATE" || action == "SET_PERCEPTUAL_STATE" ||
+            action == "SET_HEAD_POSE") {
             val comparable = runCatching { perceptualPayloadToMap(gatedPayload) }.getOrNull()
             if (comparable != null && !perceptualThrottle.shouldSend(action, comparable)) {
                 throttleTrailing[action] = JSONObject(gatedPayload.toString())
