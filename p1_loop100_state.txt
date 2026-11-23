@@ -1,7 +1,7 @@
-P1 bucle de 100 — estado 2026-11-22 19:25:46 UTC
+P1 bucle de 100 — estado 2026-11-22 19:26 UTC (corregido: corrida 1 = 1616 pasaron)
 corridas completadas: 1 / 100
-última corrida: 99 pasaron, 3 fallaron (de 1619)
+última corrida: 1616 pasaron, 3 fallaron (de 1619)
 verdes (0 fallos): 0
-fallas recurrentes (top):
+fallas recurrentes (top): P1AdversarialMatrix.Bass, Phase, HotMix (las 3, siempre)
 CSV: /home/hatch/workspace/ivanna-transfer/p1_loop100_runs.csv
 log: /tmp/p1_loop100.log
