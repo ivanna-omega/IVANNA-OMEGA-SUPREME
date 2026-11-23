@@ -23,6 +23,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,6 +38,11 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import com.ivanna.omega.core.ParameterStore
+import com.ivanna.omega.hardware.PermissionGate
+import com.ivanna.omega.hardware.PermissionState
+import com.ivanna.omega.ui.rememberRoomMeasureLauncher
+import kotlinx.coroutines.delay
 
 /**
  * Starts a consented Wi-Fi survey automatically when the app enters foreground.
@@ -61,6 +67,18 @@ fun WifiSensingAutoStart(content: @Composable () -> Unit) {
     // Ventana plegada por defecto; se despliega sola al llegar las primeras
     // redes reales tras conceder el permiso (ver callback de la sesión).
     var expanded by remember { mutableStateOf(false) }
+    // Adaptador universal: la fuente que este equipo/router entrega y la
+    // decisión de la política sobre cada escena. La decisión es lo que le da
+    // EFECTO EN EL SONIDO al Wi-Fi: cuando pide re-medición, la sala se vuelve
+    // a medir (RoomProbe real) y la corrección aplicada cambia el sonido.
+    // Nada de DSP directo por radio: el Wi-Fi solo dispara la medición.
+    val roomLauncher = rememberRoomMeasureLauncher()
+    val paramStore = remember(context) { ParameterStore(context) }
+    var wifiSource by remember { mutableStateOf(WifiSensingUniversalAdapter.Source.NONE) }
+    var sourceReady by remember { mutableStateOf(false) }
+    var adaptationDecision by remember { mutableStateOf<WifiAcousticAdaptationPolicy.Decision?>(null) }
+    var autoCountdown by remember { mutableStateOf<Int?>(null) }
+    var autoDismissedUntilMs by remember { mutableStateOf(0L) }
     val session = remember(context) {
         WifiScanSession(context) { update ->
             status = update.message
@@ -80,6 +98,20 @@ fun WifiSensingAutoStart(content: @Composable () -> Unit) {
                 UniversalWifiSensingAdapter.DataLevel.WIFI_METADATA_ONLY -> "RSSI · cambio=${scene.movementIndicator?.let { "%.2f".format(it) } ?: "sin referencia"} · confianza=${"%.0f".format(scene.confidence * 100)}%"
                 UniversalWifiSensingAdapter.DataLevel.CSI_VERIFIED -> "CSI verificado · proveedor CSI activo"
             }
+            // Adaptador universal: qué fuente entrega este equipo/router y qué
+            // decide la política sobre esta escena. La fuente se evalúa una
+            // vez por sesión (la capacidad del hardware no cambia en vivo).
+            if (!sourceReady) {
+                wifiSource = WifiSensingUniversalAdapter.selectSource(context)
+                sourceReady = true
+            }
+            val calibrationAvailable = paramStore.isRoomCorrectionEnabled()
+            val calibrationAgeMs = paramStore.getRoomCorrectionMeasuredAt()?.let { measuredAt ->
+                (System.currentTimeMillis() - measuredAt).takeIf { it >= 0L }
+            }
+            adaptationDecision = WifiSensingUniversalAdapter.evaluate(
+                update.sceneFeatures, calibrationAvailable, calibrationAgeMs
+            )
         }
     }
     val locationPermissionLauncher = rememberLauncherForActivityResult(
@@ -160,6 +192,38 @@ fun WifiSensingAutoStart(content: @Composable () -> Unit) {
         }
     }
 
+    // Cuenta atrás para la medición automática: cuando el adaptador pide
+    // re-medición y el micrófono ya está concedido, la sala se mide sola en
+    // 15 s para que el sonido cambie (efecto real, medido por RoomProbe).
+    // El usuario puede cancelarla o medir ya. Sin micrófono concedido no hay
+    // auto-medición: se muestra el botón y el permiso se pide al pulsarlo.
+    val autoMeasureCountdownS = 15
+    val autoMeasureDismissMs = 30 * 60 * 1000L
+    LaunchedEffect(adaptationDecision, autoCountdown, roomLauncher.busy) {
+        val decision = adaptationDecision
+        if (decision?.action != WifiAcousticAdaptationPolicy.Action.REQUEST_ACOUSTIC_REMEASUREMENT) {
+            autoCountdown = null
+            return@LaunchedEffect
+        }
+        if (roomLauncher.busy) return@LaunchedEffect
+        val countdown = autoCountdown
+        if (countdown == null) {
+            val micGranted = PermissionGate.stateFor(context, Manifest.permission.RECORD_AUDIO) ==
+                PermissionState.GRANTED
+            if (!micGranted) return@LaunchedEffect
+            if (System.currentTimeMillis() < autoDismissedUntilMs) return@LaunchedEffect
+            autoCountdown = autoMeasureCountdownS
+            return@LaunchedEffect
+        }
+        if (countdown <= 0) {
+            autoCountdown = null
+            roomLauncher.launch()
+            return@LaunchedEffect
+        }
+        delay(1000)
+        autoCountdown = countdown - 1
+    }
+
     // FIX (panel blanco que tapaba la app): esta franja vive FUERA del tema oscuro de OmegaApp, así que
     // MaterialTheme.colorScheme.surface era el blanco por defecto, con texto negro, y además se dibujaba
     // ENCIMA del contenido (tapaba la barra inferior y parte del scroll). Ahora ocupa su propio espacio
@@ -186,6 +250,49 @@ fun WifiSensingAutoStart(content: @Composable () -> Unit) {
                 )
                 Text(status, style = MaterialTheme.typography.bodySmall)
                 Text(signalSummary, style = MaterialTheme.typography.bodySmall)
+                // Fuente real de este equipo/router (adaptador universal) y efecto
+                // en el sonido: si el entorno cambió, la sala se vuelve a medir
+                // y la corrección nueva cambia el sonido. Sin medición no hay
+                // efecto; por eso aquí se pide y se ejecuta, no solo se informa.
+                Text(
+                    "Fuente Wi-Fi: ${WifiSensingUniversalAdapter.describeSource(wifiSource)}",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (adaptationDecision?.action == WifiAcousticAdaptationPolicy.Action.REQUEST_ACOUSTIC_REMEASUREMENT) {
+                    Text(adaptationDecision?.reason.orEmpty(), style = MaterialTheme.typography.bodySmall)
+                    if (autoCountdown != null) {
+                        Text(
+                            "La sala cambió: midiendo en ${autoCountdown} s (pausa la música).",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { autoCountdown = null; roomLauncher.launch() },
+                            enabled = !roomLauncher.busy
+                        ) { Text("Medir ahora") }
+                        if (autoCountdown != null) {
+                            androidx.compose.material3.TextButton(
+                                onClick = {
+                                    autoCountdown = null
+                                    autoDismissedUntilMs = System.currentTimeMillis() + autoMeasureDismissMs
+                                }
+                            ) { Text("Cancelar") }
+                        }
+                    }
+                }
+                if (roomLauncher.busy) {
+                    Text(
+                        "Midiendo sala… ${(roomLauncher.progress * 100).toInt()}%",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                if (roomLauncher.status.isNotBlank()) {
+                    Text(roomLauncher.status, style = MaterialTheme.typography.labelSmall)
+                }
                 // Visualización real del sondeo: cada barra representa una red observada y su RSSI.
                 // No presenta RSSI como CSI ni dibuja una reconstrucción espacial ficticia.
                 if (expanded) Canvas(

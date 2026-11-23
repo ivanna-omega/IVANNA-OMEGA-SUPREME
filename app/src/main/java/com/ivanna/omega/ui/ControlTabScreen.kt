@@ -93,49 +93,17 @@ fun ControlTabScreen(
     var npeBypassState by remember { mutableStateOf(paramStore.isNpeBypass()) }
 
     // ── Corrección acústica de sala (medición con el micrófono) ─────────────
-    var roomGains by remember { mutableStateOf(paramStore.getRoomCorrectionGains()) }
-    var roomEnabled by remember { mutableStateOf(paramStore.isRoomCorrectionEnabled()) }
-    var roomBusy by remember { mutableStateOf(false) }
-    var roomProgress by remember { mutableStateOf(0f) }
-    var roomStatus by remember { mutableStateOf("") }
-    val roomScope = rememberCoroutineScope()
-    val applyRoom: (FloatArray?, Boolean) -> Unit = { g, en ->
-        if (IvannaNativeLib.isLoaded)
-            runCatching { IvannaNativeLib.nativeSetRoomCorrection(if (en && g != null) g else FloatArray(10)) }
-    }
-    val startRoomMeasure: () -> Unit = {
-        if (!roomBusy) roomScope.launch {
-            val prevGains = roomGains; val prevEnabled = roomEnabled
-            roomBusy = true; roomProgress = 0f
-            roomStatus = "Prepara: volumen cómodo, teléfono donde te sientas, sala en silencio."
-            try {
-                when (val out = com.ivanna.omega.audio.RoomMeasurement.runVerified(
-                    context, prevGains, prevEnabled, applyRoom
-                ) { roomProgress = it }) {
-                    is com.ivanna.omega.audio.RoomMeasurement.VerifiedOutcome.Success -> {
-                        paramStore.setRoomCorrection(out.gainsDb, true)
-                        runCatching { com.ivanna.omega.audio.BassHaptics.setMeasuredLatency(context, out.latencyMs) }
-                        roomGains = out.gainsDb; roomEnabled = true
-                        applyRoom(out.gainsDb, true)
-                        // v2.5.451: si el DAC está conectado, el perfil nuevo
-                        // alimenta a Φ de inmediato (CALIBRADO), sin esperar
-                        // a reconectar el DAC.
-                        runCatching { com.ivanna.omega.audio.AudioRouteManager.syncDacCalibratedProfile() }
-                        roomStatus = "Verificado · error tonal ${"%.2f".format(java.util.Locale.ROOT, out.beforeErrorDb)} → ${"%.2f".format(java.util.Locale.ROOT, out.afterErrorDb)} dB · decisión #${out.decisionId}"
-                    }
-                    is com.ivanna.omega.audio.RoomMeasurement.VerifiedOutcome.Failure -> {
-                        applyRoom(prevGains, prevEnabled)
-                        roomStatus = "Reversión automática · ${out.reason} · decisión #${out.decisionId}"
-                    }
-                }
-            } catch (t: Throwable) {
-                applyRoom(prevGains, prevEnabled)
-                roomStatus = "Falló la calibración; se restauró el perfil previo: ${t.message ?: "error desconocido"}"
-            } finally {
-                roomBusy = false
-            }
-        }
-    }
+    // Punto único de entrada compartido con la franja Wi-Fi: la misma medición,
+    // el mismo permiso y la misma reversión, sin duplicar la lógica. El resto
+    // de la pantalla sigue leyendo estos alias; las escrituras van por
+    // roomLauncher.toggle/clear/launch.
+    val roomLauncher = rememberRoomMeasureLauncher()
+    val roomGains get() = roomLauncher.gains
+    val roomEnabled get() = roomLauncher.enabled
+    val roomBusy get() = roomLauncher.busy
+    val roomProgress get() = roomLauncher.progress
+    val roomStatus get() = roomLauncher.status
+    val applyRoom: (FloatArray?, Boolean) -> Unit = { g, en -> roomLauncher.applyRoom(g, en) }
     // ── Formato IVANNA OMEGA (v2.5.473): cargador de .ivanna.json ─────────
     // El usuario elige el archivo con el selector del sistema (SAF, JSON);
     // se parsea fail-closed y se aplica por la misma vía que un perfil
@@ -185,19 +153,20 @@ fun ControlTabScreen(
     // Referencia diferida: micLauncher usa startSweep (declarado después)
     // vía este ref; micLauncher se declara ANTES de startSweep porque
     // startSweep lo usa directamente (Kotlin exige declaración léxica previa).
+    // Solo para el barrido: la medición de sala usa su propio launcher
+    // (roomLauncher) con su propio permiso.
     var startSweepRef: (() -> Unit)? by remember { mutableStateOf(null) }
     val micLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
             if (sweepPending) { sweepPending = false; startSweepRef?.invoke() }
-            else startRoomMeasure()
         }
         else {
             val msg = com.ivanna.omega.hardware.PermissionPolicy.micDeniedMessage(
                 com.ivanna.omega.hardware.PermissionGate.stateFor(context, android.Manifest.permission.RECORD_AUDIO)
             )
-            if (sweepPending) { sweepPending = false; sweepStatus = msg } else roomStatus = msg
+            if (sweepPending) { sweepPending = false; sweepStatus = msg }
         }
     }
     val sweepScope = rememberCoroutineScope()
@@ -300,33 +269,9 @@ fun ControlTabScreen(
         roomBusy = roomBusy,
         roomProgress = roomProgress,
         roomStatus = roomStatus,
-        onRoomMeasure = {
-            // El micrófono solo se pide aquí, cuando el usuario pulsa MEDIR. Si ya quedó denegado para
-            // siempre (o se revocó en Ajustes) el sistema no vuelve a mostrar el diálogo: se explica y se
-            // abre Ajustes en vez de repetir una petición muda.
-            val micState = com.ivanna.omega.hardware.PermissionGate.stateFor(context, android.Manifest.permission.RECORD_AUDIO)
-            when (micState) {
-                com.ivanna.omega.hardware.PermissionState.GRANTED -> startRoomMeasure()
-                com.ivanna.omega.hardware.PermissionState.OPEN_SETTINGS -> {
-                    roomStatus = com.ivanna.omega.hardware.PermissionPolicy.micDeniedMessage(micState)
-                    com.ivanna.omega.hardware.PermissionGate.openAppSettings(context)
-                }
-                else -> {
-                    com.ivanna.omega.hardware.PermissionGate.markRequested(context, android.Manifest.permission.RECORD_AUDIO)
-                    micLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
-                }
-            }
-        },
-        onRoomToggle = { en ->
-            roomEnabled = en && roomGains != null
-            paramStore.setRoomCorrection(roomGains, roomEnabled)
-            applyRoom(roomGains, roomEnabled)
-        },
-        onRoomClear = {
-            roomGains = null; roomEnabled = false; roomStatus = ""
-            paramStore.setRoomCorrection(null, false)
-            applyRoom(null, false)
-        },
+        onRoomMeasure = { roomLauncher.launch() },
+        onRoomToggle = { en -> roomLauncher.toggle(en) },
+        onRoomClear = { roomLauncher.clear() },
         sweepBusy = sweepBusy,
         sweepProgress = sweepProgress,
         sweepStatus = sweepStatus,
