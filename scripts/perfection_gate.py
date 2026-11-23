@@ -114,9 +114,12 @@ THRESHOLDS_VERSION = "perfection-gate-thresholds-v1"
 # El umbral CTest se SUBE a 1619/1619 para igualar el conteo real medido
 # (1619 en host); el SOFA se queda en 694. Mismo procedimiento:
 # actualizar también el candado test_umbrales_versionados.
+# 2026-11-22 (fix no-determinismo NEURO): la suite crece de 1628 a 1631
+# con test_neuro_determinism (3 TESTs: OpNeuroTwoFreshChainsBitIdentical,
+# ClassifierGuardianTiming, IvannaTwoFreshChainsWithinTolerance).
 THRESHOLDS = {
-    "ctest_expected_total": 1628,
-    "ctest_expected_passed": 1628,
+    "ctest_expected_total": 1631,
+    "ctest_expected_passed": 1631,
     "sofa_expected_total": 694,
 }
 

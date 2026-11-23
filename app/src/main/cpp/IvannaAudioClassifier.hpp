@@ -116,6 +116,27 @@ public:
     bool loadWeights(const char* path) noexcept;
     constexpr size_t expectedWeightCount() const noexcept { return 8774u; }
 
+    // ── Modo síncrono (determinista, solo host) ──────────────────────────
+    // En host, el hilo de inferencia hace que el momento en que una
+    // clasificación se hace visible dependa de la planificación del SO:
+    // el guardián AntiDolby (que se alimenta de getModelOutput) sigue
+    // entonces trayectorias distintas en cada corrida y NEURO·Ω no es
+    // determinista entre corridas (hallazgo P0 2026-11-22: op_neuro
+    // maxDiff 0.33-0.42; el primer chunk válido llegó en el chunk 126 en
+    // una corrida y en el 1458 en otra). En modo síncrono NO se usa el
+    // hilo: el llamador (hilo de audio) drena los frames completos con
+    // processPendingFrames() antes de leer, así la secuencia de
+    // clasificaciones es función pura del audio. La inferencia por frame
+    // es la misma (mismo código, mismos frames, mismo orden): la salida
+    // por frame es idéntica; solo su momento de entrega pasa a ser
+    // función de la posición de audio. En Android el modo asíncrono no
+    // cambia (tiempo real). One-way: no hay vuelta a asíncrono.
+    void setSynchronous(bool on) noexcept;
+    void processPendingFrames() noexcept;
+    bool isSynchronous() const noexcept {
+        return m_synchronous.load(std::memory_order_relaxed);
+    }
+
 private:
     LockFreeAudioRingBuffer<float, RING_BUFFER_CAPACITY> m_audioRingBuffer;
     
@@ -149,6 +170,9 @@ private:
     
     std::atomic<bool> m_running{false};
     std::thread m_inferenceThread;
+    // Modo síncrono (ver setSynchronous): true = hilo parado, el
+    // llamador drena con processPendingFrames(). Solo host.
+    std::atomic<bool> m_synchronous{false};
 
     void initFilterbankAndWindow() noexcept;
     void inferenceLoop() noexcept;

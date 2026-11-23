@@ -44,6 +44,33 @@ IvannaAudioClassifier::~IvannaAudioClassifier() {
     }
 }
 
+// Modo síncrono (determinista, solo host). One-way e idempotente: parar
+// el hilo de inferencia; a partir de aquí el único consumidor del ring
+// es el llamador de processPendingFrames() (el invariante SPSC queda
+// intacto: un solo productor — ingestAudioFrame — y un solo consumidor).
+void IvannaAudioClassifier::setSynchronous(bool on) noexcept {
+    if (!on || m_synchronous.load(std::memory_order_relaxed)) return;
+    m_synchronous.store(true, std::memory_order_relaxed);
+    m_running.store(false, std::memory_order_release);
+    if (m_inferenceThread.joinable()) {
+        m_inferenceThread.join();
+    }
+}
+
+// Drenar en el hilo llamador todos los frames completos del ring
+// (mismo cuerpo que la rama de trabajo de inferenceLoop). Solo válido
+// en modo síncrono: en asíncrono el hilo de inferencia es el único
+// consumidor del ring y drenarlo aquí competiría con él.
+void IvannaAudioClassifier::processPendingFrames() noexcept {
+    if (!m_synchronous.load(std::memory_order_relaxed)) return;
+    while (m_audioRingBuffer.available() >= CLASSIFIER_FRAME_SIZE) {
+        m_audioRingBuffer.pop(m_frameBuffer, CLASSIFIER_FRAME_SIZE);
+        computeSTFT(m_frameBuffer);
+        extractLogMelFilterbank();
+        runInt8Inference();
+    }
+}
+
 void IvannaAudioClassifier::initFilterbankAndWindow() noexcept {
     for (size_t i = 0; i < CLASSIFIER_FRAME_SIZE; ++i) {
         m_hanningWindow[i] = 0.5f * (1.f - std::cos(2.f * PI_F * i / (CLASSIFIER_FRAME_SIZE - 1)));

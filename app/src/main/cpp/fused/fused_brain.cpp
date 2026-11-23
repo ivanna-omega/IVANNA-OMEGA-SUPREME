@@ -28,6 +28,20 @@ void FusedBrain::prepare(double sampleRate) noexcept {
     npe_.setParams(false, kBrainNpeHarmonic, kBrainNpeLateral, kBrainNpeOhc,
                    kBrainNpeMasterDb);
 
+    // Determinismo en host (hallazgo P0 2026-11-22): el hilo de
+    // inferencia del clasificador hace que la trayectoria del guardián
+    // AntiDolby dependa de la planificación del SO (el primer chunk
+    // válido llegó en el 126 en una corrida y en el 1458 en otra) y
+    // NEURO·Ω no es reproducible entre corridas (op_neuro maxDiff
+    // 0.33-0.42). En host la inferencia se drena síncronamente desde el
+    // hilo de audio (misma inferencia, mismos frames, mismo orden: la
+    // salida por frame es idéntica; solo su momento de entrega pasa a
+    // ser función de la posición de audio). En Android no cambia nada
+    // (hilo asíncrono, tiempo real).
+#if !defined(__ANDROID__)
+    classifier_.setSynchronous(true);
+#endif
+
     // Memoria del super-agente, misma ruta que el FusionEngine. En host
     // /data no existe → open() falla → false, sin crear archivos y sin
     // crashear; updateContext() sigue alimentando el estado local.
@@ -80,8 +94,12 @@ void FusedBrain::runAnalysisChunk(const float* l, const float* r, int n) noexcep
     if (l == nullptr || r == nullptr || n <= 0) return;
 
     // Clasificador de género (NPE): ingesta wait-free; la inferencia
-    // corre en su propio hilo y publica por triple buffer.
+    // corre en su propio hilo y publica por triple buffer. En modo
+    // síncrono (host, ver prepare()) la inferencia se drena aquí mismo:
+    // la clasificación queda ligada a la posición de audio, no al
+    // momento en que el hilo de inferencia despierte.
     classifier_.ingestAudioFrame(l, r, static_cast<std::size_t>(n));
+    if (classifier_.isSynchronous()) classifier_.processPendingFrames();
 
     // Prosodia (F0 / VAD / tilt).
     prosody_.analyzeAudio(l, r, static_cast<std::size_t>(n));

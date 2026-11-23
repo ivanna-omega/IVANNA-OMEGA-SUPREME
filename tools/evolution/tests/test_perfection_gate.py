@@ -145,8 +145,11 @@ class TestPerfectionGateThresholds(unittest.TestCase):
         # 1628 con test_p0_reference_lock (9 TESTs: Freeze, Levels,
         # TruePeak, Thdn, Imd, Latency, CpuXruns, SilenceTail,
         # Deterministic).
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1628)
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1628)
+        # 2026-11-22 (fix no-determinismo NEURO): la suite crece de 1628
+        # a 1631 con test_neuro_determinism (3 TESTs: op_neuro bit-idéntico,
+        # sonda clasificador+guardián, IVANNA dentro de tolerancia).
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1631)
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1631)
         self.assertEqual(gate.THRESHOLDS["sofa_expected_total"], 694)
         self.assertTrue(gate.THRESHOLDS_VERSION)
 

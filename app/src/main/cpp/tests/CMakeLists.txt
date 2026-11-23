@@ -3132,6 +3132,23 @@ if(IVANNA_SAN_FLAGS)
 endif()
 gtest_discover_tests(test_p0_reference_lock)
 
+# ── Determinismo de NEURO·Ω (hallazgo mayor de P0, 2026-11-22) ─────────────
+# op_neuro con dos cadenas frescas debe ser bit-idéntico; la causa raíz es
+# el hilo de inferencia del clasificador -> guardián AntiDolby (ver
+# test_neuro_determinism.cpp). Guarda + sonda del mecanismo.
+add_executable(test_neuro_determinism
+  test_neuro_determinism.cpp
+  ${FUSED_CHAIN_SOURCES}
+)
+target_include_directories(test_neuro_determinism PRIVATE .. ../include ../neuromorphic ../dsp host_stubs ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tests/adversarial/src)
+target_compile_options(test_neuro_determinism PRIVATE -Wall -Wextra)
+target_link_libraries(test_neuro_determinism PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_neuro_determinism PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_neuro_determinism PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_neuro_determinism)
+
 # ── Piso double de la cadena enganchada (labor grande, v2.5.486) ─────────
 # THD+N ≤ −200 dB con la cadena enganchada pero lineal a 1 kHz (ver
 # test_double_floor.cpp) + coste por hop (128 muestras = 2667 µs).
