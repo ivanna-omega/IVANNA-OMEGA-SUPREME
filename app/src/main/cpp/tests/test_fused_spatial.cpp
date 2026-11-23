@@ -534,12 +534,17 @@ TEST(FusedSpatial, WfsStageGoldenWithPoincareOff) {
     ASSERT_TRUE(isFiniteBuffer(outR.data(), outR.size()));
 
     // Muestras doradas (L/R) en índices fijos, capturadas pre-cambio
-    // (%.17g, ida y vuelta exacta). RMS total como segunda clava.
+    // (%.17g). RMS total como segunda clava. Tolerancia 1e-7, NO igualdad
+    // exacta: los dorados se capturaron con g++-14 y la CI compila con
+    // clang++-18, que difiere por FMA/vectorización en ~1e-8 (medido en CI:
+    // máx 8.3e-9). Un cambio real del cableado movería las muestras órdenes
+    // de magnitud más; 1e-7 lo sigue cazando y el ruido de compilador no.
     static constexpr int kIdx[] = {100, 1000, 5000, 12000, 24000, 36000, 47999};
     static constexpr double kGoldenL[] = {0.35355339059326818, -0.0048235804904559441, -0.076335525334705667, -0.13175913760067637, -0.11161374585411231, -0.1116137425019425, -0.11843232632974263};
     static constexpr double kGoldenR[] = {0.35355339059326818, -0.0048238491737545245, -0.07633518203642646, -0.13175887588624424, -0.11161375142763194, -0.11161374807459326, -0.11843235231921902};
     static constexpr double kGoldenRmsL = 0.099134853935782405;
     static constexpr double kGoldenRmsR = 0.099134820869615753;
+    static constexpr double kGoldenTol = 1e-7;
     double rmsL = 0.0, rmsR = 0.0;
     for (size_t i = 0; i < outL.size(); ++i) {
         rmsL += outL[i] * outL[i];
@@ -549,11 +554,11 @@ TEST(FusedSpatial, WfsStageGoldenWithPoincareOff) {
     rmsR = std::sqrt(rmsR / static_cast<double>(outR.size()));
     bool ok = true;
     for (size_t i = 0; i < 7; ++i) {
-        if (outL[static_cast<size_t>(kIdx[i])] != kGoldenL[i] ||
-            outR[static_cast<size_t>(kIdx[i])] != kGoldenR[i])
+        if (std::fabs(outL[static_cast<size_t>(kIdx[i])] - kGoldenL[i]) > kGoldenTol ||
+            std::fabs(outR[static_cast<size_t>(kIdx[i])] - kGoldenR[i]) > kGoldenTol)
             ok = false;
     }
-    if (rmsL != kGoldenRmsL || rmsR != kGoldenRmsR) ok = false;
+    if (std::fabs(rmsL - kGoldenRmsL) > kGoldenTol || std::fabs(rmsR - kGoldenRmsR) > kGoldenTol) ok = false;
     if (!ok) {
         std::printf("[fused_spatial] GOLDEN L: {");
         for (size_t i = 0; i < 7; ++i)
@@ -566,13 +571,13 @@ TEST(FusedSpatial, WfsStageGoldenWithPoincareOff) {
         std::printf("}\n[fused_spatial] GOLDEN RMS L=%.17g R=%.17g\n", rmsL, rmsR);
     }
     for (size_t i = 0; i < 7; ++i) {
-        EXPECT_DOUBLE_EQ(outL[static_cast<size_t>(kIdx[i])], kGoldenL[i])
+        EXPECT_NEAR(outL[static_cast<size_t>(kIdx[i])], kGoldenL[i], kGoldenTol)
             << "muestra dorada L idx=" << kIdx[i];
-        EXPECT_DOUBLE_EQ(outR[static_cast<size_t>(kIdx[i])], kGoldenR[i])
+        EXPECT_NEAR(outR[static_cast<size_t>(kIdx[i])], kGoldenR[i], kGoldenTol)
             << "muestra dorada R idx=" << kIdx[i];
     }
-    EXPECT_DOUBLE_EQ(rmsL, kGoldenRmsL) << "RMS dorado L";
-    EXPECT_DOUBLE_EQ(rmsR, kGoldenRmsR) << "RMS dorado R";
+    EXPECT_NEAR(rmsL, kGoldenRmsL, kGoldenTol) << "RMS dorado L";
+    EXPECT_NEAR(rmsR, kGoldenRmsR, kGoldenTol) << "RMS dorado R";
 }
 
 }  // namespace
