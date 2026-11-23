@@ -1,0 +1,81 @@
+# Tests host en el runner self-hosted ivanna-vm (esta VM).
+# Existe porque los runners hospedados por GitHub están bloqueados por
+# facturación en golozotns-art (2026-11-23): "recent account payments have
+# failed or your spending limit needs to be increased". Los runners
+# self-hosted no consumen minutos de GitHub Actions, así que la suite
+# C++ se verifica aquí gratis. No toca la release (build.yml sigue siendo
+# el pipeline de publicación; este workflow solo verifica tests).
+# El runner vive en /home/runner/actions-runner (usuario runner, servicio
+# systemd actions.runner.golozotns-art-IVANNA-OMEGA-SUPREME.ivanna-vm).
+# Tras un reemplazo de VM se restaura con
+# ~/workspace/github-runner-recover.sh (ver AGENTS.md).
+
+name: Tests host (self-hosted ivanna-vm)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ctest-selfhosted:
+    name: DSP Native Tests (host, CTest, self-hosted)
+    runs-on: [self-hosted, ivanna-vm]
+    timeout-minutes: 120
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      CMAKE: /home/runner/cmake-3.30.3-linux-x86_64/bin/cmake
+    steps:
+      - uses: actions/checkout@v7
+        with: { fetch-depth: 0 }
+      - name: Install HDF5 validator
+        run: python3 -m pip install --disable-pip-version-check --user h5py numpy
+      - name: Validate every SOFA with a real HDF5 reader
+        run: python3 scripts/validate_sofa_hdf5.py .
+      - name: SOFA validator regression tests
+        run: python3 -m unittest discover -s tests -p 'test_validate_sofa_hdf5.py' -v
+      - name: AutoEqManager Kotlin profiles match freshly measured HpIR corpus
+        run: python3 -m unittest discover -s tests -p 'test_autoeq_kotlin_matches_extractor.py' -v
+      - name: SAFMUS transversal wiring contract
+        run: python3 scripts/check_safmus_transversal_wiring.py
+      - name: Audio route wiring contract (A/B/C, ASRC and physical outputs)
+        run: python3 scripts/check_audio_route_wiring.py
+      - name: Adaptive DSP metric provenance contract
+        run: python3 scripts/check_adaptive_metric_truth.py
+      - name: SAFMUS sync/ASRC numerical reference self-test
+        run: python3 sync_asrc.py --self-test
+      - name: Hardware Sovereignty release approval gate tests
+        run: python3 -m unittest discover -s tests -p 'test_hws_release_approval.py' -v
+      - name: Release bump detector regression tests
+        run: python3 -m unittest discover -s tests -p 'test_release_bump_detection.py' -v
+      - name: SAFMUS sync/ASRC regression tests
+        run: python3 -m unittest discover -s tests -p 'test_sync_asrc.py' -v
+      - name: Adversarial audio measurement regression suite
+        run: python3 -m unittest discover -s tests -p 'test_ivanna_audio_certify.py' -v
+      - name: Synthetic signal fault-injection suite
+        run: python3 -m unittest discover -s tests -p 'test_ivanna_synthetic_audio_suite.py' -v
+      - name: Auditory magnificence gate policy tests
+        run: python3 -m unittest discover -s tests -p 'test_ivanna_auditory_gate.py' -v
+      - name: Release updater manifest regression tests
+        run: python3 -m unittest discover -s tests -p 'test_prepare_release_manifest.py' -v
+      - name: Transaural route and RIR crossmix contract tests
+        run: python3 -m unittest discover -s tests -p 'test_transaural_route_contract.py' -v
+      - name: Configure (Release)
+        run: $CMAKE -B build-tests -S app/src/main/cpp/tests -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: $CMAKE --build build-tests -j2
+      - name: Run tests
+        run: |
+          set -o pipefail
+          rc=0
+          ctest --test-dir build-tests --output-on-failure 2>&1 | tee ctest_last.log || rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            fails=$(grep -E "^\s*[0-9]+ - .*\(Failed|Timeout|SEGFAULT|Subprocess aborted|Exception" ctest_last.log | sed 's/^ *//' | tr '\n' ';' | cut -c1-600)
+            detail=$(grep -E "Failure|Expected|Actual|which is|SUMMARY:|medido:" ctest_last.log | head -8 | tr '\n' ' ' | cut -c1-700)
+            echo "::error title=DSP CTest fallido::${fails} | ${detail}"
+          fi
+          exit $rc
