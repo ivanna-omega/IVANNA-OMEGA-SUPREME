@@ -349,6 +349,7 @@ def infer_kotlin_var_types(cleaned_kt_contents: Dict[str, str]) -> Tuple[Dict[st
     Infiere tipos de variables/propiedades por archivo y globalmente:
       - val/var x: Clase
       - val/var x = Clase(...) / Clase.shared / Clase.getInstance(...)
+      - val/var x = paquete.completo.Clase(...) (constructor cualificado)
       - param x: Clase
       - remember { Clase(...) } / by lazy { Clase(...) }
     """
@@ -359,6 +360,16 @@ def infer_kotlin_var_types(cleaned_kt_contents: Dict[str, str]) -> Tuple[Dict[st
     pat_ctor = re.compile(
         r'\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[A-Za-z0-9_.?]+\s*)?=\s*'
         r'(?:remember\s*(?:\([^)]*\))?\s*\{\s*)?([A-Z][A-Za-z0-9_]*)\s*(?:\(|\.\s*(?:shared|instance|getInstance)\b)'
+    )
+    # Constructor con nombre COMPLETO (paquete): `val saf =
+    # com.ivanna.omega.saf.SaFEngine(ctx)`. pat_ctor exige la clase con
+    # mayúscula justo tras `=` y no ve el paquete en minúsculas, así que
+    # el receptor quedaba sin tipo y su llamador no se resolvía
+    # (PersistedStateRestorer.kt:344 saf.initialize() era falso positivo
+    # en check_kotlin_wrapper_wiring.py, Fase 2 v2.5.497).
+    pat_fq_ctor = re.compile(
+        r'\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[A-Za-z0-9_.?]+\s*)?=\s*'
+        r'(?:[a-z][A-Za-z0-9_]*\.)+([A-Z][A-Za-z0-9_]*)\s*\('
     )
     # Asignación directa de un `object` Kotlin: `val lib = IvannaNativeLib`
     # (sin paréntesis ni `.shared`). Sin este patrón, los llamadores vía
@@ -391,6 +402,10 @@ def infer_kotlin_var_types(cleaned_kt_contents: Dict[str, str]) -> Tuple[Dict[st
                 fmap.setdefault(var_name, set()).add(simple_type)
                 global_props.setdefault(var_name, set()).add(simple_type)
         for m in pat_ctor.finditer(content):
+            var_name, cls_name = m.group(1), m.group(2)
+            fmap.setdefault(var_name, set()).add(cls_name)
+            global_props.setdefault(var_name, set()).add(cls_name)
+        for m in pat_fq_ctor.finditer(content):
             var_name, cls_name = m.group(1), m.group(2)
             fmap.setdefault(var_name, set()).add(cls_name)
             global_props.setdefault(var_name, set()).add(cls_name)

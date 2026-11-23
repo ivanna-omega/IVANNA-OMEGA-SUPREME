@@ -38,6 +38,22 @@ EXPECTED_DEFERRED = {
     "com.ivanna.omega.core.IvannaNativeLib.nativeGetNaelCorrections",
     "com.ivanna.omega.core.IvannaNativeLib.nativeSetFastRpcEnabled",
     "com.ivanna.omega.core.IvannaNativeLib.nativeSetAtiEnabled",
+    # 11 más (2026-11-22, Fase 2 v2.5.497): sus únicos llamadores eran
+    # BrainScreen.kt y SoundScreen.kt, borradas en 64b7877. Cada una con
+    # reason + unlocks_when en el registro; la función vive por otra vía
+    # donde se indica (loudness por el motor de decisión AI, posición
+    # binaural por ORBE/FusedControls).
+    "com.ivanna.omega.core.IvannaNativeLib.nativeSetEvolutionParams",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeEvolveStep",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeGetPhaseEnergy",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeSetLabAutoEnabled",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeIsLabAutoEnabled",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeGetLabAutoFrameCount",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeSetLoudnessTarget",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeGetAudioSpectrum",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeGetPerceptualCues",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeRunNeuralBenchmarks",
+    "com.ivanna.omega.core.IvannaNativeLib.nativeSetBinauralPositionRad",
 }
 
 
@@ -89,7 +105,7 @@ class TestCheckJniWiringIntegration(unittest.TestCase):
             capture_output=True, text=True, timeout=300)
         self.assertEqual(p.returncode, 0, p.stdout[-2000:] + p.stderr[-2000:])
         self.assertIn("[PASS] 0 hallazgos de cableado JNI.", p.stdout)
-        self.assertIn("[DEFERRED] APIs JNI diferidas sin llamador (9", p.stdout)
+        self.assertIn("[DEFERRED] APIs JNI diferidas sin llamador (20", p.stdout)
 
 
 if __name__ == "__main__":
