@@ -101,14 +101,29 @@ void StereoWidener::process(double* __restrict__ left, double* __restrict__ righ
         double outL = mid + sideOut;
         double outR = mid - sideOut;
 
-        // DC blocking primer orden — elimina drift acumulado
-        double newxL = outL;
-        outL = outL - dcxL_ + dcCoef_ * dcyL_;
-        dcxL_ = newxL; dcyL_ = outL;
+        // FIX (cola DC tras fin de señal, P1 2026-11-22): el DC blocker
+        // (HPF ~5 Hz, tau ~32 ms) descarga su estado como cola DC audible
+        // (−77 dBFS en bass_01/hotmix_01, umbral −90 dBFS) cuando la señal
+        // termina. Si la entrada es silencio digital (< 1e-9 ≈ −180 dBFS,
+        // bajo el piso de ruido 24-bit), ese estado es memoria obsoleta:
+        // no hay señal que filtrar, así que se limpia y la salida es
+        // silencio exacto. NO es un gate: no toca el audio real — solo
+        // actúa cuando no hay señal (un cruce por cero real es ~1e-3,
+        // muy por encima del umbral).
+        if (std::fabs(l) < 1e-9 && std::fabs(r) < 1e-9) {
+            dcxL_ = dcyL_ = dcxR_ = dcyR_ = 0.0;
+            outL = 0.0;
+            outR = 0.0;
+        } else {
+            // DC blocking primer orden — elimina drift acumulado
+            double newxL = outL;
+            outL = outL - dcxL_ + dcCoef_ * dcyL_;
+            dcxL_ = newxL; dcyL_ = outL;
 
-        double newxR = outR;
-        outR = outR - dcxR_ + dcCoef_ * dcyR_;
-        dcxR_ = newxR; dcyR_ = outR;
+            double newxR = outR;
+            outR = outR - dcxR_ + dcCoef_ * dcyR_;
+            dcxR_ = newxR; dcyR_ = outR;
+        }
 
         left[i]  = outL;
         right[i] = outR;
