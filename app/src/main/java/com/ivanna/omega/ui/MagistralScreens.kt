@@ -206,7 +206,11 @@ fun MagistralScreenScaffold(
         }
         Column(
             modifier = Modifier
-                .fillMaxSize()
+                // weight(1f), no fillMaxSize(): el viewport es justo lo que
+                // queda tras la cabecera; con fillMaxSize() el viewport se
+                // extendía una cabecera por debajo de la pantalla y los
+                // últimos ~64 dp de contenido no se alcanzaban nunca.
+                .weight(1f)
                 .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -518,7 +522,10 @@ fun SaludSistemaScreen(
         onBack = onBack,
     ) { visible ->
         MagistralAnimatedCard(visible = visible, index = 0) {
-            MagiskStatusPanel(omegaBridge = omegaBridge, onBack = onBack)
+            // FIX (crash 497): sin scroll propio — el panel es contenido del
+            // scroll del scaffold; con su scroll interno se medía con altura
+            // infinita y Compose lanzaba IllegalStateException.
+            MagiskStatusPanel(omegaBridge = omegaBridge, onBack = onBack, scrollable = false)
         }
         MagistralAnimatedCard(visible = visible, index = 1) {
             MagistralSectionTitle("RENDIMIENTO EN VIVO")

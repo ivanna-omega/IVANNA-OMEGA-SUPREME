@@ -96,7 +96,16 @@ private val permissionsSpec = SpecInfo(
 fun MagiskStatusPanel(
     omegaBridge: OmegaEngineBridge,
     modifier: Modifier = Modifier,
-    onBack: () -> Unit = {}
+    onBack: () -> Unit = {},
+    // FIX (crash 497): el panel es pantalla raíz de la ruta "magisk" (ahí
+    // necesita su propio scroll interno, default true) y también contenido
+    // de Salud del sistema, dentro del scroll de MagistralScreenScaffold.
+    // Un Column con verticalScroll dentro de otro scroll vertical se mide
+    // con altura infinita y Compose lanza IllegalStateException (crash
+    // 2026-11-22 13:44:25). Con scrollable=false el panel se mide a su
+    // contenido y el scroll lo pone el padre (un solo scroller, sin scroll
+    // vertical anidado). Mismo patrón que IvannaControlPanel (FIX scroll 413).
+    scrollable: Boolean = true
 ) {
     var moduleActive    by remember { mutableStateOf(false) }
     var moduleVersion   by remember { mutableStateOf("") }
@@ -162,30 +171,41 @@ fun MagiskStatusPanel(
     }
 
     Column(
-        modifier = modifier
-            .fillMaxSize()
-            .background(MagistralVoid)
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 20.dp),
+        modifier = if (scrollable) {
+            modifier
+                .fillMaxSize()
+                .background(MagistralVoid)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 20.dp)
+        } else {
+            // Embebido: sin scroll propio ni fondo propio (la tarjeta que lo
+            // hospeda ya pone el fondo); el scroll lo pone el padre.
+            modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 20.dp)
+        },
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Botón de Regreso
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-            horizontalArrangement = Arrangement.Start
-        ) {
-            Text(
-                text = "◄ VOLVER AL PANEL PRINCIPAL",
-                color = AuroraCyan,
-                fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Bold,
-                fontSize = 14.sp,
-                letterSpacing = 1.sp,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable { onBack() }
-                    .padding(vertical = 8.dp, horizontal = 4.dp)
-            )
+        // Botón de Regreso (solo como pantalla raíz: embebido, el atrás ya
+        // lo pone la cabecera del scaffold).
+        if (scrollable) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.Start
+            ) {
+                Text(
+                    text = "◄ VOLVER AL PANEL PRINCIPAL",
+                    color = AuroraCyan,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { onBack() }
+                        .padding(vertical = 8.dp, horizontal = 4.dp)
+                )
+            }
         }
 
         // Ficha del entorno · System (prototipo, Pantalla VII).
