@@ -106,9 +106,17 @@ THRESHOLDS_VERSION = "perfection-gate-thresholds-v1"
 # El umbral CTest se SUBE a 1430/1430 para igualar el conteo real medido
 # (1430/1430 en host); el SOFA se queda en 694. Mismo procedimiento:
 # actualizar también el candado test_umbrales_versionados.
+# 2026-11-22 (salto/control-cerrado): la suite crece de 1430 a 1607
+# con el sistema de control cerrado (177 tests nuevos).
+# 2026-11-22 (P1 banco adversarial permanente): la suite crece de 1607
+# a 1619 con la matriz bypass vs IVANNA vs cada operador (11 casos +
+# 1 diagnóstico APEX/limiter en test_p1_adversarial_matrix).
+# El umbral CTest se SUBE a 1619/1619 para igualar el conteo real medido
+# (1619 en host); el SOFA se queda en 694. Mismo procedimiento:
+# actualizar también el candado test_umbrales_versionados.
 THRESHOLDS = {
-    "ctest_expected_total": 1607,
-    "ctest_expected_passed": 1607,
+    "ctest_expected_total": 1619,
+    "ctest_expected_passed": 1619,
     "sofa_expected_total": 694,
 }
 

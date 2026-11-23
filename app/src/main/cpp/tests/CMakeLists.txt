@@ -3093,6 +3093,25 @@ if(IVANNA_SAN_FLAGS)
 endif()
 gtest_discover_tests(test_fused_chain)
 
+# ── P1 (2026-11-22): matriz adversarial bypass vs IVANNA vs cada operador ─
+# El núcleo de medición es el del banco adversarial (tests/adversarial, C++17,
+# sin dependencias); se compila su .cpp aquí y se añade su include. El banco
+# sigue siendo proyecto CTest independiente (7 tests); esta matriz vive en la
+# suite principal (10 TESTs, uno por caso) y la Puerta cuenta sus 10 entradas.
+add_executable(test_p1_adversarial_matrix
+  test_p1_adversarial_matrix.cpp
+  ${FUSED_CHAIN_SOURCES}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tests/adversarial/src/adversarial_core.cpp
+)
+target_include_directories(test_p1_adversarial_matrix PRIVATE .. ../include ../neuromorphic ../dsp host_stubs ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tests/adversarial/src)
+target_compile_options(test_p1_adversarial_matrix PRIVATE -Wall -Wextra)
+target_link_libraries(test_p1_adversarial_matrix PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_p1_adversarial_matrix PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_p1_adversarial_matrix PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_p1_adversarial_matrix)
+
 # ── Piso double de la cadena enganchada (labor grande, v2.5.486) ─────────
 # THD+N ≤ −200 dB con la cadena enganchada pero lineal a 1 kHz (ver
 # test_double_floor.cpp) + coste por hop (128 muestras = 2667 µs).

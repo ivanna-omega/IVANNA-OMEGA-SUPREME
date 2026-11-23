@@ -138,8 +138,11 @@ class TestPerfectionGateThresholds(unittest.TestCase):
         # 2026-11-22 (salto/control-cerrado): la suite crece de 1430 a 1607
         # con el sistema de control cerrado (M0 6 + M3 7 + telemetría 9 +
         # M5 16 + M6 9 + M8 11 + adversarial 119 = 177 tests nuevos).
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1607)
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1607)
+        # 2026-11-22 (P1 banco adversarial permanente): la suite crece de
+        # 1607 a 1619 con la matriz bypass vs IVANNA vs cada operador
+        # (11 casos + 1 diagnóstico APEX/limiter).
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1619)
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1619)
         self.assertEqual(gate.THRESHOLDS["sofa_expected_total"], 694)
         self.assertTrue(gate.THRESHOLDS_VERSION)
 
