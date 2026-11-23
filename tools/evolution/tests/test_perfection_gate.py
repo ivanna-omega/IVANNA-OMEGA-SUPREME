@@ -151,8 +151,11 @@ class TestPerfectionGateThresholds(unittest.TestCase):
         # 2026-11-22 (v2.5.498, fix del tronido): la suite crece de 1631
         # a 1634 con test_tronidos_layer_step (3 TESTs: AllLayers,
         # FixEngageNoStepAndModeNoSilence, ApexOffProbe).
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1634)
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1634)
+        # 2026-11-23 (pan Poincaré de campo cercano, flag OFF por defecto):
+        # la suite crece de 1634 a 1639 con test_poincare_pan (4 TESTs) y
+        # test_fused_spatial.WfsStageGoldenWithPoincareOff (1 TEST).
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1639)
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1639)
         self.assertEqual(gate.THRESHOLDS["sofa_expected_total"], 694)
         self.assertTrue(gate.THRESHOLDS_VERSION)
 

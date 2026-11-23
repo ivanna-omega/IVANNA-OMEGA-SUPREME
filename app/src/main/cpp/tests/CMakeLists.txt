@@ -2960,6 +2960,43 @@ if(IVANNA_SAN_FLAGS)
 endif()
 gtest_discover_tests(test_fused_spatial)
 
+# ── test_poincare_pan: pan Poincaré de campo cercano (2026-11-23) ──────────
+# Cableado en FusedSpatial (sustituye el spread WFS) detrás del flag
+# kPoincarePanEnabled. ESTE TARGET ES EL ÚNICO QUE COMPILA CON EL FLAG ON
+# (-DIVANNA_POINCARE_PAN_ENABLED=1): es el único que ejercita el camino
+# ON; el resto de la suite (y producción) corre con el flag OFF. Mismas
+# fuentes que test_fused_spatial (todo lo que FusedSpatial necesita).
+add_executable(test_poincare_pan
+  test_poincare_pan.cpp
+  ../fused/fused_spatial.cpp
+  ../spatial/IntelligentUpmixer.cpp
+  ../spatial/HoaBinauralDecoder.cpp
+  ../spatial/hrtf_convolver.cpp
+  ../SafHRTFDatasetBridge.cpp
+  ../SafPcaDecoder.cpp
+  ../HRTFBinLoader.cpp
+  ../HrtfManager.cpp
+  ../SofaHRTFLoader.cpp
+  ../fused/geodesic_pinna_model.cpp
+  ../fused/physical_head_model.cpp
+  ../fused/physical_propagation.cpp
+  ../hexagon/ivanna_fastrpc_client.cpp
+  ../hexagon/ivanna_dsp.cpp
+  ../spatial/RirConvolver.cpp
+  ../spatial/WfsRenderer.cpp
+  ../spatial/OrbeBinaural.cpp
+  ../spatial/ivanna_head_tracker.cpp
+)
+target_include_directories(test_poincare_pan PRIVATE .. ../include host_stubs)
+target_compile_definitions(test_poincare_pan PRIVATE IVANNA_POINCARE_PAN_ENABLED=1)
+target_compile_options(test_poincare_pan PRIVATE -Wall -Wextra)
+target_link_libraries(test_poincare_pan PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_poincare_pan PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_poincare_pan PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_poincare_pan)
+
 # ── test_sofa_comparison: arnes de comparacion SOFA (Trabajador C, 2026-11-18) ──
 # HRTF medida (kemar.ihr1, conversion de MIT_KEMAR_normal_pinna.sofa) vs
 # IR efectiva de ORBE·Ω (FusedSpatial) vs par reconstruido de SofaHRTFLoader.

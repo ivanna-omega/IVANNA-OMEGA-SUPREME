@@ -503,4 +503,76 @@ TEST(FusedSpatial, PitchAudibleViaHrtfStage) {
     EXPECT_GT(n.maxAbsDiff, 1e-3);
 }
 
+// Pan Poincaré OFF por defecto (2026-11-23): con el flag apagado la etapa
+// WFS debe producir EXACTAMENTE la salida de la cadena actual. Este test
+// clava la salida WFS con muestras doradas capturadas ANTES del cableado
+// (rama poincare-wire, pre-cambio): si el cableado toca el camino OFF,
+// el test cae. La etapa es Wfs (amount 0, hrtfWet 0, upmix off,
+// wfsSpread 1): ORBE/HRTF/HOA no intervienen.
+TEST(FusedSpatial, WfsStageGoldenWithPoincareOff) {
+    SpatialControls c;
+    c.amount = 0.0f;
+    c.azimuthDeg = 0.0f;
+    c.distanceM = 1.0f;
+    c.width = 1.0f;
+    c.mode = OmegaOutputMode::HEADPHONES;
+    c.wfsSpread = 1.0f;
+    c.hrtfWet = 0.0f;
+    c.headTracking = false;
+    c.xtcEnabled = false;
+    c.upmixEnabled = false;
+    c.clamp();
+    FusedSpatial s;
+    s.prepare(kSr);
+    s.setControls(c);
+    ASSERT_FALSE(s.isNeutral());
+
+    const std::vector<double> in = makeTone();  // 1 kHz, 1 s, -3 dBFS
+    std::vector<double> outL = in, outR = in;
+    processBoth(s, outL, outR);
+    ASSERT_TRUE(isFiniteBuffer(outL.data(), outL.size()));
+    ASSERT_TRUE(isFiniteBuffer(outR.data(), outR.size()));
+
+    // Muestras doradas (L/R) en índices fijos, capturadas pre-cambio
+    // (%.17g, ida y vuelta exacta). RMS total como segunda clava.
+    static constexpr int kIdx[] = {100, 1000, 5000, 12000, 24000, 36000, 47999};
+    static constexpr double kGoldenL[] = {0.35355339059326818, -0.0048235804904559441, -0.076335525334705667, -0.13175913760067637, -0.11161374585411231, -0.1116137425019425, -0.11843232632974263};
+    static constexpr double kGoldenR[] = {0.35355339059326818, -0.0048238491737545245, -0.07633518203642646, -0.13175887588624424, -0.11161375142763194, -0.11161374807459326, -0.11843235231921902};
+    static constexpr double kGoldenRmsL = 0.099134853935782405;
+    static constexpr double kGoldenRmsR = 0.099134820869615753;
+    double rmsL = 0.0, rmsR = 0.0;
+    for (size_t i = 0; i < outL.size(); ++i) {
+        rmsL += outL[i] * outL[i];
+        rmsR += outR[i] * outR[i];
+    }
+    rmsL = std::sqrt(rmsL / static_cast<double>(outL.size()));
+    rmsR = std::sqrt(rmsR / static_cast<double>(outR.size()));
+    bool ok = true;
+    for (size_t i = 0; i < 7; ++i) {
+        if (outL[static_cast<size_t>(kIdx[i])] != kGoldenL[i] ||
+            outR[static_cast<size_t>(kIdx[i])] != kGoldenR[i])
+            ok = false;
+    }
+    if (rmsL != kGoldenRmsL || rmsR != kGoldenRmsR) ok = false;
+    if (!ok) {
+        std::printf("[fused_spatial] GOLDEN L: {");
+        for (size_t i = 0; i < 7; ++i)
+            std::printf("%.17g%s", outL[static_cast<size_t>(kIdx[i])],
+                        i + 1 < 7 ? ", " : "");
+        std::printf("}\n[fused_spatial] GOLDEN R: {");
+        for (size_t i = 0; i < 7; ++i)
+            std::printf("%.17g%s", outR[static_cast<size_t>(kIdx[i])],
+                        i + 1 < 7 ? ", " : "");
+        std::printf("}\n[fused_spatial] GOLDEN RMS L=%.17g R=%.17g\n", rmsL, rmsR);
+    }
+    for (size_t i = 0; i < 7; ++i) {
+        EXPECT_DOUBLE_EQ(outL[static_cast<size_t>(kIdx[i])], kGoldenL[i])
+            << "muestra dorada L idx=" << kIdx[i];
+        EXPECT_DOUBLE_EQ(outR[static_cast<size_t>(kIdx[i])], kGoldenR[i])
+            << "muestra dorada R idx=" << kIdx[i];
+    }
+    EXPECT_DOUBLE_EQ(rmsL, kGoldenRmsL) << "RMS dorado L";
+    EXPECT_DOUBLE_EQ(rmsR, kGoldenRmsR) << "RMS dorado R";
+}
+
 }  // namespace

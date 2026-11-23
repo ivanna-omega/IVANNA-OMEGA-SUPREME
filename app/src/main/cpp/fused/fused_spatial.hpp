@@ -9,7 +9,9 @@
 //      no hay dataset; wet/dry por hrtfWet).
 //   4. WfsRenderer (2 objetos L/R a ±apertura, mezcla de potencia constante
 //      según wfsSpread; la apertura la modula el análisis de escena del
-//      StereoObjectDecomposer).
+//      StereoObjectDecomposer). Con kPoincarePanEnabled (OFF por defecto)
+//      el spread WFS lo sustituye el pan geodésico de Poincaré
+//      (spatial/poincare_binaural.hpp), con el mismo wet/dry wfsMix_.
 //   5. OrbeBinaural (ORBE, campo cercano esférico por bandas ERB).
 //   6. CrosstalkCanceller (solo SPEAKERS / Genezi).
 //   7. AuxFieldCoherence (solo SPEAKERS / Genezi; preset AuxGeneziRoute
@@ -73,6 +75,7 @@
 #include "HrtfManager.hpp"
 #include "spatial/WfsRenderer.hpp"
 #include "spatial/OrbeBinaural.hpp"
+#include "spatial/poincare_binaural.hpp"
 #include "spatial/CrosstalkCanceller.hpp"
 #include "spatial/AuxFieldCoherence.hpp"
 #include "spatial/StereoObjectDecomposer.hpp"
@@ -83,8 +86,25 @@
 
 namespace ivanna::fused {
 
+// Pan Poincaré de campo cercano (2026-11-23): sustituye el spread WFS
+// por el pan geodésico de Poincaré (cue exacto por nearFieldParallax),
+// detrás de flag y OFF por defecto. NUNCA por defecto sin ABX en el
+// teléfono (orden 8 de Luna). El flag es compile-time (patrón
+// kEmergentToneEnabled en spatial/OmniField.hpp): el target
+// test_poincare_pan compila con -DIVANNA_POINCARE_PAN_ENABLED=1 para
+// ejercitar el camino ON; en producción y en el resto de la suite el
+// flag es false y el camino WFS es el de siempre, bit-idéntico.
+#ifndef IVANNA_POINCARE_PAN_ENABLED
+#define IVANNA_POINCARE_PAN_ENABLED 0
+#endif
+
 class FusedSpatial {
 public:
+    // Pan Poincaré de campo cercano: false = spread WFS (comportamiento
+    // actual); true = pan geodésico en lugar del WFS (solo en el target
+    // de test dedicado, ver arriba). Nunca true en producción sin ABX.
+    static constexpr bool kPoincarePanEnabled = (IVANNA_POINCARE_PAN_ENABLED != 0);
+
     FusedSpatial();
     ~FusedSpatial() = default;
     FusedSpatial(const FusedSpatial&) = delete;
@@ -151,6 +171,7 @@ private:
 
     void applyControls() noexcept;             // empuja controls_ a los motores
     void applyPose(bool force) noexcept;       // azimut + yaw tracker → ORBE/HRTF/XTC
+    void updatePoincareScene() noexcept;       // azimut + yaw tracker + distancia → setScene (flag ON)
     // Una sola etapa binaural por trozo (Fallo 3d). HOA = upmixer + decoder
     // (un render completo); ORBE = campo cercano; HRTF = SOFA/síntesis;
     // WFS = 2 objetos a ±apertura. None = SPEAKERS o nada activo.
@@ -170,6 +191,7 @@ private:
     Ivanna::HrtfManagerD hrtf_;
     ivanna::spatial::WfsRendererD wfs_;
     ivanna::OrbeBinauralD orbe_;
+    ivanna::poincare::Operator poincare_;  // pan de campo cercano (flag ON; ver kPoincarePanEnabled)
     ivanna::spatial::CrosstalkCanceller xtc_;
     ivanna::dsp::AuxFieldCoherenceD auxField_;
     // Análisis de escena + tracking (envueltos en su etapa).
@@ -195,11 +217,19 @@ private:
     std::array<double, kChunk> hoaR_{};
     std::array<double, kChunk> wfsL_{};
     std::array<double, kChunk> wfsR_{};
+    // Scratch float del pan Poincaré (el operador es float nativo; la
+    // cadena es double: ida y vuelta por trozo, solo con flag ON).
+    std::array<float, kChunk> poinL_{};
+    std::array<float, kChunk> poinR_{};
     std::array<double, kChunk> objBuf_[4]{};
 
     // Estado de rampas / cachés (evitan re-síntesis y clics).
     double wfsMix_ = 0.0;            // mezcla WFS vigente (0 seco .. 1 WFS)
     float lastAperture_ = -1.0f;     // última apertura WFS aplicada (m)
+    // Escena Poincaré vigente (azimut efectivo + distancia): setScene
+    // solo se llama cuando cambian (umbral 0.25° / 1 mm, como applyPose).
+    float lastPoincareAzimuthDeg_ = 1.0e9f;
+    float lastPoincareDistanceM_ = -1.0f;
     float lastPoseYawDeg_ = 1.0e9f;  // último yaw aplicado a ORBE/HRTF
     float lastPosePitchDeg_ = 1.0e9f;  // último pitch aplicado a ORBE/HRTF
     float lastPoseRollDeg_ = 1.0e9f;  // último roll aplicado a ORBE/HRTF

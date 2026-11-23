@@ -5,6 +5,7 @@
 // camino. Trozos de 128 frames (Ivanna::BLOCK_SIZE), motores en orden,
 // saneo fail-closed (no finito → 0.0). Sin malloc/locks/I-O en process().
 #include "fused/fused_spatial.hpp"
+#include "fused/physical_propagation.hpp"  // nearFieldParallax (cue del pan Poincaré)
 
 #include <algorithm>
 #include <time.h>
@@ -57,6 +58,17 @@ void FusedSpatial::prepare(double sampleRate) noexcept {
     hrtf_.prepare(fsr);
     orbe_.prepare(fsr);
     wfs_.init(fsr, kChunk, 16);
+    // Pan Poincaré (flag OFF por defecto): se prepara siempre para que el
+    // camino ON no tenga que allocar en process(); con flag OFF no se
+    // llama nunca a process(). Cue completo interno (amount 1.0) y sin
+    // cambio de anchura (width 1.0): el wet/dry lo hace la rampa wfsMix_,
+    // igual que con el WFS. setAmount DESPUÉS de prepare (prepare lo
+    // resetea a 0).
+    poincare_.prepare(sr);
+    poincare_.setAmount(1.0f);
+    poincare_.setWidth(1.0f);
+    lastPoincareAzimuthDeg_ = 1.0e9f;  // fuerza setScene en el primer trozo
+    lastPoincareDistanceM_ = -1.0f;
     xtc_.prepare(fsr, 2048);
     auxField_.prepare(fsr);
     decomposer_.prepare(fsr, kChunk);
@@ -180,6 +192,42 @@ void FusedSpatial::applyPose(bool force) noexcept {
             xtc_.setHeadOffset(az, lat);
             lastXtcYawDeg_ = az;
         }
+    }
+}
+
+// Pan Poincaré (solo flag ON): azimut efectivo + distancia → setScene.
+// El azimut es el MISMO que applyPose empuja a ORBE/HRTF (control +
+// yaw del tracker escalado por parallaxAmount; sin tracker, el control
+// solo) — el plumbing de pose ya existe y es este, no se inventa otro.
+// La distancia es la del control (clamp 0.15..2.0 m en clamp()).
+// setScene solo se llama cuando algo cambia >0.25° / 1 mm (como
+// applyPose): rebuild() re-sintetiza 257 matrices SU(2) y no se paga
+// por trozo. El cue es SOLO nearFieldParallax (rayos, Parte I); NUNCA
+// las funciones de ley de curvatura (Parte II, REFUTADAS).
+// Nota: el cambio de escena es instantáneo en el operador (sin slew
+// propio): con headTracking los pasos son de 0.25° (inaudibles) y con
+// control manual el cambio es deliberado; el slew de enganche lo da la
+// rampa wfsMix_ (15 ms).
+void FusedSpatial::updatePoincareScene() noexcept {
+    float azDeg = controls_.azimuthDeg;
+    if (controls_.headTracking) {
+        azDeg += trackerFusion_.latest().yawDeg * controls_.parallaxAmount;
+    }
+    const float distM = controls_.distanceM;
+    if (std::fabs(azDeg - lastPoincareAzimuthDeg_) > 0.25f ||
+        std::fabs(distM - lastPoincareDistanceM_) > 0.001f) {
+        const double azRad =
+            static_cast<double>(azDeg) * 3.14159265358979323846 / 180.0;
+        poincare_.setScene(azRad, static_cast<double>(distM),
+            [](double az, double r, double /*freqHz*/, double& ildDb,
+               double& itdSec) noexcept {
+                const auto p =
+                    ivanna::fused::propagation::nearFieldParallax(az, r);
+                ildDb = p.ildDivergenceDb;
+                itdSec = p.itdSeconds;
+            });
+        lastPoincareAzimuthDeg_ = azDeg;
+        lastPoincareDistanceM_ = distM;
     }
 }
 
@@ -362,7 +410,10 @@ void FusedSpatial::processChunk(double* l, double* r, int n) noexcept {
         hrtf_.processBinauralScene(l, r, n);
     }
 
-    // 3. WFS (2 objetos L/R a ±apertura). Solo renderiza si es la etapa
+    // 3. WFS (2 objetos L/R a ±apertura) o PAN POINCARÉ (flag ON: el pan
+    //    geodésico sustituye el spread WFS; la mezcla dry/wet sigue
+    //    siendo la rampa wfsMix_ de siempre, así el fundido, la cola y
+    //    hasActiveTail() no cambian). Solo renderiza si es la etapa
     //    elegida; si no lo es pero su mezcla venía activa (wfsMix_ > 0),
     //    corre su rampa DE SALIDA hacia 0 (fundido, no segundo render).
     //    El descomponedor mide el ancho real de la escena (sideRatio) y
@@ -370,7 +421,26 @@ void FusedSpatial::processChunk(double* l, double* r, int n) noexcept {
     //    suave por bloque (sin clic al entrar/salir).
     const double wfsTarget =
         (stage == BinauralStage::Wfs) ? static_cast<double>(controls_.wfsSpread) : 0.0;
-    if (wfsTarget > 0.0f || wfsMix_ > 0.0f) {
+    if (kPoincarePanEnabled) {
+        // Pre-roll: el operador corre en TODOS los trozos para que su
+        // línea de retardo (511 muestras) esté caliente al enganchar el
+        // pan; si no, el wet saldría en silencio ~10.6 ms al entrar.
+        // La salida vive en los scratch WFS (wfsL_/wfsR_) y la mezcla
+        // de abajo la usa igual que la del renderer WFS. El descomponedor
+        // no corre aquí: el cue lo dan azimuth/distance, no la escena.
+        updatePoincareScene();
+        for (int i = 0; i < n; ++i) {
+            poinL_[static_cast<std::size_t>(i)] = static_cast<float>(l[i]);
+            poinR_[static_cast<std::size_t>(i)] = static_cast<float>(r[i]);
+        }
+        poincare_.process(poinL_.data(), poinR_.data(), n);
+        for (int i = 0; i < n; ++i) {
+            wfsL_[static_cast<std::size_t>(i)] =
+                static_cast<double>(poinL_[static_cast<std::size_t>(i)]);
+            wfsR_[static_cast<std::size_t>(i)] =
+                static_cast<double>(poinR_[static_cast<std::size_t>(i)]);
+        }
+    } else if (wfsTarget > 0.0f || wfsMix_ > 0.0f) {
         double* objs[4] = {objBuf_[0].data(), objBuf_[1].data(),
                           objBuf_[2].data(), objBuf_[3].data()};
         decomposer_.decompose(l, r, objs, static_cast<std::size_t>(n));
@@ -387,6 +457,8 @@ void FusedSpatial::processChunk(double* l, double* r, int n) noexcept {
         std::fill(wfsR_.begin(), wfsR_.begin() + n, 0.0);
         const double* inputs[2] = {l, r};
         wfs_.process(inputs, 2, wfsL_.data(), wfsR_.data(), n);
+    }
+    if (wfsTarget > 0.0f || wfsMix_ > 0.0f) {
         // PARCHE v2.6 (punto 3): fundido WFS por muestra (no interpolación
         // lineal por bloque): wfsMix_ avanza hacia wfsTarget con paso
         // 1/(0.015*SR) por muestra (constante de tiempo 15 ms), así el

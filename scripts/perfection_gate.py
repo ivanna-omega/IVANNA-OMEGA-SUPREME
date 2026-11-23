@@ -120,9 +120,14 @@ THRESHOLDS_VERSION = "perfection-gate-thresholds-v1"
 # 2026-11-22 (v2.5.498, fix del tronido): la suite crece de 1631 a 1634
 # con test_tronidos_layer_step (3 TESTs: AllLayers,
 # FixEngageNoStepAndModeNoSilence, ApexOffProbe).
+# 2026-11-23 (pan Poincaré de campo cercano, flag OFF por defecto): la
+# suite crece de 1634 a 1639 con test_poincare_pan (4 TESTs: FlagIsOn,
+# OperatorSelfTest, CueAccuracyWired, NetGainAndSilence) y
+# test_fused_spatial.WfsStageGoldenWithPoincareOff (1 TEST: clava la
+# salida WFS con el flag apagado).
 THRESHOLDS = {
-    "ctest_expected_total": 1634,
-    "ctest_expected_passed": 1634,
+    "ctest_expected_total": 1639,
+    "ctest_expected_passed": 1639,
     "sofa_expected_total": 694,
 }
 
