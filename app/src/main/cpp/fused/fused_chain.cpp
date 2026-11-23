@@ -798,6 +798,24 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
         // en el lugar que ocupaba la matriz volumétrica WOLA (LEGACY).
         if (tOmega) applyTOmega(l, r, chunk);
 
+        // ── TECHO FINAL (P1 2026-11-22): el safety limiter de PULSO ya no
+        // es la última barrera — APEX 2 suma el transitorio DESPUÉS de él
+        // (hotmix_01: APEX ON +0.81 dBFS, APEX OFF −0.14 dBFS) y TΩ también
+        // puede subir el pico. Este techo es la última barrera absoluta:
+        // clava la salida a ±0.98855 (−0.1 dBFS, el MISMO techo del safety
+        // limiter, para que ambos no diverjan). Transparente bajo el techo
+        // (bit-idéntico: solo actúa cuando |x| > techo) y fail-closed.
+        // Solo cuando la cadena NO es neutra: en bypass no corre y se
+        // preserva la bit-exactitud. No cambia la ganancia neta (Regla de
+        // Oro Matched-LUFS: 0.0 dB).
+        if (!isNeutral()) {
+            const double ceil = static_cast<double>(FusedDynamics::kLimiterCeiling);
+            for (int i = 0; i < chunk; ++i) {
+                l[i] = std::clamp(l[i], -ceil, ceil);
+                r[i] = std::clamp(r[i], -ceil, ceil);
+            }
+        }
+
         ++stats_.totalBlocks;
         for (int i = 0; i < kNumOperators; ++i) telemetry_.active[i] = active[i];
 
