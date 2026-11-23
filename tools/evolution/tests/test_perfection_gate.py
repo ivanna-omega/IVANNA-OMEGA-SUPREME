@@ -141,8 +141,12 @@ class TestPerfectionGateThresholds(unittest.TestCase):
         # 2026-11-22 (P1 banco adversarial permanente): la suite crece de
         # 1607 a 1619 con la matriz bypass vs IVANNA vs cada operador
         # (11 casos + 1 diagnóstico APEX/limiter).
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1619)
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1619)
+        # 2026-11-22 (P0 referencia congelada): la suite crece de 1619 a
+        # 1628 con test_p0_reference_lock (9 TESTs: Freeze, Levels,
+        # TruePeak, Thdn, Imd, Latency, CpuXruns, SilenceTail,
+        # Deterministic).
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1628)
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1628)
         self.assertEqual(gate.THRESHOLDS["sofa_expected_total"], 694)
         self.assertTrue(gate.THRESHOLDS_VERSION)
 

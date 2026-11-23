@@ -3112,6 +3112,26 @@ if(IVANNA_SAN_FLAGS)
 endif()
 gtest_discover_tests(test_p1_adversarial_matrix)
 
+# ── P0 (2026-11-22): referencia congelada REFERENCE_LOCKED ───────────────
+# WAV de referencia fijo (10 s, 6 segmentos) + configuración IVANNA fija,
+# con niveles, latencia, true peak, THD+N, IMD, CPU y xruns congelados en
+# p0_reference_values.hpp (generado por scripts/p0_freeze.sh). Los TESTs
+# hacen GTEST_SKIP hasta que P0 se congele (kFrozen=true). 9 TESTs.
+add_executable(test_p0_reference_lock
+  test_p0_reference_lock.cpp
+  ${FUSED_CHAIN_SOURCES}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tests/adversarial/src/adversarial_core.cpp
+)
+target_include_directories(test_p0_reference_lock PRIVATE .. ../include ../neuromorphic ../dsp host_stubs ${CMAKE_CURRENT_SOURCE_DIR}/../../../../../tests/adversarial/src)
+target_compile_definitions(test_p0_reference_lock PRIVATE P0_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(test_p0_reference_lock PRIVATE -Wall -Wextra)
+target_link_libraries(test_p0_reference_lock PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_p0_reference_lock PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_p0_reference_lock PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_p0_reference_lock)
+
 # ── Piso double de la cadena enganchada (labor grande, v2.5.486) ─────────
 # THD+N ≤ −200 dB con la cadena enganchada pero lineal a 1 kHz (ver
 # test_double_floor.cpp) + coste por hop (128 muestras = 2667 µs).

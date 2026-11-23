@@ -115,8 +115,8 @@ THRESHOLDS_VERSION = "perfection-gate-thresholds-v1"
 # (1619 en host); el SOFA se queda en 694. Mismo procedimiento:
 # actualizar también el candado test_umbrales_versionados.
 THRESHOLDS = {
-    "ctest_expected_total": 1619,
-    "ctest_expected_passed": 1619,
+    "ctest_expected_total": 1628,
+    "ctest_expected_passed": 1628,
     "sofa_expected_total": 694,
 }
 
