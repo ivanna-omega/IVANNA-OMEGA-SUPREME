@@ -158,6 +158,17 @@ const CaseInfo kCases[] = {
      "Mismo estímulo; el runner congela el snapshot del daemon 500 ms y luego salta de estado: estado obsoleto y reconvergencia."},
     {"route_03", 10.0,
      "Mismo estímulo (10 s); el runner alimenta Ruta A y B con snapshots desplazados 1-4 hops: divergencia entre rutas."},
+    // ── P1 (2026-11-22): material extremo que faltaba ──────────────────────
+    {"voice_01", 6.0,
+     "Voz seca sintética (f0 120 Hz, armónicos con formantes 700/1200 Hz, sílabas de 300 ms + sibilante): voz sin reverberación, aliasing y aspereza."},
+    {"drums_01", 6.0,
+     "Transitorios de batería: bombo (seno 60 Hz con caída exponencial) y caja (ruido 1-4 kHz con caída) a 120 BPM: preservación de ataques rítmicos."},
+    {"hotmix_01", 10.0,
+     "Mezcla muy comprimida: ruido rosa + 8 tonos, RMS -6 dBFS, pico limitado a -0.5 dBFS (crest ~6 dB): cadena bajo entrada caliente y limitada."},
+    {"pause_01", 6.0,
+     "Pausa/reanudación (TIDAL): tono 1 kHz 2 s, silencio 1 s (pausa), tono 2 s: click de reanudación y estado tras la pausa."},
+    {"srchange_01", 5.0,
+     "Tono 1 kHz continuo 5 s; el runner re-prepara la cadena a otra tasa a mitad (2.5 s): discontinuidad por cambio de sample rate."},
 };
 
 const CaseInfo* find_case(const std::string& id) {
@@ -535,6 +546,130 @@ Signal generate_case(const std::string& id, const GenOptions& opt) {
         add_sine(s.r, 1000.0, -12.0, 1.0, tone_dur);
         add_click(s.l, 48000, -0.1);
         add_click(s.r, 48000, -0.1);
+    } else if (id == "voice_01") {
+        // Voz seca sintética (P1): complejo armónico f0 120 Hz (1-12), con
+        // formantes (refuerzo x2.0 en 720 Hz y x1.6 en 1200 Hz), en 4 sílabas
+        // de 300 ms (ataque/release 10 ms) + 1 sibilante a 4.0 s. Sin
+        // reverberación (seca): la cadena no debe añadir cola ni aspereza.
+        // Aproximación sintética (ver README.md): no es una voz real.
+        auto voiced = [&](std::vector<double>& x, double t0, double dur) {
+            const size_t a = static_cast<size_t>(t0 * kFs);
+            const size_t b = std::min(x.size(), a + static_cast<size_t>(dur * kFs));
+            if (b <= a) return;
+            const double f0 = 120.0;
+            for (size_t i = a; i < b; ++i) {
+                const double dur_s = static_cast<double>(i - a) / kFs;
+                // Envolvente silábica: ataque 10 ms, sostenido, release 10 ms.
+                double env = 1.0;
+                if (dur_s < 0.010) env = dur_s / 0.010;
+                if (dur_s > dur - 0.010) env = (dur - dur_s) / 0.010;
+                if (env < 0.0) env = 0.0;
+                double v = 0.0;
+                for (int k = 1; k <= 12; ++k) {
+                    double amp = 1.0 / static_cast<double>(k);
+                    const double hz = f0 * static_cast<double>(k);
+                    if (std::abs(hz - 720.0) < 61.0) amp *= 2.0;
+                    if (std::abs(hz - 1200.0) < 61.0) amp *= 1.6;
+                    v += amp * std::sin(2.0 * kPi * hz * static_cast<double>(i) / kFs);
+                }
+                x[i] += env * v;
+            }
+        };
+        for (double t0 : {0.5, 1.3, 2.1, 2.9}) {
+            voiced(s.l, t0, 0.3);
+            voiced(s.r, t0, 0.3);
+        }
+        // Sibilante a 4.0 s (misma envolvente que sibilant_01).
+        auto sib = [&](std::vector<double>& x, uint32_t seed) {
+            const size_t len = static_cast<size_t>(0.078 * kFs);
+            auto nz = shaped_noise(len, seed, 5500.0, 10500.0, false);
+            const double pk = peak_abs(nz, 0, nz.size());
+            const double g = (pk > 1e-12) ? amp_from_db(-12.0) / pk : 0.0;
+            const size_t a = static_cast<size_t>(4.0 * kFs);
+            for (size_t i = 0; i < len && a + i < x.size(); ++i) {
+                const double t = static_cast<double>(i) / kFs;
+                x[a + i] += g * sibilant_env(t) * nz[i];
+            }
+        };
+        sib(s.l, seedL);
+        sib(s.r, seedR);
+        // Sílaba final a 5.0 s.
+        voiced(s.l, 5.0, 0.3);
+        voiced(s.r, 5.0, 0.3);
+        // Normalizar RMS a -14 dBFS en la región activa (0.5-5.3 s).
+        normalize_rms_region(s.l, 24000, 254400, -14.0);
+        normalize_rms_region(s.r, 24000, 254400, -14.0);
+    } else if (id == "drums_01") {
+        // Transitorios de batería (P1) a 120 BPM (un golpe cada 0.5 s):
+        // bombo = seno 60 Hz con caída exponencial (tau 30 ms); caja = ruido
+        // 1-4 kHz con caída exponencial (tau 25 ms). Bombo en 0.5/1.5/2.5/
+        // 3.5/4.5 s, caja en 1.0/2.0/3.0/4.0/5.0 s.
+        auto kick = [&](std::vector<double>& x, double t0) {
+            const size_t a = static_cast<size_t>(t0 * kFs);
+            const size_t len = static_cast<size_t>(0.12 * kFs);
+            const double g = amp_from_db(-3.0);
+            for (size_t i = 0; i < len && a + i < x.size(); ++i) {
+                const double t = static_cast<double>(i) / kFs;
+                x[a + i] += g * std::exp(-t / 0.030) * std::sin(2.0 * kPi * 60.0 * t);
+            }
+        };
+        auto snare = [&](std::vector<double>& x, double t0, uint32_t seed) {
+            const size_t len = static_cast<size_t>(0.08 * kFs);
+            auto nz = shaped_noise(len, seed, 1000.0, 4000.0, false);
+            const double pk = peak_abs(nz, 0, nz.size());
+            const double g = (pk > 1e-12) ? amp_from_db(-6.0) / pk : 0.0;
+            const size_t a = static_cast<size_t>(t0 * kFs);
+            for (size_t i = 0; i < len && a + i < x.size(); ++i) {
+                const double t = static_cast<double>(i) / kFs;
+                x[a + i] += g * std::exp(-t / 0.025) * nz[i];
+            }
+        };
+        for (int k = 0; k < 5; ++k) {
+            const double tk = 0.5 + 0.5 * (2 * k);
+            kick(s.l, tk);
+            kick(s.r, tk);
+            const double ts = 1.0 + 0.5 * (2 * k);
+            if (ts < 5.5) {
+                snare(s.l, ts, seedL + static_cast<uint32_t>(k));
+                snare(s.r, ts, seedR + static_cast<uint32_t>(k));
+            }
+        }
+    } else if (id == "hotmix_01") {
+        // Mezcla muy comprimida (P1): ruido rosa + 8 tonos, RMS -6 dBFS,
+        // pico limitado (clamp) a -0.5 dBFS. Crest factor ~5.5 dB: una master
+        // caliente y limitada. La cadena no debe añadir más degradación.
+        const size_t len = static_cast<size_t>(9.0 * kFs);
+        auto build = [&](uint32_t seed) {
+            auto pn = shaped_noise(len, seed, 0.0, 0.0, true);
+            normalize_rms(pn, -9.0);
+            for (double hz : {60.0, 120.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0})
+                add_sine(pn, hz, -14.0, 0.0, 9.0);
+            normalize_rms(pn, -6.0);
+            const double lim = amp_from_db(-0.5);
+            for (auto& v : pn) v = std::clamp(v, -lim, lim);
+            return pn;
+        };
+        auto hl = build(seedL);
+        auto hr = build(seedR);
+        const size_t a = static_cast<size_t>(0.5 * kFs);
+        for (size_t i = 0; i < len && a + i < n; ++i) {
+            s.l[a + i] = hl[i];
+            s.r[a + i] = hr[i];
+        }
+    } else if (id == "pause_01") {
+        // Pausa/reanudación (P1, TIDAL): tono 1 kHz -12 dBFS 2 s, silencio
+        // 1 s (la pausa), tono 2 s (la reanudación). La cadena no debe
+        // producir click de reanudación ni ruido durante la pausa.
+        add_sine(s.l, 1000.0, -12.0, 0.5, 2.0);
+        add_sine(s.r, 1000.0, -12.0, 0.5, 2.0);
+        add_sine(s.l, 1000.0, -12.0, 3.5, 2.0);
+        add_sine(s.r, 1000.0, -12.0, 3.5, 2.0);
+    } else if (id == "srchange_01") {
+        // Tono 1 kHz continuo 5 s (P1, cambio de sample rate). El runner
+        // re-prepara la cadena a otra tasa a mitad (2.5 s); el caso es solo
+        // el tono continuo para que cualquier discontinuidad sea visible.
+        add_sine(s.l, 1000.0, -12.0, 0.5, 4.0);
+        add_sine(s.r, 1000.0, -12.0, 0.5, 4.0);
     } else {
         throw std::runtime_error("Caso desconocido: " + id);
     }

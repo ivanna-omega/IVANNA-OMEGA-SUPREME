@@ -22,11 +22,11 @@ PCM 16-bit estéreo (el generador escribe WAV; el harness lee WAV).
 | `src/adversarial_core.hpp` / `.cpp` | API: generador de los 21 casos, umbrales, medición, eventos. FFT radix-2, Goertzel, coherencia de Welch, análisis de eventos. |
 | `src/adversarial_gen.cpp` | CLI generador: `list`, `generate`, `all`, `transform`. |
 | `src/adversarial_harness.cpp` | CLI medición: `measure` (JSON a stdout, resumen humano a stderr; salida 0/1/2). |
-| `tests/test_adversarial_harness.cpp` | Tests unitarios sin framework externo (134 checks). |
+| `tests/test_adversarial_harness.cpp` | Tests unitarios sin framework externo (159 checks). |
 | `scripts/run_harness_case.sh` | Driver de ctest: genera → transforma → mide un caso. |
 | `CMakeLists.txt` | Proyecto CTest independiente (C++17, g++-14, -O2 -Wall -Wextra). |
 
-## Matriz de casos (21)
+## Matriz de casos (26)
 
 Todos los casos son estéreo, 48 kHz. Las semillas son deterministas
 (FNV-1a del ID xor la semilla pedida); `--variant mono` usa la misma semilla
@@ -55,6 +55,11 @@ en ambos canales, `--variant stereo`/`seed` usa una distinta en R.
 | 19 | `route_01` | 5 s | Tono 1 kHz −12 dBFS + click a −0.1 dBFS en 1.0 s (marcador) | Recuperación JNI tras desconexión de 300 ms |
 | 20 | `route_02` | 5 s | Mismo estímulo | Estado obsoleto y reconvergencia tras congelar el snapshot 500 ms |
 | 21 | `route_03` | 10 s | Mismo estímulo (10 s) | Divergencia entre Ruta A y B con snapshots desplazados 1–4 hops |
+| 22 | `voice_01` | 6 s | Voz seca sintética (f0 120 Hz, armónicos con formantes 700/1200 Hz, 4 sílabas de 300 ms + sibilante) | Voz sin reverberación; aliasing, aspereza, colas añadidas |
+| 23 | `drums_01` | 6 s | Bombo (seno 60 Hz, caída exponencial) y caja (ruido 1–4 kHz, caída) a 120 BPM | Preservación de ataques rítmicos y transitorios de batería |
+| 24 | `hotmix_01` | 10 s | Ruido rosa + 8 tonos, RMS −6 dBFS, pico limitado a −0.5 dBFS (crest ~6 dB) | Cadena bajo entrada caliente y limitada (master moderna) |
+| 25 | `pause_01` | 6 s | Tono 1 kHz 2 s, silencio 1 s (pausa), tono 2 s | Click de reanudación y estado tras una pausa (TIDAL) |
+| 26 | `srchange_01` | 5 s | Tono 1 kHz continuo 5 s; el runner re-prepara la cadena a otra tasa a 2.5 s | Discontinuidad por cambio de sample rate |
 
 Los casos `route_*` solo aportan el estímulo con marcador; la
 desconexión / congelamiento / desplazamiento la ejecuta el runner del DUT
@@ -297,7 +302,7 @@ correcciones se hicieron al verificarlo con tests, y son parte del diseño:
    retardada de verdad.
 6. **El lector WAV y el `measure` completo son propios.** El diseño inicial
    traía el lector WAV omitido y `measure` como stub; ambos se implementaron
-   y se verifican con los 134 checks unitarios.
+   y se verifican con los 159 checks unitarios.
 
 ## Build y tests
 
@@ -307,8 +312,8 @@ cmake --build /tmp/build-adversarial -j
 ctest --test-dir /tmp/build-adversarial --output-on-failure
 ```
 
-Resultado de referencia (2026-11-21): **7/7 tests ctest, 134/134 checks
-unitarios**. Los 7 tests: unitario, generación de los 21 casos, y 5 casos de
+Resultado de referencia (2026-11-22, P1): **7/7 tests ctest, 159/159 checks
+unitarios**. Los 7 tests: unitario, generación de los 26 casos, y 5 casos de
 harness (passthrough de click, passthrough de seno, retardo de 128 muestras,
 inversión —que debe fallar la fase—, ganancia −3 dB —que debe fallar el
 overshoot/RMS—). Los dos últimos son **WILL_FAIL a propósito**: comprueban

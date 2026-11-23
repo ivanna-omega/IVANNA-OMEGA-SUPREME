@@ -106,7 +106,7 @@ void test_wav_roundtrip(const fs::path& tmp) {
 
 void test_gen_all_cases() {
     const auto ids = case_ids();
-    check(ids.size() == 21, "gen: 21 casos");
+    check(ids.size() == 26, "gen: 26 casos");
     for (const auto& id : ids) {
         Signal s = generate_case(id);
         const size_t want = static_cast<size_t>(case_duration_s(id) * kFs);
@@ -170,6 +170,33 @@ void test_gen_all_cases() {
         check_near(s.l[48000], amp_from_db(-0.1), 1e-9,
                    "gen: " + std::string(id) + " marcador");
     }
+    // ── P1 (2026-11-22): spot checks de los 5 casos nuevos, con valores
+    // medidos al generarlos (no inventados; ver medición del commit).
+    Signal v1 = generate_case("voice_01");
+    check_near(dbfs(rms(v1.l, 24000, 38400)), -8.95, 0.5,
+               "gen: voice_01 sílaba 0.5-0.8 s RMS ~-9 dBFS");
+    check(dbfs(peak_abs(v1.l, 192000, 195744)) > -30.0,
+          "gen: voice_01 sibilante presente a 4.0 s");
+    Signal dr = generate_case("drums_01");
+    check_near(dbfs(peak_abs(dr.l, 24000, 29760)), -4.17, 0.5,
+               "gen: drums_01 bombo pico ~-4 dBFS");
+    check(dbfs(rms(dr.l, 29760, 48000)) < -100.0,
+          "gen: drums_01 silencio entre bombo y caja");
+    Signal hm = generate_case("hotmix_01");
+    check_near(dbfs(peak_abs(hm.l, 24000, 456000)), -0.50, 0.05,
+               "gen: hotmix_01 pico limitado a -0.5 dBFS");
+    check_near(dbfs(rms(hm.l, 24000, 456000)), -6.39, 0.5,
+               "gen: hotmix_01 RMS activo ~-6.4 dBFS");
+    const double hm_cf = dbfs(peak_abs(hm.l, 24000, 456000) / rms(hm.l, 24000, 456000));
+    check(hm_cf >= 5.0 && hm_cf <= 8.0, "gen: hotmix_01 crest factor en [5, 8] dB");
+    Signal pa = generate_case("pause_01");
+    check(dbfs(rms(pa.l, 124800, 163200)) < -100.0,
+          "gen: pause_01 silencio en la pausa 2.6-3.4 s");
+    check_near(dbfs(rms(pa.l, 24000, 120000)), dbfs(rms(pa.l, 168000, 264000)), 0.1,
+               "gen: pause_01 mismo nivel antes y después de la pausa");
+    Signal sr = generate_case("srchange_01");
+    check_near(dbfs(rms(sr.l, 48000, 96000)), dbfs(rms(sr.l, 144000, 192000)), 0.1,
+               "gen: srchange_01 mismo nivel a ambos lados de 2.5 s");
     Signal a = generate_case("noise_imp_01", GenOptions{0, Variant::Mono});
     Signal b = generate_case("noise_imp_01", GenOptions{0, Variant::Mono});
     check(a.l == b.l && a.r == b.r, "gen: determinista con la misma semilla");
