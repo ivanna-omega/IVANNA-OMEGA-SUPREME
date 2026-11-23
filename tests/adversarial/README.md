@@ -319,6 +319,34 @@ inversión —que debe fallar la fase—, ganancia −3 dB —que debe fallar el
 overshoot/RMS—). Los dos últimos son **WILL_FAIL a propósito**: comprueban
 que el harness detecta el defecto, no que el DUT pase.
 
+## P1 — Matriz bypass vs IVANNA vs cada operador (2026-11-22)
+
+El banco standalone mide un DUT contra una referencia. **P1** lo conecta a
+la FusedChain REAL: `app/src/main/cpp/tests/test_p1_adversarial_matrix.cpp`
+(12 tests CTest en la suite principal) pasa 11 casos por 9 configuraciones
+(bypass, IVANNA completa, cada operador solo con el safety limiter siempre
+activo) y escribe `p1_matrix_<caso>.json` por caso. `scripts/p1_aggregate.py`
+consolida los 11 JSON en tablas (defectos, pico, RMS) y defectos por operador;
+el reporte de referencia vive en `docs/p1_reporte_2026-11-22.md`.
+
+El test solo falla por defectos (no-finito, clipping digital > 0 dBFS, DC
+añadido ≥ 1e-2, latencia > 8192, silencio residual > −90 dBFS); THD+N, fase,
+RMS, coherencia y pérdida de transitorio se REPORTAN, no fallan (la cadena
+cambia el sonido por diseño; sin P0 no hay línea base para un umbral absoluto
+de smearing).
+
+**Hallazgos P1 (medidos 2026-11-22):** APEX suma el transitorio DESPUÉS del
+safety limiter, así que en hotmix_01 la salida IVANNA llega a +0.81 dBFS
+(APEX OFF: −0.14 dBFS, contenido por el limiter). NEURO deja cola residual
+de −77 dBFS tras el fin de la señal. 89/99 configuraciones sin defecto; 3
+tests en rojo (Bass, Phase, HotMix) por esos 2 defectos reales del motor.
+Su fix es un cambio de motor aparte. El bucle de 100 corridas
+(`scripts/p1_loop100.sh`, estado en `p1_loop100_state.txt`) prueba
+determinismo hasta que el motor se arregle.
+
+**P0 (REFERENCE_LOCKED) sigue sin existir:** P1 detecta regresiones, no
+sustituye la referencia congelada.
+
 ## CI
 
 El banco corre en su propio job `adversarial-bank` de
