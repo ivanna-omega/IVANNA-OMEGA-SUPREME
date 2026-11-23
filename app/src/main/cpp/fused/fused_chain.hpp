@@ -278,6 +278,42 @@ private:
     // guardián + enrutado del upmix) y los empuja a los operadores.
     void pushEffectiveControls() noexcept;
 
+    // ── TRONIDOS 493 — fundido de enganche + fundido de modo (2026-11-22) ──
+    // Rampa wet por muestra: 30 ms (el doble del patrón de la casa de
+    // 15 ms: el transitorio de cebado de los biquads de ARMONÍA — banda
+    // grave de 60 Hz, τ ≈ 2.7 ms, con ringing de varios ms — no cabe en
+    // 15 ms: con 15 ms ARMONÍA medía +5.3 dB de excess; con 30 ms el wet
+    // sigue ≤0.18 en la ventana de medida de 256 muestras y el ringing
+    // queda por debajo del slew natural). Paso = 1/(0.030·fs); 0.0 si fs
+    // es inválida (el blend salta al objetivo: fail-closed, asignación
+    // directa).
+    static constexpr double kOpWetRampSeconds = 0.030;
+    // Fundido de modo en muestras (no en tiempo: el hop es 128 muestras a
+    // cualquier fs): OUT 256 (~5.3 ms @ 48 kHz), IN 512 (~10.7 ms).
+    static constexpr int kModeFadeOutSamples = 256;
+    static constexpr int kModeFadeInSamples = 512;
+    double wetRampStep() const noexcept;
+    // Mezcla seco/procesado con el wet del operador `op` (0..6), que avanza
+    // por muestra hacia targetActive (1.0 si activo, 0.0 si neutro). dryL/dryR
+    // es el seco guardado antes del operador (nullptr = sin seco: salta al
+    // objetivo sin mezclar, fail-closed). Al llegar al objetivo, el resto
+    // del chunk queda tal cual (bit-exacto: procesado si 1.0, seco si 0.0).
+    void blendOperatorWet(double* l, double* r, const double* dryL,
+                          const double* dryR, int frames, int op,
+                          bool targetActive) noexcept;
+    // Alimenta el anillo de historia de TΩ con la señal post-conservación
+    // AUNQUE TΩ esté apagado (sin calcular frames): al engancharse, el
+    // primer frame usa historia real y no ceros. Sin frames ni FFT: un
+    // anillo por muestra, coste despreciable.
+    void warmTOmegaHistory(const double* l, const double* r, int frames) noexcept;
+    // Aplica los controles pendientes del cambio de modo (distribuye a los
+    // operadores, fuerza un frame TΩ en la siguiente muestra si TΩ se
+    // engancha) y pasa el fundido a IN. Se llama al llegar la ganancia a 0.
+    void applyModeFadePending() noexcept;
+    // Reparte userControls_ a los 7 operadores (cuerpo de setControls sin
+    // la detección de cambio de modo; lo usan setControls y el pendiente).
+    void distributeControls() noexcept;
+
     // ── GEMELO ACÚSTICO + CALIBRACIÓN — CALL SITE (2026-11-21/22) ────────
     // Consulta la estimación del gemelo para el modo efectivo y alimenta
     // su interventionScale a la conservación. Solo recomputa cuando
@@ -316,6 +352,57 @@ private:
     // NO es un operador: arbitra tras los 7 + APEX, antes de TΩ. Apagado
     // por defecto (amount 0 = no toca el buffer, bit-exacto).
     PerceptualConservation conservation_;
+
+    // ── TRONIDOS 493 — FUNDIDO DE ENGANCHE POR OPERADOR + FUNDIDO DE MODO (2026-11-22) ──
+    // Medido en host (test_tronidos_layer_step, 2026-11-22): re-empujar el
+    // mismo estado y cambiar UN parámetro con la cadena enganchada NO mete
+    // escalón (excess −0.01…+0.03 dB); enganchar una capa desde neutro SÍ:
+    // ARMONÍA +18.1, PULSO +14.6, NEURO +12.4, ORBE +11.3, HOLOS +7.1 dB.
+    // Y el cambio de modo HEADPHONES→SPEAKERS dejaba la salida EXACTAMENTE
+    // en 0 durante 2 bloques (512 muestras: la FIFO de TΩ arranca vacía).
+    // El fix sigue el patrón de slew de la casa (per-muestra; 30 ms, ver
+    // kOpWetRampSeconds: 15 ms no bastaba para el ringing de ARMONÍA):
+    //   (a) WET POR OPERADOR: cada operador tiene un wet (0 = seco, 1 =
+    //       procesado) que sube/baja por muestra hacia su objetivo
+    //       (1 si el operador NO es neutro tras pushEffectiveControls, 0
+    //       si lo es). La salida es seco + wet·(procesado − seco). En
+    //       régimen (wet == objetivo) NO se mezcla nada: bit-exacto como
+    //       antes, sin coste extra. Solo durante la rampa (15 ms tras un
+    //       cambio) se guarda el seco y se mezcla. Si el paso de rampa es
+    //       inválido, el wet salta al objetivo sin mezclar (fail-closed:
+    //       asignación directa, jamás silenciar).
+    //   (b) FUNDIDO DE MODO: un cambio de modo o de enganche de TΩ NO se
+    //       aplica de golpe. setControls() lo deja PENDIENTE y la cadena
+    //       sigue con los controles viejos mientras la ganancia de salida
+    //       baja 1→0 en 256 muestras; al llegar a 0 se aplica el pendiente
+    //       (con la historia de TΩ ya caliente — ver warmTOmegaHistory— y
+    //       un frame forzado en la siguiente muestra) y la ganancia sube
+    //       0→1 en 512 muestras. Sin bloques de 0 exacto y sin escalón en
+    //       la frontera (la ganancia ya está en 0 cuando cambia el modo).
+    //       Si llega otro cambio de modo durante el fundido, el pendiente
+    //       se reemplaza (gana el último) y el fundido sigue desde la
+    //       ganancia vigente (nunca se reinicia a 1.0: eso sería un escalón).
+    //   (c) WET DE CADENA: misma mezcla sobre la salida final, con objetivo
+    //       1 si la cadena no es neutra y 0 si lo es. Cubre el splitter
+    //       APEX (engancha con la cadena y su transitorio se suma después
+    //       de los operadores, fuera del alcance de los wets por operador).
+    double opWet_[kNumOperators] = {};  // wet vigente por operador
+    std::vector<double> wetDryL_, wetDryR_;  // seco de entrada por operador (scratch por chunk)
+    // Wet a nivel de cadena (cubre lo que los wets por operador no ven:
+    // el splitter APEX, que también engancha al pasar de neutro a activo
+    // y cuyo transitorio se suma DESPUÉS de los operadores — con APEX
+    // apagado el enganche ya es ~0 dB, con APEX es +1.1…1.7 dB). Misma
+    // rampa (30 ms) y misma mezcla seco/procesado, sobre la salida final
+    // (tras el techo, antes del fundido de modo). Objetivo: 1 si la cadena
+    // no es neutra, 0 si lo es. En régimen no se mezcla nada (bit-exacto).
+    double chainWet_ = 0.0;  // wet vigente de la cadena
+    std::vector<double> chainDryL_, chainDryR_;  // seco de entrada de la cadena (scratch por chunk)
+    // Fundido de modo: fase DONE = sin fundido (ganancia 1.0, sin coste).
+    enum class ModeFadePhase { DONE, OUT, IN };
+    ModeFadePhase modeFadePhase_ = ModeFadePhase::DONE;
+    double modeFadeGain_ = 1.0;              // ganancia de salida del fundido de modo
+    FusedControls modeFadePending_;          // controles nuevos en espera (cambio de modo)
+    bool modeFadePendingValid_ = false;      // true = hay un pendiente por aplicar
 
     FusedControls userControls_;
     double sampleRate_ = 48000.0;

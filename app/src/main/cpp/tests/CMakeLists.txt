@@ -3148,6 +3148,21 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_neuro_determinism PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 gtest_discover_tests(test_neuro_determinism)
+# ── Caza de los tronidos de la 493 (2026-11-22) ────────────────────────────
+# Salto muestra a muestra por capa al cambiar parámetros en mitad del stream.
+# Mismo patrón que la matriz P1 (FusedChain real + ${FUSED_CHAIN_SOURCES}).
+add_executable(test_tronidos_layer_step
+  test_tronidos_layer_step.cpp
+  ${FUSED_CHAIN_SOURCES}
+)
+target_include_directories(test_tronidos_layer_step PRIVATE .. ../include ../neuromorphic ../dsp host_stubs)
+target_compile_options(test_tronidos_layer_step PRIVATE -Wall -Wextra)
+target_link_libraries(test_tronidos_layer_step PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_tronidos_layer_step PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_tronidos_layer_step PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_tronidos_layer_step)
 
 # ── Piso double de la cadena enganchada (labor grande, v2.5.486) ─────────
 # THD+N ≤ −200 dB con la cadena enganchada pero lineal a 1 kHz (ver
