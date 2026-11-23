@@ -1,0 +1,7 @@
+P1 bucle de 100 — estado 2026-11-22 19:25:46 UTC
+corridas completadas: 1 / 100
+última corrida: 99 pasaron, 3 fallaron (de 1619)
+verdes (0 fallos): 0
+fallas recurrentes (top):
+CSV: /home/hatch/workspace/ivanna-transfer/p1_loop100_runs.csv
+log: /tmp/p1_loop100.log
