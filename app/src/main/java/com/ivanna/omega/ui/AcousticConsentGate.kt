@@ -42,7 +42,7 @@ fun AcousticConsentGate(content: @Composable () -> Unit) {
             Text("Antes de activar la inteligencia acústica", style = MaterialTheme.typography.headlineSmall)
             Text(
                 "IVANNA-OMEGA puede usar mediciones para personalizar el audio. Estas funciones son opcionales. " +
-                    "Puedes continuar sin activarlas y cambiar tus decisiones después en Ajustes."
+                    "Puedes continuar sin activarlas. La medición Wi-Fi se puede activar después desde su franja en la pantalla principal."
             )
             HorizontalDivider()
             Text("Qué hace cada opción", style = MaterialTheme.typography.titleMedium)

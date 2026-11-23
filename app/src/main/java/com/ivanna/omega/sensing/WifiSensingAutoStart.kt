@@ -13,7 +13,10 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -55,13 +58,21 @@ fun WifiSensingAutoStart(content: @Composable () -> Unit) {
     var signalSummary by remember { mutableStateOf("Sin datos de señal") }
     var userStopped by remember { mutableStateOf(false) }
     var askedPermission by remember { mutableStateOf(false) }
+    // Ventana plegada por defecto; se despliega sola al llegar las primeras
+    // redes reales tras conceder el permiso (ver callback de la sesión).
+    var expanded by remember { mutableStateOf(false) }
     val session = remember(context) {
         WifiScanSession(context) { update ->
             status = update.message
             active = update.sessionRunning
             observations = update.observations.size
             if (update.observations.isNotEmpty()) {
+                // Al llegar las primeras redes reales, la ventana se
+                // despliega sola para mostrarlas; si el usuario la pliega,
+                // no se le vuelve a abrir encima mientras haya datos.
+                val wasEmpty = networkRows.isEmpty()
                 networkRows = update.observations.sortedByDescending { it.rssiDbm }.take(12)
+                if (wasEmpty) expanded = true
             }
             val scene = update.sceneFeatures
             signalSummary = when (scene.level) {
@@ -154,10 +165,14 @@ fun WifiSensingAutoStart(content: @Composable () -> Unit) {
     // ENCIMA del contenido (tapaba la barra inferior y parte del scroll). Ahora ocupa su propio espacio
     // debajo del contenido (el contenido se encoge en vez de quedar tapado), usa colores oscuros
     // explícitos y el gráfico queda plegado por defecto.
-    var expanded by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxSize()) {
         Box(Modifier.weight(1f).fillMaxWidth()) { content() }
-        if (optedIn || active) Surface(
+        // FIX (franja inalcanzable): la franja es la única vía en la app para
+        // activar la medición Wi-Fi; si solo se muestra con opt-in, quien no
+        // marcó la casilla en el consentimiento no puede activarla nunca
+        // (tampoco hay interruptor en Ajustes). Siempre visible; compacta
+        // cuando está inactiva, con su botón de activación a la vista.
+        Surface(
             modifier = Modifier.fillMaxWidth(),
             color = Color(0xFF0B1220),
             contentColor = Color(0xFFDDE6F0),
@@ -218,13 +233,24 @@ fun WifiSensingAutoStart(content: @Composable () -> Unit) {
                     }
                 }
                 if (expanded) if (networkRows.isNotEmpty()) {
-                    Text(
-                        networkRows.take(5).joinToString("   ·   ") {
-                            "${it.ssid.ifBlank { "<red oculta>" }} ${it.rssiDbm} dBm"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        maxLines = 2
-                    )
+                    // Scroll real de la ventana: todas las redes observadas
+                    // (hasta 12), no solo 5 en 2 líneas. Altura acotada para
+                    // que la franja no se coma la pantalla; el scroll es
+                    // propio de la franja, no anidado en el contenido.
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 120.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        networkRows.forEach { network ->
+                            Text(
+                                "${network.ssid.ifBlank { "<red oculta>" }} · ${network.rssiDbm} dBm",
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1
+                            )
+                        }
+                    }
                 } else {
                     Text("El gráfico aparecerá cuando el sondeo entregue redes reales.", style = MaterialTheme.typography.labelSmall)
                 }
