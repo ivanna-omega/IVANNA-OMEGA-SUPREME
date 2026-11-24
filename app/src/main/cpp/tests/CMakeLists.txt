@@ -976,6 +976,26 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_orbe_binaural PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 gtest_discover_tests(test_orbe_binaural)
+
+# ── test_orbe_power_conservation: fix L1/L2 del defecto M1 (Fase 1, 2026-11-24) ──
+# BandPowerConserver + kSideGain=1.0 en OrbeBinaural, detrás del flag
+# kOrbePowerConservation. ESTE TARGET ES EL ÚNICO QUE COMPILA CON EL FLAG ON
+# (-DIVANNA_ORBE_POWER_CONSERVATION=1): es el único que ejercita el camino
+# ON; el resto de la suite (y producción) corre con el flag OFF. Mismas
+# fuentes que test_orbe_binaural (OrbeBinaural.cpp directo).
+add_executable(test_orbe_power_conservation
+  test_orbe_power_conservation.cpp
+  ../spatial/OrbeBinaural.cpp
+)
+target_link_libraries(test_orbe_power_conservation PRIVATE GTest::gtest_main ivanna_dsp_under_test)
+target_include_directories(test_orbe_power_conservation PRIVATE .. ../include host_stubs)
+target_compile_definitions(test_orbe_power_conservation PRIVATE IVANNA_ORBE_POWER_CONSERVATION=1)
+target_compile_options(test_orbe_power_conservation PRIVATE -Wall -Wextra)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_orbe_power_conservation PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_orbe_power_conservation PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_orbe_power_conservation)
 add_executable(test_neu_compiler
   test_neu_compiler.cpp
   ../spatial/OrbeBinaural.cpp

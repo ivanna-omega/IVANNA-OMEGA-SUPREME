@@ -54,6 +54,8 @@ void OrbeBinauralT<Scalar>::prepare(float sr) {
     imR_.assign(n, Scalar(0.0));
     activeBands_ = (bandCount_.load(std::memory_order_relaxed) == 12) ? 12 : 24;
     rebuildBandTables();
+    // Fase 1 (L1): el conservador trabaja sobre las bandas ERB activas.
+    if constexpr (kOrbePowerConservation) nfCons_.prepare(activeBands_, (float)kHop / s);
     prepared_ = true;
     reset();
 }
@@ -105,6 +107,9 @@ void OrbeBinauralT<Scalar>::reset() noexcept {
     blend_ = Scalar(0.0);
     flushPending_ = false;
     meanCoherence_ = 1.0f;
+    // Fase 1 (L1/L2): el conservador y el suavizador vuelven a su estado
+    // inicial (ganancias 1.0, Cantidad suavizada 0).
+    if constexpr (kOrbePowerConservation) { nfCons_.reset(); nfAmt_.v = 0.0f; }
     const float d0 = distanceM_.load(std::memory_order_relaxed);
     for (int b = 0; b < kMaxBands; ++b) {
         azimuth_[b] = 0.0f;
@@ -312,6 +317,13 @@ void OrbeBinauralT<Scalar>::renderBins(Scalar* reL, Scalar* imL, Scalar* reR, Sc
     const float diffuse = diffuse_.load(std::memory_order_relaxed);
     const float proxCap = proximityDb_.load(std::memory_order_relaxed);
     const float proxScale = proxCap / 6.0f;
+    // Fase 1 (L2): la Cantidad escala la señal física (ITD/ILD/estante),
+    // no la mezcla. aLaw suaviza el amount (tau 25 ms) para no hacer
+    // zipper al mover el slider. Con el flag OFF, aLaw = 1.0f (sin cambio).
+    float aLaw = 1.0f;
+    if constexpr (kOrbePowerConservation) {
+        aLaw = nfAmt_.step(amount_.load(std::memory_order_relaxed), (float)kHop / sr);
+    }
     const float yaw = headTracking_.load(std::memory_order_relaxed)
                           ? yawRad_.load(std::memory_order_relaxed) : 0.0f;
     // Ω (v2.5.444): diafonía κ de la vía y ILD máximo radiable. Se cargan
@@ -330,7 +342,10 @@ void OrbeBinauralT<Scalar>::renderBins(Scalar* reL, Scalar* imL, Scalar* reR, Sc
         const float th = std::clamp(azimuth_[b] * coherence_[b] - yaw, -kPiF, kPiF);
         thetaB[b] = th;
         rB[b] = distance_[b];
-        itdB[b] = nearfield::itdSeconds(th, rB[b], headRadiusM());
+        // Fase 1 (L2): con el flag ON, la Cantidad escala el ITD.
+        float itdVal = nearfield::itdSeconds(th, rB[b], headRadiusM());
+        if constexpr (kOrbePowerConservation) itdVal *= aLaw;
+        itdB[b] = itdVal;
         const float wR = 0.5f * (1.0f + std::sin(th));
         wRB[b] = wR;
         wLB[b] = 1.0f - wR;
@@ -349,6 +364,8 @@ void OrbeBinauralT<Scalar>::renderBins(Scalar* reL, Scalar* imL, Scalar* reR, Sc
         const float af = std::fabs(fSigned);
         const float itd = itdB[b];
         float ild = nearfield::ildDb(theta, r, af, headRadiusM());
+        // Fase 1 (L2): con el flag ON, la Cantidad escala el ILD.
+        if constexpr (kOrbePowerConservation) ild *= aLaw;
         // Ω (v2.5.444) — pre-compensación de diafonía (G^Ω, §5.2): el ILD
         // radiado se expande por la inversa de la Ec. 7 para que el
         // percibido iguale al de diseño, hasta el techo D_max(κ). κ=0
@@ -358,7 +375,9 @@ void OrbeBinauralT<Scalar>::renderBins(Scalar* reL, Scalar* imL, Scalar* reR, Sc
             ild = ivanna::spatial::OmegaOperator::radiatedIldClippedDb(
                 ild, xtalkKappa, xtalkMaxIld);
         }
-        const float shelf = nearfield::proximityShelfDb(r, af) * proxScale;
+        float shelf = nearfield::proximityShelfDb(r, af) * proxScale;
+        // Fase 1 (L2): con el flag ON, la Cantidad escala el estante.
+        if constexpr (kOrbePowerConservation) shelf *= aLaw;
         // v2.5.380 — 2 pow en vez de 4: pow(10,a)·pow(10,b) = pow(10,a+b)
         // salvo ≤1 ulp; el cambio en THD+N/IMD es despreciable (el test
         // lo verifica: THD+N −139.3x dB, IMD ≈ −157 dB, como antes).
@@ -386,12 +405,16 @@ void OrbeBinauralT<Scalar>::renderBins(Scalar* reL, Scalar* imL, Scalar* reR, Sc
             phLRe = std::cos(aL); phLIm = std::sin(aL);
             phRRe = std::cos(aR); phRIm = std::sin(aR);
         }
-        // outL = mid*gL*phL + side*diffuse ; outR = mid*gR*phR - side*diffuse
-        const Scalar diffuseS = static_cast<Scalar>(diffuse);
-        const Scalar oLRe = (mRe * gL * phLRe - mIm * gL * phLIm) + sRe * diffuseS;
-        const Scalar oLIm = (mRe * gL * phLIm + mIm * gL * phLRe) + sIm * diffuseS;
-        const Scalar oRRe = (mRe * gR * phRRe - mIm * gR * phRIm) - sRe * diffuseS;
-        const Scalar oRIm = (mRe * gR * phRIm + mIm * gR * phRRe) - sIm * diffuseS;
+        // outL = mid*gL*phL + side*sideGain ; outR = mid*gR*phR - side*sideGain
+        // Fase 1 (L2): con el flag ON, S nunca se atenúa (kSideGain = 1.0f,
+        // fix del defecto M1); con el flag OFF, el diffuse de siempre
+        // (0.5 por defecto).
+        Scalar sideGain = static_cast<Scalar>(diffuse);
+        if constexpr (kOrbePowerConservation) sideGain = static_cast<Scalar>(ivanna::nf::kSideGain);
+        const Scalar oLRe = (mRe * gL * phLRe - mIm * gL * phLIm) + sRe * sideGain;
+        const Scalar oLIm = (mRe * gL * phLIm + mIm * gL * phLRe) + sIm * sideGain;
+        const Scalar oRRe = (mRe * gR * phRRe - mIm * gR * phRIm) - sRe * sideGain;
+        const Scalar oRIm = (mRe * gR * phRIm + mIm * gR * phRRe) - sIm * sideGain;
         reL[k] = oLRe; imL[k] = oLIm;
         reR[k] = oRRe; imR[k] = oRIm;
         const int m = (n - k) % n;
@@ -452,7 +475,26 @@ void OrbeBinauralT<Scalar>::runFrame() {
         }
     }
     estimateBands(reL_.data(), imL_.data(), reR_.data(), imR_.data());
+    // Fase 1 (L1): envolver el render con el conservador de potencia
+    // por banda. addIn mide la potencia de entrada por banda ERB,
+    // addOut la de salida, commit() calcula g_b = sqrt(E_in/E_out) y
+    // la ganancia se aplica al espectro de salida. Con el flag OFF,
+    // este bloque no existe (if constexpr) y el camino es el de siempre.
+    if constexpr (kOrbePowerConservation) {
+        nfCons_.beginFrame();
+        for (int k = 0; k <= n / 2; ++k)
+            nfCons_.addIn(bandOfBin_[k], (double)reL_[k] * reL_[k] + (double)imL_[k] * imL_[k] + (double)reR_[k] * reR_[k] + (double)imR_[k] * imR_[k]);
+    }
     renderBins(reL_.data(), imL_.data(), reR_.data(), imR_.data());
+    if constexpr (kOrbePowerConservation) {
+        for (int k = 0; k <= n / 2; ++k)
+            nfCons_.addOut(bandOfBin_[k], (double)reL_[k] * reL_[k] + (double)imL_[k] * imL_[k] + (double)reR_[k] * reR_[k] + (double)imR_[k] * imR_[k]);
+        nfCons_.commit();
+        for (int k = 0; k < n; ++k) {
+            const Scalar g = static_cast<Scalar>(nfCons_.gain[bandOfBin_[k]]);
+            reL_[k] *= g; imL_[k] *= g; reR_[k] *= g; imR_[k] *= g;
+        }
+    }
     // NEU-Omega Fase 0 (v2.5.430): dos IFFT reales en una compleja.
     // Empaquetar Y_L + j*Y_R en reL/imL y hacer UN solo IFFT (en vez de
     // dos). Por linealidad: IFFT(Y_L + j*Y_R) = y_L + j*y_R, así que tras
@@ -509,10 +551,16 @@ template <typename Scalar>
 void OrbeBinauralT<Scalar>::process(Scalar* l, Scalar* r, int n) noexcept {
     if (!prepared_ || l == nullptr || r == nullptr || n <= 0) return;
     const float sr = sampleRate_;
+    // Fase 1 (L2, flag ON): la Cantidad escala la señal física (aLaw),
+    // no la mezcla: el wet es binario (1 si amount>0, 0 si amount=0).
+    // Con el flag OFF, el wetTarget continuo de siempre.
     const Scalar wetTarget =
         (thermalShed_.load(std::memory_order_relaxed) || meanCoherence_ < 0.3f)
             ? Scalar(0.0)
-            : static_cast<Scalar>(amount_.load(std::memory_order_relaxed));
+            : (kOrbePowerConservation
+                   ? (amount_.load(std::memory_order_relaxed) > 0.0f ? Scalar(1.0)
+                                                                     : Scalar(0.0))
+                   : static_cast<Scalar>(amount_.load(std::memory_order_relaxed)));
     const Scalar blendTarget = (wetTarget > Scalar(0.0) || wet_ > Scalar(0.0)) ? Scalar(1.0) : Scalar(0.0);
     // La puerta abierta resetea el sondeo (el próximo cierre empieza su
     // espera desde cero).

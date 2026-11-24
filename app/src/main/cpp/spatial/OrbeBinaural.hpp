@@ -43,6 +43,7 @@
 #include <memory>
 #include <vector>
 
+#include "BandPowerConserver.hpp"
 #include "NearFieldHeadModel.hpp"
 #include "fft_radix2.hpp"
 
@@ -62,6 +63,19 @@ struct OrbeParams {
     float headRadiusM = nearfield::kHeadRadiusM;
 };
 
+// Fase 1 (consejo, plan 5D, 2026-11-24) — conservación de potencia por
+// banda L1/L2 (fix del defecto M1: OrbeBinaural pierde −2.05 dB con
+// diffuse=0.5; ver analysis-portal5d/FASE0_M1_MEDICION.md). Detrás de
+// flag compile-time, OFF por defecto. NUNCA por defecto sin ABX en el
+// teléfono (orden 8 de Luna) ni sin re-congelar P0: cambia el sonido.
+// El target test_orbe_power_conservation compila con
+// -DIVANNA_ORBE_POWER_CONSERVATION=1 para ejercitar el camino ON; en
+// producción y en el resto de la suite el flag es false y el camino es
+// el de siempre, bit-idéntico.
+#ifndef IVANNA_ORBE_POWER_CONSERVATION
+#define IVANNA_ORBE_POWER_CONSERVATION 0
+#endif
+
 // F2/486 (labor grande, motor double): plantilla con default float +
 // alias. OrbeBinaural = float histórico bit-idéntico;
 // OrbeBinauralD = núcleo double (lo usa FusedSpatial).
@@ -73,6 +87,12 @@ struct OrbeParams {
 template <typename Scalar = float>
 class OrbeBinauralT {
 public:
+    // Conservación de potencia L1/L2: false = diffuse=0.5 de siempre
+    // (comportamiento actual); true = kSideGain=1.0 + conservador por
+    // banda + aLaw + wet binario (solo en el target de test dedicado).
+    // Nunca true en producción sin ABX.
+    static constexpr bool kOrbePowerConservation = (IVANNA_ORBE_POWER_CONSERVATION != 0);
+
     static constexpr int kHop = 128;  // == Ivanna::BLOCK_SIZE
     static constexpr int kMaxBands = 24;
 
@@ -167,6 +187,11 @@ private:
 
     // Estimación por banda (suavizada).
     std::vector<Band> bands_;
+    // Fase 1 (L1/L2): conservador de potencia por banda + suavizador de
+    // Cantidad. Solo se usan con kOrbePowerConservation; con el flag OFF
+    // nunca se tocan y el comportamiento es bit-idéntico al actual.
+    ivanna::nf::BandPowerConserver nfCons_;
+    ivanna::nf::AmountSmoother nfAmt_;
     std::vector<int> bandOfBin_;  // por bin 0..fftSize-1
     float azimuth_[kMaxBands] = {};
     float distance_[kMaxBands] = {};
