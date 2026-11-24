@@ -98,11 +98,11 @@ fun ControlTabScreen(
     // de la pantalla sigue leyendo estos alias; las escrituras van por
     // roomLauncher.toggle/clear/launch.
     val roomLauncher = rememberRoomMeasureLauncher()
-    val roomGains get() = roomLauncher.gains
-    val roomEnabled get() = roomLauncher.enabled
-    val roomBusy get() = roomLauncher.busy
-    val roomProgress get() = roomLauncher.progress
-    val roomStatus get() = roomLauncher.status
+    val roomGains = roomLauncher.gains
+    val roomEnabled = roomLauncher.enabled
+    val roomBusy = roomLauncher.busy
+    val roomProgress = roomLauncher.progress
+    val roomStatus = roomLauncher.status
     val applyRoom: (FloatArray?, Boolean) -> Unit = { g, en -> roomLauncher.applyRoom(g, en) }
     // ── Formato IVANNA OMEGA (v2.5.473): cargador de .ivanna.json ─────────
     // El usuario elige el archivo con el selector del sistema (SAF, JSON);

@@ -14,7 +14,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import com.ivanna.omega.audio.AudioRouteManager
 import com.ivanna.omega.audio.BassHaptics
-import com.ivanna.omega.audio.IvannaNativeLib
+import com.ivanna.omega.core.IvannaNativeLib
 import com.ivanna.omega.audio.RoomMeasurement
 import com.ivanna.omega.core.ParameterStore
 import com.ivanna.omega.hardware.PermissionGate
