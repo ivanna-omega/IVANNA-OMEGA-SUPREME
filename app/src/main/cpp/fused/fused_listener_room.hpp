@@ -39,6 +39,16 @@
 //      synthesizeMasterStudioBrir() (la misma BRIR Master Studio que
 //      HolosOperator se auto-sintetiza; es la vía que usa IvannaFusionCore
 //      desde la corrección del FALLO 5, porque ahí no hay dataset RIR).
+//   2b. CAMPO DIFUSO SDRF (2026-11-24, fusión homogénea): la red
+//      unitaria SDRF (guías Weil/GUE + Householder + Gray-Markel + Kerr
+//      + softReflect ≤0.95, sdrf_diffuse_field.hpp) vive DENTRO de este
+//      operador, SIN controles nuevos: effectiveWet_ es la puerta y la
+//      densidad ρ_E; rt60Sec es el decaimiento del lazo SOLO sin IR
+//      cargada (con IR el campo es difusión pura, g=1). Sin IR cargada
+//      el campo ES la sala (antes el stage era bypass); con IR cargada
+//      difunde la cola RIR con espaciamiento GUE. La mezcla de potencia
+//      constante no cambia (el wet llega con la misma forma). Con
+//      effectiveWet_ = 0 el campo no corre y su estado se limpia.
 //   3. RoomCorrectionEq — ENVUELTO, instancia PROPIA (el Balance Tonal
 //      tiene la suya para el EQ de usuario). setCutOnly(true) + setTarget
 //      (roomCorrDb[10] directo, ya clampado a -12..0 en los controles).
@@ -79,6 +89,7 @@
 #include <vector>
 
 #include "fused/fused_controls.hpp"
+#include "fused/sdrf_diffuse_field.hpp"
 #include "spatial/BioControl5D.hpp"
 #include "spatial/HearingAdaptationEngine.hpp"
 #include "spatial/RirConvolver.hpp"
@@ -133,6 +144,17 @@ private:
     // (RIR double, EQ double); dryL/dryR son el dry post-hearing.
     void processChunk(double* l, double* r, const double* dryL, const double* dryR,
                       int n) noexcept;
+    // CAMPO DIFUSO SDRF (2026-11-24): la red unitaria SDRF difunde el wet
+    // de la sala. Sin IR cargada el campo ES la sala (decaimiento RT60
+    // propio); con IR cargada difunde la cola RIR sin decaimiento añadido
+    // (g=1, exactamente el kernel verificado). Ambas dejan l/r con la
+    // forma del convolver (0.32*in + 0.82*ws*wet) para que la mezcla de
+    // potencia constante de processChunk no cambie. In-place sobre l/r;
+    // usan el scratch diffuseIn_/diffuseOut_ (kChunkFrames).
+    void diffuseRirWet(double* l, double* r, const double* dryL,
+                       const double* dryR, int n, double ws) noexcept;
+    void diffuseFromDry(double* l, double* r, const double* dryL,
+                        const double* dryR, int n) noexcept;
     void warmupRir() noexcept;
 
     ListenerRoomControls controls_{};
@@ -154,6 +176,12 @@ private:
     Ivanna::BioControl5D bio_;
     ivanna::spatial::RoomGeometryConfig geometry_;
 
+    // Campo difuso SDRF (2026-11-24): vive dentro de SALA VIVA, sin
+    // controles nuevos (ver sdrf_diffuse_field.hpp). diffuseActive_
+    // marca si el campo tiene estado que limpiar al apagarse.
+    SdrfDiffuseField diffuse_;
+    bool diffuseActive_ = false;
+
     // Scratch pre-reservado en prepare() (sin malloc en process()):
     // dry post-hearing para la mezcla RIR de potencia constante.
     // F2/486: double; el scratchL_/scratchR_ float de la conversión
@@ -161,6 +189,12 @@ private:
     // buffers double del llamador).
     std::vector<double> dryL_;
     std::vector<double> dryR_;
+    // Scratch del campo difuso (trozos de kChunkFrames): entrada y salida
+    // separadas (el campo necesita el seco mientras escribe el wet).
+    std::vector<double> diffuseInL_;
+    std::vector<double> diffuseInR_;
+    std::vector<double> diffuseOutL_;
+    std::vector<double> diffuseOutR_;
 };
 
 }  // namespace ivanna::fused

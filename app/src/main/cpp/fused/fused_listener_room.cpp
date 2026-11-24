@@ -46,6 +46,12 @@ void FusedListenerRoom::prepare(double sampleRate) noexcept {
     // Scratch pre-reservado (hilo de control; process() no aloca).
     dryL_.assign(kFusedMaxBlockFrames, 0.0);
     dryR_.assign(kFusedMaxBlockFrames, 0.0);
+    // Scratch del campo difuso SDRF (trozos de kChunkFrames).
+    diffuseInL_.assign(kChunkFrames, 0.0);
+    diffuseInR_.assign(kChunkFrames, 0.0);
+    diffuseOutL_.assign(kChunkFrames, 0.0);
+    diffuseOutR_.assign(kChunkFrames, 0.0);
+    diffuse_.prepare(sampleRate_);
     rir_.setSampleRate(static_cast<int>(sampleRate_));
     roomEq_.prepare(static_cast<float>(sampleRate_));
     applyControls();
@@ -76,6 +82,8 @@ void FusedListenerRoom::setControls(const ListenerRoomControls& c) noexcept {
 void FusedListenerRoom::reset() noexcept {
     hearing_.reset();
     bio_.reset();
+    diffuse_.reset();
+    diffuseActive_ = false;
     roomEq_.prepare(static_cast<float>(sampleRate_));
     applyControls();  // prepare() resetea los targets del EQ; reponerlos
 }
@@ -172,18 +180,32 @@ void FusedListenerRoom::processChunk(double* l, double* r, const double* dryL,
     //    mantiene alimentado con etaStar = eta0 (su fail-closed §3.4).
     bio_.update(static_cast<double>(n) / sampleRate_, bio_.eta0());
 
-    // 2. RIR: bypass fail-closed sin IR cargada (roomWet tratado como 0).
-    if (rir_.isLoaded() && effectiveWet_ > 0.0f) {
-        rir_.setWetDry(1.0f);
-        rir_.process(l, r, n);
-        // Mezcla de potencia constante gDry^2 + gWet^2 = 1.
-        // El convolver no tiene salida wet pura: con wn asentado a 1 su
-        // salida es out = 0.32*in + 0.82*wetScale*wet (RirConvolver.cpp,
-        // mezcla wet/dry: dry = 1-0.68*wn, wetGain = 0.82*wn*wetScale).
-        // Recuperación exacta del wet con la combinación lineal
-        //   final = a*dry + b*out,  b = gWet/(0.82*ws),  a = gDry - 0.32*b
-        // que da coef. de dry = gDry y coef. de wet = gWet.
-        const double ws = std::max(1e-6, static_cast<double>(rir_.wetScale()));
+    // 2. RIR + campo difuso SDRF (la sala):
+    // El campo difuso es la red unitaria SDRF (guías Weil/GUE + reflexión
+    // Householder + all-pass Gray-Markel + Kerr + techo softReflect ≤0.95),
+    // alimentada con los controles que YA hay: effectiveWet_ es la puerta
+    // y la mezcla de potencia constante (igual que el RIR); rt60Sec es el
+    // decaimiento del lazo solo sin IR cargada (con IR la cola RIR ya
+    // decae y el campo solo la difunde, g=1); ρ_E = effectiveWet_.
+    // Con effectiveWet_ = 0 el campo no corre y su estado se limpia: la
+    // cadena con todo apagado sigue bit-exacta (Regla de Oro).
+    if (effectiveWet_ > 0.0f) {
+        const double ws = rir_.isLoaded()
+            ? std::max(1e-6, static_cast<double>(rir_.wetScale())) : 1.0;
+        if (rir_.isLoaded()) {
+            rir_.setWetDry(1.0f);
+            rir_.process(l, r, n);
+            // out = 0.32*in + 0.82*ws*wet. Recuperar el wet puro, difundirlo
+            // (sin decaimiento añadido) y recomponer con la misma forma.
+            diffuseRirWet(l, r, dryL, dryR, n, ws);
+        } else {
+            // Sin IR cargada el campo difuso ES la sala: el seco alimenta
+            // la red y su salida es el wet (con decaimiento RT60 propio).
+            // out = 0.32*dry + 0.82*wetDifuso (misma forma que el convolver).
+            diffuseFromDry(l, r, dryL, dryR, n);
+        }
+        // Mezcla de potencia constante gDry^2 + gWet^2 = 1 (sin cambios:
+        // la fórmula es la misma porque el wet llega con la misma forma).
         const double gWet = static_cast<double>(effectiveWet_);
         const double gDry = std::sqrt(std::max(0.0, 1.0 - gWet * gWet));
         const double b = gWet / (0.82 * ws);
@@ -192,18 +214,69 @@ void FusedListenerRoom::processChunk(double* l, double* r, const double* dryL,
             l[i] = a * dryL[i] + b * l[i];
             r[i] = a * dryR[i] + b * r[i];
         }
+        diffuseActive_ = true;
+    } else if (diffuseActive_) {
+        diffuse_.reset();
+        diffuseActive_ = false;
     }
 
     // 3. Corrección de sala cut-only (no-op bit-exacto si targets en 0).
     roomEq_.process(l, r, n);
 }
 
+// Recupera el wet puro del convolver, lo difunde con el campo SDRF (sin
+// decaimiento añadido: la cola RIR ya decae) y recompone la salida con la
+// misma forma (0.32*in + 0.82*ws*wetDifuso), in-place sobre l/r.
+void FusedListenerRoom::diffuseRirWet(double* l, double* r, const double* dryL,
+                                      const double* dryR, int n, double ws) noexcept {
+    diffuse_.setRt60(0.0f);  // difusión pura (g=1, kernel verificado)
+    diffuse_.setDensity(effectiveWet_);
+    for (int i = 0; i < n; ++i) {
+        diffuseInL_[static_cast<std::size_t>(i)] =
+            (l[i] - 0.32 * dryL[i]) / (0.82 * ws);
+        diffuseInR_[static_cast<std::size_t>(i)] =
+            (r[i] - 0.32 * dryR[i]) / (0.82 * ws);
+    }
+    diffuse_.process(diffuseInL_.data(), diffuseInR_.data(),
+                     diffuseOutL_.data(), diffuseOutR_.data(), n);
+    for (int i = 0; i < n; ++i) {
+        l[i] = 0.32 * dryL[i] + 0.82 * ws * diffuseOutL_[static_cast<std::size_t>(i)];
+        r[i] = 0.32 * dryR[i] + 0.82 * ws * diffuseOutR_[static_cast<std::size_t>(i)];
+    }
+}
+
+// Sin IR: el seco alimenta el campo (con decaimiento RT60 propio) y la
+// salida toma la forma del convolver (0.32*dry + 0.82*wetDifuso).
+void FusedListenerRoom::diffuseFromDry(double* l, double* r, const double* dryL,
+                                       const double* dryR, int n) noexcept {
+    diffuse_.setRt60(controls_.rt60Sec);
+    diffuse_.setDensity(effectiveWet_);
+    diffuse_.process(dryL, dryR, diffuseOutL_.data(), diffuseOutR_.data(), n);
+    for (int i = 0; i < n; ++i) {
+        l[i] = 0.32 * dryL[i] + 0.82 * diffuseOutL_[static_cast<std::size_t>(i)];
+        r[i] = 0.32 * dryR[i] + 0.82 * diffuseOutR_[static_cast<std::size_t>(i)];
+    }
+}
+
 void FusedListenerRoom::process(double* left, double* right, int frames) noexcept {
     if (!left || !right || frames <= 0) return;
-    if (isNeutral()) return;  // bit-transparente, ganancia exactamente 1.0
+    if (isNeutral()) {
+        // Bit-transparente, ganancia exactamente 1.0. Si el campo difuso
+        // tenía estado (se apagó el wet), limpiarlo aquí (hilo de audio):
+        // nunca libera energía almacenada como golpe al re-enganchar.
+        if (diffuseActive_) {
+            diffuse_.reset();
+            diffuseActive_ = false;
+        }
+        return;
+    }
     if (!prepared_) prepare(48000.0);  // una vez; aloca el scratch
     if (dryL_.size() < static_cast<std::size_t>(kFusedMaxBlockFrames) ||
-        dryR_.size() < static_cast<std::size_t>(kFusedMaxBlockFrames)) {
+        dryR_.size() < static_cast<std::size_t>(kFusedMaxBlockFrames) ||
+        diffuseInL_.size() < static_cast<std::size_t>(kChunkFrames) ||
+        diffuseInR_.size() < static_cast<std::size_t>(kChunkFrames) ||
+        diffuseOutL_.size() < static_cast<std::size_t>(kChunkFrames) ||
+        diffuseOutR_.size() < static_cast<std::size_t>(kChunkFrames)) {
         return;  // fail-closed: sin scratch no se procesa
     }
 

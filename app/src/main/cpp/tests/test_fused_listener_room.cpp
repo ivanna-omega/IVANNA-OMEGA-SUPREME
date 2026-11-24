@@ -12,6 +12,7 @@
 
 #include "../fused/fused_listener_room.hpp"
 #include "../fused/fused_measure.hpp"
+#include "../fused/sdrf_diffuse_field.hpp"
 
 using namespace ivanna::fused;
 using namespace ivanna::fused::measure;
@@ -331,4 +332,258 @@ TEST(FusedListenerRoom, RirConstantPowerMix) {
     EXPECT_GT(rWet1, 0.05);  // el wet está presente de verdad
     const double predicted05 = std::sqrt(0.75 + 0.25 * rWet1 * rWet1);
     EXPECT_NEAR(rWet05, predicted05, 0.10 * predicted05);
+}
+
+// ── CAMPO DIFUSO SDRF (2026-11-24, fusión homogénea en SALA VIVA) ──────
+// El campo es el kernel SDRF PROD verificado (transcripción fiel del
+// port sdrf_prod_port.cpp) con la ganancia de lazo RT60 como único cambio.
+// Umbrales medidos con la sonda del campo (no inventados).
+
+// T60 por ajuste de pendiente (dB/s) en la cola: energía por bloque de
+// 10 ms, regresión lineal en la ventana -10..-40 dB bajo el pico.
+double SlopeFitT60(const std::vector<double>& x, double sr) {
+    const int blk = static_cast<int>(0.01 * sr);
+    const int nb = static_cast<int>(x.size()) / blk;
+    std::vector<double> e(static_cast<std::size_t>(nb), 0.0);
+    double eMax = 0.0;
+    for (int b = 0; b < nb; ++b) {
+        double p = 0.0;
+        for (int i = 0; i < blk; ++i) {
+            const double v = x[static_cast<std::size_t>(b * blk + i)];
+            p += v * v;
+        }
+        e[static_cast<std::size_t>(b)] = p;
+        eMax = std::max(eMax, p);
+    }
+    double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0;
+    int n = 0;
+    for (int b = 0; b < nb; ++b) {
+        const double db =
+            10.0 * std::log10(e[static_cast<std::size_t>(b)] / eMax + 1e-20);
+        if (db <= -10.0 && db >= -40.0) {
+            const double t = b * 0.01;
+            sx += t;
+            sy += db;
+            sxx += t * t;
+            sxy += t * db;
+            ++n;
+        }
+    }
+    if (n < 3) return -1.0;
+    const double slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+    return -60.0 / slope;
+}
+
+TEST(SdrfDiffuseField, EnergyConservingWithPureDiffusion) {
+    // Difusión pura (g=1, sin decaimiento RT60): el kernel verificado es
+    // conservativo — ruido continuo ganancia ~0.995×, impulso ~0.997×.
+    SdrfDiffuseField f;
+    f.prepare(kSr);
+    f.setRt60(0.0f);
+    f.setDensity(0.22f);
+    const int n = 96000;
+    const auto in = Noise(0.4, n, 777u);
+    std::vector<double> oL(static_cast<std::size_t>(n)), oR(static_cast<std::size_t>(n));
+    f.process(in.data(), in.data(), oL.data(), oR.data(), n);
+    const double gain = Rms(oL, n / 2) / Rms(in, n / 2);
+    std::printf("[EnergyConserving] ganancia ruido=%.4f pico=%.4f\n", gain,
+                peakAbs(oL.data(), oL.size()));
+    EXPECT_NEAR(gain, 1.0, 0.10);
+    EXPECT_LE(peakAbs(oL.data(), oL.size()), 0.95);
+
+    // Impulso en un solo canal: energía total de salida ≈ entrada.
+    SdrfDiffuseField fi;
+    fi.prepare(kSr);
+    fi.setRt60(0.0f);
+    const int ni = 48000 * 3;
+    std::vector<double> ii(static_cast<std::size_t>(ni), 0.0),
+        oiL(static_cast<std::size_t>(ni)), oiR(static_cast<std::size_t>(ni));
+    ii[0] = 1.0;
+    fi.process(ii.data(), ii.data(), oiL.data(), oiR.data(), ni);
+    double eOut = 0.0;
+    for (int i = 0; i < ni; ++i)
+        eOut += oiL[static_cast<std::size_t>(i)] * oiL[static_cast<std::size_t>(i)] +
+                oiR[static_cast<std::size_t>(i)] * oiR[static_cast<std::size_t>(i)];
+    // Entrada (1.0, 1.0) en ambos canales: energía 2.0.
+    std::printf("[EnergyConserving] energia impulso=%.4f (entrada 2.0)\n", eOut);
+    EXPECT_NEAR(eOut, 2.0, 0.10);
+    EXPECT_LE(peakAbs(oiL.data(), oiL.size()), 0.95);
+}
+
+TEST(SdrfDiffuseField, Rt60DrivesDecay) {
+    // El decaimiento del lazo sigue a rt60Sec (monótono y en rango).
+    // Medido: T60(0.34) ≈ 0.53 s, T60(1.0) ≈ 0.96 s (pendiente de cola);
+    // el lazo en sí decae a RT60 nominal ±10% (energía almacenada).
+    auto t60 = [](float rt) {
+        SdrfDiffuseField f;
+        f.prepare(kSr);
+        f.setRt60(rt);
+        f.setDensity(0.22f);
+        const int n = 48000 * 4;
+        std::vector<double> in(static_cast<std::size_t>(n), 0.0),
+            oL(static_cast<std::size_t>(n)), oR(static_cast<std::size_t>(n));
+        in[0] = 1.0;
+        f.process(in.data(), in.data(), oL.data(), oR.data(), n);
+        return SlopeFitT60(oL, kSr);
+    };
+    const double t034 = t60(0.34f);
+    const double t100 = t60(1.0f);
+    std::printf("[Rt60DrivesDecay] T60(0.34)=%.3f s, T60(1.0)=%.3f s\n", t034, t100);
+    EXPECT_GT(t034, 0.30);
+    EXPECT_LT(t034, 0.80);
+    EXPECT_GT(t100, 0.60);
+    EXPECT_LT(t100, 1.40);
+    EXPECT_GT(t100, t034);
+}
+
+TEST(SdrfDiffuseField, StressCeilingBelow095) {
+    // Estrés 10 s (ruido + tonos): techo softReflect ≤ 0.95, sin NaN.
+    SdrfDiffuseField f;
+    f.prepare(kSr);
+    f.setRt60(0.34f);
+    f.setDensity(0.5f);
+    const int n = 480000;
+    std::vector<double> in(static_cast<std::size_t>(n)), oL(static_cast<std::size_t>(n)),
+        oR(static_cast<std::size_t>(n));
+    std::uint32_t s = 4242u;
+    for (int i = 0; i < n; ++i) {
+        const double t = i / kSr;
+        in[static_cast<std::size_t>(i)] =
+            0.9 * static_cast<double>(LcgUni(s)) * 0.3 +
+            0.5 * std::sin(2.0 * 3.141592653589793 * 1000.0 * t) * 0.35 +
+            0.5 * std::sin(2.0 * 3.141592653589793 * 3000.0 * t) * 0.35;
+    }
+    f.process(in.data(), in.data(), oL.data(), oR.data(), n);
+    std::printf("[StressCeiling] pico=%.4f rms=%.4f\n",
+                peakAbs(oL.data(), oL.size()), Rms(oL, n / 2));
+    EXPECT_TRUE(isFiniteBuffer(oL.data(), oL.size()));
+    EXPECT_TRUE(isFiniteBuffer(oR.data(), oR.size()));
+    EXPECT_LE(peakAbs(oL.data(), oL.size()), 0.95);
+    EXPECT_LE(peakAbs(oR.data(), oR.size()), 0.95);
+}
+
+TEST(SdrfDiffuseField, NoClickOnDensityAndRt60Sweep) {
+    // Barrido de densidad 0→1 y RT60 0.05→1.5 con seno 100 Hz: el
+    // suavizado 25 ms no añade clics (max|Δ| igual que con fijos).
+    const int n = 96000;
+    std::vector<double> in(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        in[static_cast<std::size_t>(i)] =
+            0.5 * std::sin(2.0 * 3.141592653589793 * 100.0 * i / kSr);
+    auto maxDelta = [](const std::vector<double>& x) {
+        double md = 0.0;
+        for (std::size_t i = 1; i < x.size(); ++i)
+            md = std::max(md, std::fabs(x[i] - x[i - 1]));
+        return md;
+    };
+    std::vector<double> oL(static_cast<std::size_t>(n)), oR(static_cast<std::size_t>(n));
+    SdrfDiffuseField fr;
+    fr.prepare(kSr);
+    fr.setRt60(0.34f);
+    fr.setDensity(0.5f);
+    fr.process(in.data(), in.data(), oL.data(), oR.data(), n);
+    const double ref = maxDelta(oL);
+    SdrfDiffuseField f;
+    f.prepare(kSr);
+    for (int off = 0; off < n; off += 128) {
+        const double frac = static_cast<double>(off) / n;
+        f.setDensity(static_cast<float>(frac));
+        f.setRt60(0.05f + static_cast<float>(frac) * 1.45f);
+        f.process(in.data() + off, in.data() + off, oL.data() + off,
+                  oR.data() + off, 128);
+    }
+    const double swept = maxDelta(oL);
+    std::printf("[NoClickSweep] max|delta| fijo=%.5f barrido=%.5f\n", ref, swept);
+    EXPECT_LE(swept, 2.0 * ref);
+}
+
+TEST(FusedListenerRoom, DiffuseFieldIsTheRoomWithoutRir) {
+    // Sin IR cargada el campo difuso ES la sala: tras una ráfaga de ruido
+    // queda cola audible (primeros 200 ms tras la ráfaga); con wet=0 la
+    // salida es bit-exacta (sin cola).
+    const int burst = 24000, tail = 9600;
+    const int n = burst + tail;
+    const auto in = Noise(0.4, burst, 999u);
+    std::vector<double> sig(static_cast<std::size_t>(n), 0.0);
+    std::copy(in.begin(), in.end(), sig.begin());
+    auto run = [&](float wet) {
+        FusedListenerRoom op;
+        op.prepare(kSr);
+        EXPECT_FALSE(op.rirLoaded());
+        ListenerRoomControls c;
+        c.roomWet = wet;
+        c.rt60Sec = 0.34f;
+        c.hearingProfile = 0;
+        op.setControls(c);
+        auto outL = sig;
+        auto outR = sig;
+        op.process(outL.data(), outR.data(), n);
+        EXPECT_TRUE(isFiniteBuffer(outL.data(), outL.size()));
+        // Cola: primeros 200 ms tras la ráfaga (RT60=0.34 s).
+        return Rms(outL, static_cast<std::size_t>(burst));
+    };
+    const double tailWet = run(0.5f);
+    const double tailDry = run(0.0f);
+    std::printf("[DiffuseIsRoom] cola wet=0.5: %.6f, wet=0: %.6f\n", tailWet, tailDry);
+    EXPECT_GT(tailWet, 1e-3);  // la cola existe de verdad
+    EXPECT_EQ(tailDry, 0.0);   // sin wet no hay cola (bit-exacto)
+}
+
+TEST(FusedListenerRoom, DiffuseFieldOffWhenWetZero) {
+    // Con roomWet=0 el campo no corre: cambiar rt60 o roomSizeM no debe
+    // alterar la salida en absoluto (bit-idéntica), aunque el operador
+    // no sea neutro (perfil auditivo activo).
+    const auto inL = Tone(0.5);
+    const auto inR = Tone(0.5);
+    auto run = [&](float rt60, float sizeM) {
+        FusedListenerRoom op;
+        op.prepare(kSr);
+        ListenerRoomControls c;
+        c.roomWet = 0.0f;
+        c.rt60Sec = rt60;
+        c.roomSizeM = sizeM;
+        c.hearingProfile = 1;  // HARMAN: operador no neutro
+        op.setControls(c);
+        auto outL = inL;
+        auto outR = inR;
+        op.process(outL.data(), outR.data(), kFrames);
+        return std::make_pair(outL, outR);
+    };
+    const auto a = run(0.05f, 2.0f);
+    const auto b = run(1.5f, 12.0f);
+    EXPECT_EQ(a.first, b.first);
+    EXPECT_EQ(a.second, b.second);
+}
+
+TEST(FusedListenerRoom, DiffuseFieldRt60ChangesTail) {
+    // A través del operador: RT60 largo → cola más larga (sin IR).
+    // Cola tardía (0.3–0.6 s tras el impulso): con rt60=1.0 s sigue
+    // sonando; con rt60=0.34 s ya decayó.
+    auto tailRms = [](float rt) {
+        FusedListenerRoom op;
+        op.prepare(kSr);
+        ListenerRoomControls c;
+        c.roomWet = 0.5f;
+        c.rt60Sec = rt;
+        c.hearingProfile = 0;
+        op.setControls(c);
+        const int n = 48000 * 2;
+        std::vector<double> in(static_cast<std::size_t>(n), 0.0),
+            oL(static_cast<std::size_t>(n)), oR(static_cast<std::size_t>(n));
+        in[0] = 1.0;
+        oL = in;
+        oR = in;
+        op.process(oL.data(), oR.data(), n);
+        double p = 0.0;
+        for (int i = 14400; i < 28800; ++i)
+            p += oL[static_cast<std::size_t>(i)] * oL[static_cast<std::size_t>(i)];
+        return std::sqrt(p / 14400.0);
+    };
+    const double t034 = tailRms(0.34f);
+    const double t100 = tailRms(1.0f);
+    std::printf("[DiffuseRt60Tail] cola 0.3-0.6s rt60=0.34: %.6f, rt60=1.0: %.6f\n",
+                t034, t100);
+    // Medido: 1.0e-5 vs 1.0e-6 (ratio 10×). Umbral con margen 3×.
+    EXPECT_GT(t100, 3e-6);
+    EXPECT_GT(t100, 3.0 * t034);
 }
