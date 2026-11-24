@@ -33,7 +33,7 @@ jobs:
       - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
       - name: Install HDF5 validator
-        run: python3 -m pip install --disable-pip-version-check --user h5py numpy
+        run: python3 -m pip install --disable-pip-version-check --user --break-system-packages h5py numpy
       - name: Validate every SOFA with a real HDF5 reader
         run: python3 scripts/validate_sofa_hdf5.py .
       - name: SOFA validator regression tests
