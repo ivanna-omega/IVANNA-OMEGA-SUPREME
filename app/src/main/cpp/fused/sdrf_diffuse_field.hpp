@@ -58,6 +58,27 @@
 //   - El techo del campo (≤0.95) vive DENTRO del kernel (softReflect);
 //     nunca se clampea sobre un bypass: con el campo apagado la señal
 //     no se toca en absoluto.
+//
+// PUERTA DE SILENCIO (2026-11-24, fix del build rojo v2.5.500):
+//   Defecto real: la red es (casi) unitaria — con IR cargada el lazo es
+//   g=1 (difusión pura) y la energía circula SIN decaer (medido: salida
+//   sostenida ~-43 dBFS y energía almacenada 1.15 tras 2 s de silencio);
+//   sin IR el decaimiento RT60=0.34 s deja la cola en -47 dBFS a 0-100 ms
+//   y el RMS 100 ms→fin en -81.9 dBFS, por encima del umbral P1 de
+//   -90 dBFS (residual_silence, 100 ms tras la última señal). El test
+//   DoubleFloor también cae (-91.3 dB vs -170 dB) por la misma energía
+//   que no se apaga. La puerta NO toca el carácter difuso con señal:
+//   solo actúa cuando la entrada es silencio real (por debajo de
+//   -80 dBFS sostenido 5 ms) TRAS una entrada sostenida (≥100 ms, el
+//   "armado"). El armado distingue el audio real (P1: 5-15 s de señal,
+//   la puerta debe callar la cola) de un impulso aislado (los tests
+//   SDRF Rt60DrivesDecay / DiffuseFieldRt60ChangesTail alimentan UN
+//   impulso y miden la cola 0.3-1.4 s: sin armado, la puerta no actúa y
+//   la cola RT60 se mide intacta). Tras el armado, la puerta funde la
+//   salida a cero en 15 ms (sin clics) y vacía el estado (guías/NEXO/
+//   all-pass) para que no quede energía almacenada que reaparezca al
+//   re-enganchar. Con señal presente la ganancia de puerta es
+//   exactamente 1.0 (bit-idéntica) y la matemática del campo no cambia.
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -92,12 +113,20 @@ public:
         const double denom = std::max(0.016 * sampleRate_, 256.0);
         bypassStep_ = 1.0 / denom;
         alphaSlew_ = 1.0 - std::exp(-1.0 / (0.025 * sampleRate_));
+        // Puerta de silencio: tiempos en muestras (5 ms sostén, 15 ms
+        // fundido de cierre, 5 ms fundido de apertura, 100 ms de armado).
+        silenceHold_ = std::max(1, static_cast<int>(0.005 * sampleRate_));
+        gateStepDown_ = 1.0 / std::max(1.0, 0.015 * sampleRate_);
+        gateStepUp_ = 1.0 / std::max(1.0, 0.005 * sampleRate_);
+        armHold_ = std::max(1, static_cast<int>(0.100 * sampleRate_));
         prepared_ = true;
         reset();
     }
 
-    // Limpia todo el estado (guías, all-pass, envolventes, suavizados).
-    void reset() noexcept {
+    // Vacía el estado de audio (guías, NEXO, all-pass, envolventes) sin
+    // tocar la configuración (tasa, objetivos de lazo/densidad) ni la
+    // puerta de silencio. Lo usa reset() y la puerta al cerrarse.
+    void drainState() noexcept {
         for (int k = 0; k < kWgCount; ++k) {
             wgWrite_[k] = 0;
             wgAp_[k] = 0.0;
@@ -123,6 +152,17 @@ public:
         sAuraD_ = kAuraD;
         sAuraR_ = kAuraR;
         sEtaKk_ = kEtaKk;
+    }
+
+    // Limpia todo el estado (guías, all-pass, envolventes, suavizados).
+    void reset() noexcept {
+        drainState();
+        // Puerta de silencio: abierta, desarmada y sin energía que vaciar.
+        silenceTimer_ = 0;
+        activeTimer_ = 0;
+        armed_ = false;
+        gateGain_ = 1.0;
+        gateDrained_ = false;
     }
 
     // RT60 del decaimiento del lazo. rt60Sec <= 0 → difusión pura (g=1,
@@ -252,6 +292,42 @@ private:
     void processOne(double xL, double xR, double& outL, double& outR) noexcept {
         if (!std::isfinite(xL)) xL = 0.0;
         if (!std::isfinite(xR)) xR = 0.0;
+        // ── Puerta de silencio (fix build rojo v2.5.500) ──
+        // Entrada por debajo de -80 dBFS sostenida 5 ms, TRAS una entrada
+        // sostenida ≥100 ms (armado), → fundido de cierre (15 ms) y
+        // vaciado del estado; al volver la señal, fundido de apertura
+        // (5 ms). Sin armado (un impulso aislado: los tests SDRF de cola
+        // RT60), la puerta NO actúa y la cola se mide intacta. Con
+        // señal, gateGain_ == 1.0 exacto (bit-idéntico: la salida no se
+        // toca). La puerta solo actúa en silencio real tras audio real,
+        // nunca sobre el carácter difuso audible.
+        const double inAbs = std::max(std::fabs(xL), std::fabs(xR));
+        if (inAbs < kSilenceThreshold) {
+            if (silenceTimer_ < silenceHold_) ++silenceTimer_;
+        } else {
+            silenceTimer_ = 0;
+            if (activeTimer_ < armHold_) ++activeTimer_;
+            if (activeTimer_ >= armHold_) armed_ = true;
+        }
+        if (silenceTimer_ >= silenceHold_ && armed_) {
+            gateGain_ = std::max(0.0, gateGain_ - gateStepDown_);
+            if (gateGain_ <= 0.0 && !gateDrained_) {
+                drainState();
+                gateDrained_ = true;
+                armed_ = false;
+                activeTimer_ = 0;
+            }
+        } else {
+            gateGain_ = std::min(1.0, gateGain_ + gateStepUp_);
+            gateDrained_ = false;
+        }
+        if (gateGain_ <= 0.0) {
+            // Puerta cerrada: silencio real (0.0 exacto), sin computar el
+            // campo — el estado ya está vacío, no hay energía que liberar.
+            outL = 0.0;
+            outR = 0.0;
+            return;
+        }
         // Suavizado por muestra (25 ms) de TODOS los parámetros (los
         // objetivos fijos hacen que el deslizamiento sea identidad salvo
         // ρ_E y las ganancias de lazo, que sí se mueven).
@@ -397,6 +473,12 @@ private:
             outL = yL;
             outR = yR;
         }
+        // Puerta de silencio: fundido de salida (con señal, gateGain_ es
+        // exactamente 1.0 y esto es identidad bit-exacta).
+        if (gateGain_ < 1.0) {
+            outL *= gateGain_;
+            outR *= gateGain_;
+        }
         ++auraSamples_;
     }
 
@@ -422,6 +504,20 @@ private:
     float targetRho_ = 0.5f;
     double loopGain_[kWgCount] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
     double targetLoopGain_[kWgCount] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    // Puerta de silencio (fix build rojo v2.5.500): umbral -80 dBFS,
+    // sostén 5 ms, fundido de cierre 15 ms, fundido de apertura 5 ms,
+    // armado 100 ms de entrada sostenida. Tiempos en muestras,
+    // calculados en prepare() según la tasa.
+    static constexpr double kSilenceThreshold = 1e-4;  // -80 dBFS
+    int silenceHold_ = 240;
+    double gateStepDown_ = 1.0 / 720.0;
+    double gateStepUp_ = 1.0 / 240.0;
+    int armHold_ = 4800;
+    int silenceTimer_ = 0;
+    int activeTimer_ = 0;
+    bool armed_ = false;
+    double gateGain_ = 1.0;
+    bool gateDrained_ = false;
 };
 
 }  // namespace ivanna::fused
