@@ -163,6 +163,17 @@ jobs:
           path: ~/.gradle/wrapper/dists
           key: gradle-${{ env.GRADLE_VERSION }}-${{ runner.os }}
 
+      - name: Cache Gradle dependencies and build cache
+        # Sin esto cada corrida re-descarga todas las dependencias y
+        # recompila desde cero (~1.7 GB de caches). Con el caché, el
+        # build del APK reusa dependencias y salidas ya compiladas.
+        uses: actions/cache@v6
+        with:
+          path: ~/.gradle/caches
+          key: gradle-deps-${{ env.GRADLE_VERSION }}-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-deps-${{ env.GRADLE_VERSION }}-${{ runner.os }}-
+
       - name: Provision Gradle (retry + mirror)
         run: |
           set -euo pipefail
