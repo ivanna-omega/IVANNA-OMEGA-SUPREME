@@ -49,13 +49,21 @@
 //   - ORBE + SALA + ARMONÍA: −180.80 dB (ambos canales idénticos).
 //   - SALA + ARMONÍA solos: −297.35 dB (piso del medidor: la matemática
 //     double de la convolución RIR y del EQ es numéricamente perfecta).
-//   - ORBE es quien fija el piso en −181 dB: su convolución HRTF corre en
-//     double, pero los datos HRTF/PCA que alimenta son float32 — el piso
-//     es el de los DATOS, no el de la aritmética. 40 dB mejor que el piso
-//     float32 (~−140 dB), pero la meta −200 dB NO se cumple en la cadena
-//     con ORBE activo. Umbral del test: −170 dB (10 dB de margen sobre lo
-//     medido). Subir el piso a −200 dB exigiría HRTF en double (datos +
-//     interpolación), trabajo futuro, no de este commit.
+//   - ORBE es quien fijaba el piso en −181 dB antes de SDRF: su convolución
+//     HRTF corre en double, pero los datos HRTF/PCA que alimenta son
+//     float32 — el piso es el de los DATOS, no el de la aritmética. 40 dB
+//     mejor que el piso float32 (~−140 dB), pero la meta −200 dB NO se
+//     cumple en la cadena con ORBE activo. Umbral del test: −170 dB
+//     (10 dB de margen sobre lo medido). Subir el piso a −200 dB
+//     exigiría HRTF en double (datos + interpolación), trabajo futuro,
+//     no de este commit.
+//   - DESDE v2.5.500 (SDRF dentro de SALA VIVA) el piso lo fija el campo
+//     difuso, no ORBE: la red SDRF es variable en el tiempo y no lineal
+//     (AURA 0.07 Hz, Kerr dependiente de energía), su THD+N a 1 kHz es
+//     −76.66 dB en el campo solo y en la cadena (wet 0.22) da −91.34 dB
+//     (peor canal). El umbral del test pasa a −80 dB (~11 dB de margen):
+//     es carácter del reverb vivo, no error numérico. Ver el comentario
+//     del test ChainLinearEngagedHeadphones (v2.5.501).
 //   - TΩ en SPEAKERS: −40.04 dB, bandas laterales a ±375 Hz (tasa de hop)
 //     con periodo de 3 hops (384 muestras): la etapa espectral modula el
 //     tono a la tasa de frame (carácter, no ruido numérico). Con TΩ
@@ -151,11 +159,26 @@ double measureFloor(const FusedControls& c, bool volumetric, const char* tag) {
 
 TEST(DoubleFloor, ChainLinearEngagedHeadphones) {
     // HEADPHONES: TΩ salta (M = I). Mide ORBE + SALA + ARMONÍA +
-    // PULSO-lineal en double. Umbral −170 dB (medido −180.80 dB;
-    // la meta −200 dB no se cumple con ORBE: sus datos HRTF son
-    // float32 — ver cabecera).
+    // PULSO-lineal en double. Umbral −80 dB (medido −91.34 dB peor
+    // canal, −94.95 dB R; ~11 dB de margen).
+    //
+    // POR QUÉ YA NO ES −170 dB (v2.5.501, decisión de Esse): el umbral
+    // −170 dB era un piso de cadena LINEAL, fijado cuando SALA VIVA
+    // sin IR era bypass (el piso lo marcaba ORBE en −180.80 dB, por
+    // sus datos HRTF float32). Desde la v2.5.500 el campo difuso SDRF
+    // vive DENTRO de SALA VIVA (FusedListenerRoom, roomWet 0.22 aquí),
+    // y ese campo es una red VARIABLE EN EL TIEMPO Y NO LINEAL (AURA
+    // 0.07 Hz, Kerr dependiente de energía, ángulos por envolvente):
+    // su THD+N a 1 kHz es −76.66 dB en el campo solo, que en la cadena
+    // da los −91.34 dB medidos. Eso es CARÁCTER del reverb (su campo
+    // difuso vivo), no error numérico: la matemática double sigue
+    // siendo exacta (SALA+ARMONÍA solos miden −297.35 dB, piso del
+    // medidor). Un reverb variable en el tiempo no puede dar −170 dB
+    // sin destripar su carácter (quitar Kerr/AURA). El umbral −80 dB
+    // fija que el campo no se degrade más, sin venderlo como piso de
+    // precisión numérica — mismo patrón que SPEAKERS/TΩ (−30 dB).
     const double floor = measureFloor(linearEngagedControls(), true, "HEADPHONES lineal enganchada");
-    EXPECT_LT(floor, -170.0) << "Piso double enganchado peor que -170 dB (peor canal " << floor << " dB)";
+    EXPECT_LT(floor, -80.0) << "Piso double enganchado peor que -80 dB (peor canal " << floor << " dB)";
 }
 
 TEST(DoubleFloor, ChainLinearEngagedSpeakers) {
