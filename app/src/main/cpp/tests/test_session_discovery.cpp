@@ -582,3 +582,126 @@ TEST(SessionChangeGate, ErrorCongelaTodoFailClosed) {
     EXPECT_EQ(h.pendingCount(), 0);
     EXPECT_EQ(h.sessionId(), 2305);
 }
+
+// ── Cableado del gate en el daemon (CORONA Frente A, defecto 4) ──────────
+// applyDiscoveryPoll() es la lógica EXACTA del paso 4 de ivanna_daemon.cpp:
+// el daemon alimenta cada poll (~3 s) al gate y publica sessionId/sessionGen
+// + resetea el snapshot a neutro SOLO cuando el gate confirma un cambio
+// real. Antes del cableado, el bucle usaba
+// shouldResetSnapshotForSessionChange + actualización inmediata, así que cada
+// poll ruidoso reseteaba y subía sessionGen (1.380 "sesión publicada" en
+// daemon_v2.log, sesiones 1105/1297/1313 alternando). Estos tests simulan el
+// estado publicado del daemon (sid/gen/package + flag de reset) poll a poll.
+// Invariante: la gen del daemon == gate.sessionGen() en todo momento.
+using ivanna::daemon::applyDiscoveryPoll;
+
+namespace {
+
+SessionDiscoveryOutcome mkFoundPkg(int32_t sid, const char* pkg) {
+    SessionDiscoveryOutcome o;
+    o.status = SessionDiscoveryStatus::kFound;
+    o.sessionId = sid;
+    o.packageName = pkg;
+    return o;
+}
+
+// Un poll del daemon: alimenta al gate y actualiza el estado publicado.
+// Devuelve true solo si hubo que resetear el snapshot a neutro (Parche B).
+bool daemonPoll(SessionChangeGate& g, const SessionDiscoveryOutcome& out,
+                int32_t& sid, uint64_t& gen, std::string& pkg) {
+    return applyDiscoveryPoll(g, out, sid, gen, pkg);
+}
+
+}  // namespace
+
+TEST(SessionChangeGate, DaemonWiringFlapNoReseteaNiSubeGen) {
+    // Replay del flap: sesión real + otra de 1 poll + kNone aislado.
+    // Con el cableado viejo: 5 generaciones + 5 resets. Con gate: 1 commit.
+    SessionChangeGate g;
+    int32_t sid = 0;
+    uint64_t gen = 0;
+    std::string pkg;
+    EXPECT_FALSE(daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg));
+    EXPECT_EQ(sid, 0);
+    EXPECT_EQ(gen, 0u);
+    EXPECT_FALSE(daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg));
+    EXPECT_FALSE(daemonPoll(g, mkFoundPkg(2337, "com.music.appB"), sid, gen, pkg));
+    EXPECT_FALSE(daemonPoll(g, mkNone(), sid, gen, pkg));
+    EXPECT_FALSE(daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg));
+    EXPECT_FALSE(daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg));
+    EXPECT_EQ(sid, 0);
+    EXPECT_EQ(gen, 0u);
+    EXPECT_EQ(pkg, "");
+    // 3er poll consecutivo de 2305 (el kNone no reseteó el candidato):
+    // único commit: sid 2305, gen 1, reset a neutro, package de la confirmada.
+    EXPECT_TRUE(daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg));
+    EXPECT_EQ(sid, 2305);
+    EXPECT_EQ(gen, 1u);
+    EXPECT_EQ(gen, g.sessionGen());
+    EXPECT_EQ(pkg, "com.music.appA");
+    // La misma sesión en los polls siguientes: sin más generaciones ni resets.
+    EXPECT_FALSE(daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg));
+    EXPECT_EQ(gen, 1u);
+}
+
+TEST(SessionChangeGate, DaemonWiringNoneAisladoNoReseteaYCadaATresSi) {
+    SessionChangeGate g;
+    int32_t sid = 0;
+    uint64_t gen = 0;
+    std::string pkg;
+    daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg);
+    daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg);
+    ASSERT_TRUE(daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg));
+    ASSERT_EQ(sid, 2305);
+    ASSERT_EQ(gen, 1u);
+    // kNone aislado: no cae, no resetea, no sube gen, package intacto.
+    EXPECT_FALSE(daemonPoll(g, mkNone(), sid, gen, pkg));
+    EXPECT_EQ(sid, 2305);
+    EXPECT_EQ(gen, 1u);
+    EXPECT_EQ(pkg, "com.music.appA");
+    EXPECT_FALSE(daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg));
+    // 2 kNone seguidos no bastan...
+    EXPECT_FALSE(daemonPoll(g, mkNone(), sid, gen, pkg));
+    EXPECT_FALSE(daemonPoll(g, mkNone(), sid, gen, pkg));
+    EXPECT_EQ(sid, 2305);
+    EXPECT_EQ(gen, 1u);
+    // ...el 3º sí: caída a 0 con UN reset y UNA generación; package limpio.
+    EXPECT_TRUE(daemonPoll(g, mkNone(), sid, gen, pkg));
+    EXPECT_EQ(sid, 0);
+    EXPECT_EQ(gen, 2u);
+    EXPECT_EQ(gen, g.sessionGen());
+    EXPECT_EQ(pkg, "");
+    // Ya en 0, más kNone no generan nada.
+    EXPECT_FALSE(daemonPoll(g, mkNone(), sid, gen, pkg));
+    EXPECT_EQ(gen, 2u);
+}
+
+TEST(SessionChangeGate, DaemonWiringCambioDeAppConfirmaUnaVez) {
+    SessionChangeGate g;
+    int32_t sid = 0;
+    uint64_t gen = 0;
+    std::string pkg;
+    daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg);
+    daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg);
+    ASSERT_TRUE(daemonPoll(g, mkFoundPkg(2305, "com.music.appA"), sid, gen, pkg));
+    ASSERT_EQ(gen, 1u);
+    // El usuario cambia de app: 2 polls de la nueva no bastan; la vieja
+    // sigue publicada (sesión + package) y no hay reset.
+    EXPECT_FALSE(daemonPoll(g, mkFoundPkg(2337, "com.music.appB"), sid, gen, pkg));
+    EXPECT_FALSE(daemonPoll(g, mkFoundPkg(2337, "com.music.appB"), sid, gen, pkg));
+    EXPECT_EQ(sid, 2305);
+    EXPECT_EQ(gen, 1u);
+    EXPECT_EQ(pkg, "com.music.appA");
+    // 3er poll: confirma UNA vez (gen 2) y el package sigue a la confirmada.
+    EXPECT_TRUE(daemonPoll(g, mkFoundPkg(2337, "com.music.appB"), sid, gen, pkg));
+    EXPECT_EQ(sid, 2337);
+    EXPECT_EQ(gen, 2u);
+    EXPECT_EQ(gen, g.sessionGen());
+    EXPECT_EQ(pkg, "com.music.appB");
+    // kError congela todo: ni confirma, ni resetea, ni mueve package/gen.
+    EXPECT_FALSE(daemonPoll(g, mkError(), sid, gen, pkg));
+    EXPECT_FALSE(daemonPoll(g, mkError(), sid, gen, pkg));
+    EXPECT_EQ(sid, 2337);
+    EXPECT_EQ(gen, 2u);
+    EXPECT_EQ(pkg, "com.music.appB");
+}

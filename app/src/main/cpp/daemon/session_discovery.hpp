@@ -337,6 +337,10 @@ struct SessionDiscoveryOutcome {
 // el llamador resetea lastSnap a makeNeutral() antes de publicar (si no, el
 // bofo persiste tras cerrar IVANNA hasta matar la app de música).
 // Pura (sin I/O): unit-testeable en host.
+// LEGACY (CORONA Frente A, defecto 4): el bucle del daemon ya NO usa este
+// helper directo — usa applyDiscoveryPoll() con SessionChangeGate (el helper
+// decide por poll, sin dwell, y cada poll ruidoso reseteaba + subía gen).
+// Se conserva para sus tests y como decisión por poll sin histéresis.
 inline bool shouldResetSnapshotForSessionChange(int32_t currentSessionId,
                                                 const SessionDiscoveryOutcome& out) noexcept {
     if (out.status == SessionDiscoveryStatus::kFound) {
@@ -444,6 +448,42 @@ struct SessionChangeGate {
     int pendingCount_ = 0;            // polls seguidos reportando al candidato
     int noneCount_ = 0;               // kNone seguidos con sesión confirmada
 };
+
+// ── Cableado del gate en el bucle del daemon (CORONA Frente A, defecto 4) ──
+// El gate (FIX 2, v2.5.465) existía y estaba unit-testeado, pero el bucle
+// de ivanna_daemon.cpp NO lo usaba: aplicaba shouldResetSnapshotForSession-
+// Change + actualización inmediata de sessionId/sessionGen en cada poll, así
+// que cada poll ruidoso reseteaba el snapshot a neutro y subía sessionGen
+// (1.380 "sesión publicada" en daemon_v2.log, sesiones 1105/1297/1313
+// alternando). ESTA función es la lógica cableada del paso 4 del daemon,
+// pura (sin I/O) para poder testearla en host:
+//   - alimenta el poll al gate; SOLO cuando el gate confirma un cambio
+//     real se publican sessionId/sessionGen nuevos (gen++ una vez) y se
+//     devuelve true → el llamador resetea el snapshot a neutro (Parche B);
+//   - `package` sigue a la sesión CONFIRMADA, no al poll crudo (el package
+//     del poll solo vale si es el de la sesión publicada; al caer a 0 se
+//     limpia); en polls sin commit, si el poll reporta la sesión
+//     confirmada, su package se refresca (mismo valor en la práctica).
+// El foreground NO se toca aquí: el daemon lo refresca en cada poll no
+// error, fuera del gate (FASE A). Sin noexcept: la asignación de std::string
+// puede lanzar (igual que en el código anterior del daemon).
+inline bool applyDiscoveryPoll(SessionChangeGate& gate,
+                               const SessionDiscoveryOutcome& out,
+                               int32_t& sessionId, uint64_t& sessionGen,
+                               std::string& package) {
+    const bool committed = gate.feed(out);
+    if (committed) {
+        sessionId = gate.sessionId();
+        ++sessionGen;
+    }
+    if (gate.sessionId() != 0 && out.status == SessionDiscoveryStatus::kFound &&
+        out.sessionId == gate.sessionId()) {
+        package = out.packageName;
+    } else if (gate.sessionId() == 0) {
+        package.clear();
+    }
+    return committed;
+}
 
 // Ejecuta `dumpsys media.audio_flinger` (root) y devuelve el sessionId de
 // música. kError si dumpsys falla (popen/read): el llamador NO debe borrar

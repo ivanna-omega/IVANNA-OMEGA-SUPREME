@@ -385,6 +385,12 @@ int main() {
     bool firDesigned = false;
     int32_t sessionId = 0;
     uint64_t sessionGen = 0;
+    // CORONA Frente A (defecto 4): puerta de cambio de sesión con dwell
+    // (FIX 2, v2.5.465). Sin ella, cada poll ruidoso de descubrimiento
+    // (~3 s) reseteaba el snapshot a neutro y subía sessionGen (re-acople
+    // del efecto). Instancia persistente: el gate acumula polls; solo un
+    // cambio confirmado (3 polls seguidos) publica sesión y resetea.
+    ivanna::daemon::SessionChangeGate sessionGate;
     // FASE A: package de la sesión descubierta + app en foreground (del
     // mismo ciclo de descubrimiento; se publican en GET_STATUS vía cmdState).
     std::string sessionPackage;
@@ -547,6 +553,12 @@ int main() {
         // coloreado NO debe sobrevivir en omega_shm: se resetea a neutro
         // antes de publicar (si no, el bofo persiste tras cerrar IVANNA
         // hasta matar la app de música).
+        // CORONA Frente A (defecto 4): el cambio se publica SOLO a través
+        // de SessionChangeGate (applyDiscoveryPoll): un kNone aislado o un
+        // flap de 1-2 polls ya no resetea el snapshot ni sube sessionGen;
+        // un cambio real se adopta en <= ~9 s. El reset-a-neutro en sí
+        // (Parche B) NO se toca: sigue protegiendo contra bofo colgado
+        // cuando la sesión cae de verdad (3 kNone seguidos).
         bool resetSnapForSessionChange = false;
         if (--sessionCountdown <= 0) {
             sessionCountdown = 60;
@@ -558,23 +570,9 @@ int main() {
             if (out.status != ivanna::daemon::SessionDiscoveryStatus::kError) {
                 foregroundPackage = out.foregroundPackage;
             }
-            // 0038+0040 Parche B: si la sesión cambia o cae, el snapshot
-            // coloreado NO debe sobrevivir en omega_shm (se resetea a neutro
-            // antes de publicar en el paso 8).
-            resetSnapForSessionChange =
-                ivanna::daemon::shouldResetSnapshotForSessionChange(sessionId, out);
-            if (out.status == ivanna::daemon::SessionDiscoveryStatus::kFound) {
-                if (out.sessionId != sessionId) {
-                    sessionId = out.sessionId; ++sessionGen;
-                }
-                sessionPackage = out.packageName;
-            } else if (out.status == ivanna::daemon::SessionDiscoveryStatus::kNone) {
-                if (sessionId != 0) {
-                    sessionId = 0; ++sessionGen;
-                }
-                sessionPackage.clear();
-            }
-            // kError: se conserva la sesión anterior.
+            resetSnapForSessionChange = ivanna::daemon::applyDiscoveryPoll(
+                sessionGate, out, sessionId, sessionGen, sessionPackage);
+            // kError: el gate congela todo (se conserva la sesión anterior).
         }
 
         // 0044 (Fallo 2): vigilar si la app IVANNA fue forzada a cerrar.
