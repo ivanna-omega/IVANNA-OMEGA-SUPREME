@@ -19,17 +19,17 @@
  *   initFilterbankAndWindow() construye el banco triangular real (64
  *   bandas, 0-8000 Hz, misma construcción que IvannaTinyMLKernel) y
  *   computeSTFT() calcula la FFT radix-2 de 512 con las tablas
- *   precalculadas (bit-reversal + twiddles). PERO el uso del frontend
- *   real está detrás de setRealFrontendEnabled(), con default OFF
- *   (fail-closed): con el flag OFF, computeSTFT() y
- *   extractLogMelFilterbank() reproducen EXACTAMENTE el comportamiento
- *   legacy (espectro falso + log(1e-10) constante → siempre MUSIC), así
- *   que el sonido por defecto NO cambia y P0 sigue en verde. Encender el
- *   flag vuelve adaptativo al guardián AntiDolby (cambia el sonido): solo
- *   con decisión de Esse + ABX. Los pesos INT8 siguen siendo placeholder
- *   sintético salvo loadWeights(); el cableado real (CRNN TFLite +
- *   frontend idéntico al entrenamiento) sigue siendo trabajo de
- *   laboratorio.
+ *   precalculadas (bit-reversal + twiddles). El uso del frontend
+ *   real está detrás de setRealFrontendEnabled(), con default ON
+ *   (orden Esse 2026-11-25, todo activo en la 502): con el flag ON,
+ *   computeSTFT() y extractLogMelFilterbank() usan la FFT y el banco
+ *   reales y el guardián AntiDolby vuelve adaptativo (cambia el sonido
+ *   respecto al legacy; P0 se re-congela con el flag ON). Con el flag
+ *   OFF, reproducen EXACTAMENTE el comportamiento legacy (espectro
+ *   falso + log(1e-10) constante → siempre MUSIC). Los pesos INT8
+ *   siguen siendo placeholder sintético salvo loadWeights(); el cableado
+ *   real (CRNN TFLite + frontend idéntico al entrenamiento) sigue
+ *   siendo trabajo de laboratorio.
  */
 
 #include "IvannaFusionCore.hpp"
@@ -197,9 +197,9 @@ private:
     uint16_t m_bitRevTable[CLASSIFIER_FRAME_SIZE];
     // Banco mel triangular real (64 bandas, 0-8000 Hz): lo construye
     // initFilterbankAndWindow(). Su USO está detrás del flag
-    // m_realFrontendEnabled (default OFF): con el flag OFF,
-    // extractLogMelFilterbank() devuelve el legacy log(1e-10) constante
-    // y el banco no se consulta, así que el sonido no cambia.
+    // m_realFrontendEnabled (default ON, orden Esse 2026-11-25): con el
+    // flag OFF, extractLogMelFilterbank() devuelve el legacy log(1e-10)
+    // constante y el banco no se consulta, así que el sonido no cambia.
     ALIGN_NEON float m_melFilterbank[MEL_BANDS][FFT_SPECTRUM_SIZE];
 
     // Decimador FIR state
@@ -226,7 +226,8 @@ private:
     std::atomic<bool> m_synchronous{false};
     // Frontend mel real (ver setRealFrontendEnabled): false = legacy
     // exacto (siempre MUSIC); true = FFT + banco mel reales.
-    std::atomic<bool> m_realFrontendEnabled{false};
+    // Default ON (orden Esse 2026-11-25, todo activo en la 502).
+    std::atomic<bool> m_realFrontendEnabled{true};
 
     void initFilterbankAndWindow() noexcept;
     void inferenceLoop() noexcept;

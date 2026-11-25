@@ -4,22 +4,23 @@
 // porque (1) el banco mel estaba a cero y nada lo llenaba nunca y (2)
 // computeSTFT() no calculaba FFT (el "espectro" era |muestra| x 0.5).
 // El fix implementa la FFT radix-2 real + el banco triangular real,
-// detrás del flag setRealFrontendEnabled() (default OFF, fail-closed).
+// detrás del flag setRealFrontendEnabled() (default ON, orden Esse
+// 2026-11-25, todo activo en la 502).
 //
 // Qué afirma este test (host, modo síncrono = determinista):
-//   1. LegacyDefaultIsAlwaysMusic: con el flag OFF (default) el
+//   1. LegacyFlagOffIsAlwaysMusic: con el flag OFF (explícito) el
 //      comportamiento es EXACTAMENTE el de antes del fix (siempre MUSIC,
-//      probabilidades idénticas para cualquier contenido) — el sonido por
-//      defecto NO cambia y P0 sigue en verde.
-//   2. RealFrontendMelBankIsNonZeroAndSelective: con el flag ON el banco
-//      mel ya no es cero y es selectivo en frecuencia (tono grave →
-//      energía en bandas bajas; tono agudo → bandas altas).
+//      probabilidades idénticas para cualquier contenido) — el legacy
+//      queda congelado como referencia.
+//   2. RealFrontendMelBankIsNonZeroAndSelective: con el flag ON (default)
+//      el banco mel ya no es cero y es selectivo en frecuencia (tono
+//      grave → energía en bandas bajas; tono agudo → bandas altas).
 //   3. RealFrontendOutputDependsOnContent: con el flag ON la salida del
 //      clasificador depende del contenido (los vectores de probabilidad
 //      difieren > 0.25 entre un tono grave y uno agudo; el silencio sigue
 //      dando la salida legacy, porque no tiene contenido que discriminar).
 //   4. FlagOffRestoresLegacyExactly: apagar el flag restaura el legacy
-//      exacto (el toggle es reversible y fail-closed).
+//      exacto (el toggle es reversible).
 //
 // LÍMITE HONESTO (pesos placeholder): los pesos INT8 son sintéticos
 // ((f+k)%15-7 / (c+i)%11-5) salvo loadWeights(); ningún peso entrenado
@@ -97,9 +98,18 @@ size_t peakMelBand(const std::array<float, MEL_BANDS>& e) {
 
 }  // namespace
 
-TEST(AudioClassifierFrontend, LegacyDefaultIsAlwaysMusic) {
+TEST(AudioClassifierFrontend, DefaultIsRealFrontendOn) {
+    // Default ON (orden Esse 2026-11-25, todo activo en la 502): el
+    // clasificador nace con la FFT + banco mel reales, no con el legacy.
     IvannaAudioClassifier c;
-    // Default OFF (fail-closed): el flag nace apagado.
+    EXPECT_TRUE(c.isRealFrontendEnabled());
+}
+
+TEST(AudioClassifierFrontend, LegacyFlagOffIsAlwaysMusic) {
+    IvannaAudioClassifier c;
+    // Flag OFF explícito (el default es ON desde la orden 2026-11-25):
+    // el legacy queda congelado aquí como referencia.
+    c.setRealFrontendEnabled(false);
     EXPECT_FALSE(c.isRealFrontendEnabled());
     c.setSynchronous(true);
     // El banco se construye siempre (es solo una tabla); con el flag OFF
@@ -198,8 +208,9 @@ TEST(AudioClassifierFrontend, RealFrontendOutputDependsOnContent) {
 }
 
 TEST(AudioClassifierFrontend, FlagOffRestoresLegacyExactly) {
-    // Referencia legacy: clasificador siempre OFF, mismo tono.
+    // Referencia legacy: clasificador con el flag OFF explícito, mismo tono.
     IvannaAudioClassifier legacy;
+    legacy.setRealFrontendEnabled(false);
     legacy.setSynchronous(true);
     feedSignal(legacy, makeTone(200.0));
     const AIModelOutput oLegacy = readOut(legacy);

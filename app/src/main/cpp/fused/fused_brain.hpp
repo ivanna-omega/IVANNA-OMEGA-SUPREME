@@ -179,12 +179,11 @@ public:
 
     // ── Clasificación adaptativa (fix CORONA Frente A, defecto 3) ────
     // Reenvía el flag del frontend mel real del clasificador (ver
-    // IvannaAudioClassifier::setRealFrontendEnabled). Default OFF
-    // (fail-closed): el clasificador sigue devolviendo siempre MUSIC y
-    // el sonido por defecto NO cambia (P0 en verde). Encenderlo vuelve
-    // adaptativo al guardián AntiDolby y CAMBIA el sonido: solo con
-    // decisión explícita de Esse + ABX. Sin cableado JNI/UI: nadie lo
-    // enciende por accidente desde la app.
+    // IvannaAudioClassifier::setRealFrontendEnabled). Default ON
+    // (orden Esse 2026-11-25, todo activo en la 502): el clasificador
+    // usa la FFT + banco mel reales y el guardián AntiDolby es
+    // adaptativo. Apagarlo vuelve al legacy (siempre MUSIC).
+    // Sin cableado JNI/UI: nadie lo apaga por accidente desde la app.
     void setAdaptiveClassificationEnabled(bool on) noexcept {
         classifier_.setRealFrontendEnabled(on);
     }
