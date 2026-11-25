@@ -213,6 +213,11 @@ float OrbeBinauralT<Scalar>::bandCoherence(int b) const noexcept {
     if (b < 0 || b >= activeBands_) return 0.0f;
     return coherence_[b];
 }
+template <typename Scalar>
+float OrbeBinauralT<Scalar>::bandConserverGain(int b) const noexcept {
+    if (!kOrbePowerConservation || b < 0 || b >= activeBands_) return 1.0f;
+    return nfCons_.gain[b];
+}
 
 template <typename Scalar>
 float OrbeBinauralT<Scalar>::thetaFromItd(float tauSeconds, float r) const noexcept {

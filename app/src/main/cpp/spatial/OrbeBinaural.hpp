@@ -133,6 +133,10 @@ public:
     float bandAzimuth(int b) const noexcept;
     float bandDistance(int b) const noexcept;
     float bandCoherence(int b) const noexcept;
+    // Ganancia del conservador de potencia por banda (Fase 1, M1): g_b del
+    // último frame comprometido. 1.0 si el flag está OFF o la banda no
+    // existe. La usa NeuCompiler::orbeMatrix para replicar el render vivo.
+    float bandConserverGain(int b) const noexcept;
     float meanCoherence() const noexcept { return meanCoherence_; }
     float appliedAmount() const noexcept { return static_cast<float>(wet_); }
     bool isActive() const noexcept { return wet_ > 0.0f || blend_ > 0.0f; }

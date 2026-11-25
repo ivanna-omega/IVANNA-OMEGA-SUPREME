@@ -193,6 +193,7 @@ TEST(NeuCompiler, E2OrbeSolo) {
         comp.orbe.azimuth[b] = orbe.bandAzimuth(b);
         comp.orbe.distance[b] = orbe.bandDistance(b);
         comp.orbe.coherence[b] = orbe.bandCoherence(b);
+        comp.orbe.conserverGain[b] = orbe.bandConserverGain(b);
     }
     comp.orbe.diffuse = 0.5f;
     comp.orbe.proximityDb = 3.0f;
@@ -260,6 +261,7 @@ TEST(NeuCompiler, E2BroadbandNoise) {
         comp.orbe.azimuth[b] = orbe.bandAzimuth(b);
         comp.orbe.distance[b] = orbe.bandDistance(b);
         comp.orbe.coherence[b] = orbe.bandCoherence(b);
+        comp.orbe.conserverGain[b] = orbe.bandConserverGain(b);
     }
     comp.orbe.diffuse = 0.5f;
     comp.orbe.proximityDb = 3.0f;
@@ -418,6 +420,7 @@ TEST(NeuCompiler, E4OrbeHolos) {
         comp.orbe.azimuth[b] = orbe.bandAzimuth(b);
         comp.orbe.distance[b] = orbe.bandDistance(b);
         comp.orbe.coherence[b] = orbe.bandCoherence(b);
+        comp.orbe.conserverGain[b] = orbe.bandConserverGain(b);
     }
     comp.orbe.diffuse = 0.5f;
     comp.orbe.proximityDb = 3.0f;

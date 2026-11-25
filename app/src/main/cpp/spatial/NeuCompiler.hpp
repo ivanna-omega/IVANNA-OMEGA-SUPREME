@@ -16,6 +16,7 @@
 #include "HolosGreenKernel.hpp"
 #include "NearFieldHeadModel.hpp"
 #include "OmegaOperator.hpp"  // Ω (v2.5.444): pre-compensación de diafonía
+#include "OrbeBinaural.hpp"  // flag M1 (IVANNA_ORBE_POWER_CONSERVATION) + kSideGain
 #include "SpectralCore.hpp"
 
 namespace ivanna::neu {
@@ -27,9 +28,18 @@ constexpr float kNeuPiF = 3.14159265358979323846f;
 /// Estado por banda de ORBE (lo que estimateBands produce).
 /// azimuth/distance/coherence son por banda; el resto es global.
 struct OrbeBandState {
+    // Ganancia del conservador por banda (Fase 1, M1): 1.0 por defecto
+    // (sin conservar). Quien congela el estado vivo la llena con
+    // OrbeBinaural::bandConserverGain(b); sin ella la equivalencia E2
+    // diverge a -48 dB en banda ancha (el render vivo aplica g_b por
+    // banda y la matriz sin ella no lo replica).
+    OrbeBandState() {
+        for (auto& g : conserverGain) g = 1.0f;
+    }
     float azimuth[SpectralCore::kMaxBands] = {};    // θ estimado por banda
     float distance[SpectralCore::kMaxBands] = {};   // r estimado por banda
     float coherence[SpectralCore::kMaxBands] = {};  // coherencia por banda
+    float conserverGain[SpectralCore::kMaxBands];   // g_b del conservador (M1)
     float diffuse = 0.5f;        // cuánto side pasa al render directo
     float proximityDb = 3.0f;    // techo del realce de proximidad (0..6)
     float headRadiusM = nearfield::kHeadRadiusM;
@@ -42,7 +52,8 @@ struct OrbeBandState {
 
 /// A_ORBE(banda, frecuencia): réplica EXACTA de OrbeBinaural::renderBins
 /// expresada como matriz 2x2. Misma matemática, mismos operandos:
-///   a = gL·phL, b = gR·phR, c = diffuse (real)
+///   a = gL·phL, b = gR·phR, c = sideGain (real: kSideGain=1.0 con M1 ON,
+///   diffuse con M1 OFF)
 ///   A = 0.5 · [[a+c, a−c], [b−c, b+c]]
 /// freqHz es la frecuencia CON SIGNO del bin (≥0 en 0..N/2; DC y Nyquist
 /// no rotan fase). sr es la tasa de muestreo.
@@ -87,11 +98,34 @@ inline NeuMat2x2 orbeMatrix(const OrbeBandState& s, int band, float freqHz,
     // a = gL·phL, b = gR·phR (complejos); c = diffuse (real).
     const float aRe = gL * phLRe, aIm = gL * phLIm;
     const float bRe = gR * phRRe, bIm = gR * phRIm;
-    const float c = s.diffuse;
+    // Fase 1 (M1, conservación de potencia): con el flag ON el render
+    // vivo usa sideGain = kSideGain (1.0), NO diffuse; con OFF usa
+    // diffuse. La matriz debe replicarlo: con c=diffuse=0.5 la
+    // equivalencia E2 diverge a -29 dB en banda ancha (el side es 0.075·L
+    // con ILD constante 0.85; el error 0.5·side ≈ -28.5 dB lo explica).
+    // El aLaw (escalado de ITD/ILD/estante por la Cantidad) NO se
+    // replica: en régimen con amount=1.0 vale 1.0; durante movimientos
+    // del slider el render vivo difiere transitoriamente por diseño
+    // (suavizado 25 ms). El conservador por banda (g_b, dependiente de
+    // la señal) tampoco está en la matriz: en E2 sus ganancias son
+    // ≈1.0 y la equivalencia se mantiene ≤ -80 dB.
+    const float c = ivanna::OrbeBinaural::kOrbePowerConservation
+                        ? ivanna::nf::kSideGain : s.diffuse;
     A.a00r = 0.5f * (aRe + c); A.a00i = 0.5f * aIm;
     A.a01r = 0.5f * (aRe - c); A.a01i = 0.5f * aIm;
     A.a10r = 0.5f * (bRe - c); A.a10i = 0.5f * bIm;
     A.a11r = 0.5f * (bRe + c); A.a11i = 0.5f * bIm;
+    // Conservador por banda (M1): el render vivo multiplica cada bin de
+    // la banda por g_b (BandPowerConserver::gain). La matriz es el render
+    // congelado: se escala por la g_b congelada en el estado. Con el flag
+    // OFF no hay conservador (g=1.0).
+    if (ivanna::OrbeBinaural::kOrbePowerConservation) {
+        const float g = s.conserverGain[band];
+        A.a00r *= g; A.a00i *= g;
+        A.a01r *= g; A.a01i *= g;
+        A.a10r *= g; A.a10i *= g;
+        A.a11r *= g; A.a11i *= g;
+    }
     return A;
 }
 
