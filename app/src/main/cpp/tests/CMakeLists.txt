@@ -979,10 +979,10 @@ gtest_discover_tests(test_orbe_binaural)
 
 # ── test_orbe_power_conservation: fix L1/L2 del defecto M1 (Fase 1, 2026-11-24) ──
 # BandPowerConserver + kSideGain=1.0 en OrbeBinaural, detrás del flag
-# kOrbePowerConservation. ESTE TARGET ES EL ÚNICO QUE COMPILA CON EL FLAG ON
-# (-DIVANNA_ORBE_POWER_CONSERVATION=1): es el único que ejercita el camino
-# ON; el resto de la suite (y producción) corre con el flag OFF. Mismas
-# fuentes que test_orbe_binaural (OrbeBinaural.cpp directo).
+# kOrbePowerConservation (ON por defecto, orden Esse 2026-11-25). El
+# -D=1 de este target es redundante con el default y se conserva como
+# cinturón: si alguien baja el default, este target sigue ejerciendo ON.
+# Mismas fuentes que test_orbe_binaural (OrbeBinaural.cpp directo).
 add_executable(test_orbe_power_conservation
   test_orbe_power_conservation.cpp
   ../spatial/OrbeBinaural.cpp

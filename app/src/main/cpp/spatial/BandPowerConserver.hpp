@@ -24,8 +24,8 @@
 //   AmountSmoother suaviza la Cantidad por frame (sin zipper).
 //
 // Uso: OrbeBinaural (spatial/OrbeBinaural.cpp), detrás del flag
-// IVANNA_ORBE_POWER_CONSERVATION (OFF por defecto, NUNCA por defecto
-// sin ABX: cambia el sonido y obliga a re-congelar P0).
+// IVANNA_ORBE_POWER_CONSERVATION (ON por defecto, orden Esse 2026-11-25,
+// todo activo en la 502; P0 se re-congela con el flag ON).
 #include <algorithm>
 #include <cmath>
 

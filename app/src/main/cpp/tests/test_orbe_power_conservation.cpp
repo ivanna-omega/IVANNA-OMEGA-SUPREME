@@ -3,11 +3,11 @@
 // defecto M1: ORBE perdía −2.05 dB con diffuse=0.5, lado S −6.02 dB;
 // ver analysis-portal5d/FASE0_M1_MEDICION.md).
 //
-// ESTE TARGET ES EL ÚNICO QUE COMPILA CON EL FLAG ON
-// (-DIVANNA_ORBE_POWER_CONSERVATION=1): es el único que ejercita el
-// camino ON; el resto de la suite (y producción) corre con el flag OFF
-// y el camino es el de siempre, bit-idéntico (verificado: el harness de
-// Fase 0 con el flag OFF reproduce los números de Fase 0 exactos).
+// El flag IVANNA_ORBE_POWER_CONSERVATION es ON por defecto (orden Esse
+// 2026-11-25, todo activo en la 502): TODA la suite y producción corren
+// el camino ON. Este target lo ejercita directamente (su -D=1 es
+// redundante con el default, se conserva como cinturón); el camino OFF
+// (legacy, −2.05 dB) ya no se compila por defecto en ningún sitio.
 //
 // Límites informados por la medición (harness m1_measure, 48 kHz,
 // ventana 1–2 s, g++-13): con el fix ON, decorr a=1 tot −0.01 dB,

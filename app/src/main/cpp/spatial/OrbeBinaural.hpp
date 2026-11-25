@@ -65,15 +65,14 @@ struct OrbeParams {
 
 // Fase 1 (consejo, plan 5D, 2026-11-24) — conservación de potencia por
 // banda L1/L2 (fix del defecto M1: OrbeBinaural pierde −2.05 dB con
-// diffuse=0.5; ver analysis-portal5d/FASE0_M1_MEDICION.md). Detrás de
-// flag compile-time, OFF por defecto. NUNCA por defecto sin ABX en el
-// teléfono (orden 8 de Luna) ni sin re-congelar P0: cambia el sonido.
-// El target test_orbe_power_conservation compila con
-// -DIVANNA_ORBE_POWER_CONSERVATION=1 para ejercitar el camino ON; en
-// producción y en el resto de la suite el flag es false y el camino es
-// el de siempre, bit-idéntico.
+// diffuse=0.5; ver analysis-portal5d/FASE0_M1_MEDICION.md). Flag
+// compile-time, ON por defecto (orden Esse 2026-11-25: todo activo en
+// la 502). P0 se re-congela con el flag ON: cambia el sonido (el total
+// pasa de −2.05 dB a −0.01 dB con ruido incorrelado). El target
+// test_orbe_power_conservation ejercita el camino ON (su -D=1 ya es
+// redundante con el default, se conserva como cinturón).
 #ifndef IVANNA_ORBE_POWER_CONSERVATION
-#define IVANNA_ORBE_POWER_CONSERVATION 0
+#define IVANNA_ORBE_POWER_CONSERVATION 1
 #endif
 
 // F2/486 (labor grande, motor double): plantilla con default float +
@@ -88,9 +87,9 @@ template <typename Scalar = float>
 class OrbeBinauralT {
 public:
     // Conservación de potencia L1/L2: false = diffuse=0.5 de siempre
-    // (comportamiento actual); true = kSideGain=1.0 + conservador por
-    // banda + aLaw + wet binario (solo en el target de test dedicado).
-    // Nunca true en producción sin ABX.
+    // (comportamiento legacy); true = kSideGain=1.0 + conservador por
+    // banda + aLaw + wet binario. true por defecto (orden Esse
+    // 2026-11-25, todo activo en la 502).
     static constexpr bool kOrbePowerConservation = (IVANNA_ORBE_POWER_CONSERVATION != 0);
 
     static constexpr int kHop = 128;  // == Ivanna::BLOCK_SIZE
