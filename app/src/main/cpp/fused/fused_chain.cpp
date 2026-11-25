@@ -1170,13 +1170,15 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
         // real y no ceros (sin esto, el cambio de modo dejaba 2 bloques
         // de 0 exacto). En HEADPHONES (tOmega false) nada cambia: M=I.
         // NOTA DE LATENCIA: al conmutar de la ruta espectral (FIFO ~512
-        // muestras) al kernel LTI (FIR causal de 128 taps, sin FIFO) la
-        // latencia de la etapa cambia; el morph de 512 muestras suaviza
-        // la ganancia pero no el salto de retardo. En régimen el kernel
-        // ya está enganchado desde el primer chunk con TΩ (compileTOmega
-        // corre antes, en el mismo chunk), así que la ruta espectral
-        // prácticamente no llega a sonar con D10 ON: la conmutación solo
-        // se ve al habilitar el D10 en caliente o tras un reset.
+        // muestras) al kernel LTI (FIR causal de 512 taps con
+        // desplazamiento circular de 256 — retardo puro de 5.33 ms en
+        // serie, fix-2 #1372) la latencia de la etapa cambia; el morph
+        // de 512 muestras suaviza la ganancia pero no el salto de
+        // retardo. En régimen el kernel ya está enganchado desde el
+        // primer chunk con TΩ (compileTOmega corre antes, en el mismo
+        // chunk), así que la ruta espectral prácticamente no llega a
+        // sonar con D10 ON: la conmutación solo se ve al habilitar el
+        // D10 en caliente o tras un reset.
         if (tOmega && d10Engine_.isEnabled() &&
             d10Engine_.ltiKernel().engaged()) {
             d10Engine_.ltiKernel().process(l, r, chunk);

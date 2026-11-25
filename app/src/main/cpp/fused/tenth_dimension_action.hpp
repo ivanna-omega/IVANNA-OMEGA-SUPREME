@@ -4,8 +4,9 @@
 // locks/syscalls/I-O tras prepare():
 //   1) ThermalMechanicalObserver64 — observador térmico-mecánico del
 //      transductor (bobina + imán + excursión por biquad resonante).
-//   2) TimeInvariantMatrixKernel2x2 — kernel matricial 2x2 LTI (FIR 128
-//      taps por rama) compilado desde el espectro TΩ unificado
+//   2) TimeInvariantMatrixKernel2x2 — kernel matricial 2x2 LTI (FIR 512
+//      taps por rama, la IFFT completa con desplazamiento circular de
+//      256) compilado desde el espectro TΩ unificado
 //      (apex::UnifiedFieldWorkspace::outMatrix), con morph suave.
 //   3) TenthDimensionActionEngine — árbitro D10: observación térmica y
 //      telemetría de acción hamiltoniana. La CORRECCIÓN DE GANANCIA por
@@ -178,7 +179,44 @@ private:
 
 class TimeInvariantMatrixKernel2x2 {
 public:
-    static inline constexpr int kMatrixFirTaps = 128;
+    // FIR 512 taps con DESPLAZAMIENTO CIRCULAR de 256 (fix-2, 2026-11-25):
+    // la FIR de 128 taps NO reproducía W(1000 Hz) — fuera de rejilla
+    // (1000/93.75 = 10.667 bins), daba xt 0.128 vs pred 0.058 y nivel
+    // −1.07 dB (test FusedChain.TOmegaSpeakersCrosstalk #1372); a 3000 Hz
+    // (bin exacto, 32) sí pasaba. La causa NO era el truncado: alargar a
+    // 256 midió xt 0.133 / −1.03 dB y la IFFT completa a 512 midió PEOR
+    // en xt (0.276 / −0.58 dB, aunque 3000 Hz quedó exacto: 0.036/0.00).
+    // La causa real (sonda probe-fir-interp.cpp, logs/fix-2): el IR del
+    // inverso Kirkeby es BILATERAL — 93.3% de la energía en n[0,128)
+    // pero 6.5% en tiempo NEGATIVO h[-128..-1] (la cancelación de
+    // crosstalk exige adelanto en la rama cruzada). Sin desplazar, esos
+    // taps quedan envueltos en [384,512) con fase e^{-jw·512} errónea
+    // fuera de rejilla (a 1000 Hz, 240° de error sobre el 6.5% de la
+    // energía → error relativo 34% en las ramas cruzadas). Afinar la
+    // rejilla NO lo arregla (N=1024/2048 miden lo mismo: el error depende
+    // solo de la posición fraccionaria del bin). El desplazamiento
+    // circular de 256 centra el IR ([-256,+256)) y devuelve cada tap a
+    // su retardo correcto, salvo una fase lineal COMÚN e^{-jw·256} (5.33
+    // ms @ 48 kHz, retardo puro en serie: no toca magnitudes). Medido
+    // con la sonda: 512 taps + shift 256 da xt 0.059 vs pred 0.058 y
+    // nivel +0.03 dB a 1000 Hz, y 0.036/0.00 dB a 3000 Hz (exacto);
+    // barrido 381..8000 Hz esencialmente exacto (|dxt|<=0.01). La
+    // variante 256 taps + shift 128 también pasaba (xt 0.050, −0.06 dB)
+    // pero con menos margen y peor banda media; se queda 512.
+    // Coste: 2048 MAC/muestra (4 ramas × 512); el test
+    // FusedChain.TOmegaDspUs lo vigila (p50 < 6666 µs/bloque de 320).
+    static inline constexpr int kMatrixFirTaps = 512;
+    // Desplazamiento circular del IR (muestras): centra la ventana en
+    // [-kFirCenterShift, +kFirCenterShift). Debe ser < kMatrixFirTaps.
+    static inline constexpr int kFirCenterShift = 256;
+    // LEGACY: longitud anterior (128 taps, ventana en 96..127). Medido
+    // insuficiente fuera de rejilla (#1372). La FIR de 256 taps sin
+    // desplazar también se midió insuficiente (xt 0.133, −1.03 dB) y no
+    // se conserva: el valor activo es la IFFT completa de 512 con
+    // desplazamiento circular.
+    static inline constexpr int kMatrixFirTapsLegacy128 = 128;
+    // Ventana de coseno elevado en los últimos taps (suaviza el truncado).
+    static inline constexpr int kFirWindowTaps = 32;
     static inline constexpr int kFftSizeD10 = 512;
     static inline constexpr int kFftBinsD10 = 257;
 
@@ -230,13 +268,28 @@ public:
                 }
             }
             apex::fftRadix2Double(scratch_.data(), kFftSizeD10, /*inverse=*/true);
-            // Taps 0..127 con ventana de coseno elevado en 96..127.
+            // Taps 0..kMatrixFirTaps-1 con DESPLAZAMIENTO CIRCULAR de
+            // kFirCenterShift: hTarget[n] = IFFT[(n - shift) mod 512].
+            // Sin desplazar, los taps anti-causales h[-256..-1] quedan
+            // envueltos al final del buffer con fase errónea fuera de
+            // rejilla (ver comentario de kMatrixFirTaps). Con el
+            // desplazamiento, la FIR es W(w) · e^{-jw·shift}: retardo
+            // puro en serie, magnitudes exactas. Sin ventana: la IFFT
+            // es completa (kMatrixFirTaps == kFftSizeD10); una ventana
+            // rompería la exactitud en los bins. Si algún día se vuelve
+            // a una FIR más corta que la FFT, la ventana de coseno
+            // elevado en los últimos kFirWindowTaps taps suaviza el
+            // truncado (código preservado abajo, inactivo con 512 taps).
             for (int n = 0; n < kMatrixFirTaps; ++n) {
-                double tap = scratch_[static_cast<std::size_t>(n)].real();
+                const int src = (n - kFirCenterShift + kFftSizeD10) % kFftSizeD10;
+                double tap = scratch_[static_cast<std::size_t>(src)].real();
                 if (!std::isfinite(tap)) tap = 0.0;
-                if (n >= 96) {
-                    const double win = 0.5 * (1.0 + std::cos(kPiD10 * static_cast<double>(n - 96) / 32.0));
-                    tap *= win;
+                if (kMatrixFirTaps < kFftSizeD10) {
+                    const int winStart = kMatrixFirTaps - kFirWindowTaps;
+                    if (n >= winStart) {
+                        const double win = 0.5 * (1.0 + std::cos(kPiD10 * static_cast<double>(n - winStart) / static_cast<double>(kFirWindowTaps)));
+                        tap *= win;
+                    }
                 }
                 hTarget_[static_cast<std::size_t>(branch)][static_cast<std::size_t>(n)] = tap;
             }
