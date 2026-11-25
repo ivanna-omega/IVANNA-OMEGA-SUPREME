@@ -1178,15 +1178,17 @@ TEST(FusedChainCoronaWiring, P8FlagOnAppliesWithZeroNetNominal) {
     EXPECT_FLOAT_EQ(c.dynamics.punch, 0.5f);       // PULSO (pegada)
     EXPECT_FLOAT_EQ(c.brain.adaptation, 0.5f);     // NEURO
     // Trim recomputado solo sobre lo aplicado:
-    // (0.10 - 0.05 + 0.08 + 0.12 + 0.06 - 0.04 + 0.02) * 0.5 = 0.145 -> -0.145.
-    // (CORONA D10: ARMONÍA +0.06 SÍ entra — antes de cd8fccf no se
-    // aplicaba y el trim era -0.115; con ARMONÍA aplicada el trim
-    // correcto es -0.145. Fix-arbiter 2026-11-25: expectativa actualizada
-    // al valor que el código ya daba.)
-    EXPECT_NEAR(c.tonal.trimDb, -0.145, 1e-6);
+    // (0.525 + 0.057 − 0.044 + 0.000 + 0.858 − 5.308 − 15.570) * 0.5
+    // = −19.482 * 0.5 = −9.741 -> trim +9.741.
+    // (Fix #1432, 2026-11-25: coeficientes NOMINALES sustituidos por los
+    // MEDIDOS en la cadena real — antes la suma era +0.29 y el trim
+    // −0.145; la suma medida es −19.482 dB a 1.0 (incluye la absorción
+    // del trim por PULSO), así que el trim a 0.5 es +9.741 dB. El clamp
+    // del trim es ±24 dB para que quepa.)
+    EXPECT_NEAR(c.tonal.trimDb, 9.741, 1e-6);
     // Ganancia neta NOMINAL de lo aplicado: 0.0 dB (Regla de Oro).
     // Tolerancia 1e-6, no 1e-9: el trim vive en tonal.trimDb (float32)
-    // y su redondeo al almacenar -0.145 ya mete ~2e-9 dB. La garantía
+    // y su redondeo al almacenar 9.741 ya mete ~2e-9 dB. La garantía
     // exacta (0.0 en double) es la del módulo (compiled.netGainDb,
     // verificada arriba); aquí se verifica la aplicada, en precisión
     // float32 del control real.

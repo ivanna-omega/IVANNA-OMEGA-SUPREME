@@ -194,7 +194,13 @@ struct TransducerControls {
 // Controles (solo estos): curva, trim.
 struct TonalControls {
     int curve = 1;           // 0 = plana, 1 = Harman 2018, 2 = élite (insignia).
-    float trimDb = 0.0f;     // trim -6..+6 dB (neto 0.0 dB por Matched-LUFS).
+    float trimDb = 0.0f;     // trim -24..+24 dB (neto 0.0 dB por Matched-LUFS).
+    // El rango es ±24 dB (antes ±6 dB) porque el trim es el compensador
+    // maestro de P8: la cadena real pierde ~14.2 dB con los 7 operadores
+    // a 1.0 (NEURO solo −15.57 dB/unidad, medido, fix #1432 2026-11-25)
+    // y el trim debe poder compensarla (+14.18 dB). El techo
+    // (0.9885531f, −0.1 dBFS) sigue siendo la protección dura contra
+    // clipping; el clamp solo acota el rango del control.
     float lowDb = 0.0f;      // graves -12..+12 dB.
     float midDb = 0.0f;      // medios -12..+12 dB.
     float highDb = 0.0f;     // agudos -12..+12 dB.
@@ -208,7 +214,7 @@ struct TonalControls {
 
     void clamp() noexcept {
         curve = std::clamp(curve, 0, 2);
-        trimDb = clampf(trimDb, -6.0f, 6.0f);
+        trimDb = clampf(trimDb, -24.0f, 24.0f);
         lowDb = clampf(lowDb, -12.0f, 12.0f);
         midDb = clampf(midDb, -12.0f, 12.0f);
         highDb = clampf(highDb, -12.0f, 12.0f);

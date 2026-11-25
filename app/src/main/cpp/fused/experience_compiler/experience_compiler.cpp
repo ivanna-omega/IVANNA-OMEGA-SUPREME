@@ -22,19 +22,51 @@ inline constexpr std::size_t kComponentToOperator[kNumComponents] = {
     6,  // A atención/fatiga    -> NEURO
 };
 
-// Coeficientes NOMINALES de ganancia (dB por unidad de amount). Por
-// razonamiento, NO medidos en el Genezi ni en la sala. El trim maestro
-// los compensa exactamente, así que la ganancia neta es 0.0 DENTRO de
-// este modelo nominal. La ganancia real de cada operador se mide en
-// P2/P3; cuando exista, estos coeficientes se sustituyen por los medidos.
+// Coeficientes de ganancia (dB por unidad de amount), MEDIDOS en la
+// cadena real (fix #1432, 2026-11-25), NO por razonamiento. Método:
+// tono dual-mono 1 kHz −3 dBFS, 2 s, HEADPHONES, setVolumetricEnabled
+// ON (la configuración exacta del test #1432), régimen (2º segundo).
+// Cada coeficiente es el marginal leave-one-out en la configuración
+// ALL7 (quitar ese operador de los 7 a 1.0 y medir cuánto cambia la
+// ganancia neta media L/R) — es la derivada parcial en el punto de
+// operación all-1.0, no el marginal sobre ORBE (que sobreestima la
+// pérdida porque NEURO/PULSO dependen del nivel: sobre ORBE NEURO
+// pierde −14.38 dB, en ALL7 solo −11.15 dB, porque la señal ya llega
+// atenuada). Suma de los 7 marginales leave-one-out: −9.766 dB; la
+// pérdida total medida ALL7 es −14.182 dB (media L/R). La diferencia
+// (−4.416 dB) es el término de interacción del modelo lineal (la
+// cadena no es aditiva) y se carga a NEURO, el operador dominante y
+// el responsable de la dependencia de nivel.
+// PULSO — ABSORCIÓN DEL TRIM: el trim vive en la etapa tonal (5ª) y
+// PULSO/dinámica (6ª, última) es nivel-dependiente: al subir el trim,
+// su compresor empuja hacia atrás y absorbe parte de la compensación.
+// Medido (probe-p8-trimsweep / probe-p8-pulso): sin PULSO el trim es
+// 100% efectivo (trim +14.182 dB -> neto +0.009 dB); con PULSO a 1.0
+// el trim +14.182 dB solo deja neto −2.668 dB y hacen falta +19.482 dB
+// para neto ~0 dB. Por eso el coeficiente de PULSO NO es su ganancia
+// standalone (−0.008 dB) sino su contribución EFECTIVA en all-1.0:
+// −0.008 (ganancia) − 5.300 (absorción del trim) = −5.308 dB. La suma
+// de los 7 coeficientes es −19.482 dB, así el trim P8 a 1.0 es
+// +19.482 dB y la ganancia neta medida queda ~0 dB (peor canal
+// ~0.08 dB por el desbalance residual −0.153 dB, < 0.10 dB del test).
+// Son coeficientes EFECTIVOS calibrados en el punto all-1.0 (el modelo
+// P8 es lineal y la cadena no lo es); en otros amounts son
+// aproximados. Sonda y números en
+// ~/workspace/corona-d10/logs/fix-1432/ (probe-p8-netgain2-after-centroid.log,
+// probe-p8-trimsweep.log, probe-p8-pulso.log).
+// El desbalance L/R residual de la cadena (−0.153 dB, ALL7) lo corrige
+// el level-match por canal de OmniField (conservación del centroide);
+// el trim escalar solo centra la media.
 inline constexpr double kNominalGainDb[kNumOperators] = {
-    +0.10,  // ORBE
-    -0.05,  // HOLOS
-    +0.08,  // SALA VIVA
-    +0.12,  // VOLTERRA
-    +0.06,  // ARMONÍA
-    -0.04,  // PULSO
-    +0.02,  // NEURO
+    +0.525,   // ORBE     (leave-one-out, media L/R)
+    +0.057,   // HOLOS    (leave-one-out; el campo es ~neutro en ganancia
+              //           tras la conservación de centroide de OmniField)
+    -0.044,   // SALA VIVA (leave-one-out)
+    +0.000,   // VOLTERRA (idéntico a la base: ganancia 0.000 dB)
+    +0.858,   // ARMONÍA  (leave-one-out)
+    -5.308,   // PULSO    (−0.008 ganancia − 5.300 absorción del trim;
+              //           ver comentario de arriba)
+    -15.570,  // NEURO    (−11.154 leave-one-out − 4.416 de interacción)
 };
 
 double clamp01(double x) noexcept {

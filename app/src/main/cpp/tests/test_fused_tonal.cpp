@@ -141,7 +141,8 @@ TEST(FusedTonal, ControlClamping) {
     t.setControls(c);
     const TonalControls got = t.controls();
     EXPECT_EQ(got.curve, 2);
-    EXPECT_FLOAT_EQ(got.trimDb, 6.0f);
+    EXPECT_FLOAT_EQ(got.trimDb, 24.0f);  // clamp ±24 dB (fix #1432:
+    // el trim compensa la pérdida real de P8, ~+14.2 dB a 1.0)
     EXPECT_FLOAT_EQ(got.lowDb, -12.0f);
     EXPECT_FLOAT_EQ(got.midDb, 12.0f);
     EXPECT_FLOAT_EQ(got.highDb, -12.0f);

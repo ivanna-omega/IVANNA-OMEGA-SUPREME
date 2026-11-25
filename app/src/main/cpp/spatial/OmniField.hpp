@@ -123,7 +123,8 @@ public:
         fault_ = false;
         designCount_ = 0;
         blockIndex_ = 0;
-        levelGain_ = 1.0f;
+        levelGainL_ = 1.0f;
+        levelGainR_ = 1.0f;
         hasProcessed_ = false;
     }
 
@@ -500,30 +501,58 @@ private:
                 outR_[i] += tmpR_[i] * gainE;
             }
         }
-        // 8. Nivel: match suave y acotado hacia la energía de entrada, y
-        // fault si el renderer produce (casi) silencio con entrada presente.
-        double inE = 0.0, renE = 0.0;
+        // 8. Nivel POR CANAL: match suave y acotado hacia la energía de
+        // entrada de CADA canal, y fault si el renderer produce (casi)
+        // silencio con entrada presente.
+        // Conservación del centroide (fix #1432, 2026-11-25): el level-match
+        // escalar anterior solo preservaba la energía TOTAL; los stems se
+        // renderizan en azimuts canónicos asimétricos (OTHER a +60°, DRUMS
+        // a −30°) y el render desplazaba el balance L/R de una entrada
+        // centrada (dual-mono 1 kHz: −7.97 dB, la imagen se iba a la
+        // derecha) aunque la energía total quedara intacta. Un trim escalar
+        // (P8) no puede corregir un desbalance L/R. El match por canal
+        // fija la ganancia de cada oído a sqrt(E_entrada_canal /
+        // E_render_canal): preserva la energía total Y el balance L/R de
+        // la entrada (su centroide espacial). Las pistas espaciales
+        // (ITD/ILD por stem) se conservan — solo se corrige el sesgo neto
+        // del campo. Mismo suavizado (0.05/bloque) y mismo clamp [0.5, 2.0]
+        // que el escalar anterior; el bypass bit-exacto (amount 0) y el
+        // fault no cambian.
+        double inEL = 0.0, inER = 0.0, renEL = 0.0, renER = 0.0;
         for (int i = 0; i < m; ++i) {
-            inE += l[i] * l[i] + r[i] * r[i];
-            renE += outL_[i] * outL_[i] + outR_[i] * outR_[i];
+            inEL += l[i] * l[i];
+            inER += r[i] * r[i];
+            renEL += outL_[i] * outL_[i];
+            renER += outR_[i] * outR_[i];
         }
-        inE /= static_cast<double>(2 * m);
-        renE /= static_cast<double>(2 * m);
+        const double invM = 1.0 / static_cast<double>(m);
+        inEL *= invM;
+        inER *= invM;
+        renEL *= invM;
+        renER *= invM;
+        const double inE = 0.5 * (inEL + inER);
+        const double renE = 0.5 * (renEL + renER);
         if (inE > 1e-8 && renE < inE * 1e-6) {
             fault_ = true;
             return;  // no se tocan l/r: bypass
         }
-        if (inE > 1e-12 && renE > 1e-12) {
-            double tgt = std::sqrt(inE / renE);
-            tgt = std::clamp(tgt, 0.5, 2.0);
-            levelGain_ += (tgt - levelGain_) * 0.05;
+        if (inEL > 1e-12 && renEL > 1e-12) {
+            double tgtL = std::sqrt(inEL / renEL);
+            tgtL = std::clamp(tgtL, 0.5, 2.0);
+            levelGainL_ += (tgtL - levelGainL_) * 0.05;
+        }
+        if (inER > 1e-12 && renER > 1e-12) {
+            double tgtR = std::sqrt(inER / renER);
+            tgtR = std::clamp(tgtR, 0.5, 2.0);
+            levelGainR_ += (tgtR - levelGainR_) * 0.05;
         }
         // 9. Mezcla wet/dry (el dry es la entrada original, aún intacta).
         const double a = appliedAmount_;
-        const double g = levelGain_;
+        const double gL = levelGainL_;
+        const double gR = levelGainR_;
         for (int i = 0; i < m; ++i) {
-            l[i] = (1.0 - a) * l[i] + a * outL_[i] * g;
-            r[i] = (1.0 - a) * r[i] + a * outR_[i] * g;
+            l[i] = (1.0 - a) * l[i] + a * outL_[i] * gL;
+            r[i] = (1.0 - a) * r[i] + a * outR_[i] * gR;
         }
         // Chunk renderizado de verdad: cuenta para la telemetría Ruta A.
         blocksRendered_.fetch_add(1, std::memory_order_relaxed);
@@ -540,7 +569,8 @@ private:
     bool fault_ = false;
     uint32_t designCount_ = 0;
     int blockIndex_ = 0;
-    double levelGain_ = 1.0;
+    double levelGainL_ = 1.0;  // match por canal (conserva centroide L/R)
+    double levelGainR_ = 1.0;
 
     StemSeparator separator_;
     SceneEstimator scene_;
