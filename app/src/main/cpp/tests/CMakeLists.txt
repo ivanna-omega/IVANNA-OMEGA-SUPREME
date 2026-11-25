@@ -3261,6 +3261,27 @@ if(IVANNA_SAN_FLAGS)
 endif()
 gtest_discover_tests(test_double_floor)
 
+# ── CORONA D10: 5 tests (2026-11-25) ──────────────────────────────────────
+# TΩ-2 LTI (bandas laterales ±375 Hz), neutro bit-exacto con D10 ON,
+# Matched-LUFS con los 7 operadores, protección térmica de bobina y
+# convergencia monótona de la acción hamiltoniana.
+# Registro con el patrón de test_double_floor (add_executable +
+# ${FUSED_CHAIN_SOURCES}): ivanna_add_test NO vale aquí porque
+# FusedChain no está en ivanna_dsp_under_test (solo en
+# ${FUSED_CHAIN_SOURCES}); un ivanna_add_test pelado fallaría al enlazar.
+add_executable(test_d10_corona
+  test_d10_corona.cpp
+  ${FUSED_CHAIN_SOURCES}
+)
+target_include_directories(test_d10_corona PRIVATE .. ../include ../neuromorphic ../dsp host_stubs)
+target_compile_options(test_d10_corona PRIVATE -Wall -Wextra)
+target_link_libraries(test_d10_corona PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_d10_corona PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_d10_corona PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_d10_corona)
+
 # ── Capa de conservación perceptual (árbitro de campo, 2026-11-21) ─────────
 # Solver (nunca crea energía, techo, silencio) + capa standalone (bypass
 # bit-exacto, límite de energía, slew) + integración en FusedChain
