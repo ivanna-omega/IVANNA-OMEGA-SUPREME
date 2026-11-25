@@ -1110,8 +1110,8 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
         // es la última barrera — APEX 2 suma el transitorio DESPUÉS de él
         // (hotmix_01: APEX ON +0.81 dBFS, APEX OFF −0.14 dBFS) y TΩ también
         // puede subir el pico. Este techo es la última barrera absoluta:
-        // clava la salida a ±0.98855 (−0.1 dBFS, el MISMO techo del safety
-        // limiter, para que ambos no diverjan). Transparente bajo el techo
+        // clava la salida a ±0.9885531f (−0.1 dBFS exacto a float32, el
+        // MISMO techo del safety limiter, para que ambos no diverjan). Transparente bajo el techo
         // (bit-idéntico: solo actúa cuando |x| > techo) y fail-closed.
         // Solo cuando la cadena NO es neutra: en bypass no corre y se
         // preserva la bit-exactitud. No cambia la ganancia neta (Regla de

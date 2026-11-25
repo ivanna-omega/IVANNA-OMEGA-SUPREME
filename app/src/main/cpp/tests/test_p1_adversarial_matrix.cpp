@@ -377,11 +377,62 @@ TEST(P1AdversarialMatrix, ApexLimiterDiagnostic) {
         const double peak = dbfs(std::max(peak_abs(l, 0, n), peak_abs(r, 0, n)));
         std::printf("[APEX-DIAG] hotmix ivanna apex=%s peak=%.3f dBFS (entrada -0.5)\n",
                     apexOn ? "ON " : "OFF", peak);
-        // El techo final (-0.1 dBFS = 0.98855) debe contener el pico con
-        // APEX ON y OFF: el transitorio ya no rodea el limiter.
+        // El techo final (-0.1 dBFS = 0.9885531f, float32 exacto) debe
+        // contener el pico con APEX ON y OFF: el transitorio ya no
+        // rodea el limiter.
         EXPECT_LE(peak, -0.09) << "techo final: el pico debe quedar en -0.1 dBFS con APEX "
                                << (apexOn ? "ON" : "OFF");
         EXPECT_LE(peak, 0.0) << "clipping digital con APEX " << (apexOn ? "ON" : "OFF");
+    }
+}
+
+// Techo final con material a 0 dBFS (CORONA, orden Esse 2026-11-25 —
+// rango dinámico exacto): el techo debe contener el pico aunque la
+// entrada ya esté a fondo de escala, con APEX ON y OFF. Dos señales:
+// hotmix_01 escalado a pico 1.0 exacto (0 dBFS) y seno 1 kHz a 1.0.
+// El techo final es la última barrera (fused_chain.cpp, tras APEX 2 +
+// TΩ) y clava a ±0.9885531f (-0.1 dBFS exacto a float32); ninguna
+// muestra puede superarlo. (Sin el techo final, el hotmix a -0.5 dBFS
+// llegaba a +0.81 dBFS con APEX ON — ver ApexLimiterDiagnostic.)
+TEST(P1AdversarialMatrix, ApexLimiterCeilingAtFullScale) {
+    GenOptions opt;
+    opt.seed = 0;
+    opt.variant = Variant::Mono;
+    const Signal hot = generate_case("hotmix_01", opt);
+    const size_t n = hot.frames();
+    const double hotPeak = std::max(peak_abs(hot.l, 0, n), peak_abs(hot.r, 0, n));
+    ASSERT_GT(hotPeak, 0.0);
+    std::vector<double> hotL = hot.l, hotR = hot.r;
+    for (size_t i = 0; i < n; ++i) { hotL[i] /= hotPeak; hotR[i] /= hotPeak; }
+    ASSERT_NEAR(dbfs(std::max(peak_abs(hotL, 0, n), peak_abs(hotR, 0, n))), 0.0, 1e-9);
+
+    std::vector<double> sineL(n), sineR(n);
+    for (size_t i = 0; i < n; ++i) {
+        sineL[i] = sineR[i] = std::sin(2.0 * 3.14159265358979323846 * 1000.0 *
+                                       static_cast<double>(i) / 48000.0);
+    }
+
+    for (int sig = 0; sig < 2; ++sig) {
+        for (int apexOn = 1; apexOn >= 0; --apexOn) {
+            FusedChain chain;
+            chain.prepare(48000.0);
+            chain.setControls(engagedControls());
+            chain.setApexEnabled(apexOn != 0);
+            std::vector<double> l = (sig == 0) ? hotL : sineL;
+            std::vector<double> r = (sig == 0) ? hotR : sineR;
+            for (size_t off = 0; off < n; off += 128) {
+                const int chunk = static_cast<int>(std::min<size_t>(128, n - off));
+                chain.process(l.data() + off, r.data() + off, chunk);
+            }
+            const double peak = dbfs(std::max(peak_abs(l, 0, n), peak_abs(r, 0, n)));
+            std::printf("[APEX-FS] %s 0 dBFS apex=%s peak=%.3f dBFS\n",
+                        sig == 0 ? "hotmix" : "seno1k", apexOn ? "ON " : "OFF", peak);
+            EXPECT_LE(peak, -0.09) << "techo final: material a 0 dBFS ("
+                                   << (sig == 0 ? "hotmix" : "seno 1kHz")
+                                   << ") con APEX " << (apexOn ? "ON" : "OFF");
+            EXPECT_LE(peak, 0.0) << "clipping digital a 0 dBFS con APEX "
+                                 << (apexOn ? "ON" : "OFF");
+        }
     }
 }
 

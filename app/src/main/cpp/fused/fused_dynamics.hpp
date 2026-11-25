@@ -86,8 +86,14 @@ public:
     static constexpr double kVoiceShelfFreqHz = 3000.0;
     static constexpr double kVoiceMaxGainDb = 3.0;
     // SafetyLimiter: parámetros de ruta reales (-1 dBFS / -0.1 dBFS).
+    // Valores EXACTOS a precisión float32 (no redondeos a 5 decimales):
+    //   threshold = float32 más cercano a 10^(-1/20)   → -0.9999991 dB
+    //   ceiling   = float32 más cercano a 10^(-0.1/20) → -0.0999999 dB
+    // El literal anterior 0.98855f era -0.1000271 dB (2.7e-5 dB más
+    // estricto que el -0.1 dB nominal); el techo final de fused_chain.cpp
+    // usa ESTA misma constante, así que limiter y techo final no divergen.
     static constexpr float kLimiterThreshold = 0.891251f;
-    static constexpr float kLimiterCeiling = 0.98855f;
+    static constexpr float kLimiterCeiling = 0.9885531f;
 
     FusedDynamics() = default;
     FusedDynamics(const FusedDynamics&) = delete;
