@@ -6,7 +6,7 @@
 
 **Escucha la música como si estuvieras ahí.**
 
-[![Version](https://img.shields.io/badge/version-2.5.501-c8a96b?style=flat-square)](https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME/releases/tag/v2.5.501)
+[![Version](https://img.shields.io/badge/version-2.5.502-c8a96b?style=flat-square)](https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME/releases/tag/v2.5.502)
 [![Android](https://img.shields.io/badge/Android-13%2B-83c6b0?style=flat-square)](https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/ivanna-omega/IVANNA-OMEGA-SUPREME/build.yml?branch=main&label=CI%20main&style=flat-square)](https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME/actions/workflows/build.yml)
 
