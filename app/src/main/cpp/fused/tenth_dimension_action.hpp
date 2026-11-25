@@ -1,0 +1,456 @@
+// tenth_dimension_action.hpp — CORONA D10: acción de décima dimensión.
+//
+// Tres piezas, todo en C++20, plano double, `noexcept`, cero malloc/new/
+// locks/syscalls/I-O tras prepare():
+//   1) ThermalMechanicalObserver64 — observador térmico-mecánico del
+//      transductor (bobina + imán + excursión por biquad resonante).
+//   2) TimeInvariantMatrixKernel2x2 — kernel matricial 2x2 LTI (FIR 128
+//      taps por rama) compilado desde el espectro TΩ unificado
+//      (apex::UnifiedFieldWorkspace::outMatrix), con morph suave.
+//   3) TenthDimensionActionEngine — árbitro D10: ganancia de energía con
+//      slew, protección térmica y telemetría de acción hamiltoniana.
+//
+// Origen: documento D10 de Gemini, §3, RECONSTRUIDO y CORREGIDO contra el
+// código vivo (el código del documento estaba parcialmente corrupto y su
+// fórmula ITD era inventada — aquí el ITD acoplado usa la ley de
+// curvatura verificada propagation::curvatureLawItdSeconds).
+//
+// En neutro el motor NO toca el buffer: arbitrateAction() es no-op si
+// !enabled, y el kernel es no-op si !engaged_. El llamador además solo
+// lo invoca cuando !neutral.
+//
+// © 2026 Luis Uriel Pimentel Pérez — GORE TNS. All rights reserved.
+#pragma once
+
+#include "fused/physical_propagation.hpp"
+#include "fused/unified_field_kernel.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <complex>
+#include <cstdint>
+
+namespace ivanna::fused::d10 {
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1) Observador térmico-mecánico del transductor
+// ═══════════════════════════════════════════════════════════════════════════
+
+// SUPOSICIONES NO MEDIDAS para el Sony Genezi MHC-PZ1D: no existen
+// parámetros térmicos medidos de este transductor (tau térmica de bobina
+// e imán, temperatura máxima segura, Qts, fs, potencia nominal). Los
+// valores por defecto son estimaciones de ingeniería razonables para un
+// altavoz de estantería / minicadena de ~120 W. El observador ESTIMA el
+// estado térmico a partir de la señal, NO MIDE temperatura real: no hay
+// sensor térmico en el transductor. Si algún día se miden los parámetros
+// reales, se sustituyen aquí y solo aquí.
+struct TransducerPhysicalSpec {
+    double nominalImpedanceOhm = 6.0;    // impedancia nominal (ohm)
+    double ratedPowerWatts = 120.0;      // potencia nominal (W)
+    double coilThermalTauSec = 8.5;      // tau térmica de la bobina (s)
+    double magnetThermalTauSec = 180.0;  // tau térmica del imán (s)
+    double ambientTempC = 25.0;          // temperatura ambiente (°C)
+    double maxSafeTempC = 145.0;         // temperatura máxima segura (°C)
+    double resonantFreqHz = 52.0;        // fs del transductor (Hz)
+    double qts = 0.68;                   // Q total
+    double xMaxNormalized = 1.0;         // excursión máxima normalizada
+};
+
+struct TransducerThermalState {
+    double coilTempC = 25.0;              // temperatura estimada bobina (°C)
+    double magnetTempC = 25.0;            // temperatura estimada imán (°C)
+    double thermalCompressionRatio = 1.0; // 1/rFactor, clamp [0.5, 1]
+    double normalizedExcursionPeak = 0.0; // pico de excursión / xMax
+    double powerCompressionDb = 0.0;      // -20*log10(rFactor) (<= 0 dB)
+};
+
+class ThermalMechanicalObserver64 {
+public:
+    void prepare(double sampleRate, const TransducerPhysicalSpec& spec = TransducerPhysicalSpec{}) noexcept {
+        sampleRate_ = (std::isfinite(sampleRate) && sampleRate > 0.0) ? sampleRate : 48000.0;
+        spec_ = spec;
+        // Biquad resonante pasa-bajos de 2º orden para estimar excursión
+        // (desplazamiento ~ integral doble de la aceleración; el resonador
+        // en fs aproxima la respuesta mecánica del transductor).
+        const double fs = std::clamp(spec_.resonantFreqHz, 20.0, 200.0);
+        const double w0 = 2.0 * kPiD10 * fs / sampleRate_;
+        const double cosw0 = std::cos(w0);
+        const double alpha = std::sin(w0) / (2.0 * std::max(0.2, spec_.qts));
+        const double denom = 1.0 + alpha;
+        b0_ = ((1.0 - cosw0) * 0.5) / denom;
+        b1_ = (1.0 - cosw0) / denom;
+        b2_ = b0_;
+        a1_ = (-2.0 * cosw0) / denom;
+        a2_ = (1.0 - alpha) / denom;
+        // Coeficientes térmicos por muestra (integración exacta 1er orden).
+        alphaCoil_ = 1.0 - std::exp(-1.0 / (std::max(0.1, spec_.coilThermalTauSec) * sampleRate_));
+        alphaMagnet_ = 1.0 - std::exp(-1.0 / (std::max(1.0, spec_.magnetThermalTauSec) * sampleRate_));
+        reset();
+    }
+
+    void reset() noexcept {
+        x1L_ = x2L_ = y1L_ = y2L_ = 0.0;
+        x1R_ = x2R_ = y1R_ = y2R_ = 0.0;
+        coilRise_ = 0.0;
+        magnetRise_ = 0.0;
+        maxExcursion_ = 0.0;
+        state_ = TransducerThermalState{};
+        state_.coilTempC = spec_.ambientTempC;
+        state_.magnetTempC = spec_.ambientTempC;
+    }
+
+    // Observa un bloque y devuelve el estado térmico estimado.
+    // meanSq es la potencia media cuadrática (media de l^2 y r^2).
+    TransducerThermalState observeBlock(const double* l, const double* r, int frames) noexcept {
+        if (!l || !r || frames <= 0) return state_;
+        double sumSq = 0.0;
+        for (int i = 0; i < frames; ++i) {
+            const double xl = std::isfinite(l[i]) ? l[i] : 0.0;
+            const double xr = std::isfinite(r[i]) ? r[i] : 0.0;
+            // Biquad resonante por canal (desplazamiento estimado).
+            const double dL = b0_ * xl + b1_ * x1L_ + b2_ * x2L_ - a1_ * y1L_ - a2_ * y2L_;
+            x2L_ = x1L_; x1L_ = xl; y2L_ = y1L_; y1L_ = dL;
+            const double dR = b0_ * xr + b1_ * x1R_ + b2_ * x2R_ - a1_ * y1R_ - a2_ * y2R_;
+            x2R_ = x1R_; x1R_ = xr; y2R_ = y1R_; y1R_ = dR;
+            // Envolvente de excursión: máximo absoluto con decaimiento.
+            const double absD = std::max(std::fabs(dL), std::fabs(dR));
+            if (absD > maxExcursion_) {
+                maxExcursion_ = absD;
+            } else {
+                maxExcursion_ *= 0.9992;
+            }
+            sumSq += xl * xl + xr * xr;
+        }
+        const double meanSq = sumSq / (2.0 * static_cast<double>(frames));
+        const double estWatts = meanSq * spec_.ratedPowerWatts;
+        // Resistencia de la bobina de cobre: +0.393 %/°C.
+        const double rFactor = 1.0 + 0.00393 * (coilRise_ + magnetRise_);
+        const double effWatts = estWatts * rFactor;
+        const double targetRise = (effWatts / std::max(1.0, spec_.ratedPowerWatts)) *
+                                  (spec_.maxSafeTempC - spec_.ambientTempC);
+        // Paso térmico exacto del bloque (1er orden, `frames` muestras).
+        const double stepCoil = 1.0 - std::pow(1.0 - alphaCoil_, static_cast<double>(frames));
+        const double stepMagnet = 1.0 - std::pow(1.0 - alphaMagnet_, static_cast<double>(frames));
+        coilRise_ += stepCoil * (targetRise * 0.72 - coilRise_);
+        magnetRise_ += stepMagnet * (targetRise * 0.28 - magnetRise_);
+
+        state_.coilTempC = spec_.ambientTempC + coilRise_;
+        state_.magnetTempC = spec_.ambientTempC + magnetRise_;
+        state_.normalizedExcursionPeak = maxExcursion_ / std::max(1e-6, spec_.xMaxNormalized);
+        state_.powerCompressionDb = -20.0 * std::log10(std::max(1.0, rFactor));
+        state_.thermalCompressionRatio = std::clamp(1.0 / rFactor, 0.5, 1.0);
+        return state_;
+    }
+
+    const TransducerThermalState& state() const noexcept { return state_; }
+    double sampleRate() const noexcept { return sampleRate_; }
+
+private:
+    static inline constexpr double kPiD10 = 3.14159265358979323846;
+
+    double sampleRate_ = 48000.0;
+    TransducerPhysicalSpec spec_{};
+    // Coeficientes del biquad resonante.
+    double b0_ = 0.0, b1_ = 0.0, b2_ = 0.0, a1_ = 0.0, a2_ = 0.0;
+    // Estados del biquad por canal.
+    double x1L_ = 0.0, x2L_ = 0.0, y1L_ = 0.0, y2L_ = 0.0;
+    double x1R_ = 0.0, x2R_ = 0.0, y1R_ = 0.0, y2R_ = 0.0;
+    double alphaCoil_ = 0.0;
+    double alphaMagnet_ = 0.0;
+    double coilRise_ = 0.0;    // subida térmica bobina sobre ambiente (°C)
+    double magnetRise_ = 0.0;  // subida térmica imán sobre ambiente (°C)
+    double maxExcursion_ = 0.0;
+    TransducerThermalState state_{};
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2) Kernel matricial 2x2 LTI (FIR por rama, compilado desde el espectro TΩ)
+// ═══════════════════════════════════════════════════════════════════════════
+
+class TimeInvariantMatrixKernel2x2 {
+public:
+    static inline constexpr int kMatrixFirTaps = 128;
+    static inline constexpr int kFftSizeD10 = 512;
+    static inline constexpr int kFftBinsD10 = 257;
+
+    void prepare() noexcept {
+        for (auto& h : hActive_) h.fill(0.0);
+        for (auto& h : hTarget_) h.fill(0.0);
+        // Identidad: L->L y R->R con un solo tap en 0.
+        hActive_[0][0] = 1.0;
+        hActive_[3][0] = 1.0;
+        hTarget_[0][0] = 1.0;
+        hTarget_[3][0] = 1.0;
+        ringL_.fill(0.0);
+        ringR_.fill(0.0);
+        wp_ = 0;
+        morphAlpha_ = 1.0;
+        engaged_ = false;
+    }
+
+    void reset() noexcept {
+        ringL_.fill(0.0);
+        ringR_.fill(0.0);
+        wp_ = 0;
+        morphAlpha_ = 1.0;
+    }
+
+    bool engaged() const noexcept { return engaged_; }
+    double morphAlpha() const noexcept { return morphAlpha_; }
+    // Morph terminado: coeficientes activos == objetivo.
+    bool morphComplete() const noexcept { return engaged_ && morphAlpha_ >= 1.0; }
+
+    // Compila las FIR desde el espectro TΩ (matriz 2x2 por bin, 257 bins).
+    // Ramas: [0]=m00 (L->L), [1]=m01 (R->L), [2]=m10 (L->R), [3]=m11 (R->R).
+    void updateFromCompiledSpectrum(
+        const std::array<apex::ComplexMatrix2x2, apex::kMaxUnifiedBins>& m) noexcept {
+        for (int branch = 0; branch < 4; ++branch) {
+            // Buffer hermítico de 512 puntos: DC y Nyquist forzados reales,
+            // espejo conjugado para k = 1..255.
+            scratch_.fill(std::complex<double>(0.0, 0.0));
+            for (int k = 0; k < kFftBinsD10; ++k) {
+                const std::complex<double> v = branchValue(m[static_cast<std::size_t>(k)], branch);
+                if (k == 0 || k == kFftBinsD10 - 1) {
+                    scratch_[static_cast<std::size_t>(k)] =
+                        std::complex<double>(std::isfinite(v.real()) ? v.real() : 0.0, 0.0);
+                } else {
+                    scratch_[static_cast<std::size_t>(k)] =
+                        std::complex<double>(std::isfinite(v.real()) ? v.real() : 0.0,
+                                             std::isfinite(v.imag()) ? v.imag() : 0.0);
+                    scratch_[static_cast<std::size_t>(kFftSizeD10 - k)] = std::conj(scratch_[static_cast<std::size_t>(k)]);
+                }
+            }
+            apex::fftRadix2Double(scratch_.data(), kFftSizeD10, /*inverse=*/true);
+            // Taps 0..127 con ventana de coseno elevado en 96..127.
+            for (int n = 0; n < kMatrixFirTaps; ++n) {
+                double tap = scratch_[static_cast<std::size_t>(n)].real();
+                if (!std::isfinite(tap)) tap = 0.0;
+                if (n >= 96) {
+                    const double win = 0.5 * (1.0 + std::cos(kPiD10 * static_cast<double>(n - 96) / 32.0));
+                    tap *= win;
+                }
+                hTarget_[static_cast<std::size_t>(branch)][static_cast<std::size_t>(n)] = tap;
+            }
+        }
+        morphAlpha_ = 0.0;
+        engaged_ = true;
+    }
+
+    // Convolución matricial in-place. No-op si !engaged_.
+    // morphSamples: muestras para el morph hActive_ -> hTarget_.
+    void process(double* l, double* r, int frames, double morphSamples = 512.0) noexcept {
+        if (!l || !r || frames <= 0 || !engaged_) return;
+        const double morphStep = 1.0 / std::max(1.0, morphSamples);
+        for (int i = 0; i < frames; ++i) {
+            const double inL = std::isfinite(l[i]) ? l[i] : 0.0;
+            const double inR = std::isfinite(r[i]) ? r[i] : 0.0;
+            ringL_[static_cast<std::size_t>(wp_)] = inL;
+            ringR_[static_cast<std::size_t>(wp_)] = inR;
+            // Morph: interpola hActive_ hacia hTarget_ por tap; al llegar
+            // a 1.0 copia hTarget_ a hActive_ (exacto). En régimen
+            // (morphAlpha_ == 1.0) este bloque se salta entero.
+            if (morphAlpha_ < 1.0) {
+                morphAlpha_ = std::min(1.0, morphAlpha_ + morphStep);
+                for (int b = 0; b < 4; ++b) {
+                    for (int t = 0; t < kMatrixFirTaps; ++t) {
+                        const std::size_t bi = static_cast<std::size_t>(b);
+                        const std::size_t ti = static_cast<std::size_t>(t);
+                        hActive_[bi][ti] += morphStep * (hTarget_[bi][ti] - hActive_[bi][ti]);
+                    }
+                }
+                if (morphAlpha_ >= 1.0) hActive_ = hTarget_;
+            }
+            double outL = 0.0;
+            double outR = 0.0;
+            for (int t = 0; t < kMatrixFirTaps; ++t) {
+                const int idx = (wp_ - t + kMatrixFirTaps) & (kMatrixFirTaps - 1);
+                const std::size_t ri = static_cast<std::size_t>(idx);
+                const std::size_t ti = static_cast<std::size_t>(t);
+                outL += hActive_[0][ti] * ringL_[ri] + hActive_[1][ti] * ringR_[ri];
+                outR += hActive_[2][ti] * ringL_[ri] + hActive_[3][ti] * ringR_[ri];
+            }
+            l[i] = outL;
+            r[i] = outR;
+            wp_ = (wp_ + 1) & (kMatrixFirTaps - 1);
+        }
+    }
+
+private:
+    static inline constexpr double kPiD10 = 3.14159265358979323846;
+
+    static std::complex<double> branchValue(const apex::ComplexMatrix2x2& m, int branch) noexcept {
+        switch (branch) {
+            case 0: return m.m00;
+            case 1: return m.m01;
+            case 2: return m.m10;
+            default: return m.m11;
+        }
+    }
+
+    // [rama][tap]: 0=m00, 1=m01, 2=m10, 3=m11.
+    std::array<std::array<double, kMatrixFirTaps>, 4> hActive_{};
+    std::array<std::array<double, kMatrixFirTaps>, 4> hTarget_{};
+    std::array<double, kMatrixFirTaps> ringL_{};
+    std::array<double, kMatrixFirTaps> ringR_{};
+    // Scratch MIEMBRO para la IFFT (no un array grande en pila).
+    std::array<std::complex<double>, kFftSizeD10> scratch_{};
+    int wp_ = 0;
+    double morphAlpha_ = 1.0;
+    bool engaged_ = false;
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3) Motor árbitro D10
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct D10Config {
+    bool enabled = true;               // DEFAULT TRUE: orden "todo prendido"
+    double actionWeight = 0.75;        // peso de la acción hamiltoniana [0, 1]
+    double listenerDistanceM = 3.0;    // posición de escucha de la sala (m)
+    double phaseCoherenceTarget = 0.85; // coherencia L/R objetivo [0, 1]
+    double thermalProtectionFloor = 0.15; // piso de protección térmica [0, 0.9]
+};
+
+struct D10Telemetry {
+    double hamiltonianAction = 0.0;      // acción D10 del bloque
+    double phaseCoherenceIndex = 0.0;    // |coherencia L/R| del bloque
+    double lufsDeltaDb = 0.0;            // 10*log10(eOut/eDry)
+    double thermalHeadroomScale = 1.0;   // escala térmica aplicada (<= 1)
+    double continuousTonalAmount = 0.0;  // amount tonal continuo (eco)
+    bool symplecticLocked = false;       // kernel LTI enganchado, morph completo
+};
+
+class TenthDimensionActionEngine {
+public:
+    void prepare(double sampleRate) noexcept {
+        sampleRate_ = (std::isfinite(sampleRate) && sampleRate > 0.0) ? sampleRate : 48000.0;
+        thermalObserver_.prepare(sampleRate_, TransducerPhysicalSpec{});
+        ltiKernel_.prepare();
+        reset();
+    }
+
+    void reset() noexcept {
+        thermalObserver_.reset();
+        ltiKernel_.reset();
+        smoothEnergyGain_ = 1.0;
+        smoothPhaseBlend_ = 0.0;
+        telemetry_ = D10Telemetry{};
+    }
+
+    void setConfig(const D10Config& cfg) noexcept {
+        config_.enabled = cfg.enabled;
+        config_.actionWeight = std::clamp(cfg.actionWeight, 0.0, 1.0);
+        config_.listenerDistanceM = std::clamp(cfg.listenerDistanceM, 0.3, 10.0);
+        config_.phaseCoherenceTarget = std::clamp(cfg.phaseCoherenceTarget, 0.0, 1.0);
+        config_.thermalProtectionFloor = std::clamp(cfg.thermalProtectionFloor, 0.0, 0.9);
+    }
+
+    const D10Config& config() const noexcept { return config_; }
+    bool isEnabled() const noexcept { return config_.enabled; }
+    TimeInvariantMatrixKernel2x2& ltiKernel() noexcept { return ltiKernel_; }
+    const TimeInvariantMatrixKernel2x2& ltiKernel() const noexcept { return ltiKernel_; }
+    ThermalMechanicalObserver64& thermalObserver() noexcept { return thermalObserver_; }
+    const ThermalMechanicalObserver64& thermalObserver() const noexcept { return thermalObserver_; }
+    const D10Telemetry& telemetry() const noexcept { return telemetry_; }
+
+    // ITD acoplado por la LEY DE CURVATURA verificada (ORBE). NO usa la
+    // fórmula inventada del documento de Gemini.
+    double coupledApexItdSeconds(double thetaRad) const noexcept {
+        return propagation::curvatureLawItdSeconds(
+            thetaRad, std::max(0.3, config_.listenerDistanceM));
+    }
+
+    // Árbitro D10 in-place sobre outL/outR. refDryL/refDryR son opcionales
+    // (pueden ser nulos: sin referencia seca no hay corrección LUFS, solo
+    // protección térmica y telemetría). No-op si !enabled.
+    void arbitrateAction(double* outL, double* outR,
+                         const double* refDryL, const double* refDryR,
+                         int frames, double tonalNormalizedAmount) noexcept {
+        if (!config_.enabled || !outL || !outR || frames <= 0) return;
+        // (1) Estado térmico del bloque (observa la salida real).
+        const TransducerThermalState th = thermalObserver_.observeBlock(outL, outR, frames);
+
+        // (2) Energías y coherencia L/R (saneando no-finito a 0).
+        double eDry = 0.0, eOut = 0.0, crossLR = 0.0, normL = 0.0, normR = 0.0;
+        const bool haveDry = (refDryL != nullptr) && (refDryR != nullptr);
+        for (int i = 0; i < frames; ++i) {
+            const double oL = std::isfinite(outL[i]) ? outL[i] : 0.0;
+            const double oR = std::isfinite(outR[i]) ? outR[i] : 0.0;
+            eOut += oL * oL + oR * oR;
+            crossLR += oL * oR;
+            normL += oL * oL;
+            normR += oR * oR;
+            if (haveDry) {
+                const double dL = std::isfinite(refDryL[i]) ? refDryL[i] : 0.0;
+                const double dR = std::isfinite(refDryR[i]) ? refDryR[i] : 0.0;
+                eDry += dL * dL + dR * dR;
+            }
+        }
+        const double invFrames = 1.0 / static_cast<double>(frames);
+        eDry *= invFrames;
+        eOut *= invFrames;
+        crossLR *= invFrames;
+        normL *= invFrames;
+        normR *= invFrames;
+        const double coh = std::clamp(
+            crossLR / std::sqrt(std::max(1e-24, normL * normR)), -1.0, 1.0);
+        const double absCoh = std::fabs(coh);
+
+        // (3) Ganancia objetivo: corrección LUFS acotada a ±3 dB, con
+        // protección térmica multiplicativa.
+        double targetGain = 1.0;
+        double lufsDeltaDb = 0.0;
+        double thermalScale = 1.0;
+        if (haveDry && eDry > 1e-18 && eOut > 1e-18) {
+            const double ratio = std::sqrt(eDry / eOut);
+            lufsDeltaDb = 10.0 * std::log10(eOut / eDry);
+            const double boundedRatio = std::clamp(ratio, 0.7079, 1.4125); // ±3 dB
+            targetGain = 1.0 + config_.actionWeight * (boundedRatio - 1.0);
+        }
+        if (th.normalizedExcursionPeak > 0.92) {
+            thermalScale *= std::clamp(0.92 / th.normalizedExcursionPeak,
+                                       1.0 - config_.thermalProtectionFloor, 1.0);
+        }
+        if (th.coilTempC > 125.0) {
+            thermalScale *= std::clamp(1.0 - 0.12 * ((th.coilTempC - 125.0) / 20.0),
+                                       0.85, 1.0);
+        }
+        targetGain *= thermalScale;
+
+        // (4) Acción hamiltoniana del bloque.
+        const double action =
+            std::pow(std::fabs(lufsDeltaDb) / 6.0, 2.0) +
+            0.5 * std::pow(std::max(0.0, config_.phaseCoherenceTarget - absCoh), 2.0) +
+            std::pow(std::max(0.0, th.normalizedExcursionPeak - 0.85), 2.0);
+
+        // (5) Aplicación por muestra con slew (tau 18 ms).
+        const double slewCoeff = 1.0 - std::exp(-1.0 / (0.018 * sampleRate_));
+        for (int i = 0; i < frames; ++i) {
+            smoothEnergyGain_ += slewCoeff * (targetGain - smoothEnergyGain_);
+            outL[i] *= smoothEnergyGain_;
+            outR[i] *= smoothEnergyGain_;
+        }
+
+        // (6) Telemetría.
+        telemetry_.hamiltonianAction = action;
+        telemetry_.phaseCoherenceIndex = absCoh;
+        telemetry_.lufsDeltaDb = lufsDeltaDb;
+        telemetry_.thermalHeadroomScale = thermalScale;
+        telemetry_.continuousTonalAmount =
+            std::clamp(tonalNormalizedAmount, 0.0, 1.0);
+        // Simpléctico bloqueado = kernel LTI enganchado con morph completo.
+        telemetry_.symplecticLocked = ltiKernel_.morphComplete();
+    }
+
+private:
+    D10Config config_{};
+    double sampleRate_ = 48000.0;
+    ThermalMechanicalObserver64 thermalObserver_{};
+    TimeInvariantMatrixKernel2x2 ltiKernel_{};
+    double smoothEnergyGain_ = 1.0;
+    double smoothPhaseBlend_ = 0.0; // reservado: mezcla de fase (uso futuro)
+    D10Telemetry telemetry_{};
+};
+
+}  // namespace ivanna::fused::d10
