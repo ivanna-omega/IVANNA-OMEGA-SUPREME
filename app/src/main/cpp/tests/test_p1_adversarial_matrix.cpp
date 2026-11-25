@@ -11,8 +11,8 @@
 // Defectos que fallan el test (guarda, no carácter):
 //   - salida no finita (NaN/Inf)
 //   - pico de salida > 0.0 dBFS (clipping digital real; el DAC recorta
-//     ahí. El techo del limiter es -0.1 dBFS, pero APEX suma el
-//     transitorio después del limiter — ver hallazgo abajo)
+//     ahí. El techo del limiter es -0.1 dBFS y el techo final tras APEX 2
+//     lo cierra — ver hallazgo abajo)
 //   - DC offset AÑADIDO por la cadena |media_sal - media_ent| >= 1e-2
 //     (-40 dBFS; la cadena añade un DC pequeño de base ~1-3e-3 por
 //     artefacto STFT, inaudible; la entrada ya puede traer DC:
@@ -33,13 +33,16 @@
 // Sin él, un operador solo que añade ganancia (NEURO) clipa por
 // construcción, no por defecto del operador.
 //
-// HALLAZGO P1 (2026-11-22, medido): APEX separa el transitorio y lo
-// suma DESPUÉS del limiter (fused_chain.cpp, APEX 2), así que el
-// transitorio rodea el safety limiter. En material caliente (hotmix_01,
-// pico de entrada -0.5 dBFS) la salida IVANNA llega a +0.81 dBFS y
-// op_neuro a +3.78 dBFS. Es un defecto REAL del motor (el limiter no es
-// la última barrera), detectado por P1; su fix es un cambio de motor
-// aparte, no de este guarda. Ver el reporte P1.
+// HALLAZGO P1 (2026-11-22, medido) — CERRADO por el techo final
+// (commit 671ee5a, "techo final tras APEX 2"): APEX separaba el
+// transitorio y lo sumaba DESPUÉS del limiter (fused_chain.cpp, APEX 2),
+// así que el transitorio rodeaba el safety limiter. En material caliente
+// (hotmix_01, pico de entrada -0.5 dBFS) la salida IVANNA llegaba a
+// +0.81 dBFS y op_neuro a +3.78 dBFS. Medido tras el fix (2026-11-24,
+// CORONA Frente A): APEX ON -0.100 dBFS, APEX OFF -0.138 dBFS — el
+// limiter vuelve a ser la última barrera. El diagnóstico de abajo ya no
+// es solo evidencia: AFIRMA el techo con APEX ON y OFF (guarda de
+// regresión del fix).
 //
 // P0 (REFERENCE_LOCKED) sigue sin existir: P1 detecta regresiones, no
 // sustituye la referencia congelada. Ver PLAN_P7_P10.md §P1.
@@ -244,8 +247,8 @@ bool runMatrixCase(const std::string& caseId, std::string& jsonOut) {
         const double peakR = peak_abs(dut.r, 0, n);
         const double peakDb = dbfs(std::max(peakL, peakR));
         // Clipping DIGITAL real: pico > 0.0 dBFS (el DAC recorta ahí).
-        // El techo del limiter es -0.1 dBFS, pero APEX suma el transitorio
-        // después del limiter (hallazgo P1); un pico entre -0.1 y 0.0 es
+        // El techo del limiter es -0.1 dBFS y el techo final tras APEX 2
+        // (hallazgo P1, cerrado) lo contiene; un pico entre -0.1 y 0.0 es
         // el limiter no conteniendo su techo, no clipping digital. El
         // clipping real (> 0.0) sí es defecto.
         if (peakDb > 0.0) {
@@ -348,11 +351,13 @@ void writeReport(const std::string& caseId, const std::string& json) {
 
 }  // namespace
 
-// Diagnóstico APEX vs limiter (2026-11-22): APEX suma el transitorio
-// DESPUÉS del safety limiter, así que el transitorio rodea el techo de
-// -0.1 dBFS. Este test cuantifica cuánto aporta APEX al pico en hotmix.
-// No es un test de guarda (no falla por el pico); es evidencia medida
-// del hallazgo P1 para el reporte y para el fix del motor.
+// Diagnóstico APEX vs limiter (2026-11-22) — GUARDA del techo final
+// (CORONA Frente A, 2026-11-24): APEX sumaba el transitorio DESPUÉS del
+// safety limiter, así que el transitorio rodeaba el techo de -0.1 dBFS.
+// El techo final (fused_chain.cpp, tras APEX 2 + TΩ) lo cierra: este
+// test AFIRMA que el pico en hotmix queda en el techo con APEX ON y OFF.
+// Medido: APEX ON -0.100 dBFS, APEX OFF -0.138 dBFS (antes del fix:
+// +0.81 dBFS con APEX ON).
 TEST(P1AdversarialMatrix, ApexLimiterDiagnostic) {
     GenOptions opt;
     opt.seed = 0;
@@ -372,8 +377,11 @@ TEST(P1AdversarialMatrix, ApexLimiterDiagnostic) {
         const double peak = dbfs(std::max(peak_abs(l, 0, n), peak_abs(r, 0, n)));
         std::printf("[APEX-DIAG] hotmix ivanna apex=%s peak=%.3f dBFS (entrada -0.5)\n",
                     apexOn ? "ON " : "OFF", peak);
-        // Con APEX OFF el limiter debe contener el pico en su techo (-0.1).
-        if (!apexOn) EXPECT_LE(peak, -0.09) << "sin APEX el limiter debe contener el pico";
+        // El techo final (-0.1 dBFS = 0.98855) debe contener el pico con
+        // APEX ON y OFF: el transitorio ya no rodea el limiter.
+        EXPECT_LE(peak, -0.09) << "techo final: el pico debe quedar en -0.1 dBFS con APEX "
+                               << (apexOn ? "ON" : "OFF");
+        EXPECT_LE(peak, 0.0) << "clipping digital con APEX " << (apexOn ? "ON" : "OFF");
     }
 }
 
