@@ -110,6 +110,15 @@ add_library(ivanna_omega SHARED
     fused/fused_brain.cpp
     fused/perceptual_conservation.cpp  # 8. Árbitro de campo (2026-11-21)
     fused/acoustic_twin/acoustic_twin.cpp  # gemelo + calibración P3 (call site, 2026-11-21)
+    # ── CORONA P7–P9 (cableado 2026-11-24, rama corona-cableado) ──────────
+    # Funciones puras, sin estado global ni I/O: P7 certifica (solo
+    # lectura), P8 compila intenciones (tras flag default OFF en
+    # FusedChain), P9 es modelo/datos del gemelo (NINGÚN modo de sala se
+    # aplica como efecto). P10 (Gemelo Humano) NO va aquí: es banco de
+    # pruebas, sin call site de audio; su cableado es CTest.
+    fused/total_conservation/total_conservation.cpp
+    fused/experience_compiler/experience_compiler.cpp
+    fused/living_room/living_room.cpp
     # ── FÍSICA NUEVA (LGN, 2026-11-18) — cableada en HrtfManager::synthesizeHrtf.
     # geodesic_pinna_model.cpp (Ley Geodésica del Notch) + physical_head_model.cpp
     # (esfera rígida, que el operador unificado usa) + physical_propagation.cpp
@@ -572,6 +581,12 @@ add_library(omega_effect SHARED
     fused/fused_brain.cpp
     fused/perceptual_conservation.cpp  # 8. Árbitro de campo (2026-11-21)
     fused/acoustic_twin/acoustic_twin.cpp  # gemelo + calibración P3 (call site, 2026-11-21)
+    # ── CORONA P7–P9 (cableado 2026-11-24, rama corona-cableado) ──────────
+    # Mismo motivo que en ivanna_omega: FusedChain (Ruta B) usa P7/P8/P9.
+    # P10 NO va aquí: banco de pruebas, sin call site de audio (CTest).
+    fused/total_conservation/total_conservation.cpp
+    fused/experience_compiler/experience_compiler.cpp
+    fused/living_room/living_room.cpp
     # ── FÍSICA NUEVA (LGN + Ley de Curvatura, 2026-11-18) ── ver comentario
     # en ivanna_omega (mismo motivo: HrtfManager::synthesizeHrtf las usa en
     # Ruta B). Solo la curva ITD cerrada; la inversión de distancia NO se usa.

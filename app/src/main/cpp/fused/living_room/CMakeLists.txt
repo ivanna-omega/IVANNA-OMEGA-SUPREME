@@ -1,7 +1,10 @@
 # CMakeLists standalone de P9 Sala Viva (Frente E, 2026-11-24).
 #
-# Módulo NUEVO e independiente: no toca FusedChain, JNI, UI ni el daemon.
-# Patrón standalone de P6 (universal_hearing):
+# Módulo NUEVO e independiente: no toca JNI, UI ni el daemon. Cableado
+# 2026-11-24 (rama corona-cableado): su .cpp va en los .so de la app y
+# FusedChain lo expone como modelo/datos (livingRoomDeltaDb y familia);
+# NINGÚN modo se aplica como efecto activo. Patrón standalone de P6
+# (universal_hearing):
 #   cmake -S app/src/main/cpp/fused/living_room -B /tmp/p9_build \
 #         -DCMAKE_CXX_COMPILER=g++-14
 #   cmake --build /tmp/p9_build

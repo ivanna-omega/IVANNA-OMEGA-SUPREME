@@ -1,6 +1,8 @@
 # CMakeLists standalone de P7 Conservación Total (Frente E, 2026-11-24).
 #
-# Módulo NUEVO e independiente: no toca FusedChain, JNI, UI ni el daemon.
+# Módulo NUEVO e independiente: no toca JNI, UI ni el daemon. Cableado
+# 2026-11-24 (rama corona-cableado): su .cpp va en los .so de la app y
+# FusedChain lo usa vía totalConservationCertificate() (solo lectura).
 # Patrón standalone de P6 (universal_hearing): su test vive aquí,
 # autocontenido, y se corre así:
 #   cmake -S app/src/main/cpp/fused/total_conservation -B /tmp/p7_build \

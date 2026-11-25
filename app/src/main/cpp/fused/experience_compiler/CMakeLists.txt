@@ -1,7 +1,9 @@
 # CMakeLists standalone de P8 Compilador de Experiencia (Frente E, 2026-11-24).
 #
-# Módulo NUEVO e independiente: no toca FusedChain, JNI, UI ni el daemon.
-# Patrón standalone de P6 (universal_hearing):
+# Módulo NUEVO e independiente: no toca JNI, UI ni el daemon. Cableado
+# 2026-11-24 (rama corona-cableado): su .cpp va en los .so de la app y
+# FusedChain lo usa vía compileExperience()/applyCompiledExperience()
+# (tras flag default OFF). Patrón standalone de P6 (universal_hearing):
 #   cmake -S app/src/main/cpp/fused/experience_compiler -B /tmp/p8_build \
 #         -DCMAKE_CXX_COMPILER=g++-14
 #   cmake --build /tmp/p8_build

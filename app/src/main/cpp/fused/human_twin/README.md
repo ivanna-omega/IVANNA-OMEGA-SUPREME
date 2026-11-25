@@ -46,3 +46,13 @@ cmake -S app/src/main/cpp/fused/human_twin -B /tmp/p10_build \
 cmake --build /tmp/p10_build
 ctest --test-dir /tmp/p10_build --output-on-failure
 ```
+
+## Cableado (2026-11-24, rama corona-cableado)
+
+- **En CTest, NO en la cadena de audio:** su test está registrado en
+  la suite principal (`tests/CMakeLists.txt`, `test_human_twin`).
+  P10 es un **banco de pruebas** (registro por prueba: estímulo,
+  respuesta, tiempo, eje), no una etapa de audio: no procesa señal,
+  no tiene controles y no pertenece a `FusedChain` (sin miembro, sin
+  `.cpp` en los `.so` de la app — a propósito). La UI de pruebas en
+  la app queda pendiente de las sesiones de Esse (P10.2).

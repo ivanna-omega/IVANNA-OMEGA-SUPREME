@@ -49,3 +49,23 @@ ctest --test-dir /tmp/p8_build --output-on-failure
 
 Regla de Oro: ganancia neta 0.0 dB como restricción dura del compilador
 (trim maestro; test verifica |neta| ≤ 1e-9 dB en las 50 intenciones).
+
+## Cableado (2026-11-24, rama corona-cableado)
+
+- **En la app, de verdad:** `experience_compiler.cpp` se compila en
+  `libivanna_omega.so` y `libomega_effect.so` (`app/src/main/cpp/
+  CMakeLists.txt`) y su test está registrado en la suite principal
+  (`tests/CMakeLists.txt`, `test_experience_compiler`).
+- **Enganche:** `FusedChain::compileExperience()` (puro, funciona con
+  el flag en OFF o en ON) y `FusedChain::applyCompiledExperience()`,
+  tras el flag `experienceCompilerEnabled` **default OFF** (mismo
+  patrón que la clasificación adaptativa NEURO). Con OFF, aplicar es
+  no-op y la cadena es bit-idéntica a antes (TEST
+  `P8FlagOffProcessBitIdentical`); con ON aplica los 6 amounts con
+  escalar en `FusedControls` + trim maestro recomputado sobre lo
+  aplicado, ganancia neta nominal 0.0 dB (TEST
+  `P8FlagOnAppliesWithZeroNetNominal`).
+- **ARMONÍA NO aplicada:** `FusedControls` no tiene escalar de amount
+  tonal; inventar uno falsearía la semántica. Pendiente de decisión
+  de Esse (definir el escalar tonal o aceptar ARMONÍA fija en P8).
+  Encender el flag cambia el sonido: exige ABX + decisión explícita.

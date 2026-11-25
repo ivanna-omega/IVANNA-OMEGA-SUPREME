@@ -91,6 +91,9 @@
 #include "fused/fused_brain.hpp"
 #include "fused/ivanna_apex_kernel.hpp"  // IVANNA-APEX: splitter + delay Lagrange
 #include "fused/perceptual_conservation.hpp"  // 8. Árbitro de campo (2026-11-21)
+#include "fused/total_conservation/total_conservation.hpp"  // P7 (CORONA, cableado 2026-11-24)
+#include "fused/experience_compiler/experience_compiler.hpp"  // P8 (CORONA, cableado 2026-11-24)
+#include "fused/living_room/living_room.hpp"  // P9 (CORONA, cableado 2026-11-24, solo modelo/datos)
 #include "fused/unified_field_kernel.hpp"  // TΩ: kernel 2×2 64-bit (F1/472)
 
 namespace ivanna::fused {
@@ -257,6 +260,77 @@ public:
     const acoustic_twin::AcousticTwinEstimate& twinEstimate() const noexcept {
         return twinEstimate_;
     }
+
+    // ── CORONA P7–P10 — CABLEADO (2026-11-24, rama corona-cableado) ───────
+    // P7 Conservación Total: certificado por reproducción, SOLO LECTURA.
+    // totalConservationCertificate() construye el StageInput desde los
+    // controles efectivos vigentes y devuelve el PlaybackCertificate
+    // (estimateDelta por etapa + total). NO toca buffers ni controles y
+    // NO cambia el sonido: la cadena no lo llama en el camino caliente;
+    // lo lee quien quiera certificar una reproducción (log/UI). El códec
+    // y el bit-exacto de la decodificación los aporta el llamador (la
+    // cadena no conoce la fuente). Hoy el certificado es un PISO con
+    // totalValid=false (3/9 etapas estimadas en neutro lossless): las
+    // etapas sin medir quedan "sin estimar", nunca inventadas (ver el
+    // header del módulo).
+    total_conservation::PlaybackCertificate totalConservationCertificate(
+        total_conservation::Codec codec, bool decodeBitExact,
+        std::uint64_t trackIndex, std::uint32_t ivannaVersionCode) const noexcept;
+
+    // P8 Compilador de Experiencia: intención → parámetros, tras un flag
+    // default OFF (mismo patrón que setAdaptiveClassificationEnabled del
+    // cerebro: OFF = la cadena es bit-idéntica a antes).
+    // compileExperience() es función pura (compilar no toca el audio) y
+    // funciona con el flag en OFF o en ON. applyCompiledExperience() es
+    // la única que escribe controles, y SOLO con el flag en ON: con OFF
+    // devuelve false y NO cambia nada. Con ON aplica los amounts a los
+    // 6 operadores con escalar en FusedControls (ORBE→spatial.amount,
+    // HOLOS→field.amount, SALA VIVA→listenerRoom.roomWet,
+    // VOLTERRA→transducer.correction, PULSO→dynamics.punch — pegada,
+    // mapeo nominal —, NEURO→brain.adaptation) y el trim maestro
+    // RECOMPUTADO solo sobre lo aplicado en tonal.trimDb, así la
+    // ganancia neta nominal de lo aplicado es 0.0 dB (Regla de Oro).
+    // [4] ARMONÍA NO SE APLICA: FusedControls no tiene escalar de amount
+    // tonal (curva + bandas + trim); inventar uno falsearía la semántica.
+    // Pendiente de decisión de Esse: definir el escalar tonal o aceptar
+    // ARMONÍA fija en P8. Mientras P8 esté habilitado, tonal.trimDb es
+    // el trim del compilador (toma posesión del trim del usuario). En
+    // modo MANUAL del cerebro, el clamp existente fuerza adaptation a 0
+    // y el amount NEURO de P8 queda en 0 (semántica vigente, no de P8).
+    void setExperienceCompilerEnabled(bool on) noexcept {
+        experienceCompilerEnabled_.store(on, std::memory_order_relaxed);
+    }
+    bool experienceCompilerEnabled() const noexcept {
+        return experienceCompilerEnabled_.load(std::memory_order_relaxed);
+    }
+    experience_compiler::CompileResult compileExperience(
+        const experience_compiler::ExperienceVector& target,
+        const experience_compiler::ReachableRegion& region) const noexcept;
+    bool applyCompiledExperience(
+        const experience_compiler::CompileResult& compiled) noexcept;
+
+    // P9 Sala Viva: el simulador es MODELO/DATOS para el gemelo, NO un
+    // efecto activo. Estos métodos delegan en las funciones puras del
+    // módulo con la geometría por defecto de la sala de Esse (4.0×7.0 m,
+    // altura nominal 2.5 m, RT60 0.34 s). Ningún método toca audio y
+    // ningún modo de sala se aplica en process(): convertir un modo en
+    // efecto activo cambiaría el sonido sin ABX y queda explícitamente
+    // NO cableado hasta la escucha en 3 posiciones por modo (gate P9).
+    living_room::RoomGeometry livingRoomGeometry() const noexcept;
+    living_room::RoomDeltaResult livingRoomDeltaDb(
+        double listenerDistanceM) const noexcept;
+    living_room::DeltaChangeResult predictLivingRoomDeltaChange(
+        double fromM, double toM) const noexcept;
+    living_room::ModeInfo livingRoomModeInfo(
+        living_room::RoomMode mode) const noexcept;
+
+    // P10 Gemelo Humano: SIN MIEMBRO en FusedChain, a propósito. Es un
+    // BANCO DE PRUEBAS (registro por prueba: estímulo, respuesta,
+    // tiempo, eje), no una etapa de audio: no procesa señal, no tiene
+    // controles y no pertenece a la cadena. Su cableado es el registro
+    // de su test en CTest (tests/CMakeLists.txt, test_human_twin) y su
+    // .cpp NO se enlaza en los .so de la app. La UI de pruebas en la
+    // app queda pendiente de las sesiones de Esse (P10.2).
 
     // ── Control del gemelo (orden de Esse, 2026-11-21) ───────────────────
     // Con la calibración aplicada, el gemelo CONTROLA la conservación:
@@ -445,6 +519,12 @@ private:
     long volNextFrameAt_ = 512;  // inTotal al que se procesa el próximo frame
     int volOutWp_ = 0, volOutRp_ = 0, volOutLen_ = 0;
     std::atomic<bool> volumetricEnabled_{true};
+    // ── CORONA P8 — flag default OFF (2026-11-24) ─────────────────────────
+    // Con OFF, applyCompiledExperience() es no-op y la cadena es
+    // bit-idéntica a antes. Encenderlo cambia el sonido (aplica amounts
+    // P8): exige ABX + decisión explícita de Esse, como la clasificación
+    // adaptativa NEURO.
+    std::atomic<bool> experienceCompilerEnabled_{false};
     void prepareVolumetric() noexcept;
     void resetVolumetric() noexcept;
     // LEGACY (F1/472): la matriz volumétrica WOLA ya no se llama —

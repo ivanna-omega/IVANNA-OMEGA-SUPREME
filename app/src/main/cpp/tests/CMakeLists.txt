@@ -3115,6 +3115,12 @@ set(FUSED_CHAIN_SOURCES
   ../fused/fused_chain.cpp
   ../fused/perceptual_conservation.cpp  # 8. Árbitro de campo (2026-11-21)
   ../fused/acoustic_twin/acoustic_twin.cpp  # gemelo + calibración P3 (call site)
+  # CORONA P7–P9 (cableado 2026-11-24): FusedChain los usa (certificado,
+  # compilador tras flag OFF, modelo de sala). P10 NO va aquí: banco de
+  # pruebas sin call site en la cadena (su target propio está abajo).
+  ../fused/total_conservation/total_conservation.cpp
+  ../fused/experience_compiler/experience_compiler.cpp
+  ../fused/living_room/living_room.cpp
   ../fused/fused_spatial.cpp
   ../fused/fused_field.cpp
   ../fused/fused_listener_room.cpp
@@ -3421,6 +3427,93 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_universal_hearing PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_universal_hearing COMMAND test_universal_hearing)
+
+# ── CORONA P7–P10 (cableado 2026-11-24, rama corona-cableado) ─────────────
+# Los 4 módulos entran a la suite principal con su propio main()
+# (standalone, sin gtest), mismo patrón que test_acoustic_twin /
+# test_universal_hearing. Cada uno es 1 entrada CTest (los checks
+# internos los cuenta el propio test: P7 49, P8 33, P9 33, P10 38).
+# El test del módulo en -O0 es el workaround P6 (v2.5.491): GCC 14.3.0
+# (el de la CI) sufre un ICE en -O3 en estos tests; el módulo .cpp se
+# queda en el nivel por defecto. P7/P8/P9 además se compilan en los .so
+# de la app y en FUSED_CHAIN_SOURCES (FusedChain los usa); P10 NO: es
+# banco de pruebas sin call site de audio, y su ÚNICO cableado es este
+# registro en CTest (ver fused_chain.hpp: P10 no tiene miembro).
+add_executable(test_total_conservation
+  ../fused/total_conservation/total_conservation_test.cpp
+  ../fused/total_conservation/total_conservation.cpp
+)
+target_include_directories(test_total_conservation PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../fused/total_conservation
+)
+target_compile_options(test_total_conservation PRIVATE -Wall -Wextra)
+set_source_files_properties(../fused/total_conservation/total_conservation_test.cpp
+  PROPERTIES COMPILE_OPTIONS "-O0")
+target_link_libraries(test_total_conservation PRIVATE Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_total_conservation PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_total_conservation PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+add_test(NAME test_total_conservation COMMAND test_total_conservation)
+
+add_executable(test_experience_compiler
+  ../fused/experience_compiler/experience_compiler_test.cpp
+  ../fused/experience_compiler/experience_compiler.cpp
+)
+target_include_directories(test_experience_compiler PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../fused/experience_compiler
+)
+target_compile_options(test_experience_compiler PRIVATE -Wall -Wextra)
+set_source_files_properties(../fused/experience_compiler/experience_compiler_test.cpp
+  PROPERTIES COMPILE_OPTIONS "-O0")
+target_link_libraries(test_experience_compiler PRIVATE Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_experience_compiler PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_experience_compiler PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+add_test(NAME test_experience_compiler COMMAND test_experience_compiler)
+
+add_executable(test_living_room
+  ../fused/living_room/living_room_test.cpp
+  ../fused/living_room/living_room.cpp
+)
+target_include_directories(test_living_room PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../fused/living_room
+)
+target_compile_options(test_living_room PRIVATE -Wall -Wextra)
+set_source_files_properties(../fused/living_room/living_room_test.cpp
+  PROPERTIES COMPILE_OPTIONS "-O0")
+target_link_libraries(test_living_room PRIVATE Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_living_room PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_living_room PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+add_test(NAME test_living_room COMMAND test_living_room)
+
+add_executable(test_human_twin
+  ../fused/human_twin/human_twin_test.cpp
+  ../fused/human_twin/human_twin.cpp
+)
+target_include_directories(test_human_twin PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../fused/human_twin
+)
+target_compile_options(test_human_twin PRIVATE -Wall -Wextra)
+set_source_files_properties(../fused/human_twin/human_twin_test.cpp
+  PROPERTIES COMPILE_OPTIONS "-O0")
+target_link_libraries(test_human_twin PRIVATE Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_human_twin PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_human_twin PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+add_test(NAME test_human_twin COMMAND test_human_twin)
 
 # ── Telemetría del control cerrado (plan del salto, Luna 3.14) ───────────
 # Solo registra, nunca decide: frames a 10 Hz + fallos inmediatos, anillo

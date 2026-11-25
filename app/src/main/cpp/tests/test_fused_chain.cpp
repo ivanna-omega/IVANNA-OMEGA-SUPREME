@@ -1044,3 +1044,190 @@ TEST(FusedChainTwinControl, HeadphonesNoChange) {
     EXPECT_FALSE(chain.telemetry().twinCalibrationApplied);
     EXPECT_FLOAT_EQ(chain.telemetry().twinCalibrationConfidence, 0.0f);
 }
+
+// ── CORONA P7–P10 — cableado (2026-11-24, rama corona-cableado) ─────────────
+// Estos TESTs prueban el ENGANCHE, no los módulos (cada módulo tiene su
+// propio test standalone: 49/33/33/38 checks). Lo que se afirma aquí:
+//   · P7: el certificado se construye desde los controles efectivos y es
+//     solo lectura (no cambia el sonido: el camino caliente no lo llama).
+//   · P8: con el flag OFF, aplicar es no-op y el proceso es bit-idéntico;
+//     con ON, aplica los 6 amounts con escalar + trim con ganancia neta
+//     nominal 0.0 dB, y ARMONÍA queda explícitamente sin aplicar.
+//   · P9: la delegación al simulador devuelve los valores del plan; los
+//     modos son datos, no efectos (ningún TEST procesa audio con P9).
+//   · P10: SIN TEST aquí a propósito — no es etapa de audio; su cableado
+//     es el registro en CTest (test_human_twin, tests/CMakeLists.txt).
+TEST(FusedChainCoronaWiring, P7CertificateNeutralLossless) {
+    FusedChain chain;
+    chain.prepare(kFs);
+    chain.setNeutral();
+    const total_conservation::PlaybackCertificate cert =
+        chain.totalConservationCertificate(total_conservation::Codec::kFlac,
+                                           true, 7, 501);
+    // Neutro lossless: fuente + decodificación + DSP estimados (3/9);
+    // el resto sin estimar: el certificado es un PISO, no un total.
+    EXPECT_EQ(cert.estimatedStages, 3u);
+    EXPECT_FALSE(cert.totalValid);
+    EXPECT_DOUBLE_EQ(cert.totalDb, 0.0);
+    EXPECT_DOUBLE_EQ(cert.confidence, 0.0);
+    EXPECT_EQ(cert.trackIndex, 7u);
+    EXPECT_EQ(cert.ivannaVersionCode, 501u);
+    const total_conservation::StageDelta& dsp =
+        cert.stages[static_cast<std::size_t>(total_conservation::Stage::kDsp)];
+    EXPECT_TRUE(dsp.estimated);
+    EXPECT_DOUBLE_EQ(dsp.deltaDb, 0.0);
+}
+
+TEST(FusedChainCoronaWiring, P7CertificateActiveOperatorUnestimatesDsp) {
+    FusedChain chain;
+    chain.prepare(kFs);
+    chain.setNeutral();
+    FusedControls c;
+    c.setNeutral();
+    c.spatial.amount = 1.0f;  // solo ORBE activo
+    chain.setControls(c);
+    const total_conservation::PlaybackCertificate cert =
+        chain.totalConservationCertificate(total_conservation::Codec::kFlac,
+                                           true, 8, 501);
+    EXPECT_EQ(cert.estimatedStages, 2u);
+    const total_conservation::StageDelta& dsp =
+        cert.stages[static_cast<std::size_t>(total_conservation::Stage::kDsp)];
+    EXPECT_FALSE(dsp.estimated);
+}
+
+TEST(FusedChainCoronaWiring, P7CertificateLossySourceUnestimated) {
+    FusedChain chain;
+    chain.prepare(kFs);
+    chain.setNeutral();
+    const total_conservation::PlaybackCertificate cert =
+        chain.totalConservationCertificate(total_conservation::Codec::kMp3,
+                                           true, 9, 501);
+    EXPECT_EQ(cert.estimatedStages, 2u);  // decodificación + DSP
+    const total_conservation::StageDelta& src = cert.stages[static_cast<std::size_t>(
+        total_conservation::Stage::kSource)];
+    EXPECT_FALSE(src.estimated);
+}
+
+TEST(FusedChainCoronaWiring, P8FlagOffApplyIsNoop) {
+    FusedChain chain;
+    chain.prepare(kFs);
+    EXPECT_FALSE(chain.experienceCompilerEnabled());  // default OFF
+    experience_compiler::ExperienceVector target;
+    for (std::size_t i = 0; i < experience_compiler::kNumComponents; ++i) {
+        target.v[i] = 0.5;
+    }
+    const experience_compiler::CompileResult compiled =
+        chain.compileExperience(target, experience_compiler::ReachableRegion{});
+    EXPECT_TRUE(compiled.ok);
+    EXPECT_DOUBLE_EQ(compiled.netGainDb, 0.0);  // restricción dura del módulo
+    EXPECT_FALSE(chain.applyCompiledExperience(compiled));
+    const FusedControls c = chain.controls();
+    EXPECT_FLOAT_EQ(c.spatial.amount, 1.0f);  // default intacto
+    EXPECT_FLOAT_EQ(c.tonal.trimDb, 0.0f);
+}
+
+TEST(FusedChainCoronaWiring, P8FlagOffProcessBitIdentical) {
+    const std::size_t n = 4800;
+    FusedChain a, b;
+    a.prepare(kFs);
+    b.prepare(kFs);
+    a.setControls(engagedControls());
+    b.setControls(engagedControls());
+    experience_compiler::ExperienceVector target;
+    for (std::size_t i = 0; i < experience_compiler::kNumComponents; ++i) {
+        target.v[i] = 0.5;
+    }
+    const experience_compiler::CompileResult compiled =
+        b.compileExperience(target, experience_compiler::ReachableRegion{});
+    EXPECT_FALSE(b.applyCompiledExperience(compiled));  // flag OFF: no-op
+    std::vector<double> la = tone(n), ra = tone(n);
+    std::vector<double> lb = la, rb = ra;
+    a.process(la.data(), ra.data(), static_cast<int>(n));
+    b.process(lb.data(), rb.data(), static_cast<int>(n));
+    for (std::size_t i = 0; i < n; ++i) {
+        EXPECT_DOUBLE_EQ(la[i], lb[i]);
+        EXPECT_DOUBLE_EQ(ra[i], rb[i]);
+        if (la[i] != lb[i] || ra[i] != rb[i]) break;
+    }
+}
+
+TEST(FusedChainCoronaWiring, P8FlagOnAppliesWithZeroNetNominal) {
+    FusedChain chain;
+    chain.prepare(kFs);
+    experience_compiler::ExperienceVector target;
+    for (std::size_t i = 0; i < experience_compiler::kNumComponents; ++i) {
+        target.v[i] = 0.5;
+    }
+    const experience_compiler::CompileResult compiled =
+        chain.compileExperience(target, experience_compiler::ReachableRegion{});
+    EXPECT_TRUE(compiled.ok);
+    chain.setExperienceCompilerEnabled(true);
+    EXPECT_TRUE(chain.applyCompiledExperience(compiled));
+    const FusedControls c = chain.controls();
+    EXPECT_FLOAT_EQ(c.spatial.amount, 0.5f);       // ORBE
+    EXPECT_FLOAT_EQ(c.field.amount, 0.5f);         // HOLOS
+    EXPECT_FLOAT_EQ(c.listenerRoom.roomWet, 0.5f);  // SALA VIVA
+    EXPECT_FLOAT_EQ(c.transducer.correction, 0.5f);  // VOLTERRA
+    EXPECT_FLOAT_EQ(c.dynamics.punch, 0.5f);       // PULSO (pegada)
+    EXPECT_FLOAT_EQ(c.brain.adaptation, 0.5f);     // NEURO
+    // Trim recomputado solo sobre lo aplicado:
+    // (0.10 - 0.05 + 0.08 + 0.12 - 0.04 + 0.02) * 0.5 = 0.115 -> -0.115.
+    EXPECT_NEAR(c.tonal.trimDb, -0.115, 1e-6);
+    // Ganancia neta NOMINAL de lo aplicado: 0.0 dB (Regla de Oro).
+    double net = static_cast<double>(c.tonal.trimDb);
+    const std::size_t applied[] = {0, 1, 2, 3, 5, 6};
+    for (std::size_t o : applied) {
+        double amount = 0.0;
+        switch (o) {
+            case 0: amount = c.spatial.amount; break;
+            case 1: amount = c.field.amount; break;
+            case 2: amount = c.listenerRoom.roomWet; break;
+            case 3: amount = c.transducer.correction; break;
+            case 5: amount = c.dynamics.punch; break;
+            case 6: amount = c.brain.adaptation; break;
+            default: break;
+        }
+        net += experience_compiler::nominalGainDbPerUnit(o) * amount;
+    }
+    EXPECT_NEAR(net, 0.0, 1e-9);
+    // [4] ARMONÍA: explícitamente NO aplicada (sin escalar tonal).
+    EXPECT_EQ(c.tonal.curve, 1);
+    EXPECT_FLOAT_EQ(c.tonal.lowDb, 0.0f);
+    EXPECT_FLOAT_EQ(c.tonal.midDb, 0.0f);
+    EXPECT_FLOAT_EQ(c.tonal.highDb, 0.0f);
+}
+
+TEST(FusedChainCoronaWiring, P9LivingRoomDeltaAtReference) {
+    FusedChain chain;
+    chain.prepare(kFs);
+    const living_room::RoomDeltaResult d3 = chain.livingRoomDeltaDb(3.0);
+    EXPECT_TRUE(d3.valid);
+    EXPECT_NEAR(d3.deltaDb, 11.60, 0.01);  // valor del plan/README P9
+    const living_room::DeltaChangeResult away =
+        chain.predictLivingRoomDeltaChange(3.0, 4.0);
+    EXPECT_TRUE(away.valid);
+    EXPECT_NEAR(away.changeDb, 2.37, 0.01);
+    const living_room::DeltaChangeResult near =
+        chain.predictLivingRoomDeltaChange(3.0, 2.0);
+    EXPECT_TRUE(near.valid);
+    EXPECT_NEAR(near.changeDb, -3.16, 0.01);
+    const living_room::RoomDeltaResult bad = chain.livingRoomDeltaDb(-1.0);
+    EXPECT_FALSE(bad.valid);  // fail-closed: distancia inválida
+}
+
+TEST(FusedChainCoronaWiring, P9LivingRoomModesAreData) {
+    FusedChain chain;
+    chain.prepare(kFs);
+    const living_room::RoomGeometry geo = chain.livingRoomGeometry();
+    EXPECT_DOUBLE_EQ(geo.rt60Sec, 0.34);
+    EXPECT_NEAR(living_room::schroederHz(geo), 139.4, 0.5);
+    EXPECT_NEAR(living_room::criticalDistanceM(geo), 0.82, 0.01);
+    for (std::size_t m = 0; m < living_room::kNumModes; ++m) {
+        const living_room::ModeInfo info =
+            chain.livingRoomModeInfo(static_cast<living_room::RoomMode>(m));
+        EXPECT_NE(info.name, nullptr);
+        EXPECT_NE(info.name[0], '\0');
+        EXPECT_NE(info.objective, nullptr);
+        EXPECT_NE(info.objective[0], '\0');
+    }
+}

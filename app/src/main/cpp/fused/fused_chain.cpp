@@ -564,6 +564,98 @@ void FusedChain::setTwinCalibration(
     twinCalDirty_.store(true, std::memory_order_release);
 }
 
+// ── CORONA P7–P10 — cableado (2026-11-24, rama corona-cableado) ──────────
+// P7: solo lectura. El certificado se construye desde userControls_
+// (controles efectivos vigentes); process() no lo llama.
+total_conservation::PlaybackCertificate
+FusedChain::totalConservationCertificate(
+    total_conservation::Codec codec, bool decodeBitExact,
+    std::uint64_t trackIndex, std::uint32_t ivannaVersionCode) const noexcept {
+    total_conservation::StageInput in;
+    in.codec = codec;
+    in.decodeBitExact = decodeBitExact;
+    // estimateDelta() solo distingue amount == 0 de amount > 0, así que
+    // la presencia se codifica 0.0/1.0 con el predicado verdadero de cada
+    // operador (isNeutral()), no con un escalar parcial: ORBE altera
+    // también vía width/wfsSpread/xtc/upmix aunque amount sea 0, y PULSO
+    // vía exciter/compresor aunque punch sea 0. Orden canónico: ORBE,
+    // HOLOS, SALA VIVA, VOLTERRA, ARMONÍA, PULSO, NEURO.
+    in.operatorAmounts = {
+        userControls_.spatial.isNeutral() ? 0.0 : 1.0,
+        userControls_.field.isNeutral() ? 0.0 : 1.0,
+        userControls_.listenerRoom.isNeutral() ? 0.0 : 1.0,
+        userControls_.transducer.isNeutral() ? 0.0 : 1.0,
+        userControls_.tonal.isNeutral() ? 0.0 : 1.0,
+        userControls_.dynamics.isNeutral() ? 0.0 : 1.0,
+        userControls_.brain.isNeutral() ? 0.0 : 1.0,
+    };
+    in.conservationActive = !userControls_.conservation.isNeutral();
+    return total_conservation::buildCertificate(in, trackIndex,
+                                                ivannaVersionCode);
+}
+
+// P8: compilar es puro (no depende del flag); aplicar exige flag ON.
+experience_compiler::CompileResult FusedChain::compileExperience(
+    const experience_compiler::ExperienceVector& target,
+    const experience_compiler::ReachableRegion& region) const noexcept {
+    return experience_compiler::compile(target, region);
+}
+
+bool FusedChain::applyCompiledExperience(
+    const experience_compiler::CompileResult& compiled) noexcept {
+    if (!experienceCompilerEnabled_.load(std::memory_order_relaxed)) {
+        return false;  // Flag OFF: no-op, la cadena no cambia.
+    }
+    if (!compiled.ok) return false;
+    FusedControls nc = userControls_;
+    nc.spatial.amount =
+        static_cast<float>(compiled.amounts[0]);  // ORBE
+    nc.field.amount = static_cast<float>(compiled.amounts[1]);  // HOLOS
+    nc.listenerRoom.roomWet =
+        static_cast<float>(compiled.amounts[2]);  // SALA VIVA
+    nc.transducer.correction =
+        static_cast<float>(compiled.amounts[3]);  // VOLTERRA
+    // [4] ARMONÍA: NO SE APLICA (sin escalar de amount tonal en
+    // FusedControls; ver el header). Su ganancia nominal NO entra en el
+    // trim de lo aplicado: el trim se recomputa solo sobre los 6
+    // aplicados, así la ganancia neta nominal de lo aplicado es 0.0 dB.
+    nc.dynamics.punch = static_cast<float>(compiled.amounts[5]);  // PULSO
+    nc.brain.adaptation =
+        static_cast<float>(compiled.amounts[6]);  // NEURO
+    double appliedGain = 0.0;
+    for (std::size_t o = 0; o < experience_compiler::kNumOperators; ++o) {
+        if (o == 4) continue;  // ARMONÍA no aplicada (ver arriba).
+        appliedGain += experience_compiler::nominalGainDbPerUnit(o) *
+                       compiled.amounts[o];
+    }
+    nc.tonal.trimDb = static_cast<float>(-appliedGain);
+    setControls(nc);  // clamp + fundido de modo + reparto existentes.
+    return true;
+}
+
+// P9: delegación pura al simulador con la geometría por defecto. Ningún
+// modo se aplica como efecto: NO hay camino de audio hacia living_room.
+living_room::RoomGeometry FusedChain::livingRoomGeometry() const noexcept {
+    return living_room::RoomGeometry{};
+}
+
+living_room::RoomDeltaResult FusedChain::livingRoomDeltaDb(
+    double listenerDistanceM) const noexcept {
+    return living_room::roomDeltaDb(living_room::RoomGeometry{},
+                                    listenerDistanceM);
+}
+
+living_room::DeltaChangeResult FusedChain::predictLivingRoomDeltaChange(
+    double fromM, double toM) const noexcept {
+    return living_room::predictDeltaChange(living_room::RoomGeometry{},
+                                           fromM, toM);
+}
+
+living_room::ModeInfo FusedChain::livingRoomModeInfo(
+    living_room::RoomMode mode) const noexcept {
+    return living_room::modeInfo(mode);
+}
+
 void FusedChain::refreshTwinCalibration(OmegaOutputMode mode) noexcept {
     // Solo recomputar cuando cambia el modo o la calibración (o la
     // primera vez): la estimación es función pura de parámetros

@@ -44,3 +44,18 @@ cmake -S app/src/main/cpp/fused/living_room -B /tmp/p9_build \
 cmake --build /tmp/p9_build
 ctest --test-dir /tmp/p9_build --output-on-failure
 ```
+
+## Cableado (2026-11-24, rama corona-cableado)
+
+- **En la app, como modelo/datos — NO como efecto activo:**
+  `living_room.cpp` se compila en `libivanna_omega.so` y
+  `libomega_effect.so` (`app/src/main/cpp/CMakeLists.txt`) y su test
+  está registrado en la suite principal (`tests/CMakeLists.txt`,
+  `test_living_room`).
+- **Enganche:** `FusedChain::livingRoomDeltaDb()`,
+  `predictLivingRoomDeltaChange()`, `livingRoomModeInfo()` y
+  `livingRoomGeometry()` delegan en las funciones puras del módulo con
+  la geometría por defecto. Ningún método toca audio y **ningún modo
+  de sala se aplica en `process()`**: convertir un modo en efecto
+  activo cambiaría el sonido sin ABX y queda explícitamente NO
+  cableado hasta la escucha en 3 posiciones por modo (gate P9).

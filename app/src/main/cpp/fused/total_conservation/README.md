@@ -52,3 +52,21 @@ ctest --test-dir /tmp/p7_build --output-on-failure
 
 Regla de Oro: este módulo no aplica ganancia; ganancia neta 0.0 dB por
 construcción (solo estima y certifica).
+
+## Cableado (2026-11-24, rama corona-cableado)
+
+- **En la app, de verdad:** `total_conservation.cpp` se compila en
+  `libivanna_omega.so` y `libomega_effect.so` (`app/src/main/cpp/
+  CMakeLists.txt`) y su test está registrado en la suite principal
+  (`tests/CMakeLists.txt`, `test_total_conservation`).
+- **Enganche:** `FusedChain::totalConservationCertificate()` construye
+  el `StageInput` desde los controles efectivos vigentes y devuelve el
+  `PlaybackCertificate`. Es **solo lectura**: no toca buffers ni
+  controles, el camino caliente no lo llama y el sonido por defecto es
+  bit-idéntico (lo prueban los TESTs `FusedChainCoronaWiring` en
+  `test_fused_chain.cpp`: neutro lossless → 3/9 etapas estimadas,
+  Δtotal 0.0 dB, `totalValid=false`).
+- La presencia por operador se codifica 0.0/1.0 con `isNeutral()` de
+  cada struct de controles (el predicado verdadero de "este operador
+  altera la señal"), porque `estimateDelta()` solo distingue amount
+  == 0 de amount > 0.
