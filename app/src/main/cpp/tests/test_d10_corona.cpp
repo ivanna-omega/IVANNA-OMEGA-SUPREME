@@ -429,12 +429,20 @@ TEST(D10Corona, SymplecticActionMonotonicConvergence) {
             << "acción no finita en bloque " << b;
     }
     // UMBRALES MEDIDOS (2026-11-25, g++-14 Release, 400 bloques de 128):
-    // dispersión en régimen 0.00930, deriva -0.0000097 (≈ 0). Umbral
-    // dispersión 0.02 (2.2x margen); deriva 0.005 (la media de los
+    // dispersión en régimen 0.00235, deriva -0.000049 (≈ 0). Umbral
+    // dispersión 0.02 (8.5x margen); deriva 0.005 (la media de los
     // últimos 50 bloques no supera a la de los primeros 50 en más de
     // 0.005). La acción converge a una meseta, no a cero: no se afirma
-    // monotonía por bloque (max subida medida 0.00864) ni acción final
-    // cero (meseta 0.4196).
+    // monotonía por bloque (max subida medida 0.00149) ni acción final
+    // cero (meseta 0.3532).
+    // HISTORIA: con la FIR de 128 taps la meseta era 0.4196 y la
+    // dispersión 0.00930. Con la FIR de 512 + shift 256 SIN compensar
+    // el retardo del seco, la dispersión subió a 0.134 (FALLO #1434):
+    // el árbitro comparaba bloques desalineados 256 muestras y el
+    // batido tono/bloque oscilaba la acción. La línea de retardo del
+    // seco (fix-2, FusedChain) la devuelve a 0.00235; la meseta baja a
+    // 0.3532 porque el lufsDelta ahora se mide en bloques ALINEADOS
+    // (antes el desalineado residual de ~29 muestras lo inflaba).
     EXPECT_LE(spread, 0.02) << "dispersión de la acción en régimen: " << spread;
     EXPECT_LE(drift, 0.005) << "la acción deriva hacia arriba: " << drift;
 }

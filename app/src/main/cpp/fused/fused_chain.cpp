@@ -52,6 +52,10 @@ void FusedChain::prepare(double sampleRate) noexcept {
         d10Engine_.setConfig(d10Cfg);  // resto de defaults del header
     }
     d10TelemetryValid_ = false;
+    // Línea de retardo del seco D10 (fix-2 #1434): a cero + puntero a 0.
+    d10DryDelayL_.fill(0.0);
+    d10DryDelayR_.fill(0.0);
+    d10DryDelayWp_ = 0;
 }
 
 void FusedChain::setControls(const FusedControls& c) noexcept {
@@ -148,6 +152,10 @@ void FusedChain::reset() noexcept {
     // La telemetría deja de ser válida hasta el próximo bloque arbitrado.
     d10Engine_.reset();
     d10TelemetryValid_ = false;
+    // Línea de retardo del seco D10 (fix-2 #1434): a cero + puntero a 0.
+    d10DryDelayL_.fill(0.0);
+    d10DryDelayR_.fill(0.0);
+    d10DryDelayWp_ = 0;
     // Tronidos 493: el fundido de modo no sobrevive a un reset (un
     // pendiente viejo no debe aplicarse tras reiniciar) y los wets se
     // fijan al objetivo vigente (los controles no los toca reset(), así
@@ -1058,9 +1066,28 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
         const double* d10DryL = nullptr;
         const double* d10DryR = nullptr;
         if (d10Engine_.isEnabled() && !isNeutral()) {
+            // FIX-2 #1434: el kernel LTI retrasa la salida
+            // kFirCenterShift muestras (desplazamiento circular del IR);
+            // el seco de referencia lleva el MISMO retardo o el árbitro
+            // compara bloques desalineados (acción con batido de 3
+            // bloques en tono de 1 kHz: dispersión 0.134 vs umbral 0.02).
+            // La línea se alimenta siempre (queda cebada para el
+            // enganche); el seco retardado solo se usa cuando el kernel
+            // procesa este chunk (misma condición que la llamada al
+            // kernel más abajo). La latencia FIFO de la ruta espectral
+            // LEGACY no se compensa (sin test que la mida).
+            const bool kernelActive = tOmega && d10Engine_.ltiKernel().engaged();
+            constexpr int kDelay = d10::TimeInvariantMatrixKernel2x2::kFirCenterShift;
             for (int i = 0; i < chunk; ++i) {
-                d10DryL_[static_cast<std::size_t>(i)] = l[i];
-                d10DryR_[static_cast<std::size_t>(i)] = r[i];
+                const std::size_t w = static_cast<std::size_t>(d10DryDelayWp_);
+                const double delayedL = d10DryDelayL_[w];
+                const double delayedR = d10DryDelayR_[w];
+                d10DryDelayL_[w] = l[i];
+                d10DryDelayR_[w] = r[i];
+                d10DryDelayWp_ = (d10DryDelayWp_ + 1) % kDelay;
+                const std::size_t o = static_cast<std::size_t>(i);
+                d10DryL_[o] = kernelActive ? delayedL : l[i];
+                d10DryR_[o] = kernelActive ? delayedR : r[i];
             }
             d10DryL = d10DryL_.data();
             d10DryR = d10DryR_.data();

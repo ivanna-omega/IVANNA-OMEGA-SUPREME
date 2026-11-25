@@ -585,6 +585,20 @@ private:
     d10::TenthDimensionActionEngine d10Engine_;
     std::array<double, kFusedMaxBlockFrames> d10DryL_{};
     std::array<double, kFusedMaxBlockFrames> d10DryR_{};
+    // Línea de retardo del seco D10 (fix-2 #1434): el kernel LTI retrasa
+    // la salida kFirCenterShift muestras; el seco de referencia del
+    // árbitro debe llevar el MISMO retardo o el árbitro compara bloques
+    // desalineados y la acción oscila con el batido tono/bloque
+    // (dispersión 0.134 vs umbral 0.02 en SymplecticActionMonotonic-
+    // Convergence). Se alimenta en cada chunk con D10 habilitado (aunque
+    // el kernel no esté enganchado: queda cebada para el enganche); el
+    // seco retardado solo se USA cuando el kernel procesa el chunk.
+    // Tras un periodo en neutro la línea queda obsoleta (el árbitro no
+    // corre en neutro): los 2 primeros chunks tras re-enganchar llevan
+    // un seco desalineado — transitorio, sin efecto en régimen.
+    std::array<double, d10::TimeInvariantMatrixKernel2x2::kFirCenterShift> d10DryDelayL_{};
+    std::array<double, d10::TimeInvariantMatrixKernel2x2::kFirCenterShift> d10DryDelayR_{};
+    int d10DryDelayWp_ = 0;
     float effectiveTonalAmount_ = 0.0f;  // solo hilo de audio
     bool d10TelemetryValid_ = false;     // solo hilo de audio
     std::array<std::complex<double>, kVolBins> tOmegaYl_{}, tOmegaYr_{};
