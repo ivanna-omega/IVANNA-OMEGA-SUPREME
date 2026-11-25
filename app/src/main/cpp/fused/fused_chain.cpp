@@ -1187,12 +1187,18 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
         }
 
         // ── CORONA D10 — árbitro (tras Conservación + TΩ/LTI) ───────────
-        // Corre ANTES del techo final (el techo sigue después y sigue
-        // siendo la última barrera). No-op si el D10 está deshabilitado
-        // o la cadena es neutra (en neutro d10DryL es nulo y además no
-        // se invoca). tonalAmount = amount tonal EFECTIVO del bloque
-        // (pushEffectiveControls). La telemetría del árbitro alimenta
-        // Ξ_10 del certificado P7 (d10TelemetryValid_ = true).
+        // FIX-ARBITER (2026-11-25): el árbitro YA NO TOCA EL BUFFER
+        // (energyCorrectionEnabled=false por defecto): solo observa el
+        // estado térmico y calcula telemetría (acción, coherencia,
+        // lufsDelta). La ganancia por muestra con slew es LEGACY
+        // desactivada: medida, modulaba el tono, degradaba los pisos y
+        // sumaba +2.34 dB que rompía P0. Corre ANTES del techo final (el
+        // techo sigue después y sigue siendo la última barrera). No-op si
+        // el D10 está deshabilitado o la cadena es neutra (en neutro
+        // d10DryL es nulo y además no se invoca). tonalAmount = amount
+        // tonal EFECTIVO del bloque (pushEffectiveControls). La telemetría
+        // del árbitro alimenta Ξ_10 del certificado P7
+        // (d10TelemetryValid_ = true).
         if (d10Engine_.isEnabled() && !isNeutral()) {
             d10Engine_.arbitrateAction(l, r, d10DryL, d10DryR, chunk,
                                        static_cast<double>(effectiveTonalAmount_));

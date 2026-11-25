@@ -1178,16 +1178,20 @@ TEST(FusedChainCoronaWiring, P8FlagOnAppliesWithZeroNetNominal) {
     EXPECT_FLOAT_EQ(c.dynamics.punch, 0.5f);       // PULSO (pegada)
     EXPECT_FLOAT_EQ(c.brain.adaptation, 0.5f);     // NEURO
     // Trim recomputado solo sobre lo aplicado:
-    // (0.10 - 0.05 + 0.08 + 0.12 - 0.04 + 0.02) * 0.5 = 0.115 -> -0.115.
-    EXPECT_NEAR(c.tonal.trimDb, -0.115, 1e-6);
+    // (0.10 - 0.05 + 0.08 + 0.12 + 0.06 - 0.04 + 0.02) * 0.5 = 0.145 -> -0.145.
+    // (CORONA D10: ARMONÍA +0.06 SÍ entra — antes de cd8fccf no se
+    // aplicaba y el trim era -0.115; con ARMONÍA aplicada el trim
+    // correcto es -0.145. Fix-arbiter 2026-11-25: expectativa actualizada
+    // al valor que el código ya daba.)
+    EXPECT_NEAR(c.tonal.trimDb, -0.145, 1e-6);
     // Ganancia neta NOMINAL de lo aplicado: 0.0 dB (Regla de Oro).
     // Tolerancia 1e-6, no 1e-9: el trim vive en tonal.trimDb (float32)
-    // y su redondeo al almacenar -0.115 ya mete ~2e-9 dB. La garantía
+    // y su redondeo al almacenar -0.145 ya mete ~2e-9 dB. La garantía
     // exacta (0.0 en double) es la del módulo (compiled.netGainDb,
     // verificada arriba); aquí se verifica la aplicada, en precisión
     // float32 del control real.
     double net = static_cast<double>(c.tonal.trimDb);
-    const std::size_t applied[] = {0, 1, 2, 3, 5, 6};
+    const std::size_t applied[] = {0, 1, 2, 3, 4, 5, 6};
     for (std::size_t o : applied) {
         double amount = 0.0;
         switch (o) {
@@ -1195,6 +1199,7 @@ TEST(FusedChainCoronaWiring, P8FlagOnAppliesWithZeroNetNominal) {
             case 1: amount = c.field.amount; break;
             case 2: amount = c.listenerRoom.roomWet; break;
             case 3: amount = c.transducer.correction; break;
+            case 4: amount = c.tonal.amount; break;  // ARMONÍA (escalar tonal)
             case 5: amount = c.dynamics.punch; break;
             case 6: amount = c.brain.adaptation; break;
             default: break;
@@ -1202,7 +1207,9 @@ TEST(FusedChainCoronaWiring, P8FlagOnAppliesWithZeroNetNominal) {
         net += experience_compiler::nominalGainDbPerUnit(o) * amount;
     }
     EXPECT_NEAR(net, 0.0, 1e-6);  // ver comentario arriba (float32)
-    // [4] ARMONÍA: explícitamente NO aplicada (sin escalar tonal).
+    // [4] ARMONÍA: aplicada como ESCALAR tonal continuo (tonal.amount,
+    // CORONA D10) — la curva EQ tonal NO se toca (curve/low/mid/high
+    // siguen neutros: el escalar no es una curva).
     EXPECT_EQ(c.tonal.curve, 1);
     EXPECT_FLOAT_EQ(c.tonal.lowDb, 0.0f);
     EXPECT_FLOAT_EQ(c.tonal.midDb, 0.0f);

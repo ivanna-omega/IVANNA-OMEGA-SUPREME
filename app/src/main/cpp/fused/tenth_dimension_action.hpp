@@ -7,8 +7,16 @@
 //   2) TimeInvariantMatrixKernel2x2 — kernel matricial 2x2 LTI (FIR 128
 //      taps por rama) compilado desde el espectro TΩ unificado
 //      (apex::UnifiedFieldWorkspace::outMatrix), con morph suave.
-//   3) TenthDimensionActionEngine — árbitro D10: ganancia de energía con
-//      slew, protección térmica y telemetría de acción hamiltoniana.
+//   3) TenthDimensionActionEngine — árbitro D10: observación térmica y
+//      telemetría de acción hamiltoniana. La CORRECCIÓN DE GANANCIA por
+//      muestra con slew (18 ms) es LEGACY DESACTIVADA por defecto
+//      (fix-arbiter 2026-11-25, ver D10Config::energyCorrectionEnabled):
+//      medida en vivo, esa ganancia MODULABA el tono (THD+N), degradaba
+//      los pisos 10-101 dB, sumaba +2.34 dB y rompía P0ReferenceLock, y
+//      su autoridad (±3 dB) no podía cerrar la brecha LUFS medida de
+//      ~18 dB entre seco y cadena con 7 operadores a 1.0. El motor ya no
+//      toca el buffer: observa y reporta; el kernel LTI (2) y el
+//      observador térmico (1) siguen activos.
 //
 // Origen: documento D10 de Gemini, §3, RECONSTRUIDO y CORREGIDO contra el
 // código vivo (el código del documento estaba parcialmente corrupto y su
@@ -306,6 +314,16 @@ private:
 
 struct D10Config {
     bool enabled = true;               // DEFAULT TRUE: orden "todo prendido"
+    // LEGACY DESACTIVADO (fix-arbiter 2026-11-25): la corrección de
+    // ganancia de energía por muestra con slew de 18 ms. Medido con ella
+    // ON: +2.34 dB que rompía P0ReferenceLock.Levels/TruePeak, pisos
+    // degradados 10-101 dB (audífonos -91.34 -> -81.06 dB, ORBE+ARMONÍA
+    // -180.80 -> -79.31 dB) y Matched-LUFS en -17.86 dB pese a corregir
+    // (su tope ±3 dB no cierra la brecha real de ~18 dB). Con ella OFF
+    // (default) arbitrateAction SOLO observa (térmico) y calcula
+    // telemetría: NO toca el buffer. Reactivarla exige medir de nuevo
+    // pisos + P0 + bandas; no es un flag para encender en caliente.
+    bool energyCorrectionEnabled = false;
     double actionWeight = 0.75;        // peso de la acción hamiltoniana [0, 1]
     double listenerDistanceM = 3.0;    // posición de escucha de la sala (m)
     double phaseCoherenceTarget = 0.85; // coherencia L/R objetivo [0, 1]
@@ -340,6 +358,7 @@ public:
 
     void setConfig(const D10Config& cfg) noexcept {
         config_.enabled = cfg.enabled;
+        config_.energyCorrectionEnabled = cfg.energyCorrectionEnabled;
         config_.actionWeight = std::clamp(cfg.actionWeight, 0.0, 1.0);
         config_.listenerDistanceM = std::clamp(cfg.listenerDistanceM, 0.3, 10.0);
         config_.phaseCoherenceTarget = std::clamp(cfg.phaseCoherenceTarget, 0.0, 1.0);
@@ -362,8 +381,18 @@ public:
     }
 
     // Árbitro D10 in-place sobre outL/outR. refDryL/refDryR son opcionales
-    // (pueden ser nulos: sin referencia seca no hay corrección LUFS, solo
+    // (pueden ser nulos: sin referencia seca no hay medida LUFS, solo
     // protección térmica y telemetría). No-op si !enabled.
+    //
+    // FIX-ARBITER (2026-11-25): con energyCorrectionEnabled=false
+    // (default) esta función NO TOCA EL BUFFER: solo observa el estado
+    // térmico y calcula la telemetría (acción, coherencia, lufsDelta).
+    // La aplicación de ganancia por muestra con slew queda como código
+    // LEGACY detrás del flag (ver paso 5): medir pisos + P0 + bandas
+    // antes de reactivarla. La telemetría NO depende de la ganancia:
+    // lufsDelta/acción se miden pre-ganancia, así que con el flag OFF
+    // los tests de observación (térmico, convergencia de acción, P7
+    // Ξ_10) miden lo mismo que con el flag ON.
     void arbitrateAction(double* outL, double* outR,
                          const double* refDryL, const double* refDryR,
                          int frames, double tonalNormalizedAmount) noexcept {
@@ -424,12 +453,20 @@ public:
             0.5 * std::pow(std::max(0.0, config_.phaseCoherenceTarget - absCoh), 2.0) +
             std::pow(std::max(0.0, th.normalizedExcursionPeak - 0.85), 2.0);
 
-        // (5) Aplicación por muestra con slew (tau 18 ms).
-        const double slewCoeff = 1.0 - std::exp(-1.0 / (0.018 * sampleRate_));
-        for (int i = 0; i < frames; ++i) {
-            smoothEnergyGain_ += slewCoeff * (targetGain - smoothEnergyGain_);
-            outL[i] *= smoothEnergyGain_;
-            outR[i] *= smoothEnergyGain_;
+        // (5) LEGACY — aplicación por muestra con slew (tau 18 ms).
+        // DESACTIVADA por defecto (energyCorrectionEnabled=false):
+        // la ganancia por muestra modulaba el tono y degradaba los pisos
+        // (fix-arbiter 2026-11-25). Solo corre si el flag legacy se
+        // enciende explícitamente; smoothEnergyGain_ se queda en 1.0 si
+        // no. El targetGain y thermalScale de arriba se siguen
+        // calculando para telemetría aunque la ganancia no se aplique.
+        if (config_.energyCorrectionEnabled) {
+            const double slewCoeff = 1.0 - std::exp(-1.0 / (0.018 * sampleRate_));
+            for (int i = 0; i < frames; ++i) {
+                smoothEnergyGain_ += slewCoeff * (targetGain - smoothEnergyGain_);
+                outL[i] *= smoothEnergyGain_;
+                outR[i] *= smoothEnergyGain_;
+            }
         }
 
         // (6) Telemetría.

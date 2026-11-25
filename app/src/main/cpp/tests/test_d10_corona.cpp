@@ -237,6 +237,18 @@ TEST(D10Corona, NeutralIsBitExactZeroCost) {
 // ganancia neta en 0.0 dB (Regla de Oro Matched-LUFS): el trim P8 es
 // nominal, pero el árbitro D10 corrige la energía medida hacia el seco,
 // así que la ganancia neta MEDIDA en régimen debe ser ~0 dB.
+//
+// FIX-ARBITER (2026-11-25): LA PREMISA DE ARRIBA QUEDÓ REFUTADA POR
+// MEDICIÓN. El árbitro YA NO corrige ganancia (su autoridad era ±3 dB
+// y la brecha medida es ~18 dB: con él ON netL=-17.86 dB, y el modelo
+// nominal P8 afirma netGainNominal=+0.000 dB mientras la cadena real
+// pierde ~20 dB con 7 operadores a 1.0 sobre tono dual-mono). Este test
+// sigue FALLANDO y queda como marcador del defecto REAL: el modelo
+// nominal P8 no describe la ganancia real de la cadena. Arreglarlo es
+// trabajo P8 (medir la ganancia real por operador en P2/P3 y corregir
+// los coeficientes nominales), NO del árbitro: ninguna ganancia del
+// árbitro puede cerrar 18 dB sin romper P0 y el techo. No se maquilla
+// el umbral.
 TEST(D10Corona, MatchedLufsInvariantAcross7Operators) {
     FusedChain chain;
     chain.prepare(kFs);
