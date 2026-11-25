@@ -16,6 +16,15 @@ static constexpr int DECIMATE_FACTOR = 3;
 static constexpr float EMA_COEF = 0.81f;
 static constexpr float PI_F = 3.14159265358979323846f;
 
+// Conversión Hz <-> mel (escala HTK, misma que IvannaTinyMLKernel).
+inline float hzToMel(float hz) noexcept {
+    return 2595.0f * std::log10(1.0f + hz / 700.0f);
+}
+
+inline float melToHz(float mel) noexcept {
+    return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f);
+}
+
 IvannaAudioClassifier::IvannaAudioClassifier() 
     : m_decimFirPos(0), m_decimBufPos(0), m_weightsLoaded(false) 
 {
@@ -90,12 +99,53 @@ void IvannaAudioClassifier::initFilterbankAndWindow() noexcept {
         m_fftTwiddleReal[i] = std::cos(-2.f * PI_F * i / CLASSIFIER_FRAME_SIZE);
         m_fftTwiddleImag[i] = std::sin(-2.f * PI_F * i / CLASSIFIER_FRAME_SIZE);
     }
-    // STUB: el banco mel queda en cero y NADA lo llena nunca (no hay
-    // construcción de filtros triangulares). extractLogMelFilterbank()
-    // devuelve por tanto log(1e-10) en las 64 bandas, siempre, y la
-    // clasificación es constante. No es un bug de inicialización: es
-    // funcionalidad no implementada (ver nota STUB en el .hpp).
+    // FIX CORONA Frente A (defecto 3, causa raíz 1 de 2): el banco mel
+    // triangular real. Antes esto era un memset a 0 y nada lo llenaba
+    // nunca, así que extractLogMelFilterbank() devolvía log(1e-10) en las
+    // 64 bandas, siempre. Construcción idéntica a
+    // IvannaTinyMLKernel::initializeFilterbanks (64 bandas, 0-8000 Hz,
+    // 257 bins @16 kHz). El banco se construye siempre (es solo una
+    // tabla); su USO sigue detrás del flag m_realFrontendEnabled
+    // (default OFF): con el flag OFF, extractLogMelFilterbank() devuelve
+    // el legacy log(1e-10) constante y el sonido no cambia.
     std::memset(m_melFilterbank, 0, sizeof(m_melFilterbank));
+    const float melMin = hzToMel(MEL_F_MIN);
+    const float melMax = hzToMel(MEL_F_MAX);
+    const float melStep = (melMax - melMin) / static_cast<float>(MEL_BANDS + 1);
+    for (size_t m = 0; m < MEL_BANDS; ++m) {
+        const float centerMel = melMin + static_cast<float>(m + 1) * melStep;
+        const float leftMel   = centerMel - melStep;
+        const float rightMel  = centerMel + melStep;
+        const float leftHz    = melToHz(leftMel);
+        const float centerHz  = melToHz(centerMel);
+        const float rightHz   = melToHz(rightMel);
+        for (size_t bin = 0; bin < FFT_SPECTRUM_SIZE; ++bin) {
+            const float binHz =
+                (static_cast<float>(bin) * SAMPLE_RATE_CLASS) /
+                static_cast<float>(CLASSIFIER_FRAME_SIZE);
+            if (binHz >= leftHz && binHz <= centerHz && centerHz > leftHz) {
+                m_melFilterbank[m][bin] = (binHz - leftHz) / (centerHz - leftHz);
+            } else if (binHz > centerHz && binHz <= rightHz && rightHz > centerHz) {
+                m_melFilterbank[m][bin] = (rightHz - binHz) / (rightHz - centerHz);
+            }
+        }
+    }
+}
+
+float IvannaAudioClassifier::melFilterbankWeightSum() const noexcept {
+    float s = 0.0f;
+    for (size_t m = 0; m < MEL_BANDS; ++m) {
+        for (size_t k = 0; k < FFT_SPECTRUM_SIZE; ++k) {
+            s += m_melFilterbank[m][k];
+        }
+    }
+    return s;
+}
+
+std::array<float, MEL_BANDS> IvannaAudioClassifier::logMelEnergies() const noexcept {
+    std::array<float, MEL_BANDS> out{};
+    for (size_t m = 0; m < MEL_BANDS; ++m) out[m] = m_melLogEnergies[m];
+    return out;
 }
 
 void IvannaAudioClassifier::ingestAudioFrame(const float* left, const float* right, size_t n) noexcept {
@@ -132,32 +182,91 @@ void IvannaAudioClassifier::computeSTFT(const float* frame) noexcept {
         m_windowedFrame[i] = frame[i] * m_hanningWindow[i];
     }
 #endif
-    // STUB: NO se calcula FFT. El "espectro" de abajo es
-    // |muestra ventaneada| x 0.5; las tablas de bit-reversal y twiddles
-    // precalculadas en initFilterbankAndWindow() no se usan aquí. La salida
-    // de esta función no es un espectro real: es un placeholder rápido que
-    // alimenta un banco mel que además está en cero (ver nota STUB en el .hpp).
-    std::memset(m_powerSpectrum, 0, sizeof(m_powerSpectrum));
-    for (size_t i = 0; i < FFT_SPECTRUM_SIZE; ++i) {
-        m_powerSpectrum[i] = std::abs(m_windowedFrame[i]) * 0.5f; 
+    // FIX CORONA Frente A (defecto 3, causa raíz 2 de 2): con el flag
+    // del frontend real OFF se reproduce EXACTAMENTE el "espectro" legacy
+    // (|muestra ventaneada| x 0.5, sin FFT) para que el sonido por
+    // defecto no cambie. Con el flag ON se calcula la FFT radix-2 de 512
+    // puntos con las tablas precalculadas en initFilterbankAndWindow()
+    // (bit-reversal + twiddles) y el espectro de potencia real
+    // |X[k]|^2. Sin allocs (buffers en pila, hilo de inferencia).
+    if (!m_realFrontendEnabled.load(std::memory_order_relaxed)) {
+        std::memset(m_powerSpectrum, 0, sizeof(m_powerSpectrum));
+        for (size_t i = 0; i < FFT_SPECTRUM_SIZE; ++i) {
+            m_powerSpectrum[i] = std::abs(m_windowedFrame[i]) * 0.5f;
+        }
+        return;
+    }
+
+    float re[CLASSIFIER_FRAME_SIZE];
+    float im[CLASSIFIER_FRAME_SIZE];
+    for (size_t i = 0; i < CLASSIFIER_FRAME_SIZE; ++i) {
+        re[i] = m_windowedFrame[i];
+        im[i] = 0.0f;
+    }
+    // Permutación bit-reversal (tabla de 9 bits precalculada).
+    for (size_t i = 0; i < CLASSIFIER_FRAME_SIZE; ++i) {
+        const size_t j = m_bitRevTable[i];
+        if (j > i) {
+            const float tr = re[i]; re[i] = re[j]; re[j] = tr;
+            const float ti = im[i]; im[i] = im[j]; im[j] = ti;
+        }
+    }
+    // Mariposas DIT: W_len^j = exp(-2*pi*i*j/len) = twiddle[j*step].
+    for (size_t len = 2; len <= CLASSIFIER_FRAME_SIZE; len <<= 1) {
+        const size_t half = len >> 1;
+        const size_t step = CLASSIFIER_FRAME_SIZE / len;
+        for (size_t i = 0; i < CLASSIFIER_FRAME_SIZE; i += len) {
+            for (size_t j = 0; j < half; ++j) {
+                const float wr = m_fftTwiddleReal[j * step];
+                const float wi = m_fftTwiddleImag[j * step];
+                const float xr = re[i + j + half];
+                const float xi = im[i + j + half];
+                const float tr = wr * xr - wi * xi;
+                const float ti = wr * xi + wi * xr;
+                const float ur = re[i + j];
+                const float ui = im[i + j];
+                re[i + j]        = ur + tr;
+                im[i + j]        = ui + ti;
+                re[i + j + half] = ur - tr;
+                im[i + j + half] = ui - ti;
+            }
+        }
+    }
+    for (size_t k = 0; k < FFT_SPECTRUM_SIZE; ++k) {
+        m_powerSpectrum[k] = re[k] * re[k] + im[k] * im[k];
     }
 }
 
 void IvannaAudioClassifier::extractLogMelFilterbank() noexcept {
-    // STUB (consecuencia): m_melFilterbank está en cero (ver
-    // initFilterbankAndWindow), así que `sum` es 0 en todas las bandas y
-    // esta función devuelve log(1e-10) constante. No hay nada que
-    // "arreglar" aquí sin implementar el banco mel real.
+    // FIX CORONA Frente A (defecto 3): con el flag del frontend real OFF
+    // se devuelve EXACTAMENTE el legacy (log(1e-10) constante en las 64
+    // bandas, lo que producía el banco en cero) y el sonido no cambia.
+    // Con el flag ON, energías log-mel reales sobre el espectro de
+    // potencia de la FFT y el banco triangular. NOTA NEON: el bucle
+    // vectorizado del legacy lee 4 floats por iteración hasta k=256, es
+    // decir 3 floats más allá de los 257 bins (lectura fuera del array,
+    // benigna solo porque el banco era cero); el camino real usa el
+    // límite k+4<=257 + cola escalar para no leer fuera de rango.
+    if (!m_realFrontendEnabled.load(std::memory_order_relaxed)) {
+        for (size_t m = 0; m < MEL_BANDS; ++m) {
+            m_melLogEnergies[m] = std::log(1e-10f);
+        }
+        return;
+    }
 #if defined(__ARM_NEON)
     for (size_t m = 0; m < MEL_BANDS; ++m) {
         float32x4_t v_sum = vdupq_n_f32(0.0f);
-        for (size_t k = 0; k < FFT_SPECTRUM_SIZE; k += 4) {
+        size_t k = 0;
+        for (; k + 4 <= FFT_SPECTRUM_SIZE; k += 4) {
             float32x4_t v_pow = vld1q_f32(&m_powerSpectrum[k]);
             float32x4_t v_mel = vld1q_f32(&m_melFilterbank[m][k]);
             v_sum = vmlaq_f32(v_sum, v_pow, v_mel);
         }
-        float sum = vgetq_lane_f32(v_sum, 0) + vgetq_lane_f32(v_sum, 1) + 
+        float sum = vgetq_lane_f32(v_sum, 0) + vgetq_lane_f32(v_sum, 1) +
                     vgetq_lane_f32(v_sum, 2) + vgetq_lane_f32(v_sum, 3);
+        for (; k < FFT_SPECTRUM_SIZE; ++k) {
+            sum += m_powerSpectrum[k] * m_melFilterbank[m][k];
+        }
         m_melLogEnergies[m] = std::log(std::max(sum, 1e-10f));
     }
 #else
@@ -220,10 +329,14 @@ void IvannaAudioClassifier::runInt8Inference() noexcept {
 #endif
 
     // 2. Conv1D: Simulating quantized weights pre-loaded in m_qWeights
-    // STUB: sin loadWeights() (en producción nadie lo llama; solo un test)
-    // los pesos son placeholder sintético ((f+k)%15-7 / (c+i)%11-5), no
-    // pesos entrenados. La "inferencia" es determinista pero sin contenido
-    // real: con el frontend en cero, su salida es constante.
+    // NOTA (2026-11-24): sin loadWeights() (en producción nadie lo llama;
+    // solo un test) los pesos son placeholder sintético ((f+k)%15-7 /
+    // (c+i)%11-5), no pesos entrenados. La "inferencia" es determinista
+    // pero sin contenido real: con el frontend legacy (flag OFF) su salida
+    // es constante (siempre MUSIC); con el frontend real (flag ON) las
+    // features sí discriminan contenido, pero la discriminación entre
+    // clases sigue limitada por estos pesos placeholder — el cableado de
+    // pesos entrenados (CRNN TFLite) es trabajo de laboratorio aparte.
     // For structural proof-of-concept, we do a simplistic 3-tap filter per band
     for (size_t i = 0; i < 32; ++i) {
         for (size_t f = 0; f < 8; ++f) {

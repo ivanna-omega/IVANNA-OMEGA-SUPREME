@@ -12,19 +12,24 @@
  *   - Clasificación en 6 categorías (Music, Movie, Game, Voice, Ambient, Unknown).
  *   - Uso de punteros atómicos para evitar Malloc/Free en tiempo de ejecución (Zero-Copy).
  *
- * STUB (2026-11-23) — este clasificador NO clasifica contenido real hoy:
- *   1. El banco mel (m_melFilterbank) se pone a cero en
- *      initFilterbankAndWindow() y nada lo llena nunca → extractLogMelFilterbank()
- *      devuelve log(1e-10) en las 64 bandas, siempre.
- *   2. computeSTFT() NO calcula FFT: el espectro es |muestra| x 0.5.
- *   3. Los pesos INT8 son placeholder sintético salvo que alguien llame
- *      loadWeights(); en producción nadie lo llama (solo un test) →
- *      la salida es constante (siempre MUSIC en la práctica).
- * Consecuencia: el guardián AntiDolby corre sobre un objetivo FIJO, no
- * adaptativo al contenido, en host Y en el teléfono (mismo código).
- * Arreglar el frontend cambiaría el sonido: queda fuera de este commit por
- * decisión explícita; el cableado real (CRNN TFLite + frontend idéntico al
- * entrenamiento) es trabajo de laboratorio detrás de flag + ABX.
+ * FRONTEND REAL DETRÁS DE FLAG (2026-11-24, fix CORONA Frente A):
+ *   La causa raíz del STUB era doble: (1) el banco mel se ponía a cero y
+ *   nada lo llenaba nunca; (2) computeSTFT() NO calculaba FFT (el
+ *   "espectro" era |muestra ventaneada| x 0.5). Ambas están corregidas:
+ *   initFilterbankAndWindow() construye el banco triangular real (64
+ *   bandas, 0-8000 Hz, misma construcción que IvannaTinyMLKernel) y
+ *   computeSTFT() calcula la FFT radix-2 de 512 con las tablas
+ *   precalculadas (bit-reversal + twiddles). PERO el uso del frontend
+ *   real está detrás de setRealFrontendEnabled(), con default OFF
+ *   (fail-closed): con el flag OFF, computeSTFT() y
+ *   extractLogMelFilterbank() reproducen EXACTAMENTE el comportamiento
+ *   legacy (espectro falso + log(1e-10) constante → siempre MUSIC), así
+ *   que el sonido por defecto NO cambia y P0 sigue en verde. Encender el
+ *   flag vuelve adaptativo al guardián AntiDolby (cambia el sonido): solo
+ *   con decisión de Esse + ABX. Los pesos INT8 siguen siendo placeholder
+ *   sintético salvo loadWeights(); el cableado real (CRNN TFLite +
+ *   frontend idéntico al entrenamiento) sigue siendo trabajo de
+ *   laboratorio.
  */
 
 #include "IvannaFusionCore.hpp"
@@ -151,6 +156,31 @@ public:
         return m_synchronous.load(std::memory_order_relaxed);
     }
 
+    // ── Frontend mel real (fix CORONA Frente A, 2026-11-24) ─────────────
+    // Default OFF (fail-closed): con el flag OFF el clasificador se
+    // comporta EXACTAMENTE como antes del fix (siempre MUSIC) y el sonido
+    // no cambia. Con el flag ON usa la FFT real + el banco mel triangular
+    // y el guardián AntiDolby se vuelve adaptativo al contenido (cambia
+    // el sonido: solo con decisión de Esse + ABX). Se puede volver a OFF
+    // en cualquier momento: el comportamiento legacy se restaura exacto.
+    void setRealFrontendEnabled(bool on) noexcept {
+        m_realFrontendEnabled.store(on, std::memory_order_relaxed);
+    }
+    bool isRealFrontendEnabled() const noexcept {
+        return m_realFrontendEnabled.load(std::memory_order_relaxed);
+    }
+
+    // ── Telemetría / tests del frontend (sin efecto en el audio) ───────
+    // Suma de todos los pesos del banco mel triangular (0 si el banco
+    // estuviera en cero, como antes del fix). Sirve para afirmar en tests
+    // que el banco ya no es cero sin exponer el array interno.
+    float melFilterbankWeightSum() const noexcept;
+    // Copia de las 64 energías log-mel del último frame inferido (0 si
+    // aún no hay inferencia). Permite afirmar en tests que el frontend
+    // es selectivo en frecuencia (un tono grave concentra la energía en
+    // bandas bajas y uno agudo en bandas altas).
+    std::array<float, MEL_BANDS> logMelEnergies() const noexcept;
+
 private:
     LockFreeAudioRingBuffer<float, RING_BUFFER_CAPACITY> m_audioRingBuffer;
     
@@ -165,8 +195,11 @@ private:
     ALIGN_NEON float m_fftTwiddleReal[CLASSIFIER_FRAME_SIZE / 2];
     ALIGN_NEON float m_fftTwiddleImag[CLASSIFIER_FRAME_SIZE / 2];
     uint16_t m_bitRevTable[CLASSIFIER_FRAME_SIZE];
-    // STUB: siempre a cero (ver initFilterbankAndWindow) — nunca se llena
-    // con filtros triangulares reales.
+    // Banco mel triangular real (64 bandas, 0-8000 Hz): lo construye
+    // initFilterbankAndWindow(). Su USO está detrás del flag
+    // m_realFrontendEnabled (default OFF): con el flag OFF,
+    // extractLogMelFilterbank() devuelve el legacy log(1e-10) constante
+    // y el banco no se consulta, así que el sonido no cambia.
     ALIGN_NEON float m_melFilterbank[MEL_BANDS][FFT_SPECTRUM_SIZE];
 
     // Decimador FIR state
@@ -191,6 +224,9 @@ private:
     // Modo síncrono (ver setSynchronous): true = hilo parado, el
     // llamador drena con processPendingFrames(). Solo host.
     std::atomic<bool> m_synchronous{false};
+    // Frontend mel real (ver setRealFrontendEnabled): false = legacy
+    // exacto (siempre MUSIC); true = FFT + banco mel reales.
+    std::atomic<bool> m_realFrontendEnabled{false};
 
     void initFilterbankAndWindow() noexcept;
     void inferenceLoop() noexcept;

@@ -177,6 +177,21 @@ public:
     float antiDolbySpreadMul() const noexcept { return antiDolby_.currentSpreadMultiplier(); }
     float antiDolbyIntensity() const noexcept { return antiDolby_.currentIntensity(); }
 
+    // ── Clasificación adaptativa (fix CORONA Frente A, defecto 3) ────
+    // Reenvía el flag del frontend mel real del clasificador (ver
+    // IvannaAudioClassifier::setRealFrontendEnabled). Default OFF
+    // (fail-closed): el clasificador sigue devolviendo siempre MUSIC y
+    // el sonido por defecto NO cambia (P0 en verde). Encenderlo vuelve
+    // adaptativo al guardián AntiDolby y CAMBIA el sonido: solo con
+    // decisión explícita de Esse + ABX. Sin cableado JNI/UI: nadie lo
+    // enciende por accidente desde la app.
+    void setAdaptiveClassificationEnabled(bool on) noexcept {
+        classifier_.setRealFrontendEnabled(on);
+    }
+    bool adaptiveClassificationEnabled() const noexcept {
+        return classifier_.isRealFrontendEnabled();
+    }
+
 private:
     void runAnalysisChunk(const float* l, const float* r, int n) noexcept;
     // F2/486 (labor grande, motor double): la actuación corre en double

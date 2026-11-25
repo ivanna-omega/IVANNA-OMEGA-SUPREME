@@ -2174,6 +2174,24 @@ if(IVANNA_SAN_FLAGS)
 endif()
 gtest_discover_tests(test_tinyml_kernel)
 
+# ── CORONA Frente A, defecto 3: frontend mel real del clasificador NEURO ──
+# FFT radix-2 + banco triangular detrás de flag (default OFF). El test
+# congela el legacy (siempre MUSIC) y afirma que con el flag ON el banco
+# ya no es cero, es selectivo en frecuencia y la salida depende del
+# contenido; apagar el flag restaura el legacy exacto.
+add_executable(test_audio_classifier_frontend
+  test_audio_classifier_frontend.cpp
+  ../IvannaAudioClassifier.cpp
+)
+target_link_libraries(test_audio_classifier_frontend PRIVATE GTest::gtest_main Threads::Threads m)
+target_include_directories(test_audio_classifier_frontend PRIVATE .. ../include)
+target_compile_options(test_audio_classifier_frontend PRIVATE -Wall -Wextra)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_audio_classifier_frontend PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_audio_classifier_frontend PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_audio_classifier_frontend)
+
 # ── IVANNA Acoustic Unity Engine (v2.6.0) ──
 ivanna_add_test(test_acoustic_unity_engine)
 ivanna_add_test(test_unity_closed_loop)
