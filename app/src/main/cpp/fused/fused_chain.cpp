@@ -1176,6 +1176,28 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
             }
         }
 
+        // ── TECHO FINAL, 2ª PASADA (rampa de enganche, CORONA 2026-11-25) ──
+        // El wet de cadena (TRONIDOS 493) mezcla el seco DESPUÉS del techo
+        // de arriba: durante la rampa de enganche (30 ms, chainWet_ 0→1) el
+        // seco caliente pasaba sin clavar — un seno 1 kHz a 0 dBFS salía a
+        // −0.001 dBFS con APEX ON y OFF (el hotmix a 0 dBFS sí quedaba en
+        // −0.100/−0.139 porque su pico cae tras la rampa). Esta 2ª pasada
+        // es la ÚLTIMA barrera: clava la salida a ±0.9885531f (−0.1 dBFS
+        // exacto) también durante la rampa. Transparente bajo el techo
+        // (bit-idéntico: solo actúa cuando |x| > techo) y solo cuando la
+        // cadena NO es neutra: en bypass no corre y se preserva la
+        // bit-exactitud. El fundido de modo solo multiplica por ≤1, así
+        // que no puede crear violación; la pasada va después de él para
+        // que NINGUNA etapa posterior al techo pueda subir el pico.
+        if (!isNeutral()) {
+            const double ceilFinal =
+                static_cast<double>(FusedDynamics::kLimiterCeiling);
+            for (int i = 0; i < chunk; ++i) {
+                l[i] = std::clamp(l[i], -ceilFinal, ceilFinal);
+                r[i] = std::clamp(r[i], -ceilFinal, ceilFinal);
+            }
+        }
+
         ++stats_.totalBlocks;
         for (int i = 0; i < kNumOperators; ++i) telemetry_.active[i] = active[i];
 
