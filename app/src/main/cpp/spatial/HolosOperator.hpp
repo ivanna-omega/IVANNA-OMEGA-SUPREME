@@ -79,6 +79,7 @@
 #include <memory>
 #include <vector>
 
+#include "BandPowerConserver.hpp"
 #include "HolosGainField.hpp"
 #include "HolosGreenKernel.hpp"
 #include "HolosStateEstimator.hpp"
@@ -88,6 +89,20 @@
 #include "fft_radix2.hpp"
 
 namespace ivanna {
+
+// Fase 1 (conservación de potencia, fix Green 2026-11-25) — equivalente
+// del M1 de ORBE (BandPowerConserver.hpp, L1/L2): con el flag ON, el side
+// NUNCA se atenúa (wSide = 1.0, como kSideGain en ORBE) y el conservador
+// por banda fuerza Σ|Y|² = Σ|X|² por banda (ganancia neta 0.0 dB por
+// construcción, Regla de Oro). Sin él, HOLOS pasaba el side a ~0.406 en
+// contenido coherente (widthFromState 0.3 × norma 1.354), perdía
+// −2.5…−4.1 dB y Green fallaba con todos los spreads (ORBE pasa el side
+// a 1.0 siempre por M1). Flag compile-time, ON por defecto (orden Esse
+// 2026-11-25: el producto sea magistral; la pieza se cambia por una de
+// lujo). P0 se re-congela con el flag ON: cambia el sonido.
+#ifndef IVANNA_HOLOS_POWER_CONSERVATION
+#define IVANNA_HOLOS_POWER_CONSERVATION 1
+#endif
 
 // Guarda de armónicos (v2.5.411, tarea 1): máximo de holos_harmonics
 // VALIDADO por test (test_holos_retune_sweep, HolosHarmonicsGuard).
@@ -139,6 +154,11 @@ enum class HolosThermalTier : int {
 
 class HolosOperator {
 public:
+    // Conservación de potencia L1/L2: false = width de siempre (el side
+    // se atenúa a ~0.406 en contenido coherente); true = wSide=1.0 +
+    // conservador por banda. true por defecto (orden Esse 2026-11-25).
+    static constexpr bool kHolosPowerConservation = (IVANNA_HOLOS_POWER_CONSERVATION != 0);
+
     static constexpr int kHop = 128;  // == Ivanna::BLOCK_SIZE
     static constexpr int kMaxBands = 24;
 
@@ -200,6 +220,11 @@ public:
     float bandGammaDb(int b) const noexcept;  // Γ aplicado (dB, estático+dinámico)
     float bandWidthGain(int b) const noexcept;
     float bandDiffuseMix(int b) const noexcept;
+    // Ganancia del conservador de potencia por banda (Fase 1, M1 de
+    // HOLOS): g_b del último frame comprometido. 1.0 si el flag está OFF
+    // o la banda no existe. La usa NeuCompiler::holosMatrix para
+    // replicar el render vivo.
+    float bandConserverGain(int b) const noexcept;
     float meanCoherence() const noexcept { return estimator_.meanCoherence(); }
     float appliedAmount() const noexcept { return static_cast<float>(wet_); }
     bool isActive() const noexcept { return wet_ > 0.0f || blend_ > 0.0f; }
@@ -252,6 +277,10 @@ private:
     holos::HolosVolterraKernel kernel_;
     holos::PinnaTable pinna_;
     Ivanna::RirConvolver rir_;  // término difuso: una sola IR compartida
+    // Fase 1 (L1): conservador de potencia por banda + su estado. Solo
+    // se usa con kHolosPowerConservation; con el flag OFF nunca se toca
+    // y el comportamiento es bit-idéntico al actual.
+    ivanna::nf::BandPowerConserver holosCons_;
 
     // Estado STFT principal (todo preasignado en prepare()) — double (F2/486).
     std::unique_ptr<FFTRadix2d> fft_;

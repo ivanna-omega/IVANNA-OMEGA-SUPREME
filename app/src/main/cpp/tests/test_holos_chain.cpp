@@ -261,17 +261,20 @@ TEST(HolosChain, GreenMatchesOrbe) {
     // ITD (208 µs medida) es el side, no G.
     // ── ACANTILADO DE SPREAD (medido 2026-11-25, clang++-18, M1 ON) ──
     // linearParams() NO fija spread/proximity: hereda los defaults del
-    // struct. ORBE con M1 ON da +312 µs / +2.2 dB. HOLOS: spread 1.0 →
-    // +375 µs (dif 62 µs, FALLA); 1.2 → +417 µs (dif 105 µs, FALLA);
-    // 1.3/1.4/1.5 → −333 µs (imagen ESPEJADA, FALLA). El barrido
-    // 0.7–1.0 (2026-11-25) probó que NINGÚN spread pasa Green: el ITD
-    // solo pasa ≤0.8 y la ILD falla en todos (2.41–2.70 dB, tol 2.0).
-    // Causa: el side forzado de M1 (ORBE side 1.0 vs HOLOS ~0.42); con
-    // M1 OFF Green pasa en 0.8–1.2. Spread 1.2 es el default porque
-    // evita el espejo ≥1.3, NO porque pase Green. El fix del estimador
-    // (θ×spread con clamp ±90° + realimentación por r) queda como
-    // trabajo futuro. El default del struct es 1.2 desde fix(holos)
-    // 2026-11-25.
+    // struct. Con el side de HOLOS en 0.406 (antes del fix), ORBE con M1
+    // ON daba +312 µs / +2.2 dB y HOLOS: spread 1.0 → +375 µs (dif 62 µs,
+    // FALLA); 1.2 → +417 µs (dif 105 µs, FALLA); 1.3/1.4/1.5 → −333 µs
+    // (imagen ESPEJADA, FALLA). El barrido 0.7–1.0 probó que NINGÚN
+    // spread pasaba Green: el ITD solo pasaba ≤0.8 y la ILD fallaba en
+    // todos (2.41–2.70 dB, tol 2.0). Causa: el side forzado de M1 (ORBE
+    // side 1.0 vs HOLOS ~0.42); con M1 OFF Green pasaba en 0.8–1.2.
+    // FIX 2026-11-25 (conservación de potencia en HOLOS como M1):
+    // wSide = 1.0 + conservador por banda L1. Medido: HOLOS +312 µs /
+    // +0.6 dB vs ORBE +312 µs / +2.2 dB (dif ITD 0 µs, dif ILD 1.6 dB):
+    // PASA. Spread 1.2 sigue siendo el default porque evita el espejo
+    // ≥1.3. El fix del estimador (θ×spread con clamp ±90° +
+    // realimentación por r) queda como trabajo futuro. El default del
+    // struct es 1.2 desde fix(holos) 2026-11-25.
     // NO relajar la tolerancia: el test está cazando un defecto real.
     auto mkInput = []() {
         auto base = noiseBp(0.4, 3.0, 61);

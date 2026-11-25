@@ -322,6 +322,7 @@ void FillHolosState(ivanna::HolosOperator& holos, ivanna::neu::NeuCompiler& comp
             std::pow(10.0f, holos.bandGammaDb(b) / 20.0f);
         comp.holos.wSide[b] = holos.bandWidthGain(b);
         comp.holos.diffuseMix[b] = holos.bandDiffuseMix(b);
+        comp.holos.conserverGain[b] = holos.bandConserverGain(b);
     }
     comp.holos.gamma = gamma;
     comp.holos.proximityDb = proximityDb;
@@ -536,6 +537,7 @@ TEST(NeuCompiler, E7LiveEstimators) {
                 std::pow(10.0f, p->h->bandGammaDb(b) / 20.0f);
             p->c->holos.wSide[b] = p->h->bandWidthGain(b);
             p->c->holos.diffuseMix[b] = p->h->bandDiffuseMix(b);
+            p->c->holos.conserverGain[b] = p->h->bandConserverGain(b);
         }
     };
 

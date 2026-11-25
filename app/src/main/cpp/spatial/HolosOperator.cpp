@@ -61,6 +61,15 @@ void HolosOperator::prepare(float sr) {
     rebuildBandTables();
     activeSet_ = &set24_;
     activeBands_ = 24;
+    // Tau 300 ms (no 30 ms como ORBE): el conservador es una ganancia
+    // que varía por frame y modula la salida; con tau 30 ms la AM a la
+    // tasa de hop comía ~5 dB del piso de THD+N de HOLOS (100 Hz y
+    // 10 kHz caían bajo la línea base de fase5). Con 300 ms la AM baja
+    // ~20 dB y queda bajo el piso propio del render (−80 dB); la
+    // convergencia (~1.5 s) sigue dentro de las ventanas de medida
+    // (Green y la sonda miden a 2–3 s). La ganancia neta en régimen
+    // sigue siendo 0.0 dB exactos por construcción.
+    if constexpr (kHolosPowerConservation) holosCons_.prepare(activeBands_, (float)kHop / (float)s, 0.300f);
     estimator_.prepare(s);
     estimator_.setBandTables(set24_.loBin, set24_.hiBin, set24_.centerHz, 24);
     kernel_.prepare(s);
@@ -148,6 +157,7 @@ void HolosOperator::reset() noexcept {
     flushPending_ = false;
     estimator_.reset();
     kernel_.reset();
+    if constexpr (kHolosPowerConservation) holosCons_.reset();
     if (prepared_) {
         std::fill(ringL_.begin(), ringL_.end(), 0.0);
         std::fill(ringR_.begin(), ringR_.end(), 0.0);
@@ -267,6 +277,10 @@ float HolosOperator::bandWidthGain(int b) const noexcept {
     if (b < 0 || b >= activeBands_) return 1.0f;
     return widthSide_[b] * widthNorm_[b];
 }
+float HolosOperator::bandConserverGain(int b) const noexcept {
+    if (!kHolosPowerConservation || b < 0 || b >= activeBands_) return 1.0f;
+    return holosCons_.gain[b];
+}
 float HolosOperator::bandDiffuseMix(int b) const noexcept {
     if (b < 0 || b >= activeBands_) return 0.0f;
     return diffuseMix_[b];
@@ -346,6 +360,17 @@ void HolosOperator::computeBandGains() {
         const holos::WidthGains wg = holos::widthGains(w, fc);
         widthSide_[b] = wg.sideGain;
         widthNorm_[b] = wg.norm;
+        // Fase 1 (M1 de HOLOS, L2): el side NUNCA se atenúa. Con el flag
+        // ON el wSide efectivo es 1.0 (kSideGain), como ORBE con M1 ON:
+        // el width (~0.406 en contenido coherente) perdía −2.5…−4.1 dB
+        // y hacía fallar Green con todos los spreads (ORBE pasa el side
+        // a 1.0 siempre). El control `width` queda sin efecto en el
+        // camino directo, como `diffuse` en ORBE con M1 ON.
+        // bandWidthGain() devuelve 1.0 (la ganancia real aplicada).
+        if constexpr (kHolosPowerConservation) {
+            widthSide_[b] = 1.0;
+            widthNorm_[b] = 1.0;
+        }
         // Mezcla directo/difuso de la banda.
         diffuseMix_[b] = holos::diffuseMix(s.coh, effDiffuse);
     }
@@ -562,8 +587,32 @@ void HolosOperator::runFrame() {
                          spread_.load(std::memory_order_relaxed));
     estimator_.estimate(reL_.data(), imL_.data(), reR_.data(), imR_.data(), n);
     computeBandGains();
+    // Fase 1 (M1 de HOLOS, L1): envolver el render con el conservador
+    // de potencia por banda. addIn mide la potencia de entrada por banda
+    // ERB (espectro directo), addOut la de salida (render + cola),
+    // commit() calcula g_b = sqrt(E_in/E_out) y la ganancia se aplica al
+    // espectro de salida. Con el flag OFF, este bloque no existe
+    // (if constexpr) y el camino es el de siempre.
+    if constexpr (kHolosPowerConservation) {
+        const std::vector<int>& bandOfBin = activeSet_->bandOfBin;
+        holosCons_.beginFrame();
+        for (int k = 0; k <= n / 2; ++k)
+            holosCons_.addIn(bandOfBin[k], reL_[k] * reL_[k] + imL_[k] * imL_[k] +
+                                            reR_[k] * reR_[k] + imR_[k] * imR_[k]);
+    }
     renderBins(reL_.data(), imL_.data(), reR_.data(), imR_.data(),
                tailReL_.data(), tailImL_.data(), tailReR_.data(), tailImR_.data());
+    if constexpr (kHolosPowerConservation) {
+        const std::vector<int>& bandOfBin = activeSet_->bandOfBin;
+        for (int k = 0; k <= n / 2; ++k)
+            holosCons_.addOut(bandOfBin[k], reL_[k] * reL_[k] + imL_[k] * imL_[k] +
+                                             reR_[k] * reR_[k] + imR_[k] * imR_[k]);
+        holosCons_.commit();
+        for (int k = 0; k < n; ++k) {
+            const double g = holosCons_.gain[bandOfBin[k]];
+            reL_[k] *= g; imL_[k] *= g; reR_[k] *= g; imR_[k] *= g;
+        }
+    }
     // NEU-Omega Fase 0: dos IFFT reales en una compleja (UN solo IFFT).
     // Empaquetar Y_L + j*Y_R en reL/imL; tras el IFFT, reL_ = y_L e
     // imL_ = y_R. Ahorra una IFFT por frame. HOLOS pasa de 6 a 3 FFTs/hop.

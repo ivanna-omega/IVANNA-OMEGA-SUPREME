@@ -204,13 +204,23 @@ TEST(Fase5QualityGate, OrbeThdnBaseline) {
 TEST(Fase5QualityGate, HolosThdnBaselineProductionRetune) {
     // HOLOS retune de producción ATREVIDA 502 (amount 1.0, harmonics 0.002,
     // spread 1.2, proximity 6.0, diffuse 0.85). Medido en host (clang++-18,
-    // 2026-11-25):
-    // -3 dBFS: -77.92 dB @1 kHz, -79.99 dB @100 Hz, -84.08 dB @10 kHz.
-    // -1 dBFS: -76.74 dB @1 kHz, -78.90 dB @100 Hz, -82.66 dB @10 kHz.
-    // (Retune anterior, amount 0.5 / K=0 / spread 1.0 / proximity 3.0 /
-    // diffuse 0.5: -3 dBFS -94.0/-79.6/-73.07; -1 dBFS -72.15/-77.94/-69.96.)
+    // 2026-11-25, CON la conservación de potencia como M1):
+    // -3 dBFS: -75.39 dB @1 kHz, -75.52 dB @100 Hz, -78.48 dB @10 kHz.
+    // -1 dBFS: -73.38 dB @1 kHz, -73.40 dB @100 Hz, -75.37 dB @10 kHz.
+    // (Línea base anterior, SIN conservación: -3 dBFS -77.92/-79.99/-84.08;
+    // -1 dBFS -76.74/-78.90/-82.66. La línea base SUBIÓ ~3–7 dB porque el
+    // conservador lleva la señal al nivel correcto (antes perdía
+    // −2.5…−4.1 dB) y el K (Volterra, harmonics 0.002) genera más
+    // armónicos a ese nivel: medido con sonda, K=0 da −85…−93 dB y K=0.002
+    // da −73…−78 dB (el K aporta +9…+17 dB). NO es AM del conservador
+    // (tau 300 ms; con K=0 el piso es −85 dB o mejor). Es el carácter
+    // real del retune al nivel correcto, no un defecto nuevo: la ganancia
+    // neta es 0.0 dB exactos (Regla de Oro) y la THD+N sigue ≤ −70 dB
+    // (criterio ATREVIDA) en todos los casos.
     // Umbrales con margen ~4 dB sobre lo medido en cada nivel (como antes:
-    // 2–4.6 dB). Todos siguen ≤ −70 dB (criterio ATREVIDA).
+    // 2–4.6 dB), sin bajar del criterio absoluto −70 dB: los dos umbrales
+    // de −1 dBFS @1 kHz/@100 Hz quedan en −70.0 (margen 3.4 dB) porque la
+    // línea base ya está cerca del criterio; el resto lleva ~4.4 dB.
     {
         const double thdn1k = measureHolosThdn(productionRetune(), 1000.0, kAmpMinus3Dbfs);
         const double thdn100 = measureHolosThdn(productionRetune(), 100.0, kAmpMinus3Dbfs);
@@ -220,9 +230,9 @@ TEST(Fase5QualityGate, HolosThdnBaselineProductionRetune) {
         EXPECT_TRUE(std::isfinite(thdn1k));
         EXPECT_TRUE(std::isfinite(thdn100));
         EXPECT_TRUE(std::isfinite(thdn10k));
-        EXPECT_LT(thdn1k, -74.0) << "HOLOS retune @1 kHz -3 dBFS (línea base -77.92 dB)";
-        EXPECT_LT(thdn100, -76.0) << "HOLOS retune @100 Hz -3 dBFS (línea base -79.99 dB)";
-        EXPECT_LT(thdn10k, -80.0) << "HOLOS retune @10 kHz -3 dBFS (línea base -84.08 dB)";
+        EXPECT_LT(thdn1k, -71.0) << "HOLOS retune @1 kHz -3 dBFS (línea base -75.39 dB)";
+        EXPECT_LT(thdn100, -71.0) << "HOLOS retune @100 Hz -3 dBFS (línea base -75.52 dB)";
+        EXPECT_LT(thdn10k, -74.0) << "HOLOS retune @10 kHz -3 dBFS (línea base -78.48 dB)";
     }
     {
         const double thdn1k = measureHolosThdn(productionRetune(), 1000.0, kAmpMinus1Dbfs);
@@ -233,8 +243,8 @@ TEST(Fase5QualityGate, HolosThdnBaselineProductionRetune) {
         EXPECT_TRUE(std::isfinite(thdn1k));
         EXPECT_TRUE(std::isfinite(thdn100));
         EXPECT_TRUE(std::isfinite(thdn10k));
-        EXPECT_LT(thdn1k, -73.0) << "HOLOS retune @1 kHz -1 dBFS (línea base -76.74 dB)";
-        EXPECT_LT(thdn100, -75.0) << "HOLOS retune @100 Hz -1 dBFS (línea base -78.90 dB)";
-        EXPECT_LT(thdn10k, -79.0) << "HOLOS retune @10 kHz -1 dBFS (línea base -82.66 dB)";
+        EXPECT_LT(thdn1k, -70.0) << "HOLOS retune @1 kHz -1 dBFS (línea base -73.38 dB)";
+        EXPECT_LT(thdn100, -70.0) << "HOLOS retune @100 Hz -1 dBFS (línea base -73.40 dB)";
+        EXPECT_LT(thdn10k, -71.0) << "HOLOS retune @10 kHz -1 dBFS (línea base -75.37 dB)";
     }
 }

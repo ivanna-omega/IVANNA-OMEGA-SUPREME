@@ -131,11 +131,20 @@ inline NeuMat2x2 orbeMatrix(const OrbeBandState& s, int band, float freqHz,
 
 /// Estado por banda de HOLOS (lo que HolosOperator estima + Γ por banda).
 struct HolosBandState {
+    // Ganancia del conservador por banda (Fase 1, M1 de HOLOS): 1.0 por
+    // defecto (sin conservar). Quien congela el estado vivo la llena con
+    // HolosOperator::bandConserverGain(b); sin ella la equivalencia E3
+    // diverge (el render vivo aplica g_b por banda y la matriz sin ella
+    // no lo replica). Mismo patrón que OrbeBandState::conserverGain.
+    HolosBandState() {
+        for (auto& g : conserverGain) g = 1.0f;
+    }
     float theta[SpectralCore::kMaxBands] = {};      // azimut por banda
     float distance[SpectralCore::kMaxBands] = {};   // r por banda
     float gammaLin[SpectralCore::kMaxBands] = {};   // Γ_b (lineal)
     float wSide[SpectralCore::kMaxBands] = {};      // widthSide·widthNorm
     float diffuseMix[SpectralCore::kMaxBands] = {}; // mezcla directo/difuso
+    float conserverGain[SpectralCore::kMaxBands];   // g_b del conservador (M1 de HOLOS)
     float gamma = 1.0f;        // exponente de divergencia (0.5..1.0)
     float proximityDb = 3.0f;  // techo del realce de proximidad (0..6)
     float yawRad = 0.0f;       // pose de cabeza (0 si no hay tracking)
@@ -182,6 +191,18 @@ inline NeuMat2x2 holosMatrix(const HolosBandState& s, int band, float freqHz,
     A.a01r = h * (aRe - c); A.a01i = h * aIm;
     A.a10r = h * (bRe - c); A.a10i = h * bIm;
     A.a11r = h * (bRe + c); A.a11i = h * bIm;
+    // Conservador por banda (M1 de HOLOS): el render vivo multiplica
+    // cada bin de la banda por g_b (BandPowerConserver::gain). La matriz
+    // es el render congelado: se escala por la g_b congelada en el
+    // estado. Con el flag OFF no hay conservador (g=1.0). Mismo patrón
+    // que orbeMatrix.
+    if (ivanna::HolosOperator::kHolosPowerConservation) {
+        const float g = s.conserverGain[band];
+        A.a00r *= g; A.a00i *= g;
+        A.a01r *= g; A.a01i *= g;
+        A.a10r *= g; A.a10i *= g;
+        A.a11r *= g; A.a11i *= g;
+    }
     return A;
 }
 
