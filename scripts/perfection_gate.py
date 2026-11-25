@@ -126,8 +126,15 @@ THRESHOLDS_VERSION = "perfection-gate-thresholds-v1"
 # test_fused_spatial.WfsStageGoldenWithPoincareOff (1 TEST: clava la
 # salida WFS con el flag apagado).
 THRESHOLDS = {
-    "ctest_expected_total": 1639,
-    "ctest_expected_passed": 1639,
+    # 2026-11-24 (CORONA, cableado P7–P10): la suite crece de 1639 a 1675
+    # (+12 CORONA: 4 entradas standalone test_total_conservation,
+    # test_experience_compiler, test_living_room, test_human_twin + 8 TESTs
+    # FusedChainCoronaWiring) sobre una base ya en 1663: el umbral 1639
+    # llevaba estancado desde la v2.5.498 (2026-11-23) y el Frente A midió
+    # 1,663 en el CTest completo sin subir el candado (+24). 1663 + 12 = 1675
+    # medido con `ctest -N` en el build clang++-18 completo.
+    "ctest_expected_total": 1675,
+    "ctest_expected_passed": 1675,
     "sofa_expected_total": 694,
 }
 

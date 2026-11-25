@@ -154,8 +154,13 @@ class TestPerfectionGateThresholds(unittest.TestCase):
         # 2026-11-23 (pan Poincaré de campo cercano, flag OFF por defecto):
         # la suite crece de 1634 a 1639 con test_poincare_pan (4 TESTs) y
         # test_fused_spatial.WfsStageGoldenWithPoincareOff (1 TEST).
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1639)
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1639)
+        # 2026-11-24 (CORONA, cableado P7–P10): la suite crece de 1639 a
+        # 1675 (+12 CORONA: 4 entradas standalone + 8 FusedChainCoronaWiring)
+        # sobre una base ya en 1663 (umbral 1639 estancado desde la v2.5.498;
+        # el Frente A midió 1,663 sin subir el candado). 1663 + 12 = 1675
+        # medido con `ctest -N` en el build clang++-18 completo.
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1675)
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1675)
         self.assertEqual(gate.THRESHOLDS["sofa_expected_total"], 694)
         self.assertTrue(gate.THRESHOLDS_VERSION)
 
