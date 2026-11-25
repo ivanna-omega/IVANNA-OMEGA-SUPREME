@@ -6,7 +6,7 @@
 // (libomega_effect.so) tiene su propio stub en holos_globals_effect.cpp;
 // NO duplicar en un mismo target (ODR).
 // Apagado solo como valor inicial del atomic (amount=0 = bypass
-// bit-exacto): la app lo pone a 1.0 (harmonics 0.002, spread 1.5,
+// bit-exacto): la app lo pone a 1.0 (harmonics 0.002, spread 1.2,
 // proximityDb 6.0, diffuse 0.85 — preset ATREVIDA 502, directiva Esse
 // 2026-11-24) al restaurar estado (ParameterStore). Los parámetros de la
 // Ruta B llegan por snapshot
@@ -19,7 +19,7 @@
 
 std::atomic<float> g_holos_amount{0.0f};
 std::atomic<float> g_holos_distance_m{0.35f};
-std::atomic<float> g_holos_spread{1.5f};         // ATREVIDA 502 (directiva Esse 2026-11-24)
+std::atomic<float> g_holos_spread{1.2f};         // ATREVIDA 502 (spread 1.2, decisión Esse 2026-11-25)
 std::atomic<float> g_holos_proximity_db{6.0f};  // ATREVIDA 502
 std::atomic<float> g_holos_diffuse{0.85f};      // ATREVIDA 502
 std::atomic<float> g_holos_harmonics{0.002f};  // v2.5.411: inicial = perfil de arranque (ATREVIDA 502, harmonics 0.002); la unica fuente de verdad es ParameterStore.FactoryProfile; el 0.32 viejo no estaba validado (tarea 1: max 0.002)

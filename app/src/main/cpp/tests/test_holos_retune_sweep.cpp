@@ -89,7 +89,7 @@ TEST(HolosRetuneSweep, GridThdnAndAudibility) {
 
 TEST(HolosRetuneSweep, ChosenDefaultIsCleanAndMeasurable) {
     // Default ATREVIDA 502 (directiva Esse 2026-11-24): amount=1.0,
-    // harmonics=0.002 (máximo validado), spread=1.5, proximityDb=6.0,
+    // harmonics=0.002 (máximo validado), spread=1.2, proximityDb=6.0,
     // diffuse=0.85. Medido en host (clang++-18, 2026-11-25): THD+N
     // @1 kHz −77.9 dB, @100 Hz −80.0 dB, IMD SMPTE −74.9 dB, diff vs
     // bypass (lat-comp) −11.9 dB. Requisito: THD+N ≤ −70 dB en ambas
@@ -101,7 +101,7 @@ TEST(HolosRetuneSweep, ChosenDefaultIsCleanAndMeasurable) {
     HolosParams p;
     p.amount = 1.0f;
     p.harmonics = 0.002f;
-    p.spread = 1.5f;
+    p.spread = 1.2f;
     p.proximityDb = 6.0f;
     p.diffuse = 0.85f;
     auto measureThdn = [&](double f0) {
@@ -221,7 +221,7 @@ TEST(HolosHarmonicsGuard, UserLiveValueFails) {
 
 TEST(HolosHarmonicsGuard, ValidatedMaxPassesAtAllAmounts) {
     // El máximo validado (0.002) debe cumplir el criterio a amount 0.359,
-    // 0.5 y 1.0, con la geometría ATREVIDA 502 (spread 1.5, proximity 6.0,
+    // 0.5 y 1.0, con la geometría ATREVIDA 502 (spread 1.2, proximity 6.0,
     // diffuse 0.85). Medido en host (clang++-18, 2026-11-25): (0.359)
     // −88.5/−91.7/−85.9; (0.5) −85.3/−88.3/−82.6; (1.0) −77.9/−80.0/−74.9.
     // Margen mínimo 7.9 dB (@1 kHz, amount 1.0). Con la geometría vieja

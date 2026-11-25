@@ -170,14 +170,14 @@ TEST(HolosChain, ThdnOnAndImd) {
 TEST(HolosChain, ThdnProductionRetune) {
     // Retune de producción ATREVIDA 502 (directiva Esse 2026-11-24,
     // aplicado por ParameterStore/PersistedStateRestorer, NO por los
-    // defaults del struct): amount 1.0, harmonics 0.002, spread 1.5,
+    // defaults del struct): amount 1.0, harmonics 0.002, spread 1.2,
     // proximityDb 6.0, diffuse 0.85. Es la configuración que realmente
     // suena en el teléfono: medirla aquí en vez de solo los defaults
     // del struct (harmonics 0.32).
     HolosParams p;
     p.amount = 1.0f;
     p.harmonics = 0.002f;
-    p.spread = 1.5f;
+    p.spread = 1.2f;
     p.proximityDb = 6.0f;
     p.diffuse = 0.85f;
     const double thdn1k = measureHolosThdn(p, 1000.0);
@@ -259,16 +259,19 @@ TEST(HolosChain, GreenMatchesOrbe) {
     // widthFromState(coh≈1)=0.3 × norma 1.354 = 0.406. Se lee el wSide
     // de HOLOS y se pone como diffuse de ORBE; si no, la diferencia de
     // ITD (208 µs medida) es el side, no G.
-    // ── ACANTILADO DE SPREAD (medido 2026-11-25, clang++-18) ──
+    // ── ACANTILADO DE SPREAD (medido 2026-11-25, clang++-18, M1 ON) ──
     // linearParams() NO fija spread/proximity: hereda los defaults del
-    // struct. Con spread 1.0 HOLOS da +375 µs (ORBE +396 µs, dif 21 µs,
-    // PASA); con spread 1.2 da +417 µs (ensancha bien, PASA); con spread
-    // 1.3/1.4/1.5 da −333 µs (imagen ESPEJADA, dif 729 µs, FALLA). La
-    // proximidad NO es la causa (6.0 sola con spread 1.0 da +375 µs,
-    // PASA). El preset ATREVIDA 502 pone spread 1.5 (decisión Esse
-    // 2026-11-24): este test FALLA con el preset vigente hasta que Esse
-    // decida entre spread 1.2 (verificado seguro) o un fix del estimador
-    // (el escalado θ×spread con clamp ±90° + realimentación por r).
+    // struct. ORBE con M1 ON da +312 µs / +2.2 dB. HOLOS: spread 1.0 →
+    // +375 µs (dif 62 µs, FALLA); 1.2 → +417 µs (dif 105 µs, FALLA);
+    // 1.3/1.4/1.5 → −333 µs (imagen ESPEJADA, FALLA). El barrido
+    // 0.7–1.0 (2026-11-25) probó que NINGÚN spread pasa Green: el ITD
+    // solo pasa ≤0.8 y la ILD falla en todos (2.41–2.70 dB, tol 2.0).
+    // Causa: el side forzado de M1 (ORBE side 1.0 vs HOLOS ~0.42); con
+    // M1 OFF Green pasa en 0.8–1.2. Spread 1.2 es el default porque
+    // evita el espejo ≥1.3, NO porque pase Green. El fix del estimador
+    // (θ×spread con clamp ±90° + realimentación por r) queda como
+    // trabajo futuro. El default del struct es 1.2 desde fix(holos)
+    // 2026-11-25.
     // NO relajar la tolerancia: el test está cazando un defecto real.
     auto mkInput = []() {
         auto base = noiseBp(0.4, 3.0, 61);
@@ -895,3 +898,5 @@ TEST(OmniField, ThroughputRt) {
                 rt, dt, msPerBlock128);
     EXPECT_GT(rt, 1.0) << "debe correr más rápido que tiempo real en host";
 }
+
+

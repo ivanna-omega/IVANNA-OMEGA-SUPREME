@@ -151,13 +151,13 @@ double measureOrbeThdn(float amount, double f0, double amp) {
 }
 
 // Retune de producción ATREVIDA 502 (directiva Esse 2026-11-24):
-// amount 1.0, harmonics 0.002, spread 1.5, proximityDb 6.0,
+// amount 1.0, harmonics 0.002, spread 1.2, proximityDb 6.0,
 // diffuse 0.85; el resto, defaults de producción (dynamics 1.0).
 ivanna::HolosParams productionRetune() {
     ivanna::HolosParams p;
     p.amount = 1.0f;
     p.harmonics = 0.002f;
-    p.spread = 1.5f;
+    p.spread = 1.2f;
     p.proximityDb = 6.0f;
     p.diffuse = 0.85f;
     return p;
@@ -203,7 +203,7 @@ TEST(Fase5QualityGate, OrbeThdnBaseline) {
 
 TEST(Fase5QualityGate, HolosThdnBaselineProductionRetune) {
     // HOLOS retune de producción ATREVIDA 502 (amount 1.0, harmonics 0.002,
-    // spread 1.5, proximity 6.0, diffuse 0.85). Medido en host (clang++-18,
+    // spread 1.2, proximity 6.0, diffuse 0.85). Medido en host (clang++-18,
     // 2026-11-25):
     // -3 dBFS: -77.92 dB @1 kHz, -79.99 dB @100 Hz, -84.08 dB @10 kHz.
     // -1 dBFS: -76.74 dB @1 kHz, -78.90 dB @100 Hz, -82.66 dB @10 kHz.

@@ -331,7 +331,7 @@ class ParameterStore(context: Context) {
             orbeAmount = 1.0f, orbeDistanceM = 0.35f, orbeSpread = 1.0f,
             orbeProximityDb = 3.0f, orbeDiffuse = 0.5f, orbeHeadTracking = true,
             orbeHeadRadiusM = 0.0875f,
-            holosAmount = 1.0f, holosDistanceM = 0.35f, holosSpread = 1.5f,
+            holosAmount = 1.0f, holosDistanceM = 0.35f, holosSpread = 1.2f,
             holosProximityDb = 6.0f, holosDiffuse = 0.85f, holosHarmonics = 0.002f,
             holosWarmth = 0.5f, holosDynamics = 1.0f, holosWidth = 1.0f,
             holosGamma = 1.0f, holosRoomRt60 = 0.34f, holosHeadTracking = true,

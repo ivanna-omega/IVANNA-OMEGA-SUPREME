@@ -59,7 +59,7 @@ void FusedField::pushParamsToEngines() noexcept {
     // hoy, sin compresión extra); pumping=1 → dynamics=0 (Γ dinámica off).
     hp.dynamics = 1.0f - controls_.pumping;
     // Defaults ATREVIDA 502 (directiva Esse 2026-11-24): distanceM 0.35,
-    // spread 1.5, proximityDb 6.0, diffuse 0.85, width 1.0, headTracking
+    // spread 1.2, proximityDb 6.0, diffuse 0.85, width 1.0, headTracking
     // true, bandCount 24, EQ plano.
     holos_.setParams(hp);
 

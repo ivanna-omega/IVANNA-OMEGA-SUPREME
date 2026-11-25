@@ -4,7 +4,7 @@
 // orbe_globals_effect.cpp: la definición real está en
 // holos_controls_bridge.cpp (target ivanna_omega). NO añadir a ivanna_omega:
 // ODR violation. Valores iniciales: amount=0 (valor inicial del atomic;
-// la app lo pone a 1.0, harmonics 0.002, spread 1.5, proximityDb 6.0,
+// la app lo pone a 1.0, harmonics 0.002, spread 1.2, proximityDb 6.0,
 // diffuse 0.85 (ATREVIDA 502), al restaurar estado y la Ruta B lo
 // recibe por snapshot ABI v10, campos holos_* — omega_apply_snapshot lo
 // aplica vía setHolosParams()). Hasta que llega el primer snapshot, el
@@ -15,7 +15,7 @@
 
 std::atomic<float> g_holos_amount{0.0f};
 std::atomic<float> g_holos_distance_m{0.35f};
-std::atomic<float> g_holos_spread{1.5f};         // ATREVIDA 502 (directiva Esse 2026-11-24)
+std::atomic<float> g_holos_spread{1.2f};         // ATREVIDA 502 (spread 1.2, decisión Esse 2026-11-25)
 std::atomic<float> g_holos_proximity_db{6.0f};  // ATREVIDA 502
 std::atomic<float> g_holos_diffuse{0.85f};      // ATREVIDA 502
 std::atomic<float> g_holos_harmonics{0.002f};  // v2.5.411: inicial = perfil de arranque (ATREVIDA 502, harmonics 0.002); la unica fuente de verdad es ParameterStore.FactoryProfile; el 0.32 viejo no estaba validado (tarea 1: max 0.002)

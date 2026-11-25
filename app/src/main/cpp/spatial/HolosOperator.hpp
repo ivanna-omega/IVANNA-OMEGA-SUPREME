@@ -114,7 +114,7 @@ constexpr float kHolosHarmonicsMaxValidated = 0.002f;
 struct HolosParams {
     float amount = 0.0f;       // 0..1 wet/dry vs legacy; 0 = bit-exacto
     float distanceM = 0.35f;   // 0.15..2.0 m, distancia base ("íntimo")
-    float spread = 1.5f;       // 0..1.5, escala del azimut estimado (ATREVIDA 502, directiva Esse 2026-11-24)
+    float spread = 1.2f;       // 0..1.5, escala del azimut estimado (ATREVIDA 502; spread 1.2 por decisión Esse 2026-11-25 — acantilado ≥1.3 espeja la imagen)
     float proximityDb = 6.0f;  // 0..6 dB, techo del realce de proximidad (ATREVIDA 502)
     float diffuse = 0.85f;     // 0..1, cuánto campo difuso va a la cola compartida (ATREVIDA 502)
     float harmonics = 0.32f;   // 0..1, mezcla del término K
@@ -228,7 +228,7 @@ private:
 
     std::atomic<float> amount_{0.0f};
     std::atomic<float> distanceM_{0.35f};
-    std::atomic<float> spread_{1.5f};      // ATREVIDA 502 (directiva Esse 2026-11-24)
+    std::atomic<float> spread_{1.2f};      // ATREVIDA 502 (spread 1.2, decisión Esse 2026-11-25)
     std::atomic<float> proximityDb_{6.0f};  // ATREVIDA 502
     std::atomic<float> diffuse_{0.85f};     // ATREVIDA 502
     std::atomic<float> harmonics_{0.32f};
