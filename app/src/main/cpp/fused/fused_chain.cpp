@@ -42,6 +42,16 @@ void FusedChain::prepare(double sampleRate) noexcept {
     prepareVolumetric();
     // TΩ (F1/472): kernel 2×2 64-bit (compilador + pipeline hop 128).
     prepareTOmega();
+    // CORONA D10 (2026-11-25): motor D10 ENABLED por defecto (orden
+    // "todo prendido"). Distancia de escucha viva 3.0 m — la posición
+    // documentada de la sala de Esse (NO el 1.85 m inventado de Gemini).
+    d10Engine_.prepare(sampleRate_);
+    {
+        d10::D10Config d10Cfg;
+        d10Cfg.listenerDistanceM = 3.0;
+        d10Engine_.setConfig(d10Cfg);  // resto de defaults del header
+    }
+    d10TelemetryValid_ = false;
 }
 
 void FusedChain::setControls(const FusedControls& c) noexcept {
@@ -131,6 +141,13 @@ void FusedChain::reset() noexcept {
     // TΩ (F1/472): la etapa espectral vacía su pipeline y fuerza
     // recompilar con el snapshot vivo en el próximo process().
     resetTOmega();
+    // CORONA D10: el motor vuelve a su estado inicial (observador
+    // térmico, slew, telemetría). El kernel LTI CONSERVA sus FIR
+    // compiladas y su enganche (reset() del header no los borra): el
+    // próximo compileTOmega re-compila y re-hace el morph igualmente.
+    // La telemetría deja de ser válida hasta el próximo bloque arbitrado.
+    d10Engine_.reset();
+    d10TelemetryValid_ = false;
     // Tronidos 493: el fundido de modo no sobrevive a un reset (un
     // pendiente viejo no debe aplicarse tras reiniciar) y los wets se
     // fijan al objetivo vigente (los controles no los toca reset(), así
@@ -431,6 +448,17 @@ void FusedChain::compileTOmega() noexcept {
     }
     tOmegaCompiled_ = true;
     ++tOmegaCompiles_;
+    // CORONA D10: compilar el kernel LTI desde la matriz recién
+    // compilada (M[k] = outMatrix). Solo si el D10 está habilitado: con
+    // D10 OFF el kernel no se engancha y la ruta espectral LEGACY sigue
+    // siendo la que suena. El morph (512 muestras) arranca aquí.
+    // ESTABILIDAD (verificado en process()): compileTOmega solo se llama
+    // si cambió el snapshot (modo/fs/geometría Genezi) o tras reset; en
+    // régimen la matriz NO cambia por bloque, así que el morph NO se
+    // reinicia constantemente y el kernel LTI es correcto en régimen.
+    if (d10Engine_.isEnabled()) {
+        d10Engine_.ltiKernel().updateFromCompiledSpectrum(tOmegaWs_.outMatrix);
+    }
 }
 
 void FusedChain::applyTOmega(double* l, double* r, int frames) noexcept {
@@ -590,8 +618,19 @@ FusedChain::totalConservationCertificate(
         userControls_.brain.isNeutral() ? 0.0 : 1.0,
     };
     in.conservationActive = !userControls_.conservation.isNeutral();
-    return total_conservation::buildCertificate(in, trackIndex,
-                                                ivannaVersionCode);
+    total_conservation::PlaybackCertificate cert =
+        total_conservation::buildCertificate(in, trackIndex,
+                                             ivannaVersionCode);
+    // P7 — Ξ_10 (CORONA D10): acción hamiltoniana MEDIDA del último
+    // bloque arbitrado. Las 9 etapas y totalValid NO se tocan. Si el D10
+    // está deshabilitado o aún no arbitró ningún bloque, el campo queda
+    // sin estimar (hasTenthDimension=false, acción NaN por default del
+    // struct) — nunca inventado.
+    if (d10Engine_.isEnabled() && d10TelemetryValid_) {
+        cert.hasTenthDimension = true;
+        cert.tenthDimensionAction = d10Engine_.telemetry().hamiltonianAction;
+    }
+    return cert;
 }
 
 // P8: compilar es puro (no depende del flag); aplicar exige flag ON.
@@ -615,16 +654,17 @@ bool FusedChain::applyCompiledExperience(
         static_cast<float>(compiled.amounts[2]);  // SALA VIVA
     nc.transducer.correction =
         static_cast<float>(compiled.amounts[3]);  // VOLTERRA
-    // [4] ARMONÍA: NO SE APLICA (sin escalar de amount tonal en
-    // FusedControls; ver el header). Su ganancia nominal NO entra en el
-    // trim de lo aplicado: el trim se recomputa solo sobre los 6
-    // aplicados, así la ganancia neta nominal de lo aplicado es 0.0 dB.
+    // [4] ARMONÍA: SÍ SE APLICA (CORONA D10, 2026-11-25): el escalar
+    // tonal continuo tonal.amount cierra ARMONÍA 7/7 en P8. Su ganancia
+    // nominal (+0.06 dB/unidad) SÍ entra en el trim de lo aplicado: el
+    // trim se recomputa sobre los 7 aplicados, así la ganancia neta
+    // nominal de lo aplicado es 0.0 dB.
+    nc.tonal.amount = static_cast<float>(compiled.amounts[4]);  // ARMONÍA
     nc.dynamics.punch = static_cast<float>(compiled.amounts[5]);  // PULSO
     nc.brain.adaptation =
         static_cast<float>(compiled.amounts[6]);  // NEURO
     double appliedGain = 0.0;
     for (std::size_t o = 0; o < experience_compiler::kNumOperators; ++o) {
-        if (o == 4) continue;  // ARMONÍA no aplicada (ver arriba).
         appliedGain += experience_compiler::nominalGainDbPerUnit(o) *
                        compiled.amounts[o];
     }
@@ -863,9 +903,15 @@ void FusedChain::pushEffectiveControls() noexcept {
         const float tonalDb = std::max(
             std::max(std::abs(eff.tonal.trimDb), std::abs(eff.tonal.lowDb)),
             std::max(std::abs(eff.tonal.midDb), std::abs(eff.tonal.highDb)));
-        const float tonalAmt = (eff.tonal.curve != 0)
+        // P8 — CORONA D10: el proxy tonal refleja la actividad EFECTIVA
+        // (escalada por tonal.amount): con amount 0.5 y curva, la
+        // actividad es 0.5, no 1.0. Se guarda para el árbitro D10
+        // (arbitrateAction la recibe como tonalAmount en process()).
+        const float tonalAmt = ((eff.tonal.curve != 0)
             ? 1.0f
-            : clampf(tonalDb / 12.0f, 0.0f, 1.0f);
+            : clampf(tonalDb / 12.0f, 0.0f, 1.0f)) *
+            clampf(eff.tonal.amount, 0.0f, 1.0f);
+        effectiveTonalAmount_ = tonalAmt;
         const float pulseAmt = clampf(
             std::max(std::max(eff.dynamics.punch, eff.dynamics.exciter),
                      std::max(eff.dynamics.voice, eff.dynamics.safety)),
@@ -965,9 +1011,10 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
         // ── IVANNA-APEX: ITD fraccionario del azimut de ORBE ──────────────────
         // Por chunk (el azimut del tracker puede cambiar entre bloques).
         // theta: mismo convenio que HrtfManager (azimut efectivo negado).
-        // Distancia 1.0 m (default de escena; el ITD azimutal fino con
-        // distancia viva llega en la siguiente fase). Base causal 2.0
-        // muestras (la línea de Lagrange la exige >= 1.0, óptimo >= 2.0).
+        // CORONA D10: la distancia la aporta el motor D10 (3.0 m, sala
+        // documentada) con la ley de curvatura verificada — sustituye el
+        // 1.0 m fijo de escena. Base causal 2.0 muestras (la línea de
+        // Lagrange la exige >= 1.0, óptimo >= 2.0).
         double apexDelayL = 2.0, apexDelayR = 2.0;
         if (apex) {
             const SpatialControls sc = spatial_.controls();
@@ -975,8 +1022,7 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
             if (sc.headTracking) azDeg += spatial_.trackerYawDeg();
             const double theta = -static_cast<double>(azDeg) *
                                  (3.14159265358979323846 / 180.0);
-            const double itdSec =
-                ivanna::fused::propagation::curvatureLawItdSeconds(theta, 1.0);
+            const double itdSec = d10Engine_.coupledApexItdSeconds(theta);
             const double itdSamples = itdSec * sampleRate_;
             apexDelayL = 2.0 + std::max(0.0, itdSamples);
             apexDelayR = 2.0 + std::max(0.0, -itdSamples);
@@ -1001,6 +1047,23 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
             }
             chainDryPtrL = chainDryL_.data();
             chainDryPtrR = chainDryR_.data();
+        }
+
+        // ── CORONA D10 — seco de referencia del árbitro ─────────────────
+        // Copia de la entrada cruda del chunk (antes de APEX 1 y de
+        // ningún operador) como referencia seca LUFS de arbitrateAction.
+        // Solo si el D10 está habilitado y la cadena NO es neutra: en
+        // neutro el árbitro no corre y no se paga la copia. Punteros
+        // nulos = sin referencia seca.
+        const double* d10DryL = nullptr;
+        const double* d10DryR = nullptr;
+        if (d10Engine_.isEnabled() && !isNeutral()) {
+            for (int i = 0; i < chunk; ++i) {
+                d10DryL_[static_cast<std::size_t>(i)] = l[i];
+                d10DryR_[static_cast<std::size_t>(i)] = r[i];
+            }
+            d10DryL = d10DryL_.data();
+            d10DryR = d10DryR_.data();
         }
 
         if (apex) {
@@ -1094,16 +1157,46 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
         conservation_.process(l, r, chunk, chainTime_);
         chainTime_ += static_cast<double>(chunk) / sampleRate_;
 
-        // ── TΩ (F1/472): matriz 2×2 64-bit ───────────────────────────────
+        // ── TΩ (F1/472) / D10 LTI (CORONA D10) ───────────────────────────
         // Corrección de altavoz al final (tras operadores + transitorios),
         // en el lugar que ocupaba la matriz volumétrica WOLA (LEGACY).
-        // Con TΩ apagado, la historia se sigue alimentando (warm): al
-        // engancharse, el primer frame usa señal real y no ceros (sin
-        // esto, el cambio de modo dejaba 2 bloques de 0 exacto).
-        if (tOmega) {
-            applyTOmega(l, r, chunk);
+        // CORONA D10: el kernel LTI SUSTITUYE la ruta espectral TΩ cuando
+        // está enganchado — la matriz fija no modula a la tasa de hop y
+        // mata las bandas laterales a ±375 Hz (esa es la gracia del D10).
+        // La ruta espectral (applyTOmega) queda LEGACY: solo se usa si el
+        // kernel NO está enganchado (antes del primer compile, o con el
+        // D10 deshabilitado). Con TΩ apagado, la historia se sigue
+        // alimentando (warm): al engancharse, el primer frame usa señal
+        // real y no ceros (sin esto, el cambio de modo dejaba 2 bloques
+        // de 0 exacto). En HEADPHONES (tOmega false) nada cambia: M=I.
+        // NOTA DE LATENCIA: al conmutar de la ruta espectral (FIFO ~512
+        // muestras) al kernel LTI (FIR causal de 128 taps, sin FIFO) la
+        // latencia de la etapa cambia; el morph de 512 muestras suaviza
+        // la ganancia pero no el salto de retardo. En régimen el kernel
+        // ya está enganchado desde el primer chunk con TΩ (compileTOmega
+        // corre antes, en el mismo chunk), así que la ruta espectral
+        // prácticamente no llega a sonar con D10 ON: la conmutación solo
+        // se ve al habilitar el D10 en caliente o tras un reset.
+        if (tOmega && d10Engine_.isEnabled() &&
+            d10Engine_.ltiKernel().engaged()) {
+            d10Engine_.ltiKernel().process(l, r, chunk);
+        } else if (tOmega) {
+            applyTOmega(l, r, chunk);  // LEGACY (ver arriba)
         } else {
             warmTOmegaHistory(l, r, chunk);
+        }
+
+        // ── CORONA D10 — árbitro (tras Conservación + TΩ/LTI) ───────────
+        // Corre ANTES del techo final (el techo sigue después y sigue
+        // siendo la última barrera). No-op si el D10 está deshabilitado
+        // o la cadena es neutra (en neutro d10DryL es nulo y además no
+        // se invoca). tonalAmount = amount tonal EFECTIVO del bloque
+        // (pushEffectiveControls). La telemetría del árbitro alimenta
+        // Ξ_10 del certificado P7 (d10TelemetryValid_ = true).
+        if (d10Engine_.isEnabled() && !isNeutral()) {
+            d10Engine_.arbitrateAction(l, r, d10DryL, d10DryR, chunk,
+                                       static_cast<double>(effectiveTonalAmount_));
+            d10TelemetryValid_ = true;
         }
 
         // ── TECHO FINAL (P1 2026-11-22): el safety limiter de PULSO ya no

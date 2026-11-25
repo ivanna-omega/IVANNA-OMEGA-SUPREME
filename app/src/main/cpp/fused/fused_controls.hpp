@@ -199,6 +199,12 @@ struct TonalControls {
     float midDb = 0.0f;      // medios -12..+12 dB.
     float highDb = 0.0f;     // agudos -12..+12 dB.
     bool loudnessComp = true;  // compensación de loudness (ISO 226).
+    // P8 — CORONA D10 (2026-11-25): escalar tonal CONTINUO 0..1.
+    // Default 1.0 = comportamiento actual, sin cambio. Escala las 10
+    // ganancias de banda (applyControls) y el EvoEQ por mezcla wet/dry
+    // (processBlock128); el trimDb (trim maestro / compensador P8) NO se
+    // escala. amount == 0 → neutro total (isNeutral true).
+    float amount = 1.0f;     // escalar tonal 0..1 (1 = actual, 0 = neutro).
 
     void clamp() noexcept {
         curve = std::clamp(curve, 0, 2);
@@ -206,8 +212,10 @@ struct TonalControls {
         lowDb = clampf(lowDb, -12.0f, 12.0f);
         midDb = clampf(midDb, -12.0f, 12.0f);
         highDb = clampf(highDb, -12.0f, 12.0f);
+        amount = clampf(amount, 0.0f, 1.0f);
     }
     bool isNeutral() const noexcept {
+        if (amount <= 0.0f) return true;  // P8: escalar 0 = neutro total.
         return curve == 0 && trimDb == 0.0f && lowDb == 0.0f &&
                midDb == 0.0f && highDb == 0.0f;
     }

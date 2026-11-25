@@ -147,7 +147,12 @@ private:
     // Buffer de trabajo de 128 frames para los motores (planar double).
     double workL_[kProcessChunkFrames]{};
     double workR_[kProcessChunkFrames]{};
-    // Scratch miembro pre-reservado (sin malloc en process()).
+    // P8 — CORONA D10 (2026-11-25): seco pre-EvoEQ para la mezcla
+    // wet/dry por amount (processBlock128). El EvoEQ no expone setter
+    // de objetivo, así que amount escala su efecto por mezcla:
+    // work = dry + amount·(evo − dry). Miembro fijo, sin malloc.
+    double evoDryL_[kProcessChunkFrames]{};
+    double evoDryR_[kProcessChunkFrames]{};    // Scratch miembro pre-reservado (sin malloc en process()).
     double scratchL_[kFusedMaxBlockFrames]{};
     double scratchR_[kFusedMaxBlockFrames]{};
 };

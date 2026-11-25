@@ -43,6 +43,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace ivanna::fused::total_conservation {
 
@@ -125,6 +126,18 @@ struct PlaybackCertificate {
     double confidence = 0.0;
     // Número de etapas estimadas (0..9).
     std::size_t estimatedStages = 0;
+    // ── Ξ_10 — ACCIÓN D10 (CORONA D10, 2026-11-25) ─────────────────────
+    // Campo MEDIDO, fuera de las 9 etapas: NO entra en totalDb ni en
+    // totalValid (la acción hamiltoniana es adimensional, no una pérdida
+    // en dB, y no es una etapa del recorrido de la señal). Lo puebla
+    // FusedChain::totalConservationCertificate() desde la telemetría del
+    // motor D10 (telemetry().hamiltonianAction del último bloque
+    // arbitrado). Regla dura del módulo: si el D10 está deshabilitado o
+    // aún no ha arbitrado ningún bloque, el campo queda SIN ESTIMAR
+    // (hasTenthDimension=false, acción NaN) — NUNCA inventado.
+    bool hasTenthDimension = false;
+    double tenthDimensionAction =
+        std::numeric_limits<double>::quiet_NaN();  // acción hamiltoniana D10
     std::uint64_t trackIndex = 0;  // índice de la pista en la sesión host
     std::uint32_t ivannaVersionCode = 0;  // p. ej. 501
 };

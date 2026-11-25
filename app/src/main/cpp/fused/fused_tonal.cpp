@@ -75,7 +75,11 @@ void FusedTonal::applyControls() noexcept {
                     ivanna::spatial::EliteTargetKind::HarmanEliteLean, f);
             g += (elite - harman) * kCurveTargetScale;
         }
-        gains[b] = g;
+        // P8 — CORONA D10: el escalar tonal continuo escala las 10
+        // ganancias de banda. amount=1.0 → idéntico a antes; amount=0 →
+        // ganancias 0 (bypass). El trimGain_ (trimDb) NO se escala: es
+        // el trim maestro / compensador P8.
+        gains[b] = g * controls_.amount;
     }
     roomEq_.setTarget(gains);
 }
@@ -105,7 +109,31 @@ void FusedTonal::processBlock128() noexcept {
         psycho_.predictAndMitigateFatigue(workL_, workR_, kProcessChunkFrames);
         psycho_.applyMaskingCompensation(workL_, workR_, kProcessChunkFrames);
     }
-    if (useEvo) evoEq_.processPlanar(workL_, workR_, kProcessChunkFrames);
+    // P8 — CORONA D10: el EvoEQ apunta a Harman ×0.5 con objetivo FIJO
+    // (sin setter), así que amount lo escala por mezcla wet/dry:
+    // work = dry + amount·(evo − dry). amount=1.0 corre el EvoEQ
+    // directo (bit-idéntico al comportamiento actual: la mezcla
+    // dry + 1·(evo − dry) NO es bit-idéntica en coma flotante);
+    // 0 < amount < 1 mezcla; amount=0 es inalcanzable aquí (neutral →
+    // useEvo false) y queda como guarda fail-closed (se salta el EvoEQ).
+    if (useEvo) {
+        const float amt = controls_.amount;
+        if (amt >= 1.0f) {
+            evoEq_.processPlanar(workL_, workR_, kProcessChunkFrames);
+        } else if (amt > 0.0f) {
+            for (int j = 0; j < kProcessChunkFrames; ++j) {
+                evoDryL_[j] = workL_[j];
+                evoDryR_[j] = workR_[j];
+            }
+            evoEq_.processPlanar(workL_, workR_, kProcessChunkFrames);
+            const double a = static_cast<double>(amt);
+            for (int j = 0; j < kProcessChunkFrames; ++j) {
+                workL_[j] = evoDryL_[j] + a * (workL_[j] - evoDryL_[j]);
+                workR_[j] = evoDryR_[j] + a * (workR_[j] - evoDryR_[j]);
+            }
+        }
+        // amt <= 0.0f: sin EvoEQ (guarda; en neutro useEvo ya es false).
+    }
     if (!neutral) {
         // EQ de usuario (bypass bit-exacto si los 10 objetivos son 0)
         // + medición K-weighted del trozo + trim estático al final.

@@ -95,6 +95,7 @@
 #include "fused/experience_compiler/experience_compiler.hpp"  // P8 (CORONA, cableado 2026-11-24)
 #include "fused/living_room/living_room.hpp"  // P9 (CORONA, cableado 2026-11-24, solo modelo/datos)
 #include "fused/unified_field_kernel.hpp"  // TΩ: kernel 2×2 64-bit (F1/472)
+#include "fused/tenth_dimension_action.hpp"  // CORONA D10 (2026-11-25): kernel LTI + árbitro
 
 namespace ivanna::fused {
 
@@ -231,6 +232,13 @@ public:
     // Acceso a la capa de conservación (telemetría / Ruta B / tests).
     PerceptualConservation& conservation() noexcept { return conservation_; }
     const PerceptualConservation& conservation() const noexcept { return conservation_; }
+    // ── CORONA D10 (2026-11-25) ─────────────────────────────────────────
+    // Acceso al motor D10 (kernel LTI + árbitro + observador térmico).
+    // Enabled por defecto (orden "todo prendido"); la distancia de
+    // escucha viva es 3.0 m (sala documentada). Solo lectura de
+    // telemetría en el camino caliente; setConfig es del hilo de UI.
+    d10::TenthDimensionActionEngine& d10Engine() noexcept { return d10Engine_; }
+    const d10::TenthDimensionActionEngine& d10Engine() const noexcept { return d10Engine_; }
 
     // ── GEMELO ACÚSTICO + CALIBRACIÓN — CALL SITE (2026-11-21/22) ────────
     // La calibración del Genezi vive embebida en el gemelo. Desde la
@@ -283,19 +291,17 @@ public:
     // funciona con el flag en OFF o en ON. applyCompiledExperience() es
     // la única que escribe controles, y SOLO con el flag en ON: con OFF
     // devuelve false y NO cambia nada. Con ON aplica los amounts a los
-    // 6 operadores con escalar en FusedControls (ORBE→spatial.amount,
+    // 7 operadores con escalar en FusedControls (ORBE→spatial.amount,
     // HOLOS→field.amount, SALA VIVA→listenerRoom.roomWet,
-    // VOLTERRA→transducer.correction, PULSO→dynamics.punch — pegada,
+    // VOLTERRA→transducer.correction, ARMONÍA→tonal.amount (escalar
+    // continuo P8, CORONA D10 2026-11-25), PULSO→dynamics.punch — pegada,
     // mapeo nominal —, NEURO→brain.adaptation) y el trim maestro
-    // RECOMPUTADO solo sobre lo aplicado en tonal.trimDb, así la
+    // RECOMPUTADO sobre los 7 aplicados en tonal.trimDb, así la
     // ganancia neta nominal de lo aplicado es 0.0 dB (Regla de Oro).
-    // [4] ARMONÍA NO SE APLICA: FusedControls no tiene escalar de amount
-    // tonal (curva + bandas + trim); inventar uno falsearía la semántica.
-    // Pendiente de decisión de Esse: definir el escalar tonal o aceptar
-    // ARMONÍA fija en P8. Mientras P8 esté habilitado, tonal.trimDb es
-    // el trim del compilador (toma posesión del trim del usuario). En
-    // modo MANUAL del cerebro, el clamp existente fuerza adaptation a 0
-    // y el amount NEURO de P8 queda en 0 (semántica vigente, no de P8).
+    // Mientras P8 esté habilitado, tonal.trimDb es el trim del
+    // compilador (toma posesión del trim del usuario). En modo MANUAL
+    // del cerebro, el clamp existente fuerza adaptation a 0 y el amount
+    // NEURO de P8 queda en 0 (semántica vigente, no de P8).
     void setExperienceCompilerEnabled(bool on) noexcept {
         experienceCompilerEnabled_.store(on, std::memory_order_relaxed);
     }
@@ -562,6 +568,25 @@ private:
     //   que la matriz volumétrica; sin toggle propio de TΩ).
     static constexpr int kTOmegaHop = 128;
     apex::UnifiedFieldWorkspace tOmegaWs_;  // M[k] vive en ws.outMatrix
+    // ── CORONA D10 (2026-11-25): kernel LTI 2×2 + árbitro ─────────────
+    // El kernel LTI (compilado desde tOmegaWs_.outMatrix en
+    // compileTOmega) SUSTITUYE la ruta espectral TΩ cuando está
+    // enganchado: la matriz fija no modula a la tasa de hop y mata las
+    // bandas laterales a ±375 Hz. La ruta espectral (applyTOmega /
+    // warmTOmegaHistory) queda LEGACY: se conserva y solo se usa si el
+    // kernel NO está enganchado (p. ej. D10 deshabilitado). En
+    // HEADPHONES nada cambia (M=I, kernel no-op; la puerta tOmega lo
+    // excluye). d10DryL_/R_ son el seco pre-operadores (referencia LUFS
+    // del árbitro); effectiveTonalAmount_ es el amount tonal EFECTIVO
+    // del bloque (proxy de conservación × tonal.amount, lo fija
+    // pushEffectiveControls); d10TelemetryValid_ marca que el árbitro
+    // ya corrió al menos un bloque (la telemetría 0.0 inicial NO es una
+    // medición: el certificado P7 la exige para poblar Ξ_10).
+    d10::TenthDimensionActionEngine d10Engine_;
+    std::array<double, kFusedMaxBlockFrames> d10DryL_{};
+    std::array<double, kFusedMaxBlockFrames> d10DryR_{};
+    float effectiveTonalAmount_ = 0.0f;  // solo hilo de audio
+    bool d10TelemetryValid_ = false;     // solo hilo de audio
     std::array<std::complex<double>, kVolBins> tOmegaYl_{}, tOmegaYr_{};
     std::array<std::complex<double>, kVolFft> tOmegaPack_{};
     std::array<std::complex<double>, kVolBins> tOmegaFdlL_{}, tOmegaFdlR_{};
