@@ -133,8 +133,13 @@ THRESHOLDS = {
     # llevaba estancado desde la v2.5.498 (2026-11-23) y el Frente A midió
     # 1,663 en el CTest completo sin subir el candado (+24). 1663 + 12 = 1675
     # medido con `ctest -N` en el build clang++-18 completo.
-    "ctest_expected_total": 1675,
-    "ctest_expected_passed": 1675,
+    # 2026-11-25 (CORONA, TODO ACTIVO + rango dinámico exacto): la suite
+    # crece de 1675 a 1677 (+2: AudioClassifierFrontend.DefaultIsRealFrontendOn
+    # — flag NEURO ON por defecto — y P1AdversarialMatrix.ApexLimiterCeilingAtFullScale
+    # — techo final a 0 dBFS). Medido con `ctest -N` en el build clang++-18
+    # completo (1677).
+    "ctest_expected_total": 1677,
+    "ctest_expected_passed": 1677,
     "sofa_expected_total": 694,
 }
 

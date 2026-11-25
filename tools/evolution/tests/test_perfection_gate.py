@@ -159,8 +159,12 @@ class TestPerfectionGateThresholds(unittest.TestCase):
         # sobre una base ya en 1663 (umbral 1639 estancado desde la v2.5.498;
         # el Frente A midió 1,663 sin subir el candado). 1663 + 12 = 1675
         # medido con `ctest -N` en el build clang++-18 completo.
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1675)
-        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1675)
+        # 2026-11-25 (CORONA, TODO ACTIVO + rango dinámico exacto): la suite
+        # crece de 1675 a 1677 (+2: DefaultIsRealFrontendOn y
+        # ApexLimiterCeilingAtFullScale), medido con `ctest -N` en el build
+        # clang++-18 completo.
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_total"], 1677)
+        self.assertEqual(gate.THRESHOLDS["ctest_expected_passed"], 1677)
         self.assertEqual(gate.THRESHOLDS["sofa_expected_total"], 694)
         self.assertTrue(gate.THRESHOLDS_VERSION)
 
