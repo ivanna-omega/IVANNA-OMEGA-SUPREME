@@ -127,8 +127,10 @@ TEST(HolosChain, ThdnOffIsBitExact) {
 TEST(HolosChain, ThdnOnAndImd) {
     // THD+N e IMD con HOLOS on (defaults: harmonics 0.32, dynamics 1,
     // diffuse 0.85 — ATREVIDA 502). Cotas endurecidas (auditoría 2026-11-10) sobre los
-    // valores medidos en host: THD+N −31.5 dB @1 kHz, −33.2 dB @100 Hz;
-    // IMD −28.2 dB; sin K −87.9 dB (mejora 56.4 dB). Las cotas dejan
+    // valores medidos en host con la geometría atrevida (clang++-18,
+    // 2026-11-25): THD+N −33.9 dB @1 kHz, −35.9 dB @100 Hz; IMD −30.9 dB;
+    // sin K −95.4 dB (mejora 61.5 dB). (Valores viejos, geometría 1.0/3.0/0.5:
+    // −31.5/−33.2, IMD −28.2, sin K −87.9.) Las cotas dejan
     // 3–5 dB de margen y siguen sin probar nada sobre "calidad
     // percibida": solo acotan distorsión añadida en host x86-64.
     HolosParams p;
@@ -257,6 +259,17 @@ TEST(HolosChain, GreenMatchesOrbe) {
     // widthFromState(coh≈1)=0.3 × norma 1.354 = 0.406. Se lee el wSide
     // de HOLOS y se pone como diffuse de ORBE; si no, la diferencia de
     // ITD (208 µs medida) es el side, no G.
+    // ── ACANTILADO DE SPREAD (medido 2026-11-25, clang++-18) ──
+    // linearParams() NO fija spread/proximity: hereda los defaults del
+    // struct. Con spread 1.0 HOLOS da +375 µs (ORBE +396 µs, dif 21 µs,
+    // PASA); con spread 1.2 da +417 µs (ensancha bien, PASA); con spread
+    // 1.3/1.4/1.5 da −333 µs (imagen ESPEJADA, dif 729 µs, FALLA). La
+    // proximidad NO es la causa (6.0 sola con spread 1.0 da +375 µs,
+    // PASA). El preset ATREVIDA 502 pone spread 1.5 (decisión Esse
+    // 2026-11-24): este test FALLA con el preset vigente hasta que Esse
+    // decida entre spread 1.2 (verificado seguro) o un fix del estimador
+    // (el escalado θ×spread con clamp ±90° + realimentación por r).
+    // NO relajar la tolerancia: el test está cazando un defecto real.
     auto mkInput = []() {
         auto base = noiseBp(0.4, 3.0, 61);
         std::vector<float> l(144000), r(144000);

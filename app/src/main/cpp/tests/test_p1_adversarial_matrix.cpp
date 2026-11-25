@@ -393,7 +393,11 @@ TEST(P1AdversarialMatrix, ApexLimiterDiagnostic) {
 // El techo final es la última barrera (fused_chain.cpp, tras APEX 2 +
 // TΩ) y clava a ±0.9885531f (-0.1 dBFS exacto a float32); ninguna
 // muestra puede superarlo. (Sin el techo final, el hotmix a -0.5 dBFS
-// llegaba a +0.81 dBFS con APEX ON — ver ApexLimiterDiagnostic.)
+// llegaba a +0.81 dBFS con APEX ON — ver ApexLimiterDiagnostic. Sin la
+// 2ª pasada tras el wet de cadena, el seno a 0 dBFS salía a -0.001 dBFS
+// durante la rampa de enganche — ver fix(chain) 2026-11-25.) Medido
+// 2026-11-25 (clang++-18 -O3, todo activo): hotmix 0 dBFS ON -0.100 /
+// OFF -0.139 dBFS; seno 1 kHz 0 dBFS ON -0.100 / OFF -0.100 dBFS.
 TEST(P1AdversarialMatrix, ApexLimiterCeilingAtFullScale) {
     GenOptions opt;
     opt.seed = 0;

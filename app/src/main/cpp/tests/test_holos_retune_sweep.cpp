@@ -90,10 +90,14 @@ TEST(HolosRetuneSweep, GridThdnAndAudibility) {
 TEST(HolosRetuneSweep, ChosenDefaultIsCleanAndMeasurable) {
     // Default ATREVIDA 502 (directiva Esse 2026-11-24): amount=1.0,
     // harmonics=0.002 (máximo validado), spread=1.5, proximityDb=6.0,
-    // diffuse=0.85. Requisito: THD+N ≤ −70 dB en ambas frecuencias y
-    // IMD SMPTE ≤ −60 dB. (El default anterior era amount=0.5, K=0,
-    // spread 1.0, proximity 3.0, diffuse 0.5: THD+N @1 kHz −94.0 dB,
-    // @100 Hz −79.6 dB.)
+    // diffuse=0.85. Medido en host (clang++-18, 2026-11-25): THD+N
+    // @1 kHz −77.9 dB, @100 Hz −80.0 dB, IMD SMPTE −74.9 dB, diff vs
+    // bypass (lat-comp) −11.9 dB. Requisito: THD+N ≤ −70 dB en ambas
+    // frecuencias y IMD SMPTE ≤ −60 dB. (El default anterior era
+    // amount=0.5, K=0, spread 1.0, proximity 3.0, diffuse 0.5: THD+N
+    // @1 kHz −94.0 dB, @100 Hz −79.6 dB.) La geometría atrevida MEJORA
+    // el @100 Hz (de −71.5 a −80.0 en la guarda a amount 1.0): la cola
+    // difusa no empeora el THD+N, lo mejora.
     HolosParams p;
     p.amount = 1.0f;
     p.harmonics = 0.002f;
@@ -217,10 +221,13 @@ TEST(HolosHarmonicsGuard, UserLiveValueFails) {
 
 TEST(HolosHarmonicsGuard, ValidatedMaxPassesAtAllAmounts) {
     // El máximo validado (0.002) debe cumplir el criterio a amount 0.359,
-    // 0.5 y 1.0. Medido en host: (0.359) −76.5/−77.5/−73.2; (0.5)
-    // −73.7/−74.5/−70.3; (1.0) −75.3/−71.5/−72.2. Margen mínimo 1.5 dB
-    // (@100 Hz, amount 1.0). 0.003 pasa con solo 0.3 dB de margen y 0.004
-    // ya falla a 1.0: el máximo con margen es 0.002.
+    // 0.5 y 1.0, con la geometría ATREVIDA 502 (spread 1.5, proximity 6.0,
+    // diffuse 0.85). Medido en host (clang++-18, 2026-11-25): (0.359)
+    // −88.5/−91.7/−85.9; (0.5) −85.3/−88.3/−82.6; (1.0) −77.9/−80.0/−74.9.
+    // Margen mínimo 7.9 dB (@1 kHz, amount 1.0). Con la geometría vieja
+    // (spread 1.0, proximity 3.0, diffuse 0.5) era (0.359) −76.5/−77.5/−73.2;
+    // (0.5) −73.7/−74.5/−70.3; (1.0) −75.3/−71.5/−72.2 (margen 1.5 dB):
+    // la atrevida mejora el margen, sobre todo @100 Hz.
     for (float amount : {0.359f, 0.5f, 1.0f}) {
         const GuardRow r = measureGuardRow(amount, kHolosHarmonicsMaxValidated);
         std::printf("[holos-guard] max %.3f @ amount %.3f: THD+N @1k %.1f dB, @100 %.1f dB, IMD %.1f dB\n",
