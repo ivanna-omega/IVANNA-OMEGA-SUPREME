@@ -126,7 +126,7 @@ TEST(HolosChain, ThdnOffIsBitExact) {
 
 TEST(HolosChain, ThdnOnAndImd) {
     // THD+N e IMD con HOLOS on (defaults: harmonics 0.32, dynamics 1,
-    // diffuse 0.5). Cotas endurecidas (auditoría 2026-11-10) sobre los
+    // diffuse 0.85 — ATREVIDA 502). Cotas endurecidas (auditoría 2026-11-10) sobre los
     // valores medidos en host: THD+N −31.5 dB @1 kHz, −33.2 dB @100 Hz;
     // IMD −28.2 dB; sin K −87.9 dB (mejora 56.4 dB). Las cotas dejan
     // 3–5 dB de margen y siguen sin probar nada sobre "calidad
@@ -166,24 +166,30 @@ TEST(HolosChain, ThdnOnAndImd) {
 }
 
 TEST(HolosChain, ThdnProductionRetune) {
-    // Retune de producción (directiva 2026-11-08, aplicado por
-    // ParameterStore/PersistedStateRestorer, NO por los defaults del
-    // struct): amount 0.5, harmonics 0.0; el resto, defaults. Es la
-    // configuración que realmente suena en el teléfono: medirla aquí
-    // en vez de solo los defaults del struct (harmonics 0.32).
+    // Retune de producción ATREVIDA 502 (directiva Esse 2026-11-24,
+    // aplicado por ParameterStore/PersistedStateRestorer, NO por los
+    // defaults del struct): amount 1.0, harmonics 0.002, spread 1.5,
+    // proximityDb 6.0, diffuse 0.85. Es la configuración que realmente
+    // suena en el teléfono: medirla aquí en vez de solo los defaults
+    // del struct (harmonics 0.32).
     HolosParams p;
-    p.amount = 0.5f;
-    p.harmonics = 0.0f;
+    p.amount = 1.0f;
+    p.harmonics = 0.002f;
+    p.spread = 1.5f;
+    p.proximityDb = 6.0f;
+    p.diffuse = 0.85f;
     const double thdn1k = measureHolosThdn(p, 1000.0);
     const double thdn100 = measureHolosThdn(p, 100.0);
     std::printf("[holos-chain] THD+N retune prod @1 kHz: %.1f dB, @100 Hz: %.1f dB\n",
                 thdn1k, thdn100);
     EXPECT_TRUE(std::isfinite(thdn1k));
     EXPECT_TRUE(std::isfinite(thdn100));
-    // Cotas endurecidas sobre lo medido en host: −94.0 dB @1 kHz,
-    // −79.6 dB @100 Hz (coincide con el retune documentado). Margen ~14 dB.
-    EXPECT_LT(thdn1k, -80.0);
-    EXPECT_LT(thdn100, -65.0);
+    // Cotas: THD+N ≤ −70 dB (criterio ATREVIDA, directiva 2026-11-24).
+    // Medido en host con la geometría atrevida: ver salida del test
+    // (los valores viejos eran −94.0 dB @1 kHz, −79.6 dB @100 Hz con
+    // amount 0.5 / K=0 / spread 1.0 / proximity 3.0 / diffuse 0.5).
+    EXPECT_LT(thdn1k, -70.0);
+    EXPECT_LT(thdn100, -70.0);
 }
 
 TEST(HolosChain, LatencyIsFftSize) {

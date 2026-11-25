@@ -154,12 +154,12 @@ data class SpatialControls(
 // NEU·Ω (compilador espectral holográfico) + IvannaFusionCore (etapa de
 // campo del engine) + OmniField (IVANNA).
 data class FieldControls(
-    val amount: Float = 0.5f,     // HOLOS amount 0..1. Default 0.5 (directiva 2026-11-08).
+    val amount: Float = 1.0f,     // HOLOS amount 0..1. Default 1.0 (preset ATREVIDA 502, directiva Esse 2026-11-24).
     val phiAmount: Float = 0.5f,  // Phi amount 0..1. Default 0.5 (directiva 2026-11-08).
     val phiPreset: FusedPhiPreset = FusedPhiPreset.PHONE, // Phi: 0 teléfono, 1 sala, 2 auto.
     val pumping: Float = 0.0f,    // bombeo 0..1. TARGET 0.0 (bombeo cero, magistral).
     val coherence: Float = 0.8f,  // coherencia 0..1.
-    val harmonics: Float = 0.0f,  // armónicos HOLOS 0..0.002 (kHolosHarmonicsMaxValidated).
+    val harmonics: Float = 0.002f,  // armónicos HOLOS 0..0.002 (kHolosHarmonicsMaxValidated; ATREVIDA 502).
     val gamma: Float = 1.0f,      // campo Γ (Ley 1) 0..2.
     val warmth: Float = 0.0f,     // calidez 0..1.
     val dynamics: Float = 1.0f,   // dinámica 0..1 (1 = sin compresión extra).

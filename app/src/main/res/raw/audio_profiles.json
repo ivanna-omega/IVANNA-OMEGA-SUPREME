@@ -56,8 +56,8 @@
         "orbeHeadRadiusM": 0.0875
       },
       "field": {
-        "holosAmount": 0.5,
-        "holosHarmonics": 0.0012,
+        "holosAmount": 1.0,
+        "holosHarmonics": 0.002,
         "holosWarmth": 0.5,
         "holosDynamics": 1.0,
         "holosGamma": 1.0,
@@ -181,8 +181,8 @@
         "orbeHeadRadiusM": 0.0875
       },
       "field": {
-        "holosAmount": 0.5,
-        "holosHarmonics": 0.0012,
+        "holosAmount": 1.0,
+        "holosHarmonics": 0.002,
         "holosWarmth": 0.5,
         "holosDynamics": 1.0,
         "holosGamma": 1.0,

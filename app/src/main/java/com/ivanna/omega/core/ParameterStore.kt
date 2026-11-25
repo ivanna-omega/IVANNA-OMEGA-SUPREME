@@ -273,15 +273,15 @@ class ParameterStore(context: Context) {
         // guardado, no el del perfil. El perfil de arranque es UNA constante
         // (BOOT_PROFILE); se cambiará tras el ABX.
         //   "Limpio": solo HOA+HRTF (la base; todos los operadores añadidos a 0).
-        //   "Espacial": Limpio + ORBE ~0.5 + HOLOS 0.5 con K=0 (sin Φ, sin
-        //     OmniField, sin Volterra).
-        //   "Completo": defaults actuales del README (ORBE 1.0, HOLOS 0.5 con
-        //     K=0, OmniField 1.0, Φ 0.5, Volterra ON) como perfil SELECCIONABLE,
+        //   "Espacial": Limpio + ORBE 1.0 + HOLOS 1.0 con K=0.002 (sin Φ, sin
+        //     OmniField, sin Volterra) — ATREVIDA 502 (directiva Esse 2026-11-24).
+        //   "Completo": defaults actuales del README (ORBE 1.0, HOLOS 1.0 con
+        //     K=0.002, OmniField 1.0, Φ 0.5, Volterra ON) como perfil SELECCIONABLE,
         //     NO como arranque. El bypass de OmniField de la 410 (0.0) queda
         //     como arranque (Espacial no lo enciende) y "Completo" lo mantiene
         //     disponible para comparar por ABX; pendiente de confirmación.
         // Valores de partida (tarea 2): EQ estático de HOLOS plano (0 dB en
-        // las 6 bandas), distance 0.35 m, harmonics 0, hyper_bass_trim 0,
+        // las 6 bandas), distance 0.35 m, harmonics 0.002, hyper_bass_trim 0,
         // preset Harman 2018 (targetKind 0) SIN corrección MEDIDA hasta que
         // haya calibración (el sensor MEDIDO solo corre con permiso
         // RECORD_AUDIO; sin él, Φ corre en APROXIMADO fail-closed).
@@ -331,8 +331,8 @@ class ParameterStore(context: Context) {
             orbeAmount = 1.0f, orbeDistanceM = 0.35f, orbeSpread = 1.0f,
             orbeProximityDb = 3.0f, orbeDiffuse = 0.5f, orbeHeadTracking = true,
             orbeHeadRadiusM = 0.0875f,
-            holosAmount = 0.5f, holosDistanceM = 0.35f, holosSpread = 1.0f,
-            holosProximityDb = 3.0f, holosDiffuse = 0.5f, holosHarmonics = 0.0f,
+            holosAmount = 1.0f, holosDistanceM = 0.35f, holosSpread = 1.5f,
+            holosProximityDb = 6.0f, holosDiffuse = 0.85f, holosHarmonics = 0.002f,
             holosWarmth = 0.5f, holosDynamics = 1.0f, holosWidth = 1.0f,
             holosGamma = 1.0f, holosRoomRt60 = 0.34f, holosHeadTracking = true,
             holosBandCount = 24,
@@ -353,14 +353,14 @@ class ParameterStore(context: Context) {
 
         val PROFILE_ESPACIAL: FactoryProfile = PROFILE_BASE.copy(
             name = "Espacial",
-            orbeAmount = 1.0f, holosAmount = 0.5f, holosHarmonics = 0.0f,
+            orbeAmount = 1.0f, holosAmount = 1.0f, holosHarmonics = 0.002f,
             omniAmount = 0f, hyperAmount = 0f, volterraEnabled = false
         )
 
         val PROFILE_COMPLETO: FactoryProfile = PROFILE_BASE.copy(name = "Completo")
 
         // v2.5.473 (§3.6.4): el arranque de fábrica pasa de ESPACIAL a
-        // COMPLETO (ORBE 1.0, HOLOS 0.5, OmniField 1.0, Φ 0.5, Volterra ON):
+        // COMPLETO (ORBE 1.0, HOLOS 1.0, OmniField 1.0, Φ 0.5, Volterra ON):
         // el comentario de la 411 lo dejó pendiente "tras el ABX" y la 473 lo
         // propone; si el ABX lo refuta, vuelve a PROFILE_ESPACIAL en la
         // siguiente release. Solo importa en fresh install sin prefs: el
@@ -787,7 +787,8 @@ class ParameterStore(context: Context) {
 
     /**
      * v2.5.437 — Migración única: restaurar los amounts a los valores de la
-     * directiva de Esse (ORBE 1.0, HOLOS 0.5, ACTIVOS). En vivo 2026-11-13
+     * directiva de Esse (ORBE 1.0, HOLOS 1.0, ACTIVOS — ATREVIDA 502,
+     * directiva 2026-11-24; antes HOLOS 0.5). En vivo 2026-11-13
      * los persistidos estaban en ORBE 0.19 / HOLOS 0.05 (casi inaudibles) y
      * el perfil de arranque ESPACIAL traía ORBE 0.5; con esos valores los
      * efectos se sienten a veces sí y a veces no. La migración pone los
@@ -801,11 +802,11 @@ class ParameterStore(context: Context) {
         val beforeHolos = getHolosAmount()
         prefs.edit()
             .putFloat(KEY_ORBE_AMOUNT, 1.0f)
-            .putFloat(KEY_HOLOS_AMOUNT, 0.5f)
+            .putFloat(KEY_HOLOS_AMOUNT, 1.0f)
             .putBoolean(KEY_MIGRATION_437_AMOUNTS_DONE, true)
             .apply()
         android.util.Log.i("ParameterStore",
-            "Migración 437: amounts directiva restaurados (orbe $beforeOrbe->1.0, holos $beforeHolos->0.5)")
+            "Migración 437: amounts directiva restaurados (orbe $beforeOrbe->1.0, holos $beforeHolos->1.0)")
     }
 
     // ── IVANNA — Operador Unificado de Campo Espacial (v2.5.375) ── BYPASS
@@ -1266,10 +1267,14 @@ class ParameterStore(context: Context) {
 // migrateTo386Envelope() los sigue resolviendo (mismo archivo/paquete).
 // ===========================================================================
 
-/** Techos del sobre 380 — NO subir. */
-const val ENVELOPE_380_HOLOS_AMOUNT = 0.5f
+/** Techos del sobre 380 — subidos por la ATREVIDA 502 (directiva Esse
+ * 2026-11-24): los techos 380 (amount 0.5 / diffuse 0.5) clamparían el
+ * nuevo default de fábrica (1.0 / 0.85) en la migración única de una
+ * instalación limpia. Los techos de width (1.0) y orbeSpread (1.0) no
+ * cambian: siguen deshaciendo los valores 384 (1.25 / 1.2). */
+const val ENVELOPE_380_HOLOS_AMOUNT = 1.0f
 const val ENVELOPE_380_HOLOS_WIDTH = 1.0f
-const val ENVELOPE_380_HOLOS_DIFFUSE = 0.5f
+const val ENVELOPE_380_HOLOS_DIFFUSE = 0.85f
 const val ENVELOPE_380_ORBE_SPREAD = 1.0f
 
 /** Los cuatro valores persistidos que la migración 386 clampa. */

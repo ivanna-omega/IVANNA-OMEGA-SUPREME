@@ -114,9 +114,9 @@ constexpr float kHolosHarmonicsMaxValidated = 0.002f;
 struct HolosParams {
     float amount = 0.0f;       // 0..1 wet/dry vs legacy; 0 = bit-exacto
     float distanceM = 0.35f;   // 0.15..2.0 m, distancia base ("íntimo")
-    float spread = 1.0f;       // 0..1.5, escala del azimut estimado
-    float proximityDb = 3.0f;  // 0..6 dB, techo del realce de proximidad
-    float diffuse = 0.5f;      // 0..1, cuánto campo difuso va a la cola compartida
+    float spread = 1.5f;       // 0..1.5, escala del azimut estimado (ATREVIDA 502, directiva Esse 2026-11-24)
+    float proximityDb = 6.0f;  // 0..6 dB, techo del realce de proximidad (ATREVIDA 502)
+    float diffuse = 0.85f;     // 0..1, cuánto campo difuso va a la cola compartida (ATREVIDA 502)
     float harmonics = 0.32f;   // 0..1, mezcla del término K
     float warmth = 0.5f;       // 0..1, balance par/impar de K
     float dynamics = 1.0f;     // 0..1, cantidad de Γ_dinámico (1 = compresor como hoy)
@@ -228,9 +228,9 @@ private:
 
     std::atomic<float> amount_{0.0f};
     std::atomic<float> distanceM_{0.35f};
-    std::atomic<float> spread_{1.0f};
-    std::atomic<float> proximityDb_{3.0f};
-    std::atomic<float> diffuse_{0.5f};
+    std::atomic<float> spread_{1.5f};      // ATREVIDA 502 (directiva Esse 2026-11-24)
+    std::atomic<float> proximityDb_{6.0f};  // ATREVIDA 502
+    std::atomic<float> diffuse_{0.85f};     // ATREVIDA 502
     std::atomic<float> harmonics_{0.32f};
     std::atomic<float> warmth_{0.5f};
     std::atomic<float> dynamics_{1.0f};

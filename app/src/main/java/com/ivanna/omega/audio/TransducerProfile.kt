@@ -15,14 +15,14 @@ package com.ivanna.omega.audio
  * Genezi NO deben aplicarse a una bocina que no es el Genezi.
  *
  * HEADPHONES (Holografía Binaural Pura): HRTF real (IHR1/SOFA) + ORBE
- * 1.0 + HOLOS 0.5 + Φ 0.5 + Volterra del usuario, cero EvoEQ genérico
+ * 1.0 + HOLOS 1.0 + Φ 0.5 + Volterra del usuario, cero EvoEQ genérico
  * encima. XTC APAGADO: en audífonos no hay diafonía acústica que
  * cancelar; aplicar XTC colapsaría la imagen binaural.
  *
  * SPEAKERS_GENEZI (Trinnov + Meyer GALAXY): PROHIBIDO HRTF binaural,
  * WFS de array virtual y BRIR artificial. ORBE/HOLOS SÍ pasan con los
  * montos del usuario (v2.5.483: el holograma del Genezi es el del
- * usuario, 1.0/0.5 por defecto; antes iban a 0 y el daemon re-sembraba
+ * usuario, 1.0/1.0 por defecto — ATREVIDA 502; antes iban a 0 y el daemon re-sembraba
  * ORBE 0 tras cada cambio de sesión — hallazgo Esse 2026-11-20 05:18
  * CST). SÍ: AuxFieldCoherence (graves en fase coherente bajo el cruce
  * del Genezi), CrosstalkCanceller (hyperXtc = 1, calibrado a la

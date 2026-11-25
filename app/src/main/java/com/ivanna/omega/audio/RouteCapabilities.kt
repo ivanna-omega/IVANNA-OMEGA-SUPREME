@@ -17,7 +17,7 @@ package com.ivanna.omega.audio
  * - Estado adaptativo + YAMNet: motor adaptativo local + control_set_yamnet_scores.
  * - WFS, crosstalk, upmixing, 4D y ejes supremos: módulos en nativeProcessBlock,
  *   gobernados por flags locales que el restorer fija al arrancar.
- * - ORBE y HOLOS: activos por defecto en v2.5.369 (ORBE 1.0, HOLOS 0.5 / K=0).
+ * - ORBE y HOLOS: activos por defecto en v2.5.369 (ORBE 1.0, HOLOS 1.0 / K=0.002, ATREVIDA 502).
  *
  * Se muestra al usuario para que un control sin efecto no parezca funcionar.
  */

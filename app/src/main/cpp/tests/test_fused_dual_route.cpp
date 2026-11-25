@@ -31,8 +31,9 @@ std::vector<double> tone(std::size_t n, double amp = kAmp, double freq = kFreq) 
     return v;
 }
 
-// Configuración viva de Ruta B (efecto HAL): defaults del FusionEngine
-// (ORBE 1.0, HOLOS 0.5, Phi 0.5 por directiva 2026-11-08).
+// Configuración fija de Ruta B para este test (NO es el default vivo: el
+// default ATREVIDA 502 es HOLOS 1.0 / K=0.002; aquí se fija 0.5/0.0 para
+// comparar rutas con una configuración conocida y estable).
 FusedControls routeBControls() {
     FusedControls c;
     c.spatial.amount = 1.0f;

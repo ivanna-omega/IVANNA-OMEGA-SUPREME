@@ -150,12 +150,16 @@ double measureOrbeThdn(float amount, double f0, double amp) {
     return thdn(l.data() + 48000, 48000, kFs, f0).thdnDb;
 }
 
-// Retune de producción (directiva 2026-11-08): amount 0.5, harmonics 0.0;
-// el resto, defaults de producción (dynamics 1.0, diffuse 0.5).
+// Retune de producción ATREVIDA 502 (directiva Esse 2026-11-24):
+// amount 1.0, harmonics 0.002, spread 1.5, proximityDb 6.0,
+// diffuse 0.85; el resto, defaults de producción (dynamics 1.0).
 ivanna::HolosParams productionRetune() {
     ivanna::HolosParams p;
-    p.amount = 0.5f;
-    p.harmonics = 0.0f;
+    p.amount = 1.0f;
+    p.harmonics = 0.002f;
+    p.spread = 1.5f;
+    p.proximityDb = 6.0f;
+    p.diffuse = 0.85f;
     return p;
 }
 }  // namespace

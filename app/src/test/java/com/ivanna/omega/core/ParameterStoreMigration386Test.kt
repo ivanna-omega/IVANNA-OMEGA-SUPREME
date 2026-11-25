@@ -28,8 +28,11 @@ class ParameterStoreMigration386Test {
     ) = Envelope380(holosAmount, holosWidth, holosDiffuse, orbeSpread)
 
     @Test fun values384AreClampedTo380Envelope() {
+        // Techos ATREVIDA 502 (directiva Esse 2026-11-24): amount 1.0 /
+        // diffuse 0.85 (antes 0.5 / 0.5); width 1.0 y orbeSpread 1.0 sin
+        // cambio. Los valores 384 que exceden siguen clampados.
         val out = clampTo380Envelope(env(0.75f, 1.25f, 0.65f, 1.2f))
-        assertEquals(Envelope380(0.5f, 1.0f, 0.5f, 1.0f), out)
+        assertEquals(Envelope380(0.75f, 1.0f, 0.65f, 1.0f), out)
     }
 
     @Test fun values380PassThroughUnchanged() {
@@ -54,8 +57,9 @@ class ParameterStoreMigration386Test {
     }
 
     @Test fun nanFallsBackTo380Defaults() {
+        // Fallback NaN = los techos (ATREVIDA 502: 1.0 / 1.0 / 0.85 / 1.0).
         val out = clampTo380Envelope(env(Float.NaN, Float.NaN, Float.NaN, Float.NaN))
-        assertEquals(Envelope380(0.5f, 1.0f, 0.5f, 1.0f), out)
+        assertEquals(Envelope380(1.0f, 1.0f, 0.85f, 1.0f), out)
     }
 
     @Test fun mixedValuesClampOnlyTheOffenders() {

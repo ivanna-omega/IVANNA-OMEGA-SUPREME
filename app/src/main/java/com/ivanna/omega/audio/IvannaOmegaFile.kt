@@ -75,7 +75,7 @@ data class IvannaOmegaStructuralSplit(
 data class IvannaOmegaEngine(
     val orbe_amount: Float = 1.0f,
     val orbe_distance_m: Float = 0.35f,
-    val holos_amount: Float = 0.5f,
+    val holos_amount: Float = 1.0f,   // ATREVIDA 502 (directiva Esse 2026-11-24)
     val phi_amount: Float = 0.5f,
     val volterra_enabled: Boolean = true,
     val volterra_mix: Float = 0.55f,

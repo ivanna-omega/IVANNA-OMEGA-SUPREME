@@ -105,12 +105,12 @@ struct SpatialControls {
 // La Fase B −102.79 dB (ancla linkBandGainsDb) se preserva: el operador
 // envuelve HolosOperator sin tocarlo.
 struct FieldControls {
-    float amount = 0.5f;     // HOLOS amount 0..1. Default 0.5 (directiva 2026-11-08).
+    float amount = 1.0f;     // HOLOS amount 0..1. Default 1.0 (preset ATREVIDA 502, directiva Esse 2026-11-24).
     float phiAmount = 0.5f;  // Phi amount 0..1. Default 0.5 (directiva 2026-11-08).
     int phiPreset = 0;       // Phi: 0 teléfono, 1 sala, 2 auto.
     float pumping = 0.0f;    // bombeo 0..1. TARGET 0.0 (bombeo cero, magistral).
     float coherence = 0.8f;  // coherencia 0..1.
-    float harmonics = 0.0f;  // armónicos HOLOS 0..0.002 (kHolosHarmonicsMaxValidated).
+    float harmonics = 0.002f;  // armónicos HOLOS 0..0.002 (kHolosHarmonicsMaxValidated; ATREVIDA 502).
     float gamma = 1.0f;      // campo Γ (Ley 1) 0..2.
     float warmth = 0.0f;     // calidez 0..1.
     float dynamics = 1.0f;   // dinámica 0..1 (1 = sin compresión extra).

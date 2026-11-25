@@ -46,9 +46,10 @@ void FusedField::pushParamsToEngines() noexcept {
     // deja a HolosOperator en passthrough tras su fade de salida, y
     // diffuse → 0 corta la alimentación del término difuso. En
     // HEADPHONES, valores vivos de siempre (amount del usuario,
-    // diffuse 0.5 por defecto de HolosParams).
+    // diffuse 0.85 por defecto de HolosParams — ATREVIDA 502, directiva
+    // Esse 2026-11-24).
     hp.amount = isSpeakers() ? 0.0f : controls_.amount;
-    hp.diffuse = isSpeakers() ? 0.0f : 0.5f;
+    hp.diffuse = isSpeakers() ? 0.0f : 0.85f;
     hp.gamma = controls_.gamma;
     hp.roomRt60 = controls_.roomRt60;
     // Guarda validada (v2.5.411): el K nunca recibe más de 0.002.
@@ -57,8 +58,9 @@ void FusedField::pushParamsToEngines() noexcept {
     // Bombeo CERO: pumping=0 → dynamics=1.0 (Γ dinámica de HOLOS como
     // hoy, sin compresión extra); pumping=1 → dynamics=0 (Γ dinámica off).
     hp.dynamics = 1.0f - controls_.pumping;
-    // Defaults conservados: distanceM 0.35, spread 1.0, proximityDb 3.0,
-    // diffuse 0.5, width 1.0, headTracking true, bandCount 24, EQ plano.
+    // Defaults ATREVIDA 502 (directiva Esse 2026-11-24): distanceM 0.35,
+    // spread 1.5, proximityDb 6.0, diffuse 0.85, width 1.0, headTracking
+    // true, bandCount 24, EQ plano.
     holos_.setParams(hp);
 
     // ── OmniField (campo unificado IVANNA, después de HOLOS) ─────────────

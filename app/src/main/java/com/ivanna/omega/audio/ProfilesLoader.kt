@@ -80,8 +80,10 @@ data class IvannaSpatialProfileParams(
 
 @Serializable
 data class IvannaFieldProfileParams(
-    val holosAmount: Float = 0.5f,
-    val holosHarmonics: Float = 0.0f,
+    // Default = preset ATREVIDA 502 (directiva Esse 2026-11-24): los
+    // perfiles que no especifican HOLOS heredan el default de fábrica.
+    val holosAmount: Float = 1.0f,
+    val holosHarmonics: Float = 0.002f,
     val holosWarmth: Float = 0.0f,
     val holosDynamics: Float = 1.0f,
     val holosGamma: Float = 1.0f,

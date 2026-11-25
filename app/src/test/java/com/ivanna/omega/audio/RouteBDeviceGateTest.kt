@@ -12,7 +12,7 @@ import org.junit.Test
  * El caso real (verificado en vivo 2026-11-16 16:00-16:21 CST, Esse):
  * adaptador DAC USB-C JieLi → Genezi. v2.5.483: tercer modo GENEZI
  * (DAC USB con selector SPEAKERS): los montos BINAURALES del usuario
- * pasan (ORBE 1.0 / HOLOS 0.5) y los GENERALES van a neutro (compressor
+ * pasan (ORBE 1.0 / HOLOS 1.0) y los GENERALES van a neutro (compressor
  * 0, loudness 0, exciterRed 0 — protección 0032 intacta). El JieLi
  * enumera como USB_HEADSET (dumpsys audio 2026-11-20: "USB Headset
  * Out"), a veces solo, a veces con USB_DEVICE: el selector decide para
@@ -20,14 +20,15 @@ import org.junit.Test
  * montos del usuario pasan tal cual (binaural Y general).
  *
  * Montos de usuario de los tests = los defaults reales del teléfono de
- * Esse: ORBE 1.0, HOLOS 0.5, spatialWidth 1.55, harmonicGain 0.78,
- * antiDolby 0.85 (PersistedStateRestorer + BOOT_PROFILE).
+ * Esse: ORBE 1.0, HOLOS 1.0, spatialWidth 1.55, harmonicGain 0.78,
+ * antiDolby 0.85 (PersistedStateRestorer + BOOT_PROFILE; ATREVIDA 502,
+ * directiva 2026-11-24 — antes HOLOS 0.5).
  */
 class RouteBDeviceGateTest {
 
     private val userAmounts = RouteBBinauralAmounts(
         orbeAmount = 1.0f,
-        holosAmount = 0.5f,
+        holosAmount = 1.0f,
         spatialWidth = 1.55f,
         harmonicGain = 0.78f,
         antiDolby = 0.85f
@@ -40,7 +41,7 @@ class RouteBDeviceGateTest {
         val gated = RouteBDeviceGate.gate(userAmounts, intArrayOf(AudioDeviceInfo.TYPE_USB_DEVICE))
         assertEquals(userAmounts, gated)
         assertEquals(1.0f, gated.orbeAmount, 0f)
-        assertEquals(0.5f, gated.holosAmount, 0f)
+        assertEquals(1.0f, gated.holosAmount, 0f)
         assertEquals(1.55f, gated.spatialWidth, 0f)
         assertEquals(0.78f, gated.harmonicGain, 0f)
         assertEquals(0.85f, gated.antiDolby, 0f)
@@ -172,10 +173,10 @@ class RouteBDeviceGateTest {
     // ── 0037: gate del JSON perceptual en los funnels ──
     // El comando coloreado real que la APK publica al daemon (valores de
     // PersistedStateRestorer + BOOT_PROFILE + paneles): ORBE 1.0, HOLOS
-    // 0.5, widener 1.55, harmonicGain 0.78, antiDolby 0.85, compressor
+    // 1.0 (ATREVIDA 502), widener 1.55, harmonicGain 0.78, antiDolby 0.85, compressor
     // -5.5, loudness -16, exciterRed 0.15. highCut NO es perceptual.
     private val coloredPerceptual =
-        "{\"action\":\"SET_PERCEPTUAL_STATE\",\"orbeAmount\":1.0,\"holosAmount\":0.5," +
+        "{\"action\":\"SET_PERCEPTUAL_STATE\",\"orbeAmount\":1.0,\"holosAmount\":1.0," +
         "\"spatialWidth\":1.55,\"harmonicGain\":0.78,\"antiDolby\":0.85," +
         "\"compressor\":-5.5,\"loudnessTarget\":-16.0,\"exciterRed\":0.15," +
         "\"highCut\":19500.0}"

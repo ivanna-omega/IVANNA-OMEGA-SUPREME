@@ -174,6 +174,7 @@ class IvannaOmegaFileTest {
         assertEquals("Prueba — Nadie", file.displayLabel)
         val mapped = file.toFusedControls(FusedControls())
         assertEquals(1.0f, mapped.spatial.amount)
-        assertEquals(0.5f, mapped.field.amount)
+        // Default del engine sin sección engine: HOLOS 1.0 (ATREVIDA 502).
+        assertEquals(1.0f, mapped.field.amount)
     }
 }

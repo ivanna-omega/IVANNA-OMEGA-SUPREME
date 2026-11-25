@@ -41,10 +41,14 @@ class FactoryProfileTest {
 
     @Test fun espacialAddsOrbeAndHolosOnly() {
         val p = ParameterStore.PROFILE_ESPACIAL
-        // v2.5.437 — directiva ORBE 1.0 / HOLOS 0.5 (antes ORBE 0.5).
+        // ATREVIDA 502 (directiva Esse 2026-11-24) — ORBE 1.0 / HOLOS 1.0
+        // (antes HOLOS 0.5), spread 1.5, proximity 6.0, diffuse 0.85.
         assertEquals(1.0f, p.orbeAmount, 0f)
-        assertEquals(0.5f, p.holosAmount, 0f)
-        assertEquals(0.0f, p.holosHarmonics, 0f)
+        assertEquals(1.0f, p.holosAmount, 0f)
+        assertEquals(0.002f, p.holosHarmonics, 0f)
+        assertEquals(1.5f, p.holosSpread, 0f)
+        assertEquals(6.0f, p.holosProximityDb, 0f)
+        assertEquals(0.85f, p.holosDiffuse, 0f)
         assertEquals(0f, p.omniAmount, 0f)
         assertEquals(0f, p.hyperAmount, 0f)
         assertFalse(p.volterraEnabled)
@@ -53,13 +57,16 @@ class FactoryProfileTest {
     @Test fun completoMatchesReadmeDefaults() {
         val p = ParameterStore.PROFILE_COMPLETO
         assertEquals(1.0f, p.orbeAmount, 0f)
-        assertEquals(0.5f, p.holosAmount, 0f)
-        assertEquals(0.0f, p.holosHarmonics, 0f)
+        assertEquals(1.0f, p.holosAmount, 0f)
+        assertEquals(0.002f, p.holosHarmonics, 0f)
+        assertEquals(1.5f, p.holosSpread, 0f)
+        assertEquals(6.0f, p.holosProximityDb, 0f)
+        assertEquals(0.85f, p.holosDiffuse, 0f)
         assertEquals(1.0f, p.omniAmount, 0f)
         assertEquals(0.5f, p.hyperAmount, 0f)
         assertTrue(p.volterraEnabled)
         // Valores de partida (tarea 2): EQ HOLOS plano, distance 0.35 m,
-        // harmonics 0, hyper_bass_trim 0, Harman 2018 (targetKind 0).
+        // harmonics 0.002 (ATREVIDA 502), hyper_bass_trim 0, Harman 2018 (targetKind 0).
         assertEquals(0f, p.holosEqLow, 0f)
         assertEquals(0f, p.holosEqMid, 0f)
         assertEquals(0f, p.holosEqHigh, 0f)
@@ -74,10 +81,14 @@ class FactoryProfileTest {
     @Test fun freshStoreReturnsBootProfileDefaults() {
         val store = ParameterStore(context)
         // v2.5.473 (§3.6.4) — BOOT_PROFILE = PROFILE_COMPLETO (antes ESPACIAL):
-        // ORBE 1.0, HOLOS 0.5, OmniField 1.0, Φ 0.5, Volterra ON.
+        // ORBE 1.0, HOLOS 1.0, OmniField 1.0, Φ 0.5, Volterra ON
+        // (ATREVIDA 502, directiva Esse 2026-11-24; antes HOLOS 0.5).
         assertEquals(1.0f, store.getOrbeAmount(), 0f)
-        assertEquals(0.5f, store.getHolosAmount(), 0f)
-        assertEquals(0.0f, store.getHolosHarmonics(), 0f)
+        assertEquals(1.0f, store.getHolosAmount(), 0f)
+        assertEquals(0.002f, store.getHolosHarmonics(), 0f)
+        assertEquals(1.5f, store.getHolosSpread(), 0f)
+        assertEquals(6.0f, store.getHolosProximityDb(), 0f)
+        assertEquals(0.85f, store.getHolosDiffuse(), 0f)
         assertEquals(1.0f, store.getOmniAmount(), 0f)
         assertEquals(0.5f, store.getHyperAmount(), 0f)
         assertTrue(store.isVolterraEnabled())

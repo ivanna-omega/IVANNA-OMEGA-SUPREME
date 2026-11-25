@@ -13,7 +13,7 @@ import android.util.Log
  * manda 3 SET_PERCEPTUAL_STATE al daemon del módulo al arrancar —
  * general (spatialWidth=1.55, harmonicGain=0.78, antiDolby=0.85,
  * compressor=-5.5), ORBE (orbeAmount=1.0 por defecto) y HOLOS
- * (holosAmount=0.5 por defecto) — y el daemon los aplica al efecto de
+ * (holosAmount=1.0 por defecto, ATREVIDA 502) — y el daemon los aplica al efecto de
  * AudioFlinger (Ruta B), que procesa TODO el audio del teléfono. ORBE es
  * binaural (para audífonos) y el widener se come el medio donde viven los
  * graves: por bocinas eso adelgaza el sonido = paso alto. El estado

@@ -6,9 +6,10 @@
 // (libomega_effect.so) tiene su propio stub en holos_globals_effect.cpp;
 // NO duplicar en un mismo target (ODR).
 // Apagado solo como valor inicial del atomic (amount=0 = bypass
-// bit-exacto): la app lo pone a 0.5 (harmonics 0.0 retuneado) al restaurar
-// estado (ParameterStore, directiva explícita 2026-11-08, puerta GREEN
-// anulada). Los parámetros de la Ruta B llegan por snapshot
+// bit-exacto): la app lo pone a 1.0 (harmonics 0.002, spread 1.5,
+// proximityDb 6.0, diffuse 0.85 — preset ATREVIDA 502, directiva Esse
+// 2026-11-24) al restaurar estado (ParameterStore). Los parámetros de la
+// Ruta B llegan por snapshot
 // (OmegaDspSnapshot ABI v10 ya tiene campos holos_*; omega_apply_snapshot
 // los reenvía vía setHolosParams()). El stub del audioserver
 // (holos_globals_effect.cpp) arranca en el mismo 0 inicial hasta que llega
@@ -18,10 +19,10 @@
 
 std::atomic<float> g_holos_amount{0.0f};
 std::atomic<float> g_holos_distance_m{0.35f};
-std::atomic<float> g_holos_spread{1.0f};
-std::atomic<float> g_holos_proximity_db{3.0f};
-std::atomic<float> g_holos_diffuse{0.5f};
-std::atomic<float> g_holos_harmonics{0.0f};  // v2.5.411: inicial = perfil de arranque (Espacial, harmonics 0); la unica fuente de verdad es ParameterStore.FactoryProfile; el 0.32 viejo no estaba validado (tarea 1: max 0.002)
+std::atomic<float> g_holos_spread{1.5f};         // ATREVIDA 502 (directiva Esse 2026-11-24)
+std::atomic<float> g_holos_proximity_db{6.0f};  // ATREVIDA 502
+std::atomic<float> g_holos_diffuse{0.85f};      // ATREVIDA 502
+std::atomic<float> g_holos_harmonics{0.002f};  // v2.5.411: inicial = perfil de arranque (ATREVIDA 502, harmonics 0.002); la unica fuente de verdad es ParameterStore.FactoryProfile; el 0.32 viejo no estaba validado (tarea 1: max 0.002)
 std::atomic<float> g_holos_warmth{0.5f};
 std::atomic<float> g_holos_dynamics{1.0f};
 std::atomic<float> g_holos_width{1.0f};
