@@ -64,11 +64,16 @@
 //     (peor canal). El umbral del test pasa a −80 dB (~11 dB de margen):
 //     es carácter del reverb vivo, no error numérico. Ver el comentario
 //     del test ChainLinearEngagedHeadphones (v2.5.501).
-//   - TΩ en SPEAKERS: −40.04 dB, bandas laterales a ±375 Hz (tasa de hop)
-//     con periodo de 3 hops (384 muestras): la etapa espectral modula el
-//     tono a la tasa de frame (carácter, no ruido numérico). Con TΩ
-//     apagado, SPEAKERS mide −296.74 dB. Umbral −30 dB (caracterización).
-//     Reducir la modulación de frame de TΩ es trabajo futuro.
+//   - TΩ en SPEAKERS (kernel LTI D10, fix-2 #1372/#1426): con el tono
+//     re-apuntado a 0.3 (−10.46 dBFS) el piso es −95.42 dB (peor canal,
+//     medido por el test; la sonda da −96.17 dB; a 0.1 la sonda da
+//     −96.43 dB). A 0.7071 el test medía el TECHO (pico en 0.9886,
+//     −26.94 dB), no el piso. La modulación de frame de la TΩ
+//     espectral (−40.04 dB, bandas laterales a ±375 Hz) ya no existe:
+//     el kernel LTI la mata (bandas −152 dB). Umbral −85 dB
+//     (caracterización, ~10 dB de margen). Con TΩ apagado, SPEAKERS
+//     mide −296.74 dB (piso del medidor). La modulación de frame ya
+//     está reducida por el kernel LTI D10 (ver arriba).
 //
 // CPU: coste por HOP (128 muestras @ 48 kHz = 2667 µs de audio real),
 // cadena lineal enganchada, mediana de 2000 hops tras warm-up.
@@ -134,7 +139,7 @@ FusedControls linearEngagedControls() {
     return c;
 }
 
-double measureFloor(const FusedControls& c, bool volumetric, const char* tag) {
+double measureFloor(const FusedControls& c, bool volumetric, const char* tag, double amp = kAmp) {
     FusedChain chain;
     chain.prepare(kFs);
     chain.setControls(c);
@@ -142,8 +147,8 @@ double measureFloor(const FusedControls& c, bool volumetric, const char* tag) {
     const std::size_t n = 96000;      // 2 s
     const std::size_t skip = 48000;   // 1 s de transitorio (colas RIR)
     std::vector<double> l(n), r(n);
-    fillToneDouble(l.data(), n, kFs, kFreq, kAmp);
-    fillToneDouble(r.data(), n, kFs, kFreq, kAmp);
+    fillToneDouble(l.data(), n, kFs, kFreq, amp);
+    fillToneDouble(r.data(), n, kFs, kFreq, amp);
     chain.process(l.data(), r.data(), static_cast<int>(n));
     EXPECT_TRUE(isFiniteBuffer(l.data(), n));
     EXPECT_TRUE(isFiniteBuffer(r.data(), n));
@@ -182,22 +187,37 @@ TEST(DoubleFloor, ChainLinearEngagedHeadphones) {
 }
 
 TEST(DoubleFloor, ChainLinearEngagedSpeakers) {
-    // SPEAKERS: añade la etapa espectral TΩ (XTC lineal). Su piso en
-    // tono puro es −40.04 dB — NO es ruido numérico: el espectro muestra
-    // bandas laterales a ±375 Hz (tasa de hop 128) con periodo de 3 hops
-    // (384 muestras, 125 Hz): la etapa espectral modula el tono a la
-    // tasa de frame (carácter de la etapa en tono estacionario; con
-    // música sus ganancias por frame cambian de todos modos). La prueba:
-    // SPEAKERS con TΩ apagado mide −296.74 dB (piso del medidor), así
-    // que el render SPEAKERS del espacial es numéricamente perfecto y
-    // todo el residuo es TΩ. Umbral −30 dB (10 dB de margen): fija que
-    // la etapa no se degrade más, sin venderla como piso de precisión.
-    // Reducir la modulación de frame de TΩ es trabajo futuro.
+    // SPEAKERS: añade la etapa espectral TΩ (XTC lineal).
+    //
+    // RE-APUNTADO A 0.3 (fix-2, 2026-11-25, #1426): con el tono a 0.7071
+    // (−3 dBFS) el test medía el TECHO, no el piso — la cadena sube el
+    // tono +3.5 dB (fundamental a +0.51 dBFS) y el pico se clava en el
+    // techo 0.9886 (−0.10 dBFS), dando −26.94 dB. La sonda
+    // probe-speakers-floor.cpp lo verifica: a 0.7071 el pico es 0.9886
+    // (techo); a 0.3 el pico es 0.4890 (sin clipping) y a 0.1 es 0.1810.
+    // El tono a 0.3 (−10.46 dBFS) mide el piso real.
+    //
+    // PISO MEDIDO con la FIR nueva del kernel LTI (512 taps + shift 256,
+    // fix-2 #1372), g++-14 Release: el TEST mide a 0.3 L=−95.42 dB,
+    // R=−101.86 dB (peor canal −95.42 dB, determinista en 3 corridas);
+    // la sonda probe-speakers-floor.cpp (misma configuración) mide a
+    // 0.3 L=−96.17 dB, R=−102.07 dB y a 0.1 L=−96.43 dB, R=−103.02 dB
+    // (el piso NO depende del nivel: es piso, no techo; la diferencia
+    // sonda/test de 0.75 dB es estado global del proceso — la sonda
+    // corre 3 cadenas seguidas y el test una sola — irrelevante frente
+    // al margen de ~10 dB).
+    // La FIR nueva NO mueve el piso (idéntico a 0.01 dB con la FIR de
+    // 128 taps): lo fija el resto de la cadena (SALA VIVA SDRF + ORBE;
+    // compárese HEADPHONES −91.34 dB), no la TΩ. La modulación de frame
+    // de la TΩ espectral (−40.04 dB, bandas laterales a ±375 Hz) ya no
+    // existe: el kernel LTI D10 la mata (bandas −152 dB, ver D10Corona).
+    // Umbral −85 dB (~10 dB de margen sobre lo medido): fija que la
+    // etapa no se degrade más, sin venderla como piso de precisión.
     FusedControls c = linearEngagedControls();
     c.spatial.mode = ivanna::OmegaOutputMode::SPEAKERS;
     c.clamp();
-    const double floor = measureFloor(c, true, "SPEAKERS lineal enganchada (TΩ XTC)");
-    EXPECT_LT(floor, -30.0) << "Piso TΩ peor que -30 dB (peor canal " << floor << " dB)";
+    const double floor = measureFloor(c, true, "SPEAKERS lineal enganchada (TΩ XTC)", 0.3);
+    EXPECT_LT(floor, -85.0) << "Piso TΩ peor que -85 dB (peor canal " << floor << " dB)";
 }
 
 TEST(DoubleFloor, BisectLinearEngaged) {
