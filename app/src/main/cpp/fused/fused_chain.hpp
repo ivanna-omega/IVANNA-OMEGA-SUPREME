@@ -278,8 +278,7 @@ public:
         std::uint64_t trackIndex, std::uint32_t ivannaVersionCode) const noexcept;
 
     // P8 Compilador de Experiencia: intención → parámetros, tras un flag
-    // default OFF (mismo patrón que setAdaptiveClassificationEnabled del
-    // cerebro: OFF = la cadena es bit-idéntica a antes).
+    // default ON (orden Esse 2026-11-25, todo activo en la 502).
     // compileExperience() es función pura (compilar no toca el audio) y
     // funciona con el flag en OFF o en ON. applyCompiledExperience() es
     // la única que escribe controles, y SOLO con el flag en ON: con OFF
@@ -519,12 +518,13 @@ private:
     long volNextFrameAt_ = 512;  // inTotal al que se procesa el próximo frame
     int volOutWp_ = 0, volOutRp_ = 0, volOutLen_ = 0;
     std::atomic<bool> volumetricEnabled_{true};
-    // ── CORONA P8 — flag default OFF (2026-11-24) ─────────────────────────
-    // Con OFF, applyCompiledExperience() es no-op y la cadena es
-    // bit-idéntica a antes. Encenderlo cambia el sonido (aplica amounts
-    // P8): exige ABX + decisión explícita de Esse, como la clasificación
-    // adaptativa NEURO.
-    std::atomic<bool> experienceCompilerEnabled_{false};
+    // ── CORONA P8 — flag default ON (orden Esse 2026-11-25) ──────────────
+    // Con ON, applyCompiledExperience() aplica la experiencia compilada
+    // (ganancia neta nominal 0.0 dB, Regla de Oro). Sin experiencia
+    // compilada+aplicada, la cadena es bit-idéntica a antes: el flag
+    // solo abre la puerta, no inventa una experiencia. Con OFF, apply
+    // es no-op.
+    std::atomic<bool> experienceCompilerEnabled_{true};
     void prepareVolumetric() noexcept;
     void resetVolumetric() noexcept;
     // LEGACY (F1/472): la matriz volumétrica WOLA ya no se llama —

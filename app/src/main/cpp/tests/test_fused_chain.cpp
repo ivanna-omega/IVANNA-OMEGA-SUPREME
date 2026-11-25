@@ -1111,7 +1111,11 @@ TEST(FusedChainCoronaWiring, P7CertificateLossySourceUnestimated) {
 TEST(FusedChainCoronaWiring, P8FlagOffApplyIsNoop) {
     FusedChain chain;
     chain.prepare(kFs);
-    EXPECT_FALSE(chain.experienceCompilerEnabled());  // default OFF
+    // Default ON (orden Esse 2026-11-25): el flag nace encendido.
+    EXPECT_TRUE(chain.experienceCompilerEnabled());
+    // Con OFF explícito, apply es no-op y los controles no se tocan.
+    chain.setExperienceCompilerEnabled(false);
+    EXPECT_FALSE(chain.experienceCompilerEnabled());
     experience_compiler::ExperienceVector target;
     for (std::size_t i = 0; i < experience_compiler::kNumComponents; ++i) {
         target.v[i] = 0.5;
@@ -1133,6 +1137,9 @@ TEST(FusedChainCoronaWiring, P8FlagOffProcessBitIdentical) {
     b.prepare(kFs);
     a.setControls(engagedControls());
     b.setControls(engagedControls());
+    // Flag OFF explícito en b (el default es ON): apply es no-op y el
+    // proceso debe ser bit-idéntico a la cadena sin compilar nada.
+    b.setExperienceCompilerEnabled(false);
     experience_compiler::ExperienceVector target;
     for (std::size_t i = 0; i < experience_compiler::kNumComponents; ++i) {
         target.v[i] = 0.5;
