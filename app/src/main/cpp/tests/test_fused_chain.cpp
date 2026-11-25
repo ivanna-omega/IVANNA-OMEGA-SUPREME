@@ -1174,6 +1174,11 @@ TEST(FusedChainCoronaWiring, P8FlagOnAppliesWithZeroNetNominal) {
     // (0.10 - 0.05 + 0.08 + 0.12 - 0.04 + 0.02) * 0.5 = 0.115 -> -0.115.
     EXPECT_NEAR(c.tonal.trimDb, -0.115, 1e-6);
     // Ganancia neta NOMINAL de lo aplicado: 0.0 dB (Regla de Oro).
+    // Tolerancia 1e-6, no 1e-9: el trim vive en tonal.trimDb (float32)
+    // y su redondeo al almacenar -0.115 ya mete ~2e-9 dB. La garantía
+    // exacta (0.0 en double) es la del módulo (compiled.netGainDb,
+    // verificada arriba); aquí se verifica la aplicada, en precisión
+    // float32 del control real.
     double net = static_cast<double>(c.tonal.trimDb);
     const std::size_t applied[] = {0, 1, 2, 3, 5, 6};
     for (std::size_t o : applied) {
@@ -1189,7 +1194,7 @@ TEST(FusedChainCoronaWiring, P8FlagOnAppliesWithZeroNetNominal) {
         }
         net += experience_compiler::nominalGainDbPerUnit(o) * amount;
     }
-    EXPECT_NEAR(net, 0.0, 1e-9);
+    EXPECT_NEAR(net, 0.0, 1e-6);  // ver comentario arriba (float32)
     // [4] ARMONÍA: explícitamente NO aplicada (sin escalar tonal).
     EXPECT_EQ(c.tonal.curve, 1);
     EXPECT_FLOAT_EQ(c.tonal.lowDb, 0.0f);
