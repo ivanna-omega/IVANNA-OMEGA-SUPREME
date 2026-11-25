@@ -42,11 +42,12 @@ class FactoryProfileTest {
     @Test fun espacialAddsOrbeAndHolosOnly() {
         val p = ParameterStore.PROFILE_ESPACIAL
         // ATREVIDA 502 (directiva Esse 2026-11-24) — ORBE 1.0 / HOLOS 1.0
-        // (antes HOLOS 0.5), spread 1.5, proximity 6.0, diffuse 0.85.
+        // (antes HOLOS 0.5), spread 1.2, proximity 6.0, diffuse 0.85.
+        // Spread 1.2 (no 1.5): acantilado ≥1.3 espeja la imagen (Green).
         assertEquals(1.0f, p.orbeAmount, 0f)
         assertEquals(1.0f, p.holosAmount, 0f)
         assertEquals(0.002f, p.holosHarmonics, 0f)
-        assertEquals(1.5f, p.holosSpread, 0f)
+        assertEquals(1.2f, p.holosSpread, 0f)
         assertEquals(6.0f, p.holosProximityDb, 0f)
         assertEquals(0.85f, p.holosDiffuse, 0f)
         assertEquals(0f, p.omniAmount, 0f)
@@ -59,7 +60,7 @@ class FactoryProfileTest {
         assertEquals(1.0f, p.orbeAmount, 0f)
         assertEquals(1.0f, p.holosAmount, 0f)
         assertEquals(0.002f, p.holosHarmonics, 0f)
-        assertEquals(1.5f, p.holosSpread, 0f)
+        assertEquals(1.2f, p.holosSpread, 0f)
         assertEquals(6.0f, p.holosProximityDb, 0f)
         assertEquals(0.85f, p.holosDiffuse, 0f)
         assertEquals(1.0f, p.omniAmount, 0f)
@@ -86,7 +87,7 @@ class FactoryProfileTest {
         assertEquals(1.0f, store.getOrbeAmount(), 0f)
         assertEquals(1.0f, store.getHolosAmount(), 0f)
         assertEquals(0.002f, store.getHolosHarmonics(), 0f)
-        assertEquals(1.5f, store.getHolosSpread(), 0f)
+        assertEquals(1.2f, store.getHolosSpread(), 0f)
         assertEquals(6.0f, store.getHolosProximityDb(), 0f)
         assertEquals(0.85f, store.getHolosDiffuse(), 0f)
         assertEquals(1.0f, store.getOmniAmount(), 0f)

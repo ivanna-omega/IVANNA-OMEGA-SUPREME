@@ -469,7 +469,7 @@ class RouteBDeviceGateTest {
         // HOLOS/widener/harmonicGain/antiDolby intactos; compressor/
         // loudnessTarget/exciterRed a 0; highCut intacto.
         assertEquals(
-            "{\"action\":\"SET_PERCEPTUAL_STATE\",\"orbeAmount\":1.0,\"holosAmount\":0.5," +
+            "{\"action\":\"SET_PERCEPTUAL_STATE\",\"orbeAmount\":1.0,\"holosAmount\":1.0," +
             "\"spatialWidth\":1.55,\"harmonicGain\":0.78,\"antiDolby\":0.85," +
             "\"compressor\":0,\"loudnessTarget\":0,\"exciterRed\":0," +
             "\"highCut\":19500.0}",
