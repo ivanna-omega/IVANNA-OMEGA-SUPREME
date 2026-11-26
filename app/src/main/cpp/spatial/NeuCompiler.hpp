@@ -111,10 +111,21 @@ inline NeuMat2x2 orbeMatrix(const OrbeBandState& s, int band, float freqHz,
     // ≈1.0 y la equivalencia se mantiene ≤ -80 dB.
     const float c = ivanna::OrbeBinaural::kOrbePowerConservation
                         ? ivanna::nf::kSideGain : s.diffuse;
-    A.a00r = 0.5f * (aRe + c); A.a00i = 0.5f * aIm;
-    A.a01r = 0.5f * (aRe - c); A.a01i = 0.5f * aIm;
-    A.a10r = 0.5f * (bRe - c); A.a10i = 0.5f * bIm;
-    A.a11r = 0.5f * (bRe + c); A.a11i = 0.5f * bIm;
+    // P3/3.2 (espejo de spread, 2026-11-26) — EL SIDE TAMBIÉN ROTA.
+    // El render vivo (OrbeBinaural::renderBins) rota el side con la fase
+    // ITD por oído: outL = phL·(gL·mid + c·side), outR = phR·(gR·mid −
+    // c·side). La matriz debe replicarlo: c es complejo por fila,
+    // cL = c·phL (fila L) y cR = c·phR (fila R). Antes c era real y la
+    // equivalencia E2 divergía a -29 dB en banda ancha (el side sin
+    // rotar difiere del vivo por la fase phL/phR).
+    //   A00 = 0.5·(a + cL), A01 = 0.5·(a − cL)
+    //   A10 = 0.5·(b − cR), A11 = 0.5·(b + cR)
+    const float cLRe = c * phLRe, cLIm = c * phLIm;
+    const float cRRe = c * phRRe, cRIm = c * phRIm;
+    A.a00r = 0.5f * (aRe + cLRe); A.a00i = 0.5f * (aIm + cLIm);
+    A.a01r = 0.5f * (aRe - cLRe); A.a01i = 0.5f * (aIm - cLIm);
+    A.a10r = 0.5f * (bRe - cRRe); A.a10i = 0.5f * (bIm - cRIm);
+    A.a11r = 0.5f * (bRe + cRRe); A.a11i = 0.5f * (bIm + cRIm);
     // Conservador por banda (M1): el render vivo multiplica cada bin de
     // la banda por g_b (BandPowerConserver::gain). La matriz es el render
     // congelado: se escala por la g_b congelada en el estado. Con el flag

@@ -425,6 +425,99 @@ TEST(FusedChain, VolumetricOffInHeadphones) {
     }
 }
 
+// ── GENEZI como tercer modo (evol-holos, 2026-11-26) ────────────────────────
+// El Genezi ya no codifica como SPEAKERS (2): el modo 3 sobrevive al
+// clamp de FusedControls y a setControls (antes cualquier modo distinto
+// de HEADPHONES/SPEAKERS caía a HEADPHONES), el holograma (ORBE+HOLOS)
+// suena en GENEZI y NO en SPEAKERS con los mismos controles, y la etapa
+// TΩ (trayecto de altavoz) está enganchada en GENEZI como en SPEAKERS.
+TEST(FusedChain, GeneziModeSurvivesControls) {
+    FusedControls c = engagedControls();
+    c.spatial.mode = ivanna::OmegaOutputMode::GENEZI;
+    c.clamp();
+    EXPECT_EQ(c.spatial.mode, ivanna::OmegaOutputMode::GENEZI)
+        << "clamp() no debe reescribir GENEZI a HEADPHONES";
+    FusedChain chain;
+    chain.prepare(kFs);
+    chain.setControls(c);
+    // TRONIDOS 493: el cambio de modo con la cadena enganchada se
+    // DIFIERE (modeFadePending_) y solo se aplica tras el fundido de
+    // salida (256 muestras). Procesar 1024 muestras antes de afirmar.
+    std::vector<double> l = tone(1024), r = tone(1024);
+    chain.process(l.data(), r.data(), 1024);
+    EXPECT_EQ(chain.controls().spatial.mode, ivanna::OmegaOutputMode::GENEZI)
+        << "setControls() no debe perder el modo GENEZI";
+    // UNKNOWN sigue fail-closed a HEADPHONES (contrato intacto).
+    FusedControls u = engagedControls();
+    u.spatial.mode = ivanna::OmegaOutputMode::UNKNOWN;
+    u.clamp();
+    EXPECT_EQ(u.spatial.mode, ivanna::OmegaOutputMode::HEADPHONES);
+}
+
+TEST(FusedChain, GeneziHologramDiffersFromSpeakers) {
+    // Mismos controles (ORBE 1.0, HOLOS 0.5, HRTF 0.5) en los tres modos:
+    // GENEZI suena distinto de SPEAKERS (el holograma pasa en GENEZI y
+    // va a 0 en bocina plana) y distinto de la entrada; SPEAKERS con
+    // holograma a 0 también difiere de la entrada por los demás
+    // operadores enganchados (tonal/dinámica), así que la comparación
+    // que aísla ORBE+HOLOS es GENEZI vs SPEAKERS.
+    const std::size_t n = 9600;
+    std::vector<double> lIn = tone(n), rIn = tone(n);
+    auto run = [&](ivanna::OmegaOutputMode mode) {
+        std::vector<double> l = lIn, r = rIn;
+        FusedChain chain;
+        chain.prepare(kFs);
+        FusedControls c = engagedControls();
+        c.spatial.mode = mode;
+        c.clamp();
+        chain.setControls(c);
+        chain.process(l.data(), r.data(), static_cast<int>(n));
+        return std::make_pair(std::move(l), std::move(r));
+    };
+    auto genezi = run(ivanna::OmegaOutputMode::GENEZI);
+    auto speakers = run(ivanna::OmegaOutputMode::SPEAKERS);
+    double maxDiffGS = 0.0, maxDiffGIn = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        maxDiffGS = std::max({maxDiffGS, std::abs(genezi.first[i] - speakers.first[i]),
+                              std::abs(genezi.second[i] - speakers.second[i])});
+        maxDiffGIn = std::max({maxDiffGIn, std::abs(genezi.first[i] - lIn[i]),
+                               std::abs(genezi.second[i] - rIn[i])});
+    }
+    std::printf("[FusedChain] Genezi vs Speakers maxDiff=%.3g, Genezi vs entrada maxDiff=%.3g\n",
+                maxDiffGS, maxDiffGIn);
+    EXPECT_GT(maxDiffGS, 1e-4)
+        << "en GENEZI el holograma debe sonar; en SPEAKERS va a 0";
+    EXPECT_GT(maxDiffGIn, 1e-4) << "en GENEZI la salida debe diferir de la entrada";
+}
+
+TEST(FusedChain, GeneziTOmegaActive) {
+    // TΩ enganchada en trayecto de altavoz: SPEAKERS y GENEZI sí,
+    // HEADPHONES no (con volumetricEnabled y controles no neutros).
+    // El modo se aplica tras el fundido (256 muestras) — procesar
+    // antes de afirmar (TRONIDOS 493, ver GeneziModeSurvivesControls).
+    for (auto mode : {ivanna::OmegaOutputMode::HEADPHONES,
+                      ivanna::OmegaOutputMode::SPEAKERS,
+                      ivanna::OmegaOutputMode::GENEZI}) {
+        FusedChain chain;
+        chain.prepare(kFs);
+        FusedControls c = engagedControls();
+        c.spatial.mode = mode;
+        c.clamp();
+        chain.setControls(c);
+        chain.setVolumetricEnabled(true);
+        std::vector<double> l = tone(1024), r = tone(1024);
+        chain.process(l.data(), r.data(), 1024);
+        const bool active = chain.tOmegaActive();
+        std::printf("[FusedChain] tOmegaActive mode=%d: %d\n",
+                    static_cast<int>(mode), active ? 1 : 0);
+        if (mode == ivanna::OmegaOutputMode::HEADPHONES) {
+            EXPECT_FALSE(active) << "TΩ apagada en HEADPHONES";
+        } else {
+            EXPECT_TRUE(active) << "TΩ enganchada en modo " << static_cast<int>(mode);
+        }
+    }
+}
+
 // ── TΩ conectado a FusedChain (F1/472) ────────────────────────────────────
 // La etapa espectral TΩ (Reloj 2 compile en double + Reloj 1 apply hop 128
 // empaquetado L+jR) sustituye a la matriz volumétrica WOLA en SPEAKERS.

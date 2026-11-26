@@ -56,6 +56,9 @@ void OrbeBinauralT<Scalar>::prepare(float sr) {
     rebuildBandTables();
     // Fase 1 (L1): el conservador trabaja sobre las bandas ERB activas.
     if constexpr (kOrbePowerConservation) nfCons_.prepare(activeBands_, (float)kHop / s);
+    // P3/3.1: mezcladores de potencia constante (EMAs τ = 5 ms).
+    mixBlend_.prepare((double)s);
+    mixWet_.prepare((double)s);
     prepared_ = true;
     reset();
 }
@@ -107,6 +110,10 @@ void OrbeBinauralT<Scalar>::reset() noexcept {
     blend_ = Scalar(0.0);
     flushPending_ = false;
     meanCoherence_ = 1.0f;
+    // P3/3.1: los mezcladores vuelven a EMAs en cero (tras un flush, el
+    // fundido arranca con escala 1.0 y converge en ~5 ms).
+    mixBlend_.reset();
+    mixWet_.reset();
     // Fase 1 (L1/L2): el conservador y el suavizador vuelven a su estado
     // inicial (ganancias 1.0, Cantidad suavizada 0).
     if constexpr (kOrbePowerConservation) { nfCons_.reset(); nfAmt_.v = 0.0f; }
@@ -294,7 +301,19 @@ void OrbeBinauralT<Scalar>::estimateBands(const Scalar* reL, const Scalar* imL,
             const float itdMeas = std::clamp(ipd / (2.0f * kPiF * fc), -0.0008f, 0.0008f);
             const float rCur = distance_[b];
             float thetaEst;
-            if (fc < 700.0f) {
+            // P3/3.2 (guarda antifase, 2026-11-26): IPD ≈ ±π con ILD ≈ 0
+            // es POLARIDAD (contenido antifase, p. ej. side puro), NO un
+            // retardo: thetaFromItd saturaría a ±90° aleatorio (el IPD
+            // envuelto 1/(2·fc) supera el clamp de 800 µs) y el render
+            // rotaría el side con un ITD sin sentido — el S puro perdía
+            // −0.06 dB con el side rotado (test OrbePowerConservation).
+            // Una fuente lateral real con IPD tan grande tiene ILD ≥3 dB
+            // (sombra + divergencia a 700 Hz), así que la guarda no
+            // dispara para geometría real; solo para antifase (ILD≈0).
+            const bool antiphase = std::fabs(ipd) > 2.9f && std::fabs(ildMeas) < 1.0f;
+            if (antiphase) {
+                thetaEst = 0.0f;
+            } else if (fc < 700.0f) {
                 thetaEst = thetaFromItd(itdMeas, rCur);
             } else {
                 thetaEst = thetaFromIld(ildMeas, rCur, fc);
@@ -410,16 +429,30 @@ void OrbeBinauralT<Scalar>::renderBins(Scalar* reL, Scalar* imL, Scalar* reR, Sc
             phLRe = std::cos(aL); phLIm = std::sin(aL);
             phRRe = std::cos(aR); phRIm = std::sin(aR);
         }
-        // outL = mid*gL*phL + side*sideGain ; outR = mid*gR*phR - side*sideGain
+        // outL = (mid*gL + side*sideGain)*phL ; outR = (mid*gR - side*sideGain)*phR
+        // P3/3.2 (espejo de spread, 2026-11-26): el side TAMBIÉN rota con
+        // la fase ITD por oído. Antes el side pasaba SIN rotar (y sin
+        // ganancia ILD): en bandas donde el IPD de entrada ≈ ±180° la
+        // señal es casi todo side (mid ≈ 0) y el render perdía el control
+        // de esas bandas — la interferencia mid-rotado × side-sin-rotar
+        // invertía el ILD por banda (medido: b12 ~2.1 kHz, ILD −4.3 dB
+        // con spread 1.2 y −8.9 dB con 1.5, escena a la izquierda con
+        // ILD de entrada +6 dB en todas las bandas) y el lóbulo lateral
+        // de la correlación de banda ancha superaba al pico verdadero
+        // (argmax −333 µs con spread ≥1.3). El estimador NO es la causa:
+        // θ se queda a la izquierda en todas las bandas y es monótono
+        // en spread (sonda probe_mirror, 2026-11-26). |ph| = 1, así que
+        // la potencia por banda no cambia; con side = 0 (mono) o θ = 0
+        // (ph = 1) la salida es bit-idéntica a antes.
         // Fase 1 (L2): con el flag ON, S nunca se atenúa (kSideGain = 1.0f,
         // fix del defecto M1); con el flag OFF, el diffuse de siempre
         // (0.5 por defecto).
         Scalar sideGain = static_cast<Scalar>(diffuse);
         if constexpr (kOrbePowerConservation) sideGain = static_cast<Scalar>(ivanna::nf::kSideGain);
-        const Scalar oLRe = (mRe * gL * phLRe - mIm * gL * phLIm) + sRe * sideGain;
-        const Scalar oLIm = (mRe * gL * phLIm + mIm * gL * phLRe) + sIm * sideGain;
-        const Scalar oRRe = (mRe * gR * phRRe - mIm * gR * phRIm) - sRe * sideGain;
-        const Scalar oRIm = (mRe * gR * phRIm + mIm * gR * phRRe) - sIm * sideGain;
+        const Scalar oLRe = (mRe * gL * phLRe - mIm * gL * phLIm) + (sRe * phLRe - sIm * phLIm) * sideGain;
+        const Scalar oLIm = (mRe * gL * phLIm + mIm * gL * phLRe) + (sRe * phLIm + sIm * phLRe) * sideGain;
+        const Scalar oRRe = (mRe * gR * phRRe - mIm * gR * phRIm) - (sRe * phRRe - sIm * phRIm) * sideGain;
+        const Scalar oRIm = (mRe * gR * phRIm + mIm * gR * phRRe) - (sRe * phRIm + sIm * phRRe) * sideGain;
         reL[k] = oLRe; imL[k] = oLIm;
         reR[k] = oRRe; imR[k] = oRIm;
         const int m = (n - k) % n;
@@ -607,6 +640,15 @@ void OrbeBinauralT<Scalar>::process(Scalar* l, Scalar* r, int n) noexcept {
         }
     }
     const Scalar slew = Scalar(1.0) / (Scalar(0.015) * static_cast<Scalar>(sr));  // rampa de 15 ms por muestra
+    // El blend barre al DOBLE de velocidad (7.5 ms) y el wet a la MITAD
+    // (30 ms): ver HolosOperator.cpp (mismo comentario). El enganche
+    // secuencial con blend a 15 ms dejaba el vivo audible durante la
+    // fase del blend y un impulso se colaba en vivo, desplazando el
+    // centroide de latencia (test LatencyIsFftSize); con el blend en
+    // 7.5 ms el centroide no se mueve. El wet lento da tiempo a que sus
+    // EMAs (τ = 5 ms) converjan durante el propio fundido.
+    const Scalar blendSlew = Scalar(2.0) * slew;
+    const Scalar wetSlew = Scalar(0.5) * slew;
     // Reactivación tras estar apagado (flag puesto por el fast-path):
     // las colas guardan hops viejos. Vaciarlas UNA vez y reiniciar el
     // contador retardado: los primeros 512 muestras salen en vivo (con
@@ -630,6 +672,10 @@ void OrbeBinauralT<Scalar>::process(Scalar* l, Scalar* r, int n) noexcept {
         std::fill(ringR_.begin(), ringR_.end(), Scalar(0.0));
         ringPos_ = 0;
         skipEmit_ = 3;
+        // P3/3.1: las EMAs de los mezcladores son del audio viejo; el
+        // fundido de reactivación arranca con escala 1.0 y converge en ~5 ms.
+        mixBlend_.reset();
+        mixWet_.reset();
     }
     // Alimentar: acumular en pend y correr un frame por cada hop completo.
     for (int i = 0; i < n; ++i) {
@@ -649,18 +695,51 @@ void OrbeBinauralT<Scalar>::process(Scalar* l, Scalar* r, int n) noexcept {
     size_t drain = std::min({(size_t)n, want, (size_t)qCount_});
     size_t i = 0;
     for (; i < drain; ++i) {
-        if (wet_ < wetTarget) wet_ = std::min(wet_ + slew, wetTarget);
-        else if (wet_ > wetTarget) wet_ = std::max(wet_ - slew, wetTarget);
-        if (blend_ < blendTarget) blend_ = std::min(blend_ + slew, blendTarget);
-        else if (blend_ > blendTarget) blend_ = std::max(blend_ - slew, blendTarget);
+        // P3/3.2 — fundido de enganche SECUENCIAL (blend y luego wet), no
+        // simultáneo: si barren a la vez, la fase del seco de referencia
+        // gira 120° en 15 ms (vivo 0° → seco retardado −240° ≡ +120°) y
+        // la correlación seco/wet que ve el mixer wet cambia de −0.5 a
+        // +1.0 más rápido de lo que su EMA (τ = 5 ms) puede seguir: a
+        // mitad de fundido la EMA dice ρ ≈ −0.17 cuando la real es +0.5
+        // y la escala sale ~23 % grande — el fundido IN medía +0.87 dB
+        // (HOLOS) / +0.73 dB (ORBE) en ventanas de 5 ms. Secuencial:
+        // primero el blend (ρ constante) y luego el wet (ρ constante).
+        // El apagado ya era secuencial por construcción (blendTarget = 1
+        // mientras wet_ > 0), así que aquí solo se secuencia el enganche.
+        if (wet_ < wetTarget) {
+            if (blend_ >= blendTarget) wet_ = std::min(wet_ + wetSlew, wetTarget);
+        } else if (wet_ > wetTarget) {
+            wet_ = std::max(wet_ - wetSlew, wetTarget);
+        }
+        if (blend_ < blendTarget) blend_ = std::min(blend_ + blendSlew, blendTarget);
+        else if (blend_ > blendTarget) blend_ = std::max(blend_ - blendSlew, blendTarget);
         const Scalar wetL = wetQL_[qHead_], wetR = wetQR_[qHead_];
         const Scalar dryL = dryQL_[qHead_], dryR = dryQR_[qHead_];
         qHead_ = (qHead_ + 1) % qCap_;
         const Scalar liveL = l[i], liveR = r[i];
-        const Scalar dryMixL = (Scalar(1.0) - blend_) * liveL + blend_ * dryL;
-        const Scalar dryMixR = (Scalar(1.0) - blend_) * liveR + blend_ * dryR;
-        l[i] = (Scalar(1.0) - wet_) * dryMixL + wet_ * wetL;
-        r[i] = (Scalar(1.0) - wet_) * dryMixR + wet_ * wetR;
+        // P3/3.1: mezclas de potencia constante con correlación explícita
+        // (PowerMixer). El blend usa extremos exactos (w = 0 → vivo,
+        // w = 1 → dryQ: en régimen la salida es el seco retardado tal
+        // cual, sin reescalar a la potencia actual); el wet usa el mixer
+        // en todo w ∈ [0,1] (seco y wet llevan el mismo retardo). Las
+        // EMAs se observan en cada muestra drenada para estar calientes
+        // cuando empiece un fundido.
+        // (Experimento 2026-11-26: revertir el mixer NO arregla E2 ni
+        // HeadRadius — la causa es el fix de spread 3.2, no el mixer.
+        // El mixer se conserva.)
+        mixBlend_.observe(liveL, liveR, dryL, dryR);
+        Scalar dryMixL, dryMixR;
+        if (blend_ == Scalar(0.0)) {
+            dryMixL = liveL; dryMixR = liveR;
+        } else if (blend_ == Scalar(1.0)) {
+            dryMixL = dryL; dryMixR = dryR;
+        } else {
+            mixBlend_.mix(dryMixL, dryMixR, liveL, liveR, dryL, dryR,
+                          static_cast<double>(blend_));
+        }
+        mixWet_.observe(dryMixL, dryMixR, wetL, wetR);
+        mixWet_.mix(l[i], r[i], dryMixL, dryMixR, wetL, wetR,
+                    static_cast<double>(wet_));
     }
     qCount_ -= (int)drain;
     totalOut_ += drain;

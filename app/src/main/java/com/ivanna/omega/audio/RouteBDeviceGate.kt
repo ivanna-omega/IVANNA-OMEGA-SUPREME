@@ -399,11 +399,26 @@ object RouteBDeviceGate {
      * loudnessTarget, exciterRed/exciterReduction), upmixing y holosEq_*;
      * orbeAmount, holosAmount, spatialWidth, harmonicGain y antiDolby
      * PASAN con los valores del usuario (el holograma del Genezi).
+     *
+     * Sello de modo (evol-holos, 2026-11-26): el "outputMode" que viaja
+     * al daemon sigue al DISPOSITIVO resuelto (1 audífonos / 2 bocina
+     * plana / 3 Genezi), no al spatial.mode guardado del push que lo
+     * emite. Sin esto, el push fusionado —último escritor en restore()—
+     * con spatial.mode=SPEAKERS devolvía el daemon a SPEAKERS aunque el
+     * dispositivo fuera el Genezi, y el efecto apagaba el holograma
+     * hasta el próximo pushRouteBState. Campo ausente NO se añade (como
+     * el resto de campos: missingFieldsNotAdded).
      */
     fun gatePerceptualCommandJson(command: String, output: RouteBOutput): String {
-        if (output == RouteBOutput.HEADPHONES) return command
         if (!command.contains("\"action\"")) return command
         if (!command.contains("SET_PERCEPTUAL_STATE") && !command.contains("SEND_PERCEPTUAL_STATE")) return command
+        val modeStamp = when (output) {
+            RouteBOutput.HEADPHONES -> "1"
+            RouteBOutput.GENEZI -> "3"
+            RouteBOutput.SPEAKERS -> "2"
+        }
+        val gated = OUTPUT_MODE_REGEX.replace(command) { "\"outputMode\":$modeStamp" }
+        if (output == RouteBOutput.HEADPHONES) return gated
         val neutralMap = if (output == RouteBOutput.GENEZI) mapOf(
             "compressor" to "0",
             "loudnessTarget" to "0",
@@ -441,9 +456,12 @@ object RouteBDeviceGate {
             "holosEqTiltDb" to "0"
         )
         val regex = Regex("\"(${neutralMap.keys.joinToString("|")})\"\\s*:\\s*-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?")
-        return regex.replace(command) { matchResult ->
+        return regex.replace(gated) { matchResult ->
             val key = matchResult.groupValues[1]
             "\"$key\":${neutralMap.getValue(key)}"
         }
     }
 }
+
+private val OUTPUT_MODE_REGEX =
+    Regex("\"outputMode\"\\s*:\\s*-?\\d+(\\.\\d+)?([eE][+-]?\\d+)?")

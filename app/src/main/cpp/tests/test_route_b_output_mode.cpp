@@ -5,11 +5,14 @@
 // de la app (ff6f706d, RouteBDeviceGate.kt) diga SPEAKERS. El efecto
 // aplicaba el snapshot directo, sin chequeo de dispositivo/modo.
 // El fix: el modo de salida viaja EN el snapshot (temporal_field bits
-// 18..19, OmegaOutputMode: 0 = desconocido, 1 = audífonos, 2 = bocinas/
-// Genezi), puesto por la app vía SET_PERCEPTUAL_STATE ("outputMode"), y
-// el efecto lo hace cumplir en omega_apply_snapshot (omega_effect.cpp).
+// 18..19, OmegaOutputMode: 0 = desconocido, 1 = audífonos, 2 = bocina
+// plana, 3 = Genezi — tercer modo, evol-holos 2026-11-26), puesto por
+// la app vía SET_PERCEPTUAL_STATE ("outputMode"), y el efecto lo hace
+// cumplir en omega_apply_snapshot (omega_effect.cpp).
 // Este test fija el contrato del lado control plane (sin NDK, sin red):
-//   1. encode/decode round-trip de los 3 modos; valor reservado (3) = UNKNOWN.
+//   1. encode/decode round-trip de los 4 modos (0 UNKNOWN, 1 audífonos,
+//      2 bocina plana, 3 GENEZI — tercer modo, evol-holos 2026-11-26:
+//      el Genezi ya no codifica como bocina plana).
 //   2. Sin solape de máscaras con features HRTF/adaptive (16..17),
 //      FotoHolo (6..15), XTC (5) ni temporal (0..4).
 //   3. ABI v17 (conservación): sizeof 808, VERSION 17, crc32 en 804
@@ -25,6 +28,9 @@
 //   6. Un SET con solo outputMode cuenta como campo (any() true, la
 //      generación avanza): el modo puede publicarse solo.
 //   7. outputMode fuera de rango (9) -> UNKNOWN (fail-closed).
+//   9. outputMode 3 (GENEZI) vía responder: decodifica GENEZI y el
+//      merge lo conserva (el sello de modo del gate lo re-empuja en
+//      cada comando perceptual).
 //   8. Una actualización parcial del campo temporal (temporalEnabled)
 //      conserva los bits del modo (máscara ~0x1F, no rebuild).
 #include <cmath>
@@ -61,7 +67,7 @@ int main() {
     using namespace ivanna;
     using namespace ivanna::daemon;
 
-    // 1. encode/decode round-trip; reservado (3) = UNKNOWN.
+    // 1. encode/decode round-trip; tercer modo (3) = GENEZI (evol-holos).
     check(omega_output_mode_decode(omega_output_mode_encode(OmegaOutputMode::UNKNOWN)) ==
               OmegaOutputMode::UNKNOWN,
           "codec: UNKNOWN round-trip");
@@ -71,8 +77,11 @@ int main() {
     check(omega_output_mode_decode(omega_output_mode_encode(OmegaOutputMode::SPEAKERS)) ==
               OmegaOutputMode::SPEAKERS,
           "codec: SPEAKERS round-trip");
-    check(omega_output_mode_decode(0x3u << OMEGA_OUTPUT_MODE_SHIFT) == OmegaOutputMode::UNKNOWN,
-          "codec: valor reservado 3 = UNKNOWN");
+    check(omega_output_mode_decode(omega_output_mode_encode(OmegaOutputMode::GENEZI)) ==
+              OmegaOutputMode::GENEZI,
+          "codec: GENEZI round-trip");
+    check(omega_output_mode_decode(0x3u << OMEGA_OUTPUT_MODE_SHIFT) == OmegaOutputMode::GENEZI,
+          "codec: valor 3 = GENEZI");
 
     // 2. Sin solape de máscaras.
     check((OMEGA_OUTPUT_MODE_MASK & OMEGA_EFFECT_FEATURES_MASK) == 0u,
@@ -170,6 +179,36 @@ int main() {
         applyPendingPerceptual(snap, p);
         check(omega_output_mode_decode(snap.temporal_field) == OmegaOutputMode::UNKNOWN,
               "rango: outputMode 9 = UNKNOWN");
+    }
+
+    // 9. outputMode 3 (GENEZI) vía responder: decodifica GENEZI; un
+    // segundo SET sin outputMode conserva GENEZI (merge por NaN).
+    {
+        CommandPlaneState st;
+        const std::string r = handleCommand(
+            "{\"action\":\"SET_PERCEPTUAL_STATE\",\"holosAmount\":1.0,"
+            "\"outputMode\":3.0}",
+            st);
+        check(contains(r, "\"ok\":true"), "genezi: ok true");
+        PendingPerceptual p;
+        check(takePendingPerceptual(st, p), "genezi: take true");
+        OmegaDspSnapshot snap = OmegaDspSnapshot::makeDefault();
+        applyPendingPerceptual(snap, p);
+        check(snap.holos_amount == 1.0f, "genezi: holos_amount 1.0");
+        check(omega_output_mode_decode(snap.temporal_field) == OmegaOutputMode::GENEZI,
+              "genezi: modo GENEZI aplicado");
+        check(omega_output_binaural_gated(OmegaOutputMode::GENEZI) == false,
+              "genezi: binaural NO gateado");
+        check(omega_output_binaural_gated(OmegaOutputMode::SPEAKERS) == true,
+              "genezi: binaural SI gateado en SPEAKERS");
+        check(omega_output_is_speakers_like(OmegaOutputMode::GENEZI) == true,
+              "genezi: speakers-like (XTC/Aux/twin)");
+        (void)handleCommand("{\"action\":\"SET_PERCEPTUAL_STATE\",\"orbeAmount\":1.0}", st);
+        PendingPerceptual p2;
+        check(takePendingPerceptual(st, p2), "genezi-merge: take true");
+        applyPendingPerceptual(snap, p2);
+        check(omega_output_mode_decode(snap.temporal_field) == OmegaOutputMode::GENEZI,
+              "genezi-merge: modo GENEZI conservado sin reenviarlo");
     }
 
     std::printf("test_route_b_output_mode: %d pass, %d fail\n", g_pass, g_fail);

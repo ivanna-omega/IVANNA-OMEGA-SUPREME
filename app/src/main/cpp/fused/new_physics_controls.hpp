@@ -1,7 +1,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // new_physics_controls.hpp — Controles unificados de FÍSICA NUEVA (Fase 2,
 // v2.5.472). Paquete FISICA_NUEVA_CONSOLIDADA (Esse, 2026-11-18): LGN 3D +
-// Ω·Σ + Volterra Laguerre + lazo variacional F. Header-only, RT-safe.
+// Ω·Σ + Volterra Laguerre + lazo F heurístico [P1+P4 2026-11-26: antes
+// "lazo variacional F" — no hay funcional F ni ∂F/∂Γ]. Header-only, RT-safe.
 // Estado por defecto OFF (amount = 0 → bypass bit-exacto, fail-closed).
 // Adaptación de integración: ninguna de nombres — el paquete ya empataba con
 // el repo (namespace ivanna::newphys propio, sin colisiones).
@@ -49,7 +50,8 @@ struct NewPhysicsControls {
     float volterraMix       = 0.0f;      // [0..1] 0 = identidad exacta
     bool  hasMeasuredKernel = false;     // fail-closed si no se ha calibrado
 
-    // Pilar 4: Lazo Variacional F (MOC + Anti-Adaptación Sináptica)
+    // Pilar 4: Lazo F heurístico (MOC + Anti-Adaptación Sináptica)
+    // [P1+P4 2026-11-26: antes "Lazo Variacional F"]
     float freeEnergyMix     = 0.0f;      // [0..1]
 
     // Modo de prueba ciega ABX integrado (0=Control normal, 1=Forzar A, 2=Forzar B)

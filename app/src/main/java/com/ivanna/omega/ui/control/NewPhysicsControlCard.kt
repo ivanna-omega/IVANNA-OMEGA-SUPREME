@@ -216,7 +216,7 @@ fun NewPhysicsControlCard(
             NpSlider("Genezi Volterra Laguerre H2", state.volterraMix, 0f..1f, "%.2f") {
                 apply(state.copy(volterraMix = it))
             }
-            NpSlider("Lazo Variacional F · MOC + Onsets", state.freeEnergyMix, 0f..1f, "%.2f") {
+            NpSlider("Lazo F (heurística MOC + onsets)", state.freeEnergyMix, 0f..1f, "%.2f") {
                 apply(state.copy(freeEnergyMix = it))
             }
 

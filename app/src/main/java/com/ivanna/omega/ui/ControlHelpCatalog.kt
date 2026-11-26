@@ -53,7 +53,7 @@ private val controlHelpGroups = listOf(
         ControlHelpEntry("Σ Distancia / Escala", "Distancia bocinas→cabeza que usa el modelo Σ (0.15–5.0 m, default 3.5 m, la distancia real al Genezi).", "Pon la distancia real. Un valor absurdo (15.79 m) causaba el piiiii; en este teléfono Esse lo tiene en 0.35 m por su orden."),
         ControlHelpEntry("Σ Nivel SPL Estimado", "Nivel de escucha que el motor asume para la no-linealidad Klippel (65–115 dB, default 85 dB).", "Pon tu nivel real de escucha; 85 dB es el de referencia."),
         ControlHelpEntry("Genezi Volterra Laguerre H2", "Pre-distorsión que cancela la distorsión H2 del Genezi con kernel Laguerre (polo 0.9983; H2 0.50% aproximado, 0–1, default 1.0).", "1.0 con el Genezi; 0 si no hay kernel cargado."),
-        ControlHelpEntry("Lazo Variacional F · MOC + Onsets", "Lazo de energía libre: el motor ajusta MOC y onsets según la señal (0–1, default 0.0 = apagado).", "Experimental; déjalo en 0 salvo pruebas controladas."),
+        ControlHelpEntry("Lazo F (heurística MOC + onsets)", "Heurística de ganancia (no un gradiente variacional: no hay funcional F): el motor ajusta MOC y onsets según la señal (0–1, default 0.0 = apagado).", "Experimental; déjalo en 0 salvo pruebas controladas."),
         ControlHelpEntry("Equipo Ω", "Clase de equipo que el motor asume: audífonos, bocina G85, BT, Genezi PZ1D, auto, PA/club, estadio (E5 no existe).", "Elige el equipo real que suena; cada uno cambia la física. Genezi = E4."),
         ControlHelpEntry("ABX", "Prueba ciega: A = bypass, B = física nueva (Off → A → B → Off).", "Úsalo para comparar sin sesgo al mismo volumen.")
     )),
@@ -202,7 +202,7 @@ fun ControlHelpText(label: String) {
         "sigma distancia" in key -> "Qué hace: fija la distancia bocinas→cabeza que usa el modelo (default 3.5 m, la distancia real al Genezi). Cómo usarlo: pon la distancia real; un valor absurdo (15.79 m) causaba el piiiii."
         "spl estimado" in key -> "Qué hace: fija el nivel de escucha que el motor asume para la no-linealidad (default 85 dB). Cómo usarlo: pon tu nivel real de escucha."
         "volterra laguerre" in key -> "Qué hace: pre-distorsión que cancela la distorsión H2 del Genezi (kernel Laguerre, polo 0.9983). Cómo usarlo: 1.0 con el Genezi; 0 si no hay kernel."
-        "lazo variacional" in key -> "Qué hace: lazo de energía libre que ajusta MOC y onsets según la señal. Cómo usarlo: experimental; déjalo en 0 salvo pruebas controladas."
+        "lazo f" in key -> "Qué hace: heurística de ganancia (no un gradiente variacional: no hay funcional F) que ajusta MOC y onsets según la señal. Cómo usarlo: experimental; déjalo en 0 salvo pruebas controladas."
         "sub-graves" in key && "frecuencia" in key -> "Qué hace: fija la frecuencia del modo de graves que corta esta etapa. Cómo usarlo: no la muevas salvo que hayas medido tu sala."
         "sub-graves" in key && "ganancia" in key -> "Qué hace: fija cuánto corta (negativo) esta etapa de graves. Cómo usarlo: déjala en negativo; nunca la subas a positivo sin medir (Fase 4 es cut-only)."
         "sub-graves" in key && " q" in key -> "Qué hace: fija qué tan estrecho es el corte de esta etapa (Q alto = solo el pico, Q bajo = más ancho). Cómo usarlo: Q 3–4 es el default."

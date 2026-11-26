@@ -1123,3 +1123,232 @@ TEST(SofaHrtfWiring, NeutralWithoutSofa) {
     EXPECT_FALSE(h->hasSofaDataset());
     EXPECT_EQ(h->signatureRoom(), 0);
 }
+
+// ── ITD efectivo a azimut 0° (evol-hrtf, bloque HRTF + ITD) ────────────────
+// El defecto: con PCA (sin SOFA) el ITD a azimut 0° era −396 µs (fuente al
+// frente desplazada). La causa NO es la Ley de Curvatura (a 0° da 0 exacto)
+// sino el PEDESTAL del par base PCA (p0 + V·q): medido en el par crudo,
+// xcorr −417 µs, centroide −102 µs, retardo de grupo 150–500 Hz +545 µs
+// (el par es difuso: rho_xcorr = 0.137 — no hay un ITD bien definido).
+// Método: respuesta al impulso de los 4 caminos (mismo que
+// sofaImpulseResponseL, pero con impulso en L y en R) y pico de
+// correlación cruzada hLL vs hRR con interpolación parabólica.
+// Convención de signo (la de la Ley de Curvatura): ITD > 0 = el oído
+// DERECHO va antes = fuente a la derecha; ITD < 0 = fuente a la izquierda.
+// A azimut 0° el ITD debe ser ~0: tolerancia ±50 µs (la del barrido Green:
+// 1 muestra @48 kHz = 20.83 µs; ±50 µs ≈ ±2.4 muestras — un frontal
+// simétrico no debe desplazarse más de eso).
+namespace {
+
+struct SofaIr4 {
+    std::vector<float> ll, rl, lr, rr;  // directos ll/rr + crossfeed rl/lr
+};
+
+SofaIr4 sofaImpulseResponse4(Ivanna::HrtfManager& h) {
+    Ivanna::AudioBuffer silence{};
+    std::memset(&silence, 0, sizeof(silence));
+    for (int b = 0; b < kSofaSettleBlocks; ++b) h.processBinauralScene(&silence);
+    SofaIr4 ir;
+    for (int ch = 0; ch < 2; ++ch) {  // 0 = impulso en L, 1 = impulso en R
+        for (int b = 0; b < 4; ++b) {
+            Ivanna::AudioBuffer buf{};
+            std::memset(&buf, 0, sizeof(buf));
+            if (b == 0) {
+                if (ch == 0) buf.left[0] = 1.0f;
+                else buf.right[0] = 1.0f;
+            }
+            h.processBinauralScene(&buf);
+            if (ch == 0) {
+                ir.ll.insert(ir.ll.end(), buf.left, buf.left + Ivanna::BLOCK_SIZE);
+                ir.rl.insert(ir.rl.end(), buf.right, buf.right + Ivanna::BLOCK_SIZE);
+            } else {
+                ir.lr.insert(ir.lr.end(), buf.left, buf.left + Ivanna::BLOCK_SIZE);
+                ir.rr.insert(ir.rr.end(), buf.right, buf.right + Ivanna::BLOCK_SIZE);
+            }
+        }
+    }
+    return ir;
+}
+
+// Pico de xcorr entre a y b con interpolación parabólica. Devuelve el lag
+// en muestras: b retrasado `lag` muestras respecto a a. (Si b va antes,
+// lag < 0.)
+double sofaXcorrLagSamples(const std::vector<float>& a, const std::vector<float>& b,
+                           std::size_t n) {
+    const int maxLag = static_cast<int>(n) - 1;
+    double best = -1e30;
+    int bestLag = 0;
+    std::vector<double> c(2 * static_cast<std::size_t>(maxLag) + 1, 0.0);
+    for (int lag = -maxLag; lag <= maxLag; ++lag) {
+        double s = 0.0;
+        const int i0 = std::max(0, -lag);
+        const int i1 = static_cast<int>(std::min(n, n - static_cast<std::size_t>(lag)));
+        for (int i = i0; i < i1; ++i)
+            s += static_cast<double>(a[static_cast<std::size_t>(i)]) *
+                 b[static_cast<std::size_t>(i + lag)];
+        c[static_cast<std::size_t>(lag + maxLag)] = s;
+        if (s > best) {
+            best = s;
+            bestLag = lag;
+        }
+    }
+    // Interpolación parabólica alrededor del pico.
+    double frac = 0.0;
+    if (bestLag > -maxLag && bestLag < maxLag) {
+        const double cm = c[static_cast<std::size_t>(bestLag - 1 + maxLag)];
+        const double c0 = c[static_cast<std::size_t>(bestLag + maxLag)];
+        const double cp = c[static_cast<std::size_t>(bestLag + 1 + maxLag)];
+        const double den = cm - 2.0 * c0 + cp;
+        if (std::fabs(den) > 1e-30) frac = 0.5 * (cm - cp) / den;
+    }
+    return static_cast<double>(bestLag) + frac;
+}
+
+double sofaCentroid(const std::vector<float>& x, std::size_t n) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < n && i < x.size(); ++i) {
+        const double e = static_cast<double>(x[i]) * x[i];
+        num += static_cast<double>(i) * e;
+        den += e;
+    }
+    return den > 0.0 ? num / den : 0.0;
+}
+
+double sofaIldDb(const std::vector<float>& l, const std::vector<float>& r, std::size_t n) {
+    const double el = sofaEnergy(l, n), er = sofaEnergy(r, n);
+    if (el <= 0.0 || er <= 0.0) return 0.0;
+    return 10.0 * std::log10(el / er);
+}
+
+// ITD efectivo (µs, signo Ley de Curvatura: + = oído derecho antes) por
+// xcorr hLL vs hRR, con centroide e ILD como segundo y tercer estimador.
+struct SofaItd {
+    double xcorrUs = 0.0;
+    double centroidUs = 0.0;
+    double ildDb = 0.0;
+};
+
+SofaItd sofaMeasureItd(const SofaIr4& ir) {
+    SofaItd m;
+    const double lag = sofaXcorrLagSamples(ir.ll, ir.rr, Ivanna::HRTF_TAPS);
+    m.xcorrUs = -lag * 1e6 / 48000.0;  // lag<0 (R antes) -> ITD>0
+    m.centroidUs = (sofaCentroid(ir.ll, Ivanna::HRTF_TAPS) -
+                    sofaCentroid(ir.rr, Ivanna::HRTF_TAPS)) * 1e6 / 48000.0;
+    m.ildDb = sofaIldDb(ir.ll, ir.rr, Ivanna::HRTF_TAPS);
+    return m;
+}
+
+void sofaPrintItd(const char* tag, float yawDeg, const SofaItd& m) {
+    std::printf("[sofa_itd] %s yaw %+6.1f°: ITD xcorr %+8.1f µs | centroide "
+                "%+8.1f µs | ILD %+6.2f dB\\n",
+                tag, yawDeg, m.xcorrUs, m.centroidUs, m.ildDb);
+}
+
+}  // namespace
+
+TEST(SofaHrtfWiring, PcaPathItdAtZeroAzimuth) {
+    auto h = mkSofaHrtf();  // sin SOFA: síntesis PCA (comportamiento por defecto)
+    ASSERT_FALSE(h->hasSofaDataset());
+    // yaw en radianes; theta (Ley de Curvatura) = -yaw. Se barre theta
+    // 0, ±30°, ±90°: a 0° el ITD debe ser ~0; lateral, el signo debe seguir
+    // a theta y la magnitud debe crecer con |theta| (Woodworth: ~261 µs
+    // a 30°, ~656 µs a 90° a 1 m).
+    const float thetas[5] = {0.0f, 30.0f, -30.0f, 90.0f, -90.0f};
+    SofaItd m0, m30, m90;
+    for (float thetaDeg : thetas) {
+        const float yaw = -thetaDeg * 3.14159265f / 180.0f;
+        h->setHeadPose(yaw, 0.0f, 0.0f);
+        const SofaIr4 ir = sofaImpulseResponse4(*h);
+        const SofaItd m = sofaMeasureItd(ir);
+        sofaPrintItd("PCA", thetaDeg, m);
+        if (thetaDeg == 0.0f) m0 = m;
+        if (thetaDeg == 30.0f) m30 = m;
+        if (thetaDeg == 90.0f) m90 = m;
+        if (thetaDeg == -30.0f)
+            EXPECT_LT(m.xcorrUs, 0.0) << "ITD a theta -30° debe ser negativo (fuente a la izquierda)";
+        if (thetaDeg == -90.0f)
+            EXPECT_LT(m.xcorrUs, 0.0) << "ITD a theta -90° debe ser negativo";
+    }
+    EXPECT_LE(std::fabs(m0.xcorrUs), 50.0)
+        << "ITD a azimut 0° con PCA: la fuente al frente no debe desplazarse";
+    EXPECT_GT(m30.xcorrUs, 0.0) << "ITD a theta +30° debe ser positivo (fuente a la derecha)";
+    EXPECT_GT(m90.xcorrUs, 0.0) << "ITD a theta +90° debe ser positivo";
+    EXPECT_GT(std::fabs(m90.xcorrUs), std::fabs(m30.xcorrUs))
+        << "el ITD debe crecer con el azimut";
+    EXPECT_GT(std::fabs(m30.xcorrUs), 150.0) << "ITD a 30° demasiado pequeño (Woodworth ~261 µs)";
+    EXPECT_LT(std::fabs(m30.xcorrUs), 400.0) << "ITD a 30° demasiado grande (Woodworth ~261 µs)";
+    EXPECT_GT(std::fabs(m90.xcorrUs), 500.0) << "ITD a 90° demasiado pequeño (Woodworth ~656 µs)";
+    EXPECT_LT(std::fabs(m90.xcorrUs), 800.0) << "ITD a 90° demasiado grande (Woodworth ~656 µs, máx ley 733 µs + escala)";
+}
+
+TEST(SofaHrtfWiring, MeasuredSofaItdAtZeroAzimuth) {
+    auto h = mkSofaHrtf();
+    ASSERT_TRUE(h->loadSofaDataset(sofaPath().c_str()));  // MIT KEMAR medido (assets v2)
+    ASSERT_TRUE(h->hasSofaDataset());
+    // yaw en radianes; az SOFA = +yaw (grados). El frontal medido es
+    // simétrico (L≡R en MIT KEMAR a 0°): ITD 0 por construcción.
+    const float yaws[5] = {0.0f, 30.0f, -30.0f, 90.0f, -90.0f};
+    SofaItd m0, m30, m90;
+    for (float yawDeg : yaws) {
+        const float yaw = yawDeg * 3.14159265f / 180.0f;
+        h->setHeadPose(yaw, 0.0f, 0.0f);
+        const SofaIr4 ir = sofaImpulseResponse4(*h);
+        const SofaItd m = sofaMeasureItd(ir);
+        sofaPrintItd("MIT", yawDeg, m);
+        if (yawDeg == 0.0f) m0 = m;
+        if (yawDeg == 30.0f) m30 = m;
+        if (yawDeg == 90.0f) m90 = m;
+        if (yawDeg == -30.0f)
+            EXPECT_GT(m.xcorrUs, 0.0) << "ITD medido a az +(-30°) debe ser positivo (SOFA: az+ = izquierda)";
+        if (yawDeg == -90.0f)
+            EXPECT_GT(m.xcorrUs, 0.0) << "ITD medido a az -90° debe ser positivo";
+    }
+    EXPECT_LE(std::fabs(m0.xcorrUs), 50.0)
+        << "ITD a azimut 0° con SOFA medido: el frontal de MIT KEMAR es simétrico";
+    EXPECT_LT(m30.xcorrUs, 0.0) << "ITD medido a az +30° debe ser negativo (SOFA: az+ = izquierda)";
+    EXPECT_LT(m90.xcorrUs, 0.0) << "ITD medido a az +90° debe ser negativo";
+    EXPECT_GT(std::fabs(m90.xcorrUs), std::fabs(m30.xcorrUs))
+        << "el ITD medido debe crecer con el azimut";
+    EXPECT_GT(std::fabs(m30.xcorrUs), 150.0) << "ITD medido a 30° demasiado pequeño";
+    EXPECT_LT(std::fabs(m30.xcorrUs), 400.0) << "ITD medido a 30° demasiado grande";
+    EXPECT_GT(std::fabs(m90.xcorrUs), 500.0) << "ITD medido a 90° demasiado pequeño";
+    EXPECT_LT(std::fabs(m90.xcorrUs), 800.0) << "ITD medido a 90° demasiado grande";
+}
+
+TEST(SofaHrtfWiring, ModuleV0SofaLoadsInHrtfManager) {
+    // Escenario exacto del teléfono: los SOFA del módulo son v0
+    // (re-codificados con h5py). Antes del lector v0, setSignatureRoom(2)
+    // fallaba en silencio (loadSofaDataset exigía isMeasured() y el v0 no
+    // parseaba): la sala firma no sonaba. Ahora carga el MIT KEMAR v0
+    // del módulo y el frontal medido da ITD ~0 por la vía completa
+    // (loader v0 -> HrtfManager -> banco -> convolución).
+    std::string dir;
+    {
+        std::filesystem::path cur = std::filesystem::current_path();
+        for (int i = 0; i < 10 && !cur.empty(); ++i) {
+            const std::filesystem::path cand =
+                cur / "magisk_module/system/etc/ivanna_omega/sofa";
+            if (std::filesystem::is_directory(cand)) {
+                dir = cand.string();
+                break;
+            }
+            if (cur == cur.parent_path()) break;
+            cur = cur.parent_path();
+        }
+    }
+    if (dir.empty())
+        GTEST_SKIP() << "sin dir de SOFA del módulo (repo no a la vista)";
+    auto h = mkSofaHrtf();
+    h->setSofaSearchDir(dir.c_str());
+    ASSERT_TRUE(h->setSignatureRoom(2)) << "MIT KEMAR v0 del módulo no cargó";
+    EXPECT_EQ(h->signatureRoom(), 2);
+    EXPECT_TRUE(h->hasSofaDataset());
+    h->setHeadPose(0.0f, 0.0f, 0.0f);
+    const SofaIr4 ir = sofaImpulseResponse4(*h);
+    const SofaItd m = sofaMeasureItd(ir);
+    sofaPrintItd("MIT-v0-modulo", 0.0f, m);
+    EXPECT_LE(std::fabs(m.xcorrUs), 50.0)
+        << "ITD a 0° con el SOFA v0 del módulo: el frontal medido es simétrico";
+    EXPECT_LE(std::fabs(m.centroidUs), 50.0)
+        << "ITD por centroide a 0° con el SOFA v0 del módulo";
+}

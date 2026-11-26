@@ -629,9 +629,13 @@ object FusedControlsBridge {
      * orbeProximityDb, holosDistanceM, highCutHz) NO se tocan.
      *
      * La puerta de bocinas (RouteBDeviceGate, en OmegaEngineBridge.sendCommand)
-     * neutraliza en bocinas/Genezi: orbeAmount, holosAmount, spatialWidth,
+     * neutraliza en bocina plana: orbeAmount, holosAmount, spatialWidth,
      * harmonicGain, compressor, upmixing*, holosEq*. Esos sliders solo suenan
-     * en audífonos por diseño (fix del bofo). Los NO gateados (Φ hyper*,
+     * en audífonos por diseño (fix del bofo). En GENEZI (tercer modo,
+     * v2.5.483 / evol-holos) el holograma PASA: orbeAmount, holosAmount,
+     * spatialWidth, harmonicGain y antiDolby llegan con los valores del
+     * usuario; solo lo general (compressor, loudnessTarget, exciterRed,
+     * upmixing*, holosEq*) se neutraliza. Los NO gateados (Φ hyper*,
      * Volterra, outputMode) SÍ llegan a Ruta B en bocinas.
      *
      * Campos fusionados SIN equivalente en SET_PERCEPTUAL_STATE (no viajan

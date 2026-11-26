@@ -8,7 +8,8 @@
 // a 1.2; esos valores quedaron PERSISTIDOS y el revert de la 385 solo cambió
 // los defaults — PersistedStateRestorer seguía reenviando los valores 384 al
 // daemon en cada arranque. clampTo380Envelope los clampa al sobre 380 (los
-// valores que sonaban bien en la v2.5.380).
+// valores que sonaban bien en la v2.5.380). CORONA (evol-holos): el
+// orbeSpread 1.2 YA NO se clampa — es el valor del preset CORONA.
 //
 // La migración real (lectura/escritura de SharedPreferences + flag de
 // una-sola-vez) solo se puede verificar en el teléfono: en logcat
@@ -29,10 +30,12 @@ class ParameterStoreMigration386Test {
 
     @Test fun values384AreClampedTo380Envelope() {
         // Techos ATREVIDA 502 (directiva Esse 2026-11-24): amount 1.0 /
-        // diffuse 0.85 (antes 0.5 / 0.5); width 1.0 y orbeSpread 1.0 sin
-        // cambio. Los valores 384 que exceden siguen clampados.
+        // diffuse 0.85 (antes 0.5 / 0.5); width 1.0 sin cambio. CORONA
+        // (evol-holos, 2026-11-26): orbeSpread 1.2 (antes 1.0): el 1.2
+        // persistido de la 384 YA NO se recorta — es el valor del preset.
+        // Los valores 384 que exceden siguen clampados.
         val out = clampTo380Envelope(env(0.75f, 1.25f, 0.65f, 1.2f))
-        assertEquals(Envelope380(0.75f, 1.0f, 0.65f, 1.0f), out)
+        assertEquals(Envelope380(0.75f, 1.0f, 0.65f, 1.2f), out)
     }
 
     @Test fun values380PassThroughUnchanged() {
@@ -57,9 +60,10 @@ class ParameterStoreMigration386Test {
     }
 
     @Test fun nanFallsBackTo380Defaults() {
-        // Fallback NaN = los techos (ATREVIDA 502: 1.0 / 1.0 / 0.85 / 1.0).
+        // Fallback NaN = los techos (ATREVIDA 502 + CORONA evol-holos:
+        // 1.0 / 1.0 / 0.85 / 1.2).
         val out = clampTo380Envelope(env(Float.NaN, Float.NaN, Float.NaN, Float.NaN))
-        assertEquals(Envelope380(1.0f, 1.0f, 0.85f, 1.0f), out)
+        assertEquals(Envelope380(1.0f, 1.0f, 0.85f, 1.2f), out)
     }
 
     @Test fun mixedValuesClampOnlyTheOffenders() {

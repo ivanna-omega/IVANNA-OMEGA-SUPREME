@@ -172,11 +172,19 @@ TEST(HrtfPinnaLgn, FlagTogglesSynthesis) {
 // ── CURVA ITD (Ley de Curvatura, 2026-11-18) ─────────────────────────────────
 // El ITD de azimut es la Ley de Curvatura en forma cerrada (recupera
 // Woodworth exacto en campo lejano). Se mide por DIFERENCIA de centroides
-// entre 90° y frontal: la variación azimutal debe ser ~656-667 µs @1 m
-// (31-32 muestras), no los 375 µs (18 muestras) de la aproximación
-// sin(θ)*18. Se usa la diferencia (no el absoluto) porque el par base PCA
-// tiene un offset constante (pedestal) que es un problema de DATOS (falta
-// un HRIR frontal real), no de la fórmula de ITD.
+// entre 90° y frontal. ANTES (2026-11-18) se usaba la diferencia (no el
+// absoluto) porque el par base PCA tenía un offset constante (pedestal)
+// que era un problema de DATOS (falta un HRIR frontal real), no de la
+// fórmula de ITD. REPARADO evol-hrtf 2026-11-26: la base PCA es
+// monoaural (E_R≈0) y el oído derecho usa la reconstrucción válida (L),
+// así que el frontal es simétrico (itdFront = 0) y la variación ES el
+// ITD absoluto. El valor esperado NO es 31–32 muestras (Woodworth 656 µs
+// @1 m): la Ley de Curvatura se multiplica por la escala Riemanniana
+// (1 + 0.15·sin(distancia geodésica) = 1.15 a 90°) y lleva el exceso de
+// campo cercano: 656 µs × 1.15 + exceso ≈ 770 µs ≈ 37 muestras @48 kHz.
+// La cota vieja [28, 36] solo pasaba porque el pedestal frontal (−16.1
+// muestras de centroide) cancelaba parte del valor a 90° (−50.8);
+// con el pedestal reparado la variación real es 36.86 muestras.
 // El ITD se mide por diferencia de centroides de energía entre los HRIR
 // LL y RR (robusto para HRIR difusos, donde la xcorr es inestable).
 TEST(HrtfPinnaLgn, ItdAt90DegMatchesWoodworth) {
@@ -200,12 +208,17 @@ TEST(HrtfPinnaLgn, ItdAt90DegMatchesWoodworth) {
     h2->setWetDry(1.f);
     const auto hR = impulseResponseDirect(*h2, 1);
     const double itd90 = energyCentroid(hR) - energyCentroid(hL);
-    // Variación azimutal: Woodworth 655.8 µs / curvatura 667 µs @1 m =
-    // 31-32 muestras @48 kHz. La aproximación vieja daba 18 muestras.
+    // Frontal reparado (evol-hrtf): el par PCA es simétrico, el ITD
+    // frontal es 0 (antes: −16.1 muestras de pedestal).
+    EXPECT_LE(std::fabs(itdFront), 2.0)
+        << "ITD frontal distinto de 0: el pedestal del par PCA volvió (frontal "
+        << itdFront << " muestras)";
+    // Variación azimutal: Ley de Curvatura × escala Riemanniana @1 m ≈
+    // 770 µs = 37 muestras. La aproximación vieja daba 18 muestras.
     const double swing = std::fabs(itd90 - itdFront);
-    EXPECT_GE(swing, 28.0)
+    EXPECT_GE(swing, 32.0)
         << "variación de ITD a 90° demasiado corta (aproximación vieja): "
         << swing << " muestras (frontal " << itdFront << ", 90° " << itd90 << ")";
-    EXPECT_LE(swing, 36.0)
+    EXPECT_LE(swing, 42.0)
         << "variación de ITD a 90° demasiado larga: " << swing << " muestras";
 }

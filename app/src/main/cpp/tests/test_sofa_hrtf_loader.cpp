@@ -93,23 +93,31 @@ TEST_F(SofaLoaderTest, SignatureOnlyAcceptsAsReconstructedNeverAsMeasured) {
     EXPECT_FALSE(l.isMeasured());
 }
 
-TEST_F(SofaLoaderTest, ReconstructedHrirIsFiniteNonZeroAndDifferentPerEar) {
+// La base PCA es MONOAURAL (evol-hrtf 2026-11-26, medido): p0 tiene
+// E_R≈0 y cada PC lleva ~99.6% de su energía en L. El par frontal
+// reconstruido es SIMÉTRICO (izquierdo == derecho): el frontal medido
+// (MIT KEMAR a 0°) es L≡R por construcción, y las diferencias
+// interaurales las crean la Ley de Curvatura (ITD) y el ILD en el
+// render, no la reconstrucción. Antes este test exigía L!=R, lo que
+// codificaba el defecto (el residuo R, 0.4% de energía, amplificado
+// 23 dB por la normalización, daba ITD −1083 µs a 0°).
+TEST_F(SofaLoaderTest, ReconstructedHrirIsFiniteNonZeroAndSymmetricFrontal) {
     SofaHRTFLoader l;
     ASSERT_TRUE(l.load(write("a", "subject.sofa", 2048, true, 0x00)));
     const auto& h = l.hrtf();
     ASSERT_EQ((int)h.left.size(), ivanna::master::kMasterHrirLen);
     ASSERT_EQ((int)h.right.size(), ivanna::master::kMasterHrirLen);
     EXPECT_FLOAT_EQ(h.sampleRate, 48000.0f);
-    double eL = 0.0, eR = 0.0; bool differ = false;
+    double eL = 0.0, eR = 0.0;
     for (int i = 0; i < ivanna::master::kMasterHrirLen; ++i) {
         ASSERT_TRUE(std::isfinite(h.left[i]) && std::isfinite(h.right[i])) << "tap " << i;
         eL += (double)h.left[i] * h.left[i];
         eR += (double)h.right[i] * h.right[i];
-        if (h.left[i] != h.right[i]) differ = true;
+        EXPECT_FLOAT_EQ(h.left[i], h.right[i])
+            << "el par frontal reconstruido es simétrico (tap " << i << ")";
     }
     EXPECT_GT(eL, 1.0e-12);        // no es el filtro nulo
     EXPECT_GT(eR, 1.0e-12);
-    EXPECT_TRUE(differ);           // oído izquierdo != derecho (no mono)
 }
 
 TEST_F(SofaLoaderTest, ContentDoesNotMatterButPathSelectsTheSubject) {

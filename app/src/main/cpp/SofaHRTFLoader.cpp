@@ -1,8 +1,10 @@
 // SofaHRTFLoader.cpp — v2.5.472 Fase 2 ítem D: Data.IR se lee DE VERDAD.
 //
 // Lector HDF5 MÍNIMO (sin dependencias externas) para los SOFA del catálogo
-// (netCDF4 / HDF5 1.10, superbloque v2). Decodificado empíricamente byte a
-// byte contra h5py y validado exacto (np.array_equal) en 5 archivos:
+// (netCDF4 / HDF5 1.10, superbloque v2) Y para los SOFA del módulo
+// (re-codificados por tools/reencode_sofa.py con h5py/libver earliest,
+// superbloque v0). Decodificado empíricamente byte a byte contra h5py y
+// validado exacto (np.array_equal) en 5 archivos:
 //   MIT_KEMAR_normal_pinna.sofa, MIT_KEMAR_large_pinna.sofa,
 //   TU-Berlin_QU_KEMAR_anechoic_radius_0.5m.sofa (2 chunks),
 //   subject_003.sofa (CIPIC), demo_FreeFieldHRTF_1_IR.sofa (THK KU100).
@@ -10,10 +12,15 @@
 // OHDR raíz -> Link Info -> fractal heap + B-tree v2 (nombres) -> OHDR del
 // dataset -> dataspace / datatype / filter pipeline / data layout v3 ->
 // chunk B-tree v1 -> inflate (libz, vía dlopen) + unshuffle -> ensamblado
-// N-d por offset de chunk. El datatype puede vivir en un bloque de
-// continuación OCHK (mensaje 0x10): Data.IR/SourcePosition/Data.Delay NO lo
-// llevan inline; SamplingRate/C/M/N sí. El offset del heap-ID se mide desde
-// la FIRMA del bloque FHDB (incluye su cabecera de 21 bytes).
+// N-d por offset de chunk. El camino v0 es paralelo: superbloque v0 ->
+// OHDR raíz v1 -> continuación cruda (SIN firma OCHK) -> mensaje de
+// tabla de símbolos 0x11 -> heap local "HEAP" + B-tree v1 (nombres) ->
+// OHDR del dataset v1 -> dataspace v1 (dims en +8) / datatype / filter
+// pipeline v1 (con nombre por filtro) / data layout v3 -> chunk B-tree v1.
+// El datatype puede vivir en un bloque de continuación OCHK (mensaje
+// 0x10): Data.IR/SourcePosition/Data.Delay NO lo llevan inline;
+// SamplingRate/C/M/N sí. El offset del heap-ID se mide desde la FIRMA del
+// bloque FHDB (incluye su cabecera de 21 bytes).
 //
 // La descompresión usa libz (sistema, NDK) vía dlopen/dlsym — NO hay cambio
 // de CMake ni nueva dependencia de link (el ámbito de este ítem no toca
@@ -32,6 +39,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <dlfcn.h>
 #include <android/log.h>
@@ -47,6 +55,25 @@ static bool   g_sofa_lastOk = false;
 // Las dos estáticas de arriba se comparten entre instancias e hilos (carga desde la UI y desde
 // el servicio): sin exclusión mutua eran una carrera de datos sobre un std::string. NO-RT.
 static std::mutex g_sofa_cacheMutex;
+
+// Contadores P1+P4 (ver SofaHRTFLoader::loadCounters): camino usado por
+// load() en todas las instancias. Atómicos: load() corre desde UI y
+// servicio en hilos distintos.
+static std::atomic<std::size_t> g_sofa_loadsMeasured{0};
+static std::atomic<std::size_t> g_sofa_loadsReconstructed{0};
+static std::atomic<std::size_t> g_sofa_loadsFailed{0};
+
+Ivanna::SofaHRTFLoader::LoadCounters Ivanna::SofaHRTFLoader::loadCounters() noexcept {
+    return LoadCounters{g_sofa_loadsMeasured.load(std::memory_order_relaxed),
+                        g_sofa_loadsReconstructed.load(std::memory_order_relaxed),
+                        g_sofa_loadsFailed.load(std::memory_order_relaxed)};
+}
+
+void Ivanna::SofaHRTFLoader::resetLoadCountersForTest() noexcept {
+    g_sofa_loadsMeasured.store(0, std::memory_order_relaxed);
+    g_sofa_loadsReconstructed.store(0, std::memory_order_relaxed);
+    g_sofa_loadsFailed.store(0, std::memory_order_relaxed);
+}
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 
@@ -71,6 +98,21 @@ bool rd64(const unsigned char* d, size_t n, size_t off, uint64_t& v) noexcept {
     v = 0;
     for (int i = 0; i < 8; ++i) v |= (static_cast<uint64_t>(d[off + i]) << (8 * i));
     return true;
+}
+
+// Lee un entero de tamaño offsz (4 u 8, el "size of offsets" del
+// superbloque HDF5). Los SOFA v0 del módulo usan 8; se admite 4 por
+// generalidad (fail-closed si es otro valor).
+bool rdOff(const unsigned char* d, size_t n, size_t off, size_t offsz,
+           uint64_t& v) noexcept {
+    if (offsz == 8) return rd64(d, n, off, v);
+    if (offsz == 4) {
+        uint32_t w = 0;
+        if (!rd32(d, n, off, w)) return false;
+        v = w;
+        return true;
+    }
+    return false;
 }
 
 // ── libz vía dlopen (sin dependencia de link) ───────────────────────────────
@@ -168,6 +210,173 @@ struct Link {
     std::string name;
     size_t ohdr = 0;
 };
+
+// ── Object header v1 (superbloque HDF5 v0, SOFA del módulo) ────────────────
+// Prefijo de 16 B: versión(1) reservado(1) nº mensajes(u16) refcount(u32)
+// tamaño(u32) relleno(4). Mensajes de 8 B de cabecera: tipo(u16)
+// tamaño(u16) flags(1) reservado(3) + cuerpo. La continuación (tipo
+// 0x10) lleva (dirección u64, tamaño u64) y apunta a un flujo CRUDO de
+// mensajes (SIN firma OCHK: h5py/netCDF4 no la escriben en v0 —
+// verificado byte a byte en MIT_KEMAR_normal_pinna.sofa: el bloque de
+// continuación en 800 no trae OCHK y los mensajes de atributo parsean
+// limpios). El mensaje de tabla de símbolos es el tipo 0x11 (NO 0x10:
+// en estos archivos 0x10 = continuación y 0x11 = tabla de símbolos con
+// (B-tree, heap) — verificado contra h5py: B-tree en 136, heap en 680).
+bool walkMessagesV1Stream(const std::vector<unsigned char>& d, size_t pos,
+                          size_t end, std::vector<Msg>& out, int depth) {
+    if (depth > 8) return false;
+    const size_t n = d.size();
+    const unsigned char* p = d.data();
+    while (pos + 8 <= end) {
+        uint16_t type = 0, size = 0;
+        if (!rd16(p, n, pos, type) || !rd16(p, n, pos + 2, size)) return false;
+        if (type == 0) {  // NIL: relleno, se salta
+            pos += 8 + size;
+            continue;
+        }
+        if (pos + 8 + size > end) break;  // cola del bloque
+        const size_t bodyOff = pos + 8;
+        out.push_back(Msg{static_cast<uint8_t>(type), bodyOff, size});
+        if (type == 0x10) {  // continuación -> flujo crudo de mensajes
+            uint64_t ca = 0, cs = 0;
+            if (size < 16 || !rd64(p, n, bodyOff, ca) ||
+                !rd64(p, n, bodyOff + 8, cs))
+                return false;
+            if (ca + (size_t)cs > n || cs > n) return false;
+            if (!walkMessagesV1Stream(d, (size_t)ca, (size_t)ca + (size_t)cs,
+                                      out, depth + 1))
+                return false;
+        }
+        pos += 8 + size;
+    }
+    return true;
+}
+
+bool readOhdrMessagesV1(const std::vector<unsigned char>& d, size_t ohdr,
+                        std::vector<Msg>& out) {
+    const size_t n = d.size();
+    if (ohdr + 16 > n) return false;
+    if (d[ohdr] != 1) return false;  // object header v1
+    uint16_t nmsg = 0;
+    uint32_t hdrsize = 0;
+    if (!rd16(d.data(), n, ohdr + 2, nmsg) ||
+        !rd32(d.data(), n, ohdr + 8, hdrsize))
+        return false;
+    const size_t start = ohdr + 16;
+    if (hdrsize > n || start > n || start + hdrsize > n) return false;
+    // nmsg es una cota superior (incluye los de continuación); el bucle
+    // termina al agotar el bloque. Se parsea el bloque entero y luego se
+    // siguen las continuaciones que aparezcan.
+    std::vector<Msg> first;
+    if (!walkMessagesV1Stream(d, start, start + hdrsize, first, 0))
+        return false;
+    // walkMessagesV1Stream ya siguió las continuaciones; out = todo.
+    out = std::move(first);
+    (void)nmsg;
+    return true;
+}
+
+// ── Resolución de enlaces del grupo raíz (superbloque v0) ──────────────────
+// Símbolo 0x11 -> (B-tree v1, heap local). Heap "HEAP" (h5py/netCDF4;
+// se acepta "FRHP" por generalidad): firma(4) + 4 B + tamaño del
+// segmento(8) + cabeza de lista libre(8) + dirección del segmento(8).
+// B-tree v1: "TREE" tipo(1) nivel(1) usados(u16) hermanos(2×offsz) y
+// luego (clave, hijo) intercalados: hijo[i] = palabra[2i+1], hijo final
+// = palabra[2·usados]. Los slots sin usar pueden traer punteros rancios
+// (verificado: 4º hijo 208 en MIT KEMAR): cada hijo se valida por firma
+// ("SNOD" en hoja, "TREE" en interno) y el inválido se salta.
+bool resolveRootLinksV0(const std::vector<unsigned char>& d, size_t rootAddr,
+                        size_t offsz, std::vector<Link>& out) {
+    const size_t n = d.size();
+    const unsigned char* p = d.data();
+    std::vector<Msg> root;
+    if (!readOhdrMessagesV1(d, rootAddr, root)) return false;
+    const Msg* st = findMsg(root, 0x11);  // Symbol Table
+    if (!st || st->bodyLen < 16) return false;
+    uint64_t btree = 0, heap = 0;
+    if (!rdOff(p, n, st->bodyOff, offsz, btree) ||
+        !rdOff(p, n, st->bodyOff + offsz, offsz, heap))
+        return false;
+    // Heap local: firma + segmento de datos.
+    if (heap + 8 + 2 * offsz > n) return false;
+    if (std::memcmp(p + heap, "HEAP", 4) != 0 &&
+        std::memcmp(p + heap, "FRHP", 4) != 0)
+        return false;
+    uint64_t heapData = 0, heapSize = 0;
+    if (!rdOff(p, n, heap + 8, offsz, heapSize) ||
+        !rdOff(p, n, heap + 8 + 2 * offsz, offsz, heapData))
+        return false;
+    if (heapData + heapSize > n || heapSize == 0) return false;
+    // B-tree v1 (recursivo por nivel; los grupos SOFA son planos, nivel 0).
+    struct Frame {
+        size_t addr;
+        int depth;
+    };
+    std::vector<Frame> stack;
+    stack.push_back(Frame{static_cast<size_t>(btree), 0});
+    std::vector<size_t> snods;
+    while (!stack.empty()) {
+        const Frame fr = stack.back();
+        stack.pop_back();
+        if (fr.depth > 8) return false;
+        const size_t addr = fr.addr;
+        if (addr + 8 + 2 * offsz > n ||
+            std::memcmp(p + addr, "TREE", 4) != 0)
+            return false;
+        const int level = p[addr + 5];
+        uint16_t nused = 0;
+        if (!rd16(p, n, addr + 6, nused)) return false;
+        if (nused == 0 || nused > 100000) return false;
+        const size_t hdr = 8 + 2 * offsz;
+        const size_t nwords = 2 * static_cast<size_t>(nused) + 1;
+        if (addr + hdr + nwords * offsz > n) return false;
+        std::vector<uint64_t> words(nwords, 0);
+        for (size_t i = 0; i < nwords; ++i)
+            if (!rdOff(p, n, addr + hdr + i * offsz, offsz, words[i]))
+                return false;
+        // Hijos: palabra[2i+1] (i < usados) + palabra[2·usados].
+        for (size_t i = 0; i <= nused; ++i) {
+            const size_t child = static_cast<size_t>(
+                i < nused ? words[2 * i + 1] : words[2 * nused]);
+            if (level == 0) {
+                if (child + 8 <= n && std::memcmp(p + child, "SNOD", 4) == 0)
+                    snods.push_back(child);
+            } else {
+                if (child + 8 <= n && std::memcmp(p + child, "TREE", 4) == 0)
+                    stack.push_back(Frame{child, fr.depth + 1});
+            }
+        }
+    }
+    if (snods.empty()) return false;
+    const size_t entrySize = 2 * offsz + 24;
+    for (size_t s : snods) {
+        uint16_t nent = 0;
+        if (!rd16(p, n, s + 6, nent)) return false;
+        if (nent == 0 || nent > 100000) return false;
+        for (uint16_t i = 0; i < nent; ++i) {
+            const size_t ep = s + 8 + static_cast<size_t>(i) * entrySize;
+            if (ep + entrySize > n) return false;
+            uint64_t nameOff = 0, ohdr = 0;
+            if (!rdOff(p, n, ep, offsz, nameOff) ||
+                !rdOff(p, n, ep + offsz, offsz, ohdr))
+                return false;
+            if (nameOff >= heapSize) return false;
+            const size_t np = static_cast<size_t>(heapData + nameOff);
+            const unsigned char* nul = static_cast<const unsigned char*>(
+                std::memchr(p + np, '\0', static_cast<size_t>(heapSize - nameOff)));
+            if (!nul) return false;
+            const size_t namelen = static_cast<size_t>(nul - (p + np));
+            if (namelen == 0 || namelen > 256) return false;
+            if (ohdr + 1 > n || p[ohdr] != 1) return false;  // OHDR v1
+            out.push_back(Link{std::string(reinterpret_cast<const char*>(p + np),
+                                           namelen),
+                               static_cast<size_t>(ohdr)});
+        }
+    }
+    return !out.empty();
+}
+
+// (resolveRootLinksV0 vive más arriba, junto a readOhdrMessagesV1.)
 
 bool resolveRootLinks(const std::vector<unsigned char>& d, size_t rootAddr,
                       std::vector<Link>& out) {
@@ -267,64 +476,85 @@ struct Dataset {
     std::vector<Chunk> chunks;
 };
 
-bool readDatasetMeta(const std::vector<unsigned char>& d,
-                     const std::vector<Link>& links, const char* name,
-                     Dataset& ds, bool& unsupported) {
+// Núcleo común de readDatasetMeta (v2) y readDatasetMetaV0 (v1): los
+// mensajes ya están parseados; solo cambia el origen (OHDR v2 vs v1).
+// Las versiones SE DISPATCHAN por mensaje, no por origen:
+//  - dataspace v1: dims en +8 (reservado de 4 B); v2/v3: dims en +4.
+//  - filtro v1: cabecera de 8 B (ver, nº, reservado 2+4) y por filtro
+//    ID(2) nameLen(2) flags(2) nc(2) nombre(nameLen, múltiplo de 8)
+//    clientData(nc×4) + relleno(4 si nc impar). v2: cabecera de 2 B y
+//    por filtro ID(2) nc(2) flags(2) clientData(nc×4).
+//  - layout v3 chunked + B-tree v1 de chunks: idéntico en v0 y v2.
+bool readDatasetMetaFromMsgs(const std::vector<unsigned char>& d,
+                             const std::vector<Msg>& msgs, Dataset& ds,
+                             bool& unsupported) {
     const size_t n = d.size();
     const unsigned char* p = d.data();
-    size_t ohdr = 0;
-    bool found = false;
-    for (const Link& l : links)
-        if (l.name == name) {
-            ohdr = l.ohdr;
-            found = true;
-            break;
-        }
-    if (!found) return false;
-    std::vector<Msg> msgs;
-    if (!readOhdrMessages(d, ohdr, msgs)) return false;
     const Msg* dsp = findMsg(msgs, 0x01);  // dataspace
     const Msg* dt = findMsg(msgs, 0x03);   // datatype (puede faltar: ver abajo)
     const Msg* flt = findMsg(msgs, 0x0b);  // filter pipeline
     const Msg* lay = findMsg(msgs, 0x08);  // data layout
     if (!dsp || !lay) return false;
-    // Dataspace v2/v3: ver, ndims, flags, reservado, dims (ndims x u64).
+    // Dataspace: ver, ndims, flags, reservado, [reservado 4 B solo en
+    // v1], dims (ndims x u64).
     if (dsp->bodyLen < 4) return false;
     const uint8_t ver = p[dsp->bodyOff];
-    if (ver != 2 && ver != 3) return false;
+    if (ver != 1 && ver != 2 && ver != 3) return false;
     const int ndims = p[dsp->bodyOff + 1];
     if (ndims < 1 || ndims > 8) return false;
-    if (dsp->bodyLen < 4 + (size_t)ndims * 8) return false;
+    const size_t dimsOff = (ver == 1) ? 8 : 4;
+    if (dsp->bodyLen < dimsOff + (size_t)ndims * 8) return false;
     ds.dims.clear();
     uint64_t total = 1;
     for (int i = 0; i < ndims; ++i) {
         uint64_t v = 0;
-        if (!rd64(p, n, dsp->bodyOff + 4 + (size_t)i * 8, v)) return false;
+        if (!rd64(p, n, dsp->bodyOff + dimsOff + (size_t)i * 8, v)) return false;
         if (v == 0 || v > 1000000) return false;
         if (total > (uint64_t(1) << 31) / v) return false;
         total *= v;
         ds.dims.push_back(v);
     }
-    // Filtros (pipeline v2 compacto): ver=2, numFiltros, por filtro
-    // id(2) numClient(2) flags(2) clientData(numClient x u32).
+    // Filtros: v1 con nombre por filtro, v2 compacto (ver arriba).
     if (flt) {
-        if (flt->bodyLen < 2 || p[flt->bodyOff] != 2) return false;
+        if (flt->bodyLen < 2) return false;
+        const uint8_t fver = p[flt->bodyOff];
+        if (fver != 1 && fver != 2) return false;
         const int nf = p[flt->bodyOff + 1];
         if (nf < 0 || nf > 8) return false;
-        size_t q = flt->bodyOff + 2;
+        size_t q = flt->bodyOff + (fver == 1 ? 8 : 2);
         for (int i = 0; i < nf; ++i) {
-            if (q + 6 > flt->bodyOff + flt->bodyLen) return false;
-            uint16_t fid = 0, nc = 0;
-            if (!rd16(p, n, q, fid) || !rd16(p, n, q + 2, nc)) return false;
-            q += 6;
-            if (q + (size_t)nc * 4 > flt->bodyOff + flt->bodyLen) return false;
-            if (fid == 1)
-                ds.hasDeflate = true;
-            else if (fid == 2)
-                ds.hasShuffle = true;
-            else
-                return false;  // filtro desconocido: fail-closed
-            q += (size_t)nc * 4;
+            if (fver == 1) {
+                if (q + 8 > flt->bodyOff + flt->bodyLen) return false;
+                uint16_t fid = 0, nlen = 0, nc = 0;
+                if (!rd16(p, n, q, fid) || !rd16(p, n, q + 2, nlen) ||
+                    !rd16(p, n, q + 6, nc))
+                    return false;
+                q += 8;
+                if (nlen % 8 != 0) return false;  // nombre: múltiplo de 8
+                if (q + nlen + (size_t)nc * 4 + (nc % 2 ? 4 : 0) >
+                    flt->bodyOff + flt->bodyLen)
+                    return false;
+                if (fid == 1)
+                    ds.hasDeflate = true;
+                else if (fid == 2)
+                    ds.hasShuffle = true;
+                else
+                    return false;  // filtro desconocido: fail-closed
+                q += nlen + (size_t)nc * 4 + (nc % 2 ? 4 : 0);
+            } else {
+                if (q + 6 > flt->bodyOff + flt->bodyLen) return false;
+                uint16_t fid = 0, nc = 0;
+                if (!rd16(p, n, q, fid) || !rd16(p, n, q + 2, nc)) return false;
+                q += 6;
+                if (q + (size_t)nc * 4 > flt->bodyOff + flt->bodyLen) return false;
+                if (fid == 1)
+                    ds.hasDeflate = true;
+                else if (fid == 2)
+                    ds.hasShuffle = true;
+                else
+                    return false;  // filtro desconocido: fail-closed
+                q += (size_t)nc * 4;
+            }
         }
     }
     // Layout v3 chunked: ver=3, class=2, idx B-tree (8), chunk dims (ndims x u32),
@@ -391,6 +621,41 @@ bool readDatasetMeta(const std::vector<unsigned char>& d,
         ds.chunks.push_back(std::move(c));
     }
     return true;
+}
+
+bool readDatasetMeta(const std::vector<unsigned char>& d,
+                     const std::vector<Link>& links, const char* name,
+                     Dataset& ds, bool& unsupported) {
+    size_t ohdr = 0;
+    bool found = false;
+    for (const Link& l : links)
+        if (l.name == name) {
+            ohdr = l.ohdr;
+            found = true;
+            break;
+        }
+    if (!found) return false;
+    std::vector<Msg> msgs;
+    if (!readOhdrMessages(d, ohdr, msgs)) return false;
+    return readDatasetMetaFromMsgs(d, msgs, ds, unsupported);
+}
+
+// Igual que readDatasetMeta pero con object headers v1 (superbloque v0).
+bool readDatasetMetaV0(const std::vector<unsigned char>& d,
+                       const std::vector<Link>& links, const char* name,
+                       Dataset& ds, bool& unsupported) {
+    size_t ohdr = 0;
+    bool found = false;
+    for (const Link& l : links)
+        if (l.name == name) {
+            ohdr = l.ohdr;
+            found = true;
+            break;
+        }
+    if (!found) return false;
+    std::vector<Msg> msgs;
+    if (!readOhdrMessagesV1(d, ohdr, msgs)) return false;
+    return readDatasetMetaFromMsgs(d, msgs, ds, unsupported);
 }
 
 // Coloca un chunk (elementos en orden C) en su offset del dataset destino.
@@ -482,23 +747,63 @@ bool SofaHRTFLoader::parseMeasured(const std::vector<unsigned char>& file,
     unsupported = false;
     const size_t n = file.size();
     const unsigned char* p = file.data();
-    // Superbloque v2: firma (8 B) + versión. v0/v1/v3 fuera de alcance
-    // (los hpir_nh*.sofa son v0): UNSUPPORTED, no un fallo de parseo.
-    if (n < 48 || p[8] != 2) {
+    // Superbloque HDF5: firma (8 B) + versión en p[8]. v2 = camino
+    // existente (object headers v2, heap fractal). v0 = SOFA del módulo
+    // (re-codificados por tools/reencode_sofa.py con h5py/libver earliest):
+    // object headers v1 + heap local "HEAP" + B-tree v1. v1/v3 fuera de
+    // alcance: UNSUPPORTED, no un fallo de parseo.
+    if (n < 48 || (p[8] != 2 && p[8] != 0)) {
         unsupported = true;
         return false;
     }
-    uint64_t root = 0;
-    if (!rd64(p, n, 36, root)) return false;
     std::vector<Link> links;
-    if (!resolveRootLinks(file, (size_t)root, links)) return false;
+    // El camino v0 y el v2 comparten readDatasetMetaFromMsgs y
+    // readDatasetData; solo cambia cómo se resuelven los enlaces del
+    // grupo raíz y cómo se parsean los object headers de cada dataset.
+    if (p[8] == 0) {
+        // Superbloque v0: tamaño de offsets en p[13] (8 en estos SOFA);
+        // entrada de la tabla de símbolos raíz en 24+4·offsz, con la
+        // dirección del object header raíz en 24+5·offsz (64 con offsz 8).
+        const size_t offsz = p[13];
+        if (offsz != 4 && offsz != 8) {
+            unsupported = true;
+            return false;
+        }
+        uint64_t root = 0;
+        if (!rdOff(p, n, 24 + 5 * offsz, offsz, root)) return false;
+        if (!resolveRootLinksV0(file, (size_t)root, offsz, links))
+            return false;
+    } else {
+        uint64_t root = 0;
+        if (!rd64(p, n, 36, root)) return false;
+        if (!resolveRootLinks(file, (size_t)root, links)) return false;
+    }
 
     Dataset ir, sp, sr;
-    if (!readDatasetMeta(file, links, "Data.IR", ir, unsupported)) return false;
+    if (p[8] == 0) {
+        if (!readDatasetMetaV0(file, links, "Data.IR", ir, unsupported))
+            return false;
+    } else {
+        if (!readDatasetMeta(file, links, "Data.IR", ir, unsupported))
+            return false;
+    }
     if (ir.dims.size() != 3 || ir.dims[1] != 2) return false;
-    if (!readDatasetMeta(file, links, "SourcePosition", sp, unsupported)) return false;
+    if (p[8] == 0) {
+        if (!readDatasetMetaV0(file, links, "SourcePosition", sp, unsupported))
+            return false;
+    } else {
+        if (!readDatasetMeta(file, links, "SourcePosition", sp, unsupported))
+            return false;
+    }
     if (sp.dims.size() != 2 || sp.dims[1] != 3 || sp.dims[0] != ir.dims[0]) return false;
-    if (!readDatasetMeta(file, links, "Data.SamplingRate", sr, unsupported)) return false;
+    if (p[8] == 0) {
+        if (!readDatasetMetaV0(file, links, "Data.SamplingRate", sr,
+                               unsupported))
+            return false;
+    } else {
+        if (!readDatasetMeta(file, links, "Data.SamplingRate", sr, unsupported))
+            return false;
+    }
     if (sr.dims.size() != 1 || sr.dims[0] != 1) return false;
 
     std::vector<float> irData, spData, srData;
@@ -548,15 +853,27 @@ void SofaHRTFLoader::reconstructFromPca(const std::string& path) {
             bestLen = idLen;
         }
     }
+    // REPARACIÓN PEDESTAL (evol-hrtf 2026-11-26): la base PCA es
+    // MONOAURAL — p0 tiene E_R≈0 y cada PC lleva ~99.6% de su energía
+    // en L (E_R≈0.004); el par reconstruido tiene ILD crudo +23.31 dB
+    // y correlación L/R 0.183 (medido sobre la base viva). El oído
+    // derecho usa la MISMA reconstrucción válida que el izquierdo:
+    // el frontal medido (MIT KEMAR a 0°) es L≡R por construcción, y
+    // las diferencias interaurales las crean la Ley de Curvatura
+    // (ITD) y el ILD en el render, no la reconstrucción. Sin esto, la
+    // normalización de energía del render amplifica el residuo R 23 dB
+    // y el ITD a 0° sale −1083 µs (xcorr, con pabellón) sin arreglo
+    // por alineado (ver HrtfManager.cpp, NOTA PEDESTAL DE ITD).
     for (int n = 0; n < kLen; ++n) {
         float l = ivanna::master::kMasterSofaP0[n];
-        float r = ivanna::master::kMasterSofaP0[kLen + n];
+        float r = ivanna::master::kMasterSofaP0[kLen + n];  // LEGACY: mitad R
         for (int k = 0; k < ivanna::master::kMasterSafK; ++k) {
             l += qSubj[k] * ivanna::master::kMasterSofaPcaV[k][n];
             r += qSubj[k] * ivanna::master::kMasterSofaPcaV[k][kLen + n];
         }
+        (void)r;  // la mitad R de la base es residuo (ver arriba); no se usa
         m_hrtf.left[n] = l;
-        m_hrtf.right[n] = r;
+        m_hrtf.right[n] = l;
     }
 }
 
@@ -566,6 +883,7 @@ bool SofaHRTFLoader::load(const std::string& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         lastStatus_ = Status::FILE_NOT_FOUND;
+        ++g_sofa_loadsFailed;
         LOGE("SofaHRTFLoader: Archivo no encontrado o sin permisos: %s", path.c_str());
         return false;
     }
@@ -581,6 +899,7 @@ bool SofaHRTFLoader::load(const std::string& path) {
     // para el umbral.
     if (size < 512) {
         lastStatus_ = Status::CORRUPT;
+        ++g_sofa_loadsFailed;
         LOGE("SofaHRTFLoader: Archivo demasiado pequeño (%ld bytes) — "
              "corrompido o placeholder truncado.", (long)size);
         return false;
@@ -589,6 +908,7 @@ bool SofaHRTFLoader::load(const std::string& path) {
     // cargarlo entero en memoria (fail-closed, sin OOM).
     if (size > (std::streamsize(1) << 30)) {
         lastStatus_ = Status::CORRUPT;
+        ++g_sofa_loadsFailed;
         LOGE("SofaHRTFLoader: Archivo demasiado grande (%ld bytes).", (long)size);
         return false;
     }
@@ -601,6 +921,7 @@ bool SofaHRTFLoader::load(const std::string& path) {
     uint8_t magic[8] = {};
     if (!file.read(reinterpret_cast<char*>(magic), 8) || !file.good()) {
         lastStatus_ = Status::CORRUPT;
+        ++g_sofa_loadsFailed;
         LOGE("SofaHRTFLoader: Error leyendo cabecera de %s", path.c_str());
         return false;
     }
@@ -612,6 +933,7 @@ bool SofaHRTFLoader::load(const std::string& path) {
 
     if (!isHDF5) {
         lastStatus_ = Status::NOT_HDF5;
+        ++g_sofa_loadsFailed;
         // Distinguir "no es SOFA" de "archivo corrompido" en el log para que
         // el desarrollador sepa exactamente qué pasó sin inspeccionar el archivo.
         LOGE("SofaHRTFLoader: %s NO es un SOFA AES69 válido — "
@@ -628,6 +950,7 @@ bool SofaHRTFLoader::load(const std::string& path) {
     file.seekg(0, std::ios::beg);
     if (!file.read(reinterpret_cast<char*>(bytes.data()), size) || !file.good()) {
         lastStatus_ = Status::CORRUPT;
+        ++g_sofa_loadsFailed;
         LOGE("SofaHRTFLoader: Error leyendo %s", path.c_str());
         return false;
     }
@@ -652,9 +975,11 @@ bool SofaHRTFLoader::load(const std::string& path) {
             // No debería pasar (parseMeasured validó >= 1 posición finita):
             // fail-closed al PCA antes que dejar un hrtf() vacío con éxito.
             lastStatus_ = Status::VALID_NOT_PARSED;
+            ++g_sofa_loadsReconstructed;
             reconstructFromPca(path);
             return true;
         }
+        ++g_sofa_loadsMeasured;
         LOGI("SofaHRTFLoader: MEDIDO %s: %zu posiciones, %zu taps/oído, %.0f Hz "
              "(Data.IR leído de verdad, azimut por posición más cercana).",
              path.c_str(), m_numPos, m_taps, (double)m_sampleRateHz);
@@ -667,6 +992,7 @@ bool SofaHRTFLoader::load(const std::string& path) {
     // carga de las mediciones del archivo: el sujeto (q_subj) se elige
     // buscando su id en la RUTA.
     lastStatus_ = unsupported ? Status::UNSUPPORTED : Status::VALID_NOT_PARSED;
+    ++g_sofa_loadsReconstructed;
     reconstructFromPca(path);
     LOGI("SofaHRTFLoader: firma HDF5 OK (%ld bytes); mediciones del archivo NO leídas "
          "(%s) -> HRIR RECONSTRUIDO desde base maestra SOFA-PCA (%d taps/oído).",

@@ -160,13 +160,22 @@ private:
     static constexpr float kWfsMaxApertureM = 1.5f; // apertura a wfsSpread=1
 
     float effectiveOrbeAmount() const noexcept {
+        // Solo bocina plana apaga ORBE: en GENEZI el amount del usuario
+        // pasa (tercer modo, v2.5.483 / evol-holos).
         return controls_.mode == OmegaOutputMode::SPEAKERS ? 0.0f : controls_.amount;
     }
     float effectiveHrtfWet() const noexcept {
-        return controls_.mode == OmegaOutputMode::SPEAKERS ? 0.0f : controls_.hrtfWet;
+        // HRTF binaural PROHIBIDO en Genezi (TransducerProfile): en
+        // SPEAKERS y en GENEZI el wet es 0; solo audífonos lo usan.
+        return ivanna::omega_output_is_speakers_like(controls_.mode) ? 0.0f : controls_.hrtfWet;
     }
     bool isSpeakers() const noexcept {
         return controls_.mode == OmegaOutputMode::SPEAKERS;
+    }
+    // Altavoz a efectos de XTC/AuxField/pose: bocina plana o Genezi
+    // (el trayecto Genezi lleva XTC + AuxField activos por diseño).
+    bool isSpeakersLike() const noexcept {
+        return ivanna::omega_output_is_speakers_like(controls_.mode);
     }
 
     void applyControls() noexcept;             // empuja controls_ a los motores

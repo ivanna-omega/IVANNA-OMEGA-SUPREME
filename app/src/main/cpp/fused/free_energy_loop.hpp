@@ -1,8 +1,15 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// free_energy_loop.hpp — Física 3: Lazo Variacional F (MOC + Anti-Adaptación).
-// Unifica el lazo eferente MOC + anti-adaptación sináptica bajo el principio
-// variacional F (con límites estrictos de velocidad 0.5 dB/s, cero aumento de
-// ganancia maestra). Paquete FISICA_NUEVA_CONSOLIDADA (Esse, 2026-11-18).
+// free_energy_loop.hpp — Física 3: Lazo F heurístico (MOC + Anti-Adaptación).
+// [P1+P4 2026-11-26 — RENOMBRE HONESTO, sin borrar: antes "Lazo
+// Variacional F". NO hay funcional F ni ∂F/∂Γ en este archivo: la
+// "ganancia" es una heurística escrita a mano (onsetNeed/fatiguePen
+// con constantes 1.8/2.5/1.2/0.35, no derivadas de ningún funcional).
+// bandEnv24/bandTransient24 vienen de la FFT de la SEÑAL DE ENTRADA
+// del propio motor (NewPhysicsEngine::runStftHop), NO de un micrófono
+// ni de ningún sensor. Unifica el lazo eferente MOC + anti-adaptación
+// sináptica bajo esa heurística (con límites estrictos de velocidad
+// 0.5 dB/s, cero aumento de ganancia maestra). Paquete
+// FISICA_NUEVA_CONSOLIDADA (Esse, 2026-11-18).
 // Header-only, RT-safe.
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma once
@@ -57,7 +64,12 @@ public:
             // 2) Depresión sináptica (recupera saliencia de onsets atenuados tras pasaje denso)
             synAdapt_[b] += synRec_ * (env - synAdapt_[b]);
 
-            // Gradiente variacional: -∂F/∂Γ_b = realce leve en ataque tras adaptación - atenuación por fatiga MOC
+            // Heurística de ganancia [P1+P4 2026-11-26 — LEGACY: esta línea
+            // se llamaba "Gradiente variacional: -∂F/∂Γ_b = ...". NO hay
+            // funcional F ni ∂F/∂Γ: es realce leve en ataque tras
+            // adaptación menos atenuación por fatiga MOC, con constantes
+            // escritas a mano (1.8/2.5/1.2/0.35). Medida en
+            // tests/test_p1p4_neuro.cpp (respuesta al escalón, γ por banda).
             const float onsetNeed = std::max(0.0f, tr - 1.2f) * std::min(1.0f, synAdapt_[b] * 2.0f);
             const float fatiguePen = std::max(0.0f, mocState_[b] - 0.35f);
             const float targetDb = std::clamp((1.8f * onsetNeed - 2.5f * fatiguePen) * mix, -3.0f, 2.0f);
@@ -72,6 +84,15 @@ public:
     }
 
     float fatigueIntegral() const noexcept { return fatigueIntegral_; }
+
+    // Telemetría P1+P4 (2026-11-26): ganancia de lazo por banda (dB),
+    // la que multiplica la señal (10^(γ/20)). Sin ella el lazo no se
+    // puede medir desde fuera: γ es la única salida observable del
+    // lazo además de feGain_.
+    float gammaModDb(int band) const noexcept {
+        if (band < 0 || band >= kBands) return 0.0f;
+        return gammaModDb_[band];
+    }
 
 private:
     float dt_ = 128.0f / 48000.0f;

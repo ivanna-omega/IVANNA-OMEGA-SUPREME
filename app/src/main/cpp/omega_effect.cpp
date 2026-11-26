@@ -29,6 +29,7 @@
 #include "include/omega_effect_beacon.h"   // señal real "el efecto procesa" para la app (Ruta A/B)
 #include "include/omega_effect_no_effect.h" // v2.5.470: re-arme del auto-enable tras DISABLE espurio
 #include "include/audio_callback_clock.hpp" // reloj de cadencia software; nunca referencia de fase DAC
+#include "include/effect_sample_rate.hpp"   // EVOL-LIVEPATH: tasa del FusionCore desde el reloj de callback medido (SET_CONFIG no llega)
 #include "include/audio_hardware_clock.hpp" // estimador de frecuencia desde posiciones reales del driver
 #include "include/audio_hardware_clock_bridge.hpp" // IPC HAL -> callback; productor del HAL real
 #include "supreme/SupremeTransitionEnvelope.hpp"
@@ -41,6 +42,8 @@
 #include "audio_effect_compat.h"
 #include "ivanna_asrc_bridge.h"  // ASRC del daemon (v2.5.439, magistral): puente al efecto, init lazy + fail-closed. Include dir en CMakeLists (magisk_module/engine/effect/).
 #include "include/omega_control_bus.h"
+#include "include/omega_snapshot_telemetry.h"  // P2 (2026-11-26): conservar RMS/pico/frames medidos al adoptar un snapshot nuevo
+#include "include/omega_snapshot_freshness.h"  // P2 (2026-11-26): watchdog de frescura del snapshot con caída a defaults con rampa
 #include "fused/new_physics_engine.hpp"  // FÍSICA NUEVA (Fase 2, v2.5.472): mismo motor que Ruta A
 #include "fused/np483_defaults.hpp"  // v2.5.483: órganos v3 despiertos con los mismos defaults que Ruta A
 #include <string.h>
@@ -283,7 +286,22 @@ struct omega_effect_context_t {
     float* rtVolterraScratch;       // Scratch intercalado 2*OMEGA_RT_MAX_FRAMES para Volterra sin pisar outBuf
     int    rtCapacity;              // frames que caben en rtL/rtR
     uint32_t lastConfiguredSr;      // SR previa para detectar hotplug de DAC Tipo-C (48k <-> 96k/192k)
+    // EVOL-LIVEPATH (2026-11-26): lastConfiguredSr SOLO es real si vino de
+    // un SET_CONFIG del HAL; sin él es el default 48000 de creación. Con
+    // srFromSetConfig el núcleo se crea inmediato a esa tasa; sin él, se
+    // espera a la tasa MEDIDA del reloj de callback (o 200 ms, ver
+    // effect_sample_rate.hpp). firstBlockMs es el primer bloque visto
+    // (CLOCK_MONOTONIC ms, 0 = aún ninguno).
+    bool     srFromSetConfig = false;
+    uint64_t firstBlockMs = 0;
     uint64_t lastAppliedGen;        // AUDIT FIX: seguimiento de la generation SHM
+    // P2 (2026-11-26) — WATCHDOG DE FRESCURA DEL SNAPSHOT: si el daemon
+    // deja de publicar, el efecto caería eternamente con los controles
+    // viejos. snapFresh guarda la última adopción + el fade vigente
+    // (1 = control vigente, 0 = defaults seguros con rampa). Se arma en
+    // la primera adopción; el placement-new del contexto corre sus
+    // inicializadores (fade 1.0), no depende de calloc.
+    ivanna::SnapshotFreshnessState snapFresh;
     bool     ctrlBusOpen;           // AUDIT FIX: OmegaControlBus reader ready
     uint64_t ctrlBusOpenAttemptMs = 0; // FIX 2.5.475: último intento de abrir el reader (reintento espaciado 1 s)
     ivanna::adaptive::AdaptiveEngineV2* adaptiveEngine;
@@ -315,6 +333,23 @@ struct omega_effect_context_t {
     bool     cpuShed;
     int      cpuOverCount;
     int      cpuUnderCount;
+    // 6.2 (refinamiento 2026-11-26) — CONTADORES DE TIEMPO POR BLOQUE.
+    // omega_process() ya medía la carga por bloque (usedNs/blockNs, abajo)
+    // pero la DESCARTABA salvo por la máquina de estados cpuShed: no había
+    // forma de leer cuánto tarda la cadena en el teléfono. Estos contadores
+    // acumulan (solo hilo de audio, sin malloc/locks): bloques procesados,
+    // ns de CPU totales, peor bloque, bloques sobre el presupuesto (load >
+    // 1.0 = xrun real del HAL) y bloques sobre 0.80 (umbral cpuShed).
+    // Se exponen por omega_effect_get_cpu_stats() (extern "C", al final del
+    // archivo, mismo patrón que omega_test_*). NO van al snapshot SHM: la
+    // ABI v17 tiene sizeof fijo 808 (static_assert) y añadir campos rompería
+    // la app; la visibilidad en vivo por snapshot es propuesta ABI v18
+    // (ver docs/REFINE_P6P7_MEDICION_VIVO.md). calloc => 0.
+    uint64_t cpuBlockCount;
+    uint64_t cpuUsedNsTotal;
+    uint64_t cpuUsedNsMax;
+    uint64_t cpuOverBudgetBlocks;  // load > 1.0: el bloque no cupo en tiempo real
+    uint64_t cpuOver80Blocks;      // load > 0.80: umbral que dispara cpuShed
     // FIX (distorsion digital): limiter por instancia al final de la cadena
     // (tras expansion M/S TinyML + RIR). calloc zero-init deja el puntero
     // en nullptr; se instancia lazy en SET_CONFIG junto a los buffers RT.
@@ -480,6 +515,16 @@ static inline bool omega_output_is_speakers(const ivanna::OmegaDspSnapshot& s) n
     return ivanna::omega_output_mode_decode(s.temporal_field) ==
            ivanna::OmegaOutputMode::SPEAKERS;
 }
+// TERCER MODO — GENEZI (evol-holos, 2026-11-26): DAC USB → Genezi. La
+// puerta BINAURAL (orbe/holos amount) NO se le aplica: el holograma del
+// usuario pasa (v2.5.483). Las puertas GENERALES (upmix, holosEq, EQ 10
+// bandas, sala) SÍ se le aplican, como a bocina plana: lo general queda
+// en neutro también en el efecto (defensa en profundidad; la puerta de
+// la app ya lo neutraliza antes de enviar).
+static inline bool omega_output_is_genezi(const ivanna::OmegaDspSnapshot& s) noexcept {
+    return ivanna::omega_output_mode_decode(s.temporal_field) ==
+           ivanna::OmegaOutputMode::GENEZI;
+}
 
 // ── FÍSICA NUEVA (Fase 2, v2.5.472) — ABI v14: snapshot → atomics ─────────
 // Los atomics g_np_* tienen su bloque canónico de declaraciones extern en
@@ -590,10 +635,16 @@ static inline void omega_apply_snapshot(IvannaFusionEngine* fc,
     // Intelligent Upmixing (HOA)
     // FIX 1 (bofo Genezi): con SPEAKERS el upmix (cadena de audífonos) va
     // a 0; el snapshot conserva sus valores para cuando vuelvan audífonos.
-    const bool speakersGate = omega_output_is_speakers(s);
+    // TERCER MODO — GENEZI (evol-holos, 2026-11-26): speakersGate cubre
+    // bocina plana Y Genezi para lo GENERAL (upmix, holosEq, EQ, sala);
+    // binauralGate cubre SOLO bocina plana para los amounts: en Genezi
+    // el holograma del usuario pasa (v2.5.483, tercer modo).
+    const bool speakersGate = omega_output_is_speakers(s) || omega_output_is_genezi(s);
+    const bool binauralGate = omega_output_is_speakers(s);
     // FUSIÓN MAGISTRAL (Ruta B): el modo de salida llega a la cadena
     // fusionada — el Espacial (ORBE·Ω) aplica su propia puerta Genezi
-    // (SPEAKERS → ORBE 0, HRTF 0, XTC+AuxField activos). UNKNOWN se clampa
+    // (SPEAKERS → ORBE 0, HRTF 0, XTC+AuxField activos; GENEZI → ORBE
+    // del usuario, HRTF 0, XTC+AuxField activos). UNKNOWN se clampa
     // a HEADPHONES en FusedControls (fail-closed, nunca silencio).
     fc->setFusedOutputMode(ivanna::omega_output_mode_decode(s.temporal_field));
     const bool upmixOn = (s.upmixing_enabled != 0) && !speakersGate;
@@ -623,19 +674,22 @@ static inline void omega_apply_snapshot(IvannaFusionEngine* fc,
     // por el snapshot desde la app (CONTROL / PersistedStateRestorer) y se
     // aplican al FusionCore de esta instancia. amount 0 = apagado (el snapshot
     // trae 1.0 desde la app por defecto; 0 solo si el usuario lo apaga).
-    // FIX 1 (bofo Genezi): con SPEAKERS el amount efectivo es 0 aunque el
-    // snapshot traiga 1.0; el snapshot NO se reescribe.
-    // Se clampean defensivamente: un snapshot corrupto no debe mover el motor.
+    // FIX 1 (bofo Genezi): con SPEAKERS (bocina plana) el amount efectivo
+    // es 0 aunque el snapshot traiga 1.0; el snapshot NO se reescribe.
+    // En GENEZI el amount del usuario pasa (tercer modo, v2.5.483).
+    // Se clampean defensivamente con los rangos canónicos CORONA
+    // (omega_control_bus.h, única fuente de los topes): un snapshot
+    // corrupto no debe mover el motor.
     if (std::isfinite(s.orbe_amount) && std::isfinite(s.orbe_distance_m) &&
         std::isfinite(s.orbe_spread) && std::isfinite(s.orbe_proximity_db) &&
         std::isfinite(s.orbe_diffuse)) {
-        fc->setOrbeParams(speakersGate ? 0.f : std::clamp(s.orbe_amount, 0.f, 1.f),
+        fc->setOrbeParams(binauralGate ? 0.f : ivanna::omega_clamp_orbe_amount(s.orbe_amount),
                           std::clamp(s.orbe_distance_m, 0.15f, 2.0f),
-                          // v2.5.386 — SOBRE 380: orbe_spread topado a 1.0.
-                          // La 384 lo subió a 1.2 y ese valor quedó persistido;
-                          // el efecto lo rechaza aunque llegue un snapshot
-                          // viejo o corrupto (defensa en profundidad).
-                          std::clamp(s.orbe_spread, 0.f, 1.0f),
+                          // CORONA (evol-holos, 2026-11-26): orbe_spread
+                          // admite 1.2 (antes topado a 1.0 por el SOBRE
+                          // 380; la app, el daemon y el JNI ya admitían
+                          // 1.5). El tope 1.5 es el del resto de la ruta.
+                          ivanna::omega_clamp_orbe_spread(s.orbe_spread),
                           std::clamp(s.orbe_proximity_db, 0.f, 6.f),
                           std::clamp(s.orbe_diffuse, 0.f, 1.f),
                           s.orbe_head_tracking != 0u);
@@ -644,25 +698,29 @@ static inline void omega_apply_snapshot(IvannaFusionEngine* fc,
     // HOLOS — Operador Único de Campo Acústico (ABI v10): los parámetros
     // llegan por el snapshot desde la app (CONTROL / PersistedStateRestorer)
     // y se aplican al FusionCore de esta instancia. amount 0 = apagado
-    // (el snapshot trae 0.5, harmonics 0 desde la app por defecto). Se clampean defensivamente: un snapshot corrupto no debe
-    // mover el motor. El EQ estático de Γ va plano por defecto (no-op).
-    // FIX 1 (bofo Genezi): con SPEAKERS amount 0 + EQ Γ a 0 aunque el
-    // snapshot traiga 0.5; el snapshot NO se reescribe.
+    // (el snapshot trae 1.0 desde la app por defecto; 0 solo si el
+    // usuario lo apaga). Se clampean defensivamente con los rangos
+    // canónicos CORONA (omega_control_bus.h): un snapshot corrupto no
+    // debe mover el motor. El EQ estático de Γ va plano por defecto (no-op).
+    // FIX 1 (bofo Genezi): con SPEAKERS (bocina plana) amount 0 + EQ Γ a
+    // 0 aunque el snapshot traiga 1.0; el snapshot NO se reescribe. En
+    // GENEZI el amount del usuario pasa (tercer modo, v2.5.483).
     if (std::isfinite(s.holos_amount) && std::isfinite(s.holos_distance_m) &&
         std::isfinite(s.holos_spread) && std::isfinite(s.holos_proximity_db) &&
         std::isfinite(s.holos_diffuse) && std::isfinite(s.holos_harmonics) &&
         std::isfinite(s.holos_warmth) && std::isfinite(s.holos_dynamics) &&
         std::isfinite(s.holos_width) && std::isfinite(s.holos_gamma) &&
         std::isfinite(s.holos_room_rt60)) {
-        // v2.5.386 — SOBRE 380: holos_amount topado a 0.5, holos_width a 1.0
-        // y holos_diffuse a 0.5. La 384 los subió a 0.75/1.25/0.65 y esos
-        // valores quedaron persistidos; el efecto los rechaza aunque llegue
-        // un snapshot viejo o corrupto (defensa en profundidad).
-        fc->setHolosParams(speakersGate ? 0.f : std::clamp(s.holos_amount, 0.f, 0.5f),
+        // CORONA (evol-holos, 2026-11-26): holos_amount admite 1.0 y
+        // holos_diffuse admite 0.85 (antes topados a 0.5 por el SOBRE
+        // 380; la app subió su sobre en la ATREVIDA 502 pero el efecto
+        // nunca se actualizó y recortaba el preset). Los topes 1.0 son
+        // los del resto de la ruta (daemon, JNI, HolosOperator).
+        fc->setHolosParams(binauralGate ? 0.f : ivanna::omega_clamp_holos_amount(s.holos_amount),
                            std::clamp(s.holos_distance_m, 0.15f, 2.0f),
                            std::clamp(s.holos_spread, 0.f, 1.5f),
                            std::clamp(s.holos_proximity_db, 0.f, 6.f),
-                           std::clamp(s.holos_diffuse, 0.f, 0.5f),
+                           ivanna::omega_clamp_holos_diffuse(s.holos_diffuse),
                            std::clamp(s.holos_harmonics, 0.f, 1.f),
                            std::clamp(s.holos_warmth, 0.f, 1.f),
                            std::clamp(s.holos_dynamics, 0.f, 1.f),
@@ -877,7 +935,8 @@ static inline void omega_apply_supreme_axes(omega_effect_context_t* ctx,
     // FIX 1 (bofo Genezi): con SPEAKERS la sala del snapshot no se aplica
     // (RT60/wet efectivos 0 → archetype 0, roomEngine inactivo). Scope de
     // función: los usan el bloque supremeLattice Y el de audioPipeline.
-    const bool speakersGate = omega_output_is_speakers(s);
+    // En GENEZI la sala sigue sin aplicarse (lo general queda en neutro).
+    const bool speakersGate = omega_output_is_speakers(s) || omega_output_is_genezi(s);
     const float roomRt60Eff = speakersGate ? 0.f : s.room_rt60_s;
     const float roomWetEff = speakersGate ? 0.f : s.room_wet;
     if (ctx->supremeLattice) {
@@ -1145,9 +1204,10 @@ static inline void omega_apply_room(omega_effect_context_t* ctx,
 
     // FIX 1 (bofo Genezi): con SPEAKERS la RIR va a 0 (rt60/wet efectivos
     // 0 → setWetDry(0) con rampa suave, sin corte duro). El snapshot
-    // conserva su sala para cuando vuelvan audífonos.
-    const float rt60 = omega_output_is_speakers(s) ? 0.f : s.room_rt60_s;
-    const float wet  = omega_output_is_speakers(s)
+    // conserva su sala para cuando vuelvan audífonos. En GENEZI la RIR
+    // sigue a 0 (lo general queda en neutro).
+    const float rt60 = (omega_output_is_speakers(s) || omega_output_is_genezi(s)) ? 0.f : s.room_rt60_s;
+    const float wet  = (omega_output_is_speakers(s) || omega_output_is_genezi(s))
         ? 0.f
         : ivanna::spatial::RoomGeometryConfig::limitSyntheticReverbWetForRoomT60(
               s.room_wet, rt60);
@@ -1484,6 +1544,26 @@ static int32_t omega_process(effect_handle_t self,
         return 0;
     }
 
+    // Reloj de callback ANTES de crear el núcleo (EVOL-LIVEPATH): la tasa
+    // medida (frames / CLOCK_MONOTONIC, ventana >= 100 ms) es la que decide
+    // a qué tasa nace el FusionCore cuando SET_CONFIG no llegó. Antes este
+    // bloque corría DESPUÉS de la creación, así que la medida nunca podía
+    // usarse para ella. Solo diagnóstico de cadencia (nunca referencia de
+    // fase DAC); RT-safe (sin alloc/locks/syscalls salvo clock_gettime).
+    struct timespec cpuT0;
+    clock_gettime(CLOCK_MONOTONIC, &cpuT0);
+    ivanna::audio::CallbackClockStatus clockStatus{};
+    if (ctx->callbackClock && ctx->lastConfiguredSr >= 8000u && ctx->lastConfiguredSr <= 768000u) {
+        const uint64_t nowNs = static_cast<uint64_t>(cpuT0.tv_sec) * 1000000000ull +
+                               static_cast<uint64_t>(cpuT0.tv_nsec);
+        clockStatus = ctx->callbackClock->observe(
+            nowNs, static_cast<uint64_t>(frames), ctx->lastConfiguredSr);
+        if (clockStatus.valid) {
+            ivanna::effectBeacon().onClockEstimate(clockStatus.observedSampleRateHz,
+                                                   clockStatus.driftPpm);
+        }
+    }
+
     // AUDIT FIX (session isolation): usar el fusionCore de ESTA instancia,
     // nunca el global g_fusionCore.
     // FIX (v2.5.396, 4to brick 2026-11-11): creación LAZY del FusionEngine,
@@ -1493,16 +1573,34 @@ static int32_t omega_process(effect_handle_t self,
     // aquí, el efecto queda en passthrough y audioserver sigue vivo.
     IvannaFusionEngine* fc = ctx->fusionCore;
     if (!fc && !ctx->fusionCoreInitAttempted) {
+        // EVOL-LIVEPATH (2026-11-26): la tasa del núcleo ya no es solo
+        // lastConfiguredSr. En este HAL SET_CONFIG jamás llega, así que
+        // lastConfiguredSr es el default 48000 aunque el hilo del mixer
+        // corra a otra tasa. Si el reloj de callback ya validó la tasa
+        // medida, el núcleo nace a ESA tasa; si SET_CONFIG sí llegó,
+        // manda el HAL; si nada validó en 200 ms desde el primer bloque,
+        // se crea con el default (el arranque no se retrasa más). En este
+        // G85 el mixer es 48 kHz y la medida es 48000: sin cambio de
+        // sonido hoy; en un hilo a 44.1k/96k el motor ya no nacería
+        // desafinado. (v2.5.486 hizo el primer paso: usar
+        // lastConfiguredSr en vez de 48000 fijo.)
+        const uint64_t nowMs = static_cast<uint64_t>(cpuT0.tv_sec) * 1000ull +
+                               static_cast<uint64_t>(cpuT0.tv_nsec) / 1000000ull;
+        if (ctx->firstBlockMs == 0) ctx->firstBlockMs = nowMs;
+        if (!ivanna::shouldCreateFusionCore(ctx->srFromSetConfig, clockStatus.valid,
+                                            nowMs, ctx->firstBlockMs)) {
+            // Aún sin tasa medida y sin cumplir los 200 ms: passthrough
+            // este bloque; el próximo lo reintenta (InitAttempted sigue
+            // en false hasta que se cree de verdad).
+            if (outBuf->raw != inBuf->raw) {
+                memmove(outBuf->raw, inBuf->raw, (size_t)frames * frameBytes);
+            }
+            return 0;
+        }
         ctx->fusionCoreInitAttempted = true;
-        // v2.5.486 (fundación mejor que el élite): el FusionCore nacía
-        // hardcodeado a 48000 Hz aunque el HAL/config ya supiera la tasa
-        // real (lastConfiguredSr, que SET_CONFIG actualiza; en este HAL
-        // SET_CONFIG no llega y el default es 48000, que es la tasa real
-        // del hilo del mixer en este G85 — el cambio no altera el sonido
-        // hoy, pero en un dispositivo con hilo a 44.1k/96k el motor ya no
-        // nacería desafinado). Un solo intento, lazy, como antes.
-        const float coreSr = (ctx->lastConfiguredSr >= 8000u)
-            ? static_cast<float>(ctx->lastConfiguredSr) : 48000.0f;
+        const float coreSr = static_cast<float>(ivanna::chooseEffectSampleRate(
+            ctx->lastConfiguredSr, ctx->srFromSetConfig, clockStatus.valid,
+            clockStatus.observedSampleRateHz));
         fc = new (std::nothrow) IvannaFusionEngine(coreSr);
         if (fc) {
             fc->initSpatial(coreSr, 4096);
@@ -1556,18 +1654,9 @@ static int32_t omega_process(effect_handle_t self,
             }
         }
     }
-    struct timespec cpuT0;
-    clock_gettime(CLOCK_MONOTONIC, &cpuT0);
-    if (ctx->callbackClock && ctx->lastConfiguredSr >= 8000u && ctx->lastConfiguredSr <= 768000u) {
-        const uint64_t nowNs = static_cast<uint64_t>(cpuT0.tv_sec) * 1000000000ull +
-                               static_cast<uint64_t>(cpuT0.tv_nsec);
-        const auto clockStatus = ctx->callbackClock->observe(
-            nowNs, static_cast<uint64_t>(frames), ctx->lastConfiguredSr);
-        if (clockStatus.valid) {
-            ivanna::effectBeacon().onClockEstimate(clockStatus.observedSampleRateHz,
-                                                   clockStatus.driftPpm);
-        }
-    }
+    // (El reloj de callback ya se observó ANTES de crear el núcleo, arriba:
+    // su tasa medida decide coreSr. cpuT0 sigue vigente para el bloque de
+    // abajo.)
 
     // FIX 2.5.475 — El reader del control bus se abría SOLO en SET_CONFIG,
     // pero en este HAL (Qualcomm) SET_CONFIG jamás llega al efecto (igual
@@ -1597,15 +1686,23 @@ static int32_t omega_process(effect_handle_t self,
     // no malloc, y solo retorna true si hay una generation posterior a la
     // ya aplicada. Esto conecta finalmente los sliders de la UI -> daemon
     // -> SHM -> omega_process, cerrando el ciclo que estaba roto.
+    bool adoptedSnap = false;  // P2: el watchdog la necesita tras el bloque
     if (ctx->ctrlBusOpen) {
         ivanna::OmegaDspSnapshot snap;
         if (ivanna::effectControlBus().readLatest(snap, ctx->lastAppliedGen)) {
+            adoptedSnap = true;
             auto& realityOrch = ivanna::reality::AcousticRealityOrchestrator::instance();
             if (realityOrch.isEnabled()) {
                 realityOrch.coordinateSnapshot(snap);
             }
             ctx->adaptiveEnabled =
                 (snap.temporal_field & ivanna::OMEGA_EFFECT_ADAPTIVE_ENABLED_BIT) != 0u;
+            // P2 (2026-11-26, RMS=0 en vivo): la adopción sobrescribía la
+            // telemetría medida por el efecto (RMS/pico/bandas/frames) con
+            // los ceros del snapshot del daemon, que nunca escribe esos
+            // campos. Conservarla ANTES de asignar: el control viene del
+            // daemon, la telemetría viene del efecto.
+            ivanna::omega_preserve_effect_telemetry(snap, ctx->pendingSnap);
             ctx->pendingSnap = snap; // conserva los valores originales del control plane
             // FIX 1 (bofo Genezi): la puerta se fija al adoptar la
             // generación. RT-SAFE (v2.5.473): el LOGI directo en el
@@ -1614,7 +1711,10 @@ static int32_t omega_process(effect_handle_t self,
             // sale en omega_command() (hilo no-RT). La puerta se actualiza
             // igual, solo al cambiar de modo (no por bloque).
             {
-                const bool gate = omega_output_is_speakers(snap);
+                // Puerta GENERAL (bocina plana o Genezi): sala/upmix en
+                // neutro. El holograma (ORBE/HOLOS) tiene su propia
+                // puerta binaural y NO la sigue.
+                const bool gate = omega_output_is_speakers(snap) || omega_output_is_genezi(snap);
                 if (gate != ctx->routeBSpeakersGate) {
                     ctx->routeBSpeakersGate = gate;
                     ivanna::rtlog::push(ivanna::rtlog::Event::kOutputMode,
@@ -1628,6 +1728,36 @@ static int32_t omega_process(effect_handle_t self,
             omega_apply_supreme_axes(ctx, ctx->pendingSnap);
             omega_apply_room(ctx, ctx->pendingSnap);  // cable RIR: sala desde snapshot
             omega_apply_saf_to_rir(ctx, ctx->pendingSnap);  // SAF q -> wetScale/rt60/early/decorrel de la IR viva
+        }
+    }
+
+    // P2 (2026-11-26) — WATCHDOG DE FRESCURA DEL SNAPSHOT: si el daemon
+    // deja de publicar (muere, socket caído, SHM corrupta), readLatest()
+    // deja de adoptar y el efecto seguiría eternamente con los controles
+    // viejos. Tras 3000 ms sin snapshot nuevo, los amounts caen a sus
+    // defaults seguros (bypass bit-exacto) con rampa de 100 ms — el audio
+    // sigue pasando, nunca es silencio — y al volver el daemon la rampa
+    // sube de vuelta. Solo (re-)aplica el snapshot cuando el fade cambia
+    // (coste cero en régimen). cpuT0 ya es CLOCK_MONOTONIC (mismo reloj
+    // que timestamp_ms del snapshot). En el bloque de adopción con fade
+    // en recuperación, la copia con fade gana al snapshot completo que
+    // se aplicó arriba: la vuelta es suave, sin escalón.
+    {
+        const uint64_t nowMs = static_cast<uint64_t>(cpuT0.tv_sec) * 1000ull +
+                               static_cast<uint64_t>(cpuT0.tv_nsec) / 1000000ull;
+        const uint32_t srWatch = (ctx->lastConfiguredSr >= 8000u)
+                                     ? ctx->lastConfiguredSr : 48000u;
+        const uint64_t blockMs = (static_cast<uint64_t>(frames) * 1000ull) /
+                                 static_cast<uint64_t>(srWatch);
+        if (ivanna::snapshot_freshness_update(ctx->snapFresh, nowMs, adoptedSnap,
+                                              blockMs)) {
+            ivanna::OmegaDspSnapshot faded{};
+            ivanna::omega_snapshot_apply_stale_fade(faded, ctx->pendingSnap,
+                                                    ctx->snapFresh.appliedFade);
+            omega_apply_snapshot(fc, ctx->antiDolby, faded);
+            omega_apply_supreme_axes(ctx, faded);
+            omega_apply_room(ctx, faded);
+            omega_apply_saf_to_rir(ctx, faded);
         }
     }
 
@@ -2323,6 +2453,16 @@ static int32_t omega_process(effect_handle_t self,
                              ? ctx->config.outputCfg.samplingRate : 48000u;
         const double blockNs = (double)frames * 1e9 / (double)srCpu;
         const double load = (blockNs > 0.0) ? usedNs / blockNs : 0.0;
+        // 6.2 — acumular contadores por bloque (expuestos por
+        // omega_effect_get_cpu_stats()). usedNs es double: el cast a
+        // uint64_t pierde la fracción de ns (< 1 ns por bloque, irrelevante
+        // frente a bloques de ~10 ms); el total se usa para la media.
+        ++ctx->cpuBlockCount;
+        const uint64_t usedNsU = (usedNs > 0.0 && usedNs < 1.0e18) ? static_cast<uint64_t>(usedNs) : 0u;
+        ctx->cpuUsedNsTotal += usedNsU;
+        if (usedNsU > ctx->cpuUsedNsMax) ctx->cpuUsedNsMax = usedNsU;
+        if (load > 1.0) ++ctx->cpuOverBudgetBlocks;
+        if (load > 0.80) ++ctx->cpuOver80Blocks;
         if (load > 0.80) {
             ctx->cpuUnderCount = 0;
             if (++ctx->cpuOverCount >= 3) ctx->cpuShed = true;
@@ -2593,6 +2733,7 @@ static int32_t omega_command(effect_handle_t self, uint32_t cmdCode,
                 if (sr == 0) sr = 48000;
                 const bool srChanged = (ctx->lastConfiguredSr != 0u && ctx->lastConfiguredSr != sr);
                 ctx->lastConfiguredSr = sr;
+                ctx->srFromSetConfig = true;  // EVOL-LIVEPATH: el HAL dijo la tasa (manda sobre la medida)
                 ctx->bandMeter.prepare((float)sr);
                 ctx->fotoHoloBarkMeter.prepare((float)sr);
                 ctx->fotoHoloDelta = 0.0f;
@@ -2823,8 +2964,9 @@ static int32_t omega_command(effect_handle_t self, uint32_t cmdCode,
                             ctx->adaptiveEnabled =
                                 (seed.temporal_field & ivanna::OMEGA_EFFECT_ADAPTIVE_ENABLED_BIT) != 0u;
                             ctx->pendingSnap = seed;
-                            // FIX 1 (bofo Genezi): puerta vigente desde el seed.
-                            ctx->routeBSpeakersGate = omega_output_is_speakers(seed);
+                            // FIX 1 (bofo Genezi): puerta vigente desde el seed
+                            // (general: bocina plana o Genezi).
+                            ctx->routeBSpeakersGate = omega_output_is_speakers(seed) || omega_output_is_genezi(seed);
                             if (!ctx->adaptiveEnabled) omega_neutralize_adaptive_snapshot(ctx->pendingSnap);
                             omega_apply_snapshot(ctx->fusionCore, ctx->antiDolby, ctx->pendingSnap);
                             omega_apply_supreme_axes(ctx, ctx->pendingSnap);
@@ -3557,6 +3699,44 @@ static int32_t omega_get_descriptor_lib(const effect_uuid_t *uuid,
 //     anterior eliminó → quedó rota por construcción.
 // El push SAF→ObjectRenderer inter-proceso sigue siendo alcance
 // separado (documentado en saf_latent_bridge.cpp).
+
+// ── 6.2 — Contadores de tiempo por bloque (refinamiento 2026-11-26) ────────
+// omega_effect_get_cpu_stats() expone los contadores que omega_process()
+// acumula por bloque (ver campos cpuBlockCount_* en el ctx). Lectura
+// lock-free de enteros de 64 bits: el hilo de audio solo escribe, el lector
+// solo lee; un lector que tome los 6 campos a la vez puede ver dos bloques
+// distintos entre campos (carrera benigna: los contadores son monótonos y
+// la media se calcula sobre bloques completos, no sobre muestras).
+//   blocks: bloques procesados desde la creación del efecto.
+//   used_ns_total / used_ns_max: ns de CPU acumulados / peor bloque.
+//   over_budget_blocks: bloques con load > 1.0 (xrun real del HAL).
+//   over80_blocks: bloques con load > 0.80 (umbral cpuShed).
+//   shed: 1 = cpuShed activo (etapas pesadas apagadas por sobrecarga).
+// Media por bloque = used_ns_total / blocks (ns); load media = media /
+// (frames*1e9/sr). En el teléfono el handle vive en audioserver: la vía
+// viva es ABI v18 (snapshot) o lectura por el daemon — ver
+// docs/REFINE_P6P7_MEDICION_VIVO.md. Devuelve false con handle o out nulos.
+struct OmegaEffectCpuStats {
+    uint64_t blocks;
+    uint64_t used_ns_total;
+    uint64_t used_ns_max;
+    uint64_t over_budget_blocks;
+    uint64_t over80_blocks;
+    uint32_t shed;
+};
+
+extern "C" bool omega_effect_get_cpu_stats(effect_handle_t self,
+                                           OmegaEffectCpuStats* out) noexcept {
+    if (!self || !out) return false;
+    auto* ctx = reinterpret_cast<omega_effect_context_t*>(self);
+    out->blocks = ctx->cpuBlockCount;
+    out->used_ns_total = ctx->cpuUsedNsTotal;
+    out->used_ns_max = ctx->cpuUsedNsMax;
+    out->over_budget_blocks = ctx->cpuOverBudgetBlocks;
+    out->over80_blocks = ctx->cpuOver80Blocks;
+    out->shed = ctx->cpuShed ? 1u : 0u;
+    return true;
+}
 
 extern "C" uint64_t omega_test_get_supreme_axes_apply_count(effect_handle_t self) noexcept {
     if (!self) return 0;

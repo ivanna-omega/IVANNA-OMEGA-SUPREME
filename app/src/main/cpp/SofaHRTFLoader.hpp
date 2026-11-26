@@ -27,9 +27,11 @@ public:
                             // soportado...). HRIR reconstruido desde la base
                             // maestra SOFA-PCA (ver load()).
         UNSUPPORTED,        // Firma HDF5 OK pero formato fuera del alcance del
-                            // lector mínimo (superbloque HDF5 v0/v1/v3, layout
+                            // lector mínimo (superbloque HDF5 v1/v3, layout
                             // contiguo, datatype no-float...). HRIR reconstruido
                             // desde la base maestra SOFA-PCA (fail-closed).
+                            // v0 SÍ se lee desde evol-hrtf (SOFA del módulo):
+                            // solo v1/v3 quedan fuera de alcance.
         PARSED_MEASURED,    // Data.IR + SourcePosition + Data.SamplingRate
                             // leídos DE VERDAD del archivo (lector HDF5 mínimo,
                             // v2.5.472 Fase 2 ítem D). hrtf() es el par frontal
@@ -73,6 +75,24 @@ public:
     size_t tapsPerEar() const noexcept { return m_taps; }
     float  sampleRateHz() const noexcept { return m_sampleRateHz; }
     const std::string& path() const noexcept { return m_path; }
+
+    // ── Telemetría P1+P4 (2026-11-26): qué camino se usó, en vivo ───────
+    // Contadores GLOBALES (todas las instancias) de load(): cuántas
+    // cargas leyeron Data.IR de verdad (measured), cuántas cayeron al
+    // fallback PCA (reconstructed) y cuántas fallaron (failed: archivo
+    // ausente, corrupto o sin firma HDF5). loadCached() en caliente NO
+    // incrementa (no hay carga real). Con esto la app / el daemon
+    // pueden reportar en vivo si la HRTF que suena es MEDIDA o
+    // RECONSTRUIDA — antes solo lastStatus() por instancia lo decía y
+    // nadie lo agregaba. Los LOGI/LOGE de load() ya distinguen el
+    // camino por carga en logcat; estos contadores son el agregado.
+    struct LoadCounters {
+        std::size_t measured = 0;
+        std::size_t reconstructed = 0;
+        std::size_t failed = 0;
+    };
+    static LoadCounters loadCounters() noexcept;
+    static void resetLoadCountersForTest() noexcept;
 
 private:
     // Intento de parseo real (lector HDF5 mínimo). true = PARSED_MEASURED y

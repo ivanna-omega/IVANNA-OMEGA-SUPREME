@@ -444,8 +444,12 @@ P0Measured measureAll(const Signal& ref, const Signal& out) {
         m.segOutPeakDbL[s] = toDbfs(peakOf(out.l, a, b));
         m.segOutPeakDbR[s] = toDbfs(peakOf(out.r, a, b));
     }
-    // Ganancia neta total (Regla de Oro Matched-LUFS: debe ser ~0 dB en
-    // el carácter congelado; el valor es el que es, se congela tal cual).
+    // Ganancia neta total. [P1+P4 2026-11-26: el comentario viejo decía
+    // que la Regla de Oro "debe ser ~0 dB en el carácter congelado" —
+    // FALSO para la cadena enganchada: el valor congelado ES −6.065/
+    // −6.274 dB. La regla "0.0 dB" solo vale en neutro (bit-exacto) y
+    // como objetivo nominal de P8 (trim medido). Aquí el valor es el
+    // que es y se congela tal cual.]
     m.netGainDbL = toDbfs(rmsOf(out.l, 0, kN)) - toDbfs(rmsOf(ref.l, 0, kN));
     m.netGainDbR = toDbfs(rmsOf(out.r, 0, kN)) - toDbfs(rmsOf(ref.r, 0, kN));
     // Latencia xcorr sobre ruido (ventana asentada), L y R.
@@ -526,10 +530,18 @@ bool doFreeze(bool finalFreeze) {
     m.deterministicMaxDiff = maxAbsDiff(out1, out2);
 
     // Límites de CPU desde la línea base medida (no valores exactos: el
-    // tiempo depende de la máquina). p50: 4x la base o 400 µs (lo mayor);
-    // p99: 3x la base o 1000 µs (lo mayor); máx: el presupuesto real.
-    const double cpuP50Max = std::max(4.0 * m.cpu.p50Us, 400.0);
-    const double cpuP99Max = std::max(3.0 * m.cpu.p99Us, 1000.0);
+    // tiempo depende de la máquina). p50: 1.5x la base; p99: 1.5x la base.
+    // 6.1 (refinamiento 2026-11-26) — TAPADOS POR EL PRESUPUESTO: la
+    // fórmula anterior (p50 4x / p99 3x la base) daba límites congelados
+    // p50 3087 / p99 4254 µs, POR ENCIMA del presupuesto realtime de hop
+    // (2666.67 µs): una regresión al 120% del presupuesto pasaba el test.
+    // Los límites congelados ya no pueden superar el presupuesto (p50) ni
+    // 1.5x el presupuesto (p99), que es lo mismo que imponen los EXPECT
+    // duros de CpuXruns. Base medida en VM sin carga (2026-11-26,
+    // scripts/p0_freeze.sh --final): p50 773.182 µs, p99 1585.733 µs
+    // → límites 1159.773 / 2378.600 µs.
+    const double cpuP50Max = std::min(std::max(1.5 * m.cpu.p50Us, 400.0), kHopBudgetUs);
+    const double cpuP99Max = std::min(std::max(1.5 * m.cpu.p99Us, 1000.0), 1.5 * kHopBudgetUs);
 
     std::string header;
     header += "#pragma once\n";
@@ -784,8 +796,28 @@ TEST(P0ReferenceLock, CpuXruns) {
     EXPECT_LE(cpu.p99Us, p0::kCpuP99MaxUs) << "p99 µs/hop (hilo) sobre el límite congelado";
     EXPECT_LE(cpu.maxUs, p0::kCpuMaxMaxUs)
         << "un hop consumió más del doble de su presupuesto de tiempo real";
-    // Los xruns de pared se reportan (ver [P0-CPU] arriba) pero no se
-    // imponen: en host compartido miden la carga del host, no el motor.
+    // 6.1 — PRESUPUESTO REALTIME DURO (refinamiento 2026-11-26): los
+    // límites congelados anteriores (p50 3087 / p99 4254 µs) superaban el
+    // presupuesto de hop (2666.67 µs): una regresión al 120% del
+    // presupuesto pasaba este test. El coste mediano del motor NO puede
+    // superar un hop; el p99 admite 1.5x (picos de hilo esporádicos).
+    // Son límites de CPU de HILO (CLOCK_THREAD_CPUTIME_ID): deterministas
+    // e inmunes a la carga del host, no de pared.
+    EXPECT_LE(cpu.p50Us, kHopBudgetUs)
+        << "p50 µs/hop (hilo) sobre el presupuesto realtime de hop (2667 µs): "
+           "el motor no cabe en tiempo real";
+    EXPECT_LE(cpu.p99Us, 1.5 * kHopBudgetUs)
+        << "p99 µs/hop (hilo) sobre 1.5x el presupuesto realtime de hop";
+    // Los xruns de pared se REPORTAN (ver [P0-CPU] arriba) pero NO se
+    // imponen — y esta NO-imposición es una decisión medida, no un hueco:
+    // en VM compartida cargada, runCpu midió xruns=37 con p50 de HILO en
+    // 900 µs (34% del presupuesto) y p99 de pared en 32.7 ms (2026-11-26):
+    // el motor cabe sobrado y los 37 xruns son stalls de planificación
+    // del host, no del motor. Imponer xruns=0 haría fallar el test por la
+    // carga del host (kXrunsMax=0 queda en el header congelado como
+    // referencia documentada, no como guarda). Lo que sí impone el
+    // presupuesto es la CPU de HILO (p50/p99 de arriba): determinista e
+    // inmune a la carga del host.
 }
 
 TEST(P0ReferenceLock, SilenceTail) {

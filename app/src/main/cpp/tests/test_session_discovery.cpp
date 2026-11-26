@@ -705,3 +705,170 @@ TEST(SessionChangeGate, DaemonWiringCambioDeAppConfirmaUnaVez) {
     EXPECT_EQ(gen, 2u);
     EXPECT_EQ(pkg, "com.music.appB");
 }
+
+// ── EVOL-LIVEPATH (2026-11-26): sesión rancia 4057 ─────────────────────────
+// Reproducción del fallo en vivo: Tidal en pausa (sesión 4057, hint de
+// música, cnt 5) contra Qobuz web en Chrome sonando (sesión 2297, sin hint,
+// cnt 1). ANTES: el selector elegía 4057 en cada poll y el daemon la
+// publicaba para siempre (efecto acoplado a una sesión muerta, 0 frames).
+// DESPUÉS: degradada la 4057, gana la sesión viva 2297; si no hay otra,
+// la degradada sigue ganando (fail-safe).
+TEST(SessionDiscovery, DemotedMusicLosesToLiveNonMusic) {
+    using ivanna::daemon::selectMusicSession;
+    const std::vector<AudioSessionRef> refs = {
+        {4057, 5, 2000, 1000, "com.aspiro.tidal"},
+        {2297, 1, 3000, 1000, "com.android.chrome"},
+    };
+    // Sin degradar: la 4057 gana por el hint de música (el bug).
+    EXPECT_EQ(selectMusicSession(refs).sessionId, 4057);
+    // Degradada la 4057: pierde el bonus de música y gana la viva 2297.
+    EXPECT_EQ(selectMusicSession(refs, "com.ivanna.omega", "", {4057}).sessionId, 2297);
+    EXPECT_EQ(selectMusicSession(refs, "com.ivanna.omega", "", {4057}).packageName,
+              "com.android.chrome");
+}
+
+TEST(SessionDiscovery, AllDemotedStillPicksBest) {
+    using ivanna::daemon::selectMusicSession;
+    const std::vector<AudioSessionRef> refs = {
+        {4057, 5, 2000, 1000, "com.aspiro.tidal"},
+    };
+    // Solo hay una elegible y está degradada: sigue ganando (nunca 0
+    // habiendo sesión elegible).
+    EXPECT_EQ(selectMusicSession(refs, "com.ivanna.omega", "", {4057}).sessionId, 4057);
+    // Entre dos degradadas decide cnt/id como antes.
+    const std::vector<AudioSessionRef> refs2 = {
+        {4057, 5, 2000, 1000, "com.aspiro.tidal"},
+        {4100, 1, 2001, 1000, "com.spotify.music"},
+    };
+    EXPECT_EQ(selectMusicSession(refs2, "com.ivanna.omega", "", {4057, 4100}).sessionId, 4057);
+}
+
+TEST(SessionDiscovery, DemotedKeepsForegroundAndCnt) {
+    using ivanna::daemon::selectMusicSession;
+    // Degradada en foreground: el foreground NO se pierde (solo el bonus
+    // de música). Frente a otra música no degradada, la no degradada gana.
+    const std::vector<AudioSessionRef> refs = {
+        {4057, 5, 2000, 1000, "com.aspiro.tidal"},
+        {3000, 1, 2001, 1000, "com.spotify.music"},
+    };
+    EXPECT_EQ(selectMusicSession(refs, "com.ivanna.omega", "com.aspiro.tidal", {4057})
+                  .sessionId,
+              3000);
+}
+
+// El vigilante de viveza: 5 polls mudos con otra ganadora = desalojo.
+TEST(SessionLiveness, EvictsAfterFiveSilentPollsWithOtherWinner) {
+    using ivanna::daemon::SessionLivenessTracker;
+    SessionLivenessTracker t;
+    // Primer poll: ancla los frames (no hay veredicto todavía).
+    EXPECT_FALSE(t.notePoll(4057, 2297, true, 1000ULL));
+    // 4 polls mudos más no bastan (5º contando el ancla no; el silencio
+    // se cuenta desde el 2º poll: hacen falta 5 mudos).
+    for (int i = 0; i < 4; ++i) EXPECT_FALSE(t.notePoll(4057, 2297, true, 1000ULL));
+    EXPECT_EQ(t.silentPolls(), 4);
+    // El 5º poll mudo desaloja.
+    EXPECT_TRUE(t.notePoll(4057, 2297, true, 1000ULL));
+}
+
+TEST(SessionLiveness, FramesAdvancingNeverEvicts) {
+    using ivanna::daemon::SessionLivenessTracker;
+    SessionLivenessTracker t;
+    uint64_t frames = 0;
+    for (int i = 0; i < 20; ++i) {
+        frames += 480;
+        EXPECT_FALSE(t.notePoll(4057, 2297, true, frames));
+        // El primer poll solo ancla los frames (sin referencia previa no
+        // hay "avance" que reportar); desde el 2º, cada avance se nota.
+        if (i > 0) EXPECT_TRUE(t.advancedOnLastPoll());
+    }
+    EXPECT_EQ(t.silentPolls(), 0);
+}
+
+TEST(SessionLiveness, NoEvictionWithoutOtherWinner) {
+    using ivanna::daemon::SessionLivenessTracker;
+    SessionLivenessTracker t;
+    EXPECT_FALSE(t.notePoll(4057, 4057, true, 1000ULL));
+    // La ganadora es la misma confirmada (o 0): muda 10 polls, sin desalojo.
+    for (int i = 0; i < 10; ++i) EXPECT_FALSE(t.notePoll(4057, 4057, true, 1000ULL));
+    for (int i = 0; i < 10; ++i) EXPECT_FALSE(t.notePoll(4057, 0, true, 1000ULL));
+    EXPECT_EQ(t.silentPolls(), 20);
+}
+
+TEST(SessionLiveness, NoBeaconMeansNoVerdict) {
+    using ivanna::daemon::SessionLivenessTracker;
+    SessionLivenessTracker t;
+    // Sin beacon (efecto apagado / Ruta B en pausa): nunca se desaloja.
+    for (int i = 0; i < 10; ++i) EXPECT_FALSE(t.notePoll(4057, 2297, false, 0ULL));
+    EXPECT_EQ(t.silentPolls(), 0);
+}
+
+TEST(SessionLiveness, BeaconResetCountsAsActivity) {
+    using ivanna::daemon::SessionLivenessTracker;
+    SessionLivenessTracker t;
+    EXPECT_FALSE(t.notePoll(4057, 2297, true, 5000ULL));
+    for (int i = 0; i < 4; ++i) EXPECT_FALSE(t.notePoll(4057, 2297, true, 5000ULL));
+    EXPECT_EQ(t.silentPolls(), 4);
+    // El efecto reinició (frames a 0): actividad, el silencio se resetea.
+    EXPECT_FALSE(t.notePoll(4057, 2297, true, 0ULL));
+    EXPECT_EQ(t.silentPolls(), 0);
+    EXPECT_TRUE(t.advancedOnLastPoll());
+}
+
+TEST(SessionLiveness, NoConfirmedSessionIsNoop) {
+    using ivanna::daemon::SessionLivenessTracker;
+    SessionLivenessTracker t;
+    for (int i = 0; i < 10; ++i) EXPECT_FALSE(t.notePoll(0, 2297, true, 1000ULL));
+}
+
+TEST(DemotedSessions, AddRedeemPrune) {
+    using ivanna::daemon::DemotedSessions;
+    DemotedSessions d;
+    EXPECT_TRUE(d.empty());
+    d.add(4057);
+    d.add(4057);  // idempotente
+    EXPECT_TRUE(d.contains(4057));
+    EXPECT_EQ(d.ids().size(), 1u);
+    d.add(0);  // inválido: no entra
+    EXPECT_EQ(d.ids().size(), 1u);
+    d.redeem(4057);
+    EXPECT_TRUE(d.empty());
+    d.add(4057);
+    d.add(4100);
+    // Poda: la 4100 ya no está en refs, la 4057 sí.
+    const std::vector<AudioSessionRef> refs = {
+        {4057, 1, 2000, 1000, "com.aspiro.tidal"},
+    };
+    d.pruneAbsent(refs);
+    EXPECT_TRUE(d.contains(4057));
+    EXPECT_FALSE(d.contains(4100));
+}
+
+TEST(SessionChangeGate, EvictDropsConfirmedAndBumpsGen) {
+    using ivanna::daemon::SessionChangeGate;
+    using ivanna::daemon::SessionDiscoveryOutcome;
+    using ivanna::daemon::SessionDiscoveryStatus;
+    using ivanna::daemon::applyDiscoveryPoll;
+    SessionChangeGate g;
+    int32_t sid = 0;
+    uint64_t gen = 0;
+    std::string pkg;
+    auto found = [](int32_t id, const char* p) {
+        SessionDiscoveryOutcome o;
+        o.status = SessionDiscoveryStatus::kFound;
+        o.sessionId = id;
+        o.packageName = p;
+        return o;
+    };
+    for (int i = 0; i < 3; ++i) applyDiscoveryPoll(g, found(4057, "com.aspiro.tidal"), sid, gen, pkg);
+    ASSERT_EQ(sid, 4057);
+    ASSERT_EQ(gen, 1u);
+    const uint64_t genBefore = g.sessionGen();
+    g.evict();
+    EXPECT_EQ(g.sessionId(), 0);
+    EXPECT_EQ(g.sessionGen(), genBefore + 1u);
+    // Tras el desalojo, la viva se confirma en 3 polls como si fuera nueva.
+    EXPECT_FALSE(applyDiscoveryPoll(g, found(2297, "com.android.chrome"), sid, gen, pkg));
+    EXPECT_FALSE(applyDiscoveryPoll(g, found(2297, "com.android.chrome"), sid, gen, pkg));
+    EXPECT_TRUE(applyDiscoveryPoll(g, found(2297, "com.android.chrome"), sid, gen, pkg));
+    EXPECT_EQ(sid, 2297);
+}

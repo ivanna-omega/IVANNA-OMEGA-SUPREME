@@ -243,7 +243,15 @@ public:
                 const double itdMeas = std::clamp(ipd / (2.0 * kHolosPiF * fc), -0.0008, 0.0008);
                 const double rCur = s.r;
                 double thetaEst;
-                if (fc < 700.0) {
+                // P3/3.2 (guarda antifase, 2026-11-26): IPD ≈ ±π con ILD ≈ 0
+                // es POLARIDAD (contenido antifase, p. ej. side puro), NO un
+                // retardo — ver OrbeBinaural::estimateBands (misma guarda).
+                // Sin ella, thetaFromItd saturaba a ±90° aleatorio y el
+                // side rotado perdía potencia (S puro −0.06 dB).
+                const bool antiphase = std::fabs(ipd) > 2.9 && std::fabs(ildMeas) < 1.0;
+                if (antiphase) {
+                    thetaEst = 0.0;
+                } else if (fc < 700.0) {
                     thetaEst = thetaFromItd(itdMeas, rCur);
                 } else {
                     thetaEst = thetaFromIld(ildMeas, rCur, fc);

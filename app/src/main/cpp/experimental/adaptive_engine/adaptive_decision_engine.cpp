@@ -17,9 +17,10 @@ namespace {
 constexpr float kEps = 1e-8f;
 
 // SafetyLimiter defaults (include/SafetyLimiter.h): threshold=-4 dBFS
-// (0.63096), ceiling=-0.1 dBFS (0.98855). Safety margin is measured against
-// the output ceiling; limiter attenuation telemetry arrives in dB separately.
-constexpr float kLimiterCeiling = 0.98855f;
+// (0.63096), ceiling=-0.1 dBFS (0.9885531f, FusedDynamics::kLimiterCeiling).
+// Safety margin is measured against the output ceiling; limiter attenuation
+// telemetry arrives in dB separately.
+constexpr float kLimiterCeiling = ivanna::fused::FusedDynamics::kLimiterCeiling;
 
 inline float clamp01(float x) noexcept {
     if (!std::isfinite(x)) return 0.0f;   // NaN/Inf nunca sale de esta función

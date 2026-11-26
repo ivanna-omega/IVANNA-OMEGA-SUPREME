@@ -63,6 +63,13 @@
  */
 
 #include <algorithm>
+// Techo único −0.1 dBFS (P3/3.5, 2026-11-26): el default de
+// gainReductionLinearToDb y la constante local del .cpp usaban el literal
+// viejo de 5 decimales; ahora usan FusedDynamics::kLimiterCeiling (0.9885531f).
+// Requiere `-I <app/src/main/cpp>` (Android: ${CMAKE_SOURCE_DIR} en el
+// path; host: `..` añadido a los tres targets standalone que compilan
+// este módulo en tests/CMakeLists.txt).
+#include "fused/fused_dynamics.hpp"
 #include <cmath>
 #include <atomic>
 #include <array>
@@ -458,7 +465,9 @@ public:
     // audio thread real) no existe todavía porque RawAudioMetrics no se
     // calcula en ningún lado del hot-path actual (ver README.md, punto 1
     // de Fase 4). Queda lista y testeada para cuando ese wiring se decida.
-    static float gainReductionLinearToDb(float peakExcessLinear, float ceiling = 0.98855f) noexcept;
+    static float gainReductionLinearToDb(
+        float peakExcessLinear,
+        float ceiling = ivanna::fused::FusedDynamics::kLimiterCeiling) noexcept;
 
     // Combina las funciones puras en un AdaptiveState completo.
     // Soporta evaluación con o sin fatiga acumulada (default 0.0f para compatibilidad total).

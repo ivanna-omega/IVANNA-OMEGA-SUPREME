@@ -395,38 +395,88 @@ static_assert((OMEGA_EFFECT_FEATURES_MASK & 0x0000FFFFu) == 0u,
 // persistido); el daemon root no tiene AudioManager y el efecto en el HAL
 // tampoco puede preguntarlo. Por eso el modo viaja EN el snapshot, puesto
 // por la app vía SET_PERCEPTUAL_STATE ("outputMode"), y el EFECTO lo hace
-// cumplir en omega_apply_snapshot (omega_effect.cpp): con SPEAKERS la
-// cadena de audífonos (ORBE/HOLOS/upmix/RIR/EQ) se neutraliza a 0 en el
-// efecto, SIN reescribir el snapshot y SIN apagar ORBE/HOLOS globalmente
-// (siguen activos para audífonos).
+// cumplir en omega_apply_snapshot (omega_effect.cpp).
+//
+// TERCER MODO — GENEZI (evol-holos, 2026-11-26): la v2.5.483 decidió que
+// el DAC USB → Genezi NO es bocina plana ni audífono: los montos
+// BINAURALES del usuario pasan (ORBE/HOLOS, spatialWidth, harmonicGain,
+// antiDolby) y los GENERALES quedan en neutro. Pero esa decisión solo se
+// implementó en la puerta de la app (RouteBDeviceGate): el Genezi
+// codificaba como SPEAKERS (2) y el efecto lo neutralizaba TODO
+// (speakersGate → orbe/holos amount 0), así que el holograma nunca sonó
+// en vivo aunque el snapshot trajera 1.0. El valor 3 del campo de 2 bits
+// estaba reservado: ahora es GENEZI. Bocina plana sigue en SPEAKERS (2)
+// con la cadena de audífonos neutralizada; lo que las distingue (kernel
+// Volterra Genezi, XTC, Aux Field) sigue viajando por sus propios campos
+// y NO lo toca esta puerta.
 // Codificación: bits 18..19 de temporal_field (libres: temporal 0..4, XTC
 // bit 5, FotoHolo 6..15, features HRTF/adaptive 16..17, resto libre).
 // Sin cambio de ABI por este campo: reusa bits libres de temporal_field
 // (no añade campos al struct); los lectores antiguos enmascaran solo sus bits y los
 // escritores antiguos dejan 0 = UNKNOWN. UNKNOWN = fail-closed: el efecto
 // conserva el comportamiento actual (aplicar el snapshot tal cual) y no
-// deja el audio en silencio. SPEAKERS cubre Genezi (DAC USB JieLi,
-// TYPE_USB_HEADSET con usbDacTarget=SPEAKERS) y bocina genérica: ambas
-// reciben la cadena de audífonos neutralizada; lo que las distingue
-// (kernel Volterra Genezi, XTC, Aux Field) sigue viajando por sus propios
-// campos y NO lo toca esta puerta.
+// deja el audio en silencio. Compatibilidad: un daemon viejo decodifica 3
+// como UNKNOWN (aplica el snapshot tal cual: el holograma pasa, y lo
+// general ya viene neutralizado por la puerta de la app nueva); una app
+// vieja nunca emite 3, así que un efecto nuevo no cambia su conducta.
 enum class OmegaOutputMode : uint32_t {
     UNKNOWN    = 0u,  // sin publicar: fail-closed, aplicar snapshot tal cual
     HEADPHONES = 1u,  // audífonos: cadena binaural del usuario, sin cambios
-    SPEAKERS   = 2u,  // Genezi / bocinas: cadena de audífonos neutralizada
+    SPEAKERS   = 2u,  // bocina plana/genérica: cadena de audífonos neutralizada
+    GENEZI     = 3u,  // DAC USB → Genezi: holograma del usuario, general neutro
 };
 constexpr uint32_t OMEGA_OUTPUT_MODE_SHIFT = 18u;
 constexpr uint32_t OMEGA_OUTPUT_MODE_MASK  = (0x3u << OMEGA_OUTPUT_MODE_SHIFT);
 inline uint32_t omega_output_mode_encode(OmegaOutputMode mode) noexcept {
     const uint32_t v = (mode == OmegaOutputMode::HEADPHONES) ? 1u
-                     : (mode == OmegaOutputMode::SPEAKERS)   ? 2u : 0u;
+                     : (mode == OmegaOutputMode::SPEAKERS)   ? 2u
+                     : (mode == OmegaOutputMode::GENEZI)     ? 3u : 0u;
     return v << OMEGA_OUTPUT_MODE_SHIFT;
 }
 inline OmegaOutputMode omega_output_mode_decode(uint32_t field) noexcept {
     const uint32_t v = (field & OMEGA_OUTPUT_MODE_MASK) >> OMEGA_OUTPUT_MODE_SHIFT;
     if (v == 1u) return OmegaOutputMode::HEADPHONES;
     if (v == 2u) return OmegaOutputMode::SPEAKERS;
-    return OmegaOutputMode::UNKNOWN;  // 0 y 3 (reservado) = desconocido
+    if (v == 3u) return OmegaOutputMode::GENEZI;
+    return OmegaOutputMode::UNKNOWN;  // 0 = desconocido
+}
+// ── Rangos canónicos del plano de control (app → daemon → efecto) ────────
+// CORONA / ATREVIDA (directiva Esse 2026-11-24/25): el preset atrevido es
+// HOLOS amount 1.0, spread 1.2, proximidad 6.0 dB, diffuse 0.85,
+// harmonics 0.002. Los clamps del efecto de Ruta B (omega_effect.cpp,
+// "SOBRE 380") lo recortaban a amount 0.5 / diffuse 0.5 / spread 1.0
+// aunque el daemon, el JNI y la app ya admitían los valores CORONA: la
+// app subió su sobre (ParameterStore ENVELOPE_380) en la 502 pero el
+// efecto nunca se actualizó. Estos helpers son LA ÚNICA fuente de los
+// topes: los usan el daemon (applyPendingPerceptual) y el efecto
+// (omega_apply_snapshot) para no volver a divergir. Un snapshot corrupto
+// sigue sin poder mover el motor fuera de estos rangos.
+// ¿La puerta binaural apaga ORBE/HOLOS? SOLO bocina plana (SPEAKERS).
+// GENEZI deja pasar el holograma del usuario (v2.5.483, tercer modo);
+// HEADPHONES y UNKNOWN lo dejan pasar como siempre.
+inline float omega_clamp_orbe_amount(float v) noexcept {
+    return std::clamp(v, 0.f, 1.f);
+}
+inline float omega_clamp_orbe_spread(float v) noexcept {
+    return std::clamp(v, 0.f, 1.5f);  // CORONA 1.2
+}
+inline float omega_clamp_holos_amount(float v) noexcept {
+    return std::clamp(v, 0.f, 1.f);  // CORONA 1.0
+}
+inline float omega_clamp_holos_diffuse(float v) noexcept {
+    return std::clamp(v, 0.f, 1.f);  // CORONA 0.85
+}
+inline bool omega_output_binaural_gated(OmegaOutputMode mode) noexcept {
+    return mode == OmegaOutputMode::SPEAKERS;
+}
+// ¿El modo es de altavoz (bocina plana o Genezi)? La calibración del
+// gemelo, la matriz TΩ y el XTC/AuxField del trayecto Genezi se gobiernan
+// por "altavoz", no por "bocina plana": GENEZI es altavoz a estos efectos
+// (su calibración medida es la del Genezi). La puerta BINAURAL
+// (omega_output_binaural_gated) es más estrecha: solo SPEAKERS apaga
+// ORBE/HOLOS.
+inline bool omega_output_is_speakers_like(OmegaOutputMode mode) noexcept {
+    return mode == OmegaOutputMode::SPEAKERS || mode == OmegaOutputMode::GENEZI;
 }
 static_assert((OMEGA_OUTPUT_MODE_MASK & OMEGA_EFFECT_FEATURES_MASK) == 0u,
               "Output-mode bits must not overlap Route-B feature flags");

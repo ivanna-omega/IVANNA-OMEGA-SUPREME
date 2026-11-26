@@ -10,9 +10,15 @@
 // FusedControls).
 //
 // Reglas duras:
-//  - Matched-LUFS: ganancia neta 0.0 dB siempre. Cada operador es
-//    ganancia 1.0 exacta en neutro; fuera de neutro, la única ganancia es
-//    la que dictan sus controles.
+//  - Matched-LUFS: ganancia neta 0.0 dB SOLO EN NEUTRO (bit-transparente)
+//    y como objetivo NOMINAL de P8 (el compilador compensa la pérdida
+//    MEDIDA con el trim; ver experience_compiler.cpp). NO es una
+//    propiedad de la cadena enganchada: la P0 enganchada sin trim mide
+//    −6.065/−6.274 dB en banda ancha (p0_reference_values.hpp) y ALL7
+//    a 1.0 mide −14.18 dB (test_p1p4_ablation.cpp, sonda #1432). La
+//    afirmación vieja ("0.0 dB siempre") quedó RETIRADA el 2026-11-26
+//    (P1+P4, ver tests/p1p4_golden_rule.md): fuera de neutro, la única
+//    ganancia es la que dictan los controles Y la que mide la cadena.
 //  - Neutro = bit-transparente: process() no toca el buffer cuando
 //    isNeutral() es true (así la cadena en doble precisión mide el piso
 //    aritmético, no el redondeo float32).
@@ -79,7 +85,11 @@ struct SpatialControls {
         hrtfWet = clampf(hrtfWet, 0.0f, 1.0f);
         upmixImmersivity = clampf(upmixImmersivity, 0.0f, 2.0f);
         parallaxAmount = clampf(parallaxAmount, 0.0f, 1.0f);
-        if (mode != OmegaOutputMode::HEADPHONES && mode != OmegaOutputMode::SPEAKERS)
+        // GENEZI (evol-holos, 2026-11-26) es modo válido: NO se reescribe
+        // a HEADPHONES (antes cualquier modo distinto de HEADPHONES/
+        // SPEAKERS caía a HEADPHONES y el Genezi perdía su distinción).
+        if (mode != OmegaOutputMode::HEADPHONES && mode != OmegaOutputMode::SPEAKERS &&
+            mode != OmegaOutputMode::GENEZI)
             mode = OmegaOutputMode::HEADPHONES;
     }
     // Neutro = nada de espacialización: la señal sale idéntica.
@@ -91,7 +101,9 @@ struct SpatialControls {
     // exige); las colas de fundido las cubre FusedSpatial::process() con
     // hasActiveTail(), no isNeutral().
     bool isNeutral() const noexcept {
-        const bool auxActive = (mode == OmegaOutputMode::SPEAKERS) && auxEnabled;
+        // En GENEZI el AuxField también corre (como en SPEAKERS): con
+        // auxEnabled la salida NO es bit-exacta.
+        const bool auxActive = ivanna::omega_output_is_speakers_like(mode) && auxEnabled;
         return !auxActive && amount <= 0.0f && wfsSpread <= 0.0f && width == 1.0f &&
                hrtfWet <= 0.0f && !xtcEnabled && !upmixEnabled;
     }
@@ -132,7 +144,10 @@ struct FieldControls {
         warmth = clampf(warmth, 0.0f, 1.0f);
         dynamics = clampf(dynamics, 0.0f, 1.0f);
         roomRt60 = clampf(roomRt60, 0.05f, 1.5f);
-        if (mode != OmegaOutputMode::HEADPHONES && mode != OmegaOutputMode::SPEAKERS)
+        // GENEZI (evol-holos, 2026-11-26) es modo válido: NO se reescribe
+        // a HEADPHONES (ver SpatialControls::clamp).
+        if (mode != OmegaOutputMode::HEADPHONES && mode != OmegaOutputMode::SPEAKERS &&
+            mode != OmegaOutputMode::GENEZI)
             mode = OmegaOutputMode::HEADPHONES;
     }
     bool isNeutral() const noexcept { return amount <= 0.0f && phiAmount <= 0.0f; }
@@ -194,7 +209,11 @@ struct TransducerControls {
 // Controles (solo estos): curva, trim.
 struct TonalControls {
     int curve = 1;           // 0 = plana, 1 = Harman 2018, 2 = élite (insignia).
-    float trimDb = 0.0f;     // trim -24..+24 dB (neto 0.0 dB por Matched-LUFS).
+    float trimDb = 0.0f;     // trim -24..+24 dB (compensador maestro P8:
+                             // lleva la ganancia neta NOMINAL a 0.0 dB
+                             // compensando la pérdida MEDIDA de la cadena;
+                             // la cadena sin trim NO es 0.0 dB, ver
+                             // tests/p1p4_golden_rule.md).
     // El rango es ±24 dB (antes ±6 dB) porque el trim es el compensador
     // maestro de P8: la cadena real pierde ~14.2 dB con los 7 operadores
     // a 1.0 (NEURO solo −15.57 dB/unidad, medido, fix #1432 2026-11-25)

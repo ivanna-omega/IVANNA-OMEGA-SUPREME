@@ -210,6 +210,24 @@ inline bool looksLikePackageName(const std::string& cmd) noexcept {
 // una app en foreground que NO es música (p. ej. un juego) NO le roba la
 // sesión a la música que suena en segundo plano. Sin foreground (""), el
 // ranking es exactamente el de antes.
+//
+// EVOL-LIVEPATH (2026-11-26, sesión rancia 4057): el ranking NO distingue
+// una sesión de música EN PAUSA de una SONANDO — las refs de dumpsys no
+// traen actividad. Una app de música en pausa (Tidal en fondo, sesión
+// 4057) ganaba SIEMPRE a la sesión que suena de verdad cuando el
+// reproductor vivo no tiene hint de música (Qobuz web en Chrome:
+// com.android.chrome, sin hint, cnt 1): el daemon publicaba 4057 para
+// siempre, la app acoplaba omega a una sesión muerta y el efecto procesaba
+// 0 frames (snapshot RMS=0 con música sonando, 2026-11-26 02:44 CST).
+// El remedio es el bucle de realimentación con el beacon (ver
+// SessionLivenessTracker + DemotedSessions abajo): una sesión confirmada
+// que no produce frames del efecto durante >= 5 polls (~15 s) mientras
+// OTRA sesión es la ganadora del poll se degrada (demoted): pierde contra
+// CUALQUIER sesión no degradada (quitarle solo el bonus de música no
+// bastaba: la pausada puede colgar cnt alto) hasta que desaparece de las
+// refs o vuelve a sonar (redención). Si TODAS las elegibles están
+// degradadas, gana la mejor degradada (fail-safe: nunca se publica 0
+// habiendo sesión elegible).
 struct MusicSessionChoice {
     int32_t sessionId = 0;      // 0 = ninguna elegible (fail-closed)
     std::string packageName;    // package de la sesión elegida ("" si ninguna)
@@ -217,14 +235,20 @@ struct MusicSessionChoice {
 
 inline MusicSessionChoice selectMusicSession(const std::vector<AudioSessionRef>& refs,
                                              const std::string& ownPackage = "com.ivanna.omega",
-                                             const std::string& foregroundPackage = "") noexcept {
-    struct Agg { int32_t sessionId = 0; int32_t cnt = 0; bool hasMusic = false; bool hasEligible = false; bool hasForeground = false; std::string packageName; };
+                                             const std::string& foregroundPackage = "",
+                                             const std::vector<int32_t>& demotedSessions = {}) noexcept {
+    struct Agg { int32_t sessionId = 0; int32_t cnt = 0; bool hasMusic = false; bool hasEligible = false; bool hasForeground = false; bool demoted = false; std::string packageName; };
     std::vector<Agg> aggs;
     for (const auto& r : refs) {
         if (r.sessionId <= 0) continue;
         auto it = std::find_if(aggs.begin(), aggs.end(),
                                [&](const Agg& a) { return a.sessionId == r.sessionId; });
-        if (it == aggs.end()) { aggs.push_back(Agg{r.sessionId, 0, false, false, false, ""}); it = aggs.end() - 1; }
+        if (it == aggs.end()) {
+            const bool dem = std::find(demotedSessions.begin(), demotedSessions.end(),
+                                       r.sessionId) != demotedSessions.end();
+            aggs.push_back(Agg{r.sessionId, 0, false, false, false, dem, ""});
+            it = aggs.end() - 1;
+        }
         it->cnt += r.cnt;
         if (!packageIsExcluded(r.packageName, ownPackage)) {
             it->hasEligible = true;
@@ -237,6 +261,14 @@ inline MusicSessionChoice selectMusicSession(const std::vector<AudioSessionRef>&
     for (const auto& a : aggs) {
         if (!a.hasEligible) continue;
         if (best == nullptr) { best = &a; continue; }
+        // Clave: (NO degradada, música, foreground, cnt, sessionId). Una
+        // sesión degradada (probada muda por el beacon) pierde contra
+        // CUALQUIER sesión no degradada — quitarle solo el bonus de música
+        // no bastaba: una app en pausa puede colgar cnt alto (Tidal 4057
+        // con cnt 5 seguía ganando a la viva 2297 con cnt 1). Entre
+        // degradadas decide el ranking normal (fail-safe: si no hay otra,
+        // la degradada gana).
+        if (a.demoted != best->demoted) { if (!a.demoted) best = &a; continue; }
         if (a.hasMusic != best->hasMusic) { if (a.hasMusic) best = &a; continue; }
         if (a.hasForeground != best->hasForeground) { if (a.hasForeground) best = &a; continue; }
         if (a.cnt != best->cnt) { if (a.cnt > best->cnt) best = &a; continue; }
@@ -248,8 +280,9 @@ inline MusicSessionChoice selectMusicSession(const std::vector<AudioSessionRef>&
 
 inline int32_t selectMusicSessionId(const std::vector<AudioSessionRef>& refs,
                                     const std::string& ownPackage = "com.ivanna.omega",
-                                    const std::string& foregroundPackage = "") noexcept {
-    return selectMusicSession(refs, ownPackage, foregroundPackage).sessionId;
+                                    const std::string& foregroundPackage = "",
+                                    const std::vector<int32_t>& demotedSessions = {}) noexcept {
+    return selectMusicSession(refs, ownPackage, foregroundPackage, demotedSessions).sessionId;
 }
 
 // ── App en foreground por /proc (daemon root) ───────────────────────────────
@@ -436,6 +469,17 @@ struct SessionChangeGate {
 
     int32_t sessionId() const noexcept { return confirmedSessionId_; }
     uint64_t sessionGen() const noexcept { return confirmedGen_; }
+    // EVOL-LIVEPATH (2026-11-26): desalojo forzado por el vigilante de
+    // viveza (SessionLivenessTracker). Suelta la sesión confirmada SIN
+    // esperar sus 3 polls de caída: el llamador publica sesión 0 (y
+    // resetea el snapshot a neutro) y el gate vuelve a confirmar desde
+    // cero en los polls siguientes. confirmedGen_ sube para que la app
+    // note el cambio y desacople el efecto de la sesión muerta.
+    void evict() noexcept {
+        confirmedSessionId_ = 0;
+        pendingSessionId_ = 0; pendingCount_ = 0; noneCount_ = 0;
+        ++confirmedGen_;
+    }
     // Solo para tests/diagnóstico: candidato pendiente y contadores.
     int32_t pendingSessionId() const noexcept { return pendingSessionId_; }
     int pendingCount() const noexcept { return pendingCount_; }
@@ -447,6 +491,105 @@ struct SessionChangeGate {
     int32_t pendingSessionId_ = 0;    // candidato aún no confirmado (0 = ninguno)
     int pendingCount_ = 0;            // polls seguidos reportando al candidato
     int noneCount_ = 0;               // kNone seguidos con sesión confirmada
+};
+
+// ── Vigilante de viveza de la sesión confirmada (EVOL-LIVEPATH) ──────────
+// CAUSA RAÍZ (sesión rancia 4057, 2026-11-26): dumpsys no dice si una
+// sesión SUENA; solo dice que existe. La única evidencia de "esta sesión
+// suena" que tiene el daemon es el beacon del efecto: frames avanzando
+// (effectBeacon.frames) con last_block_ms fresco = el efecto procesa
+// audio AHORA. Si la sesión confirmada lleva >= kSilentPollsToEvict polls
+// (~15 s) sin que avance NI UN frame del beacon Y el poll crudo trae OTRA
+// sesión como ganadora, la confirmada está muerta (app en pausa con la
+// ref colgada, o sesión huérfana) y se desaloja: el llamador publica 0,
+// degrada la sesión (DemotedSessions) y el gate confirma la viva en <= 9 s.
+//   - Sin beacon disponible (efecto no corre / sin archivo): NO se juzga
+//     (fail-closed: una Ruta B apagada no es una sesión muerta).
+//   - Sin otra ganadora (la confirmada sigue siendo la única elegible):
+//     NO se desaloja (no hay a dónde ir; publicar 0 no haría sonar nada).
+//   - Cualquier cambio en frames (sube, o resetea a 0 por reinicio del
+//     efecto) cuenta como actividad: el silencio exige igualdad exacta.
+//   - Sin sesión confirmada: no hay nada que vigilar.
+// Puro (sin I/O): el bucle del daemon lo alimenta con el frames del
+// beacon leído en cada poll de descubrimiento (~3 s). Unit-testeable.
+struct SessionLivenessTracker {
+    static constexpr int kSilentPollsToEvict = 5;  // ~15 s a 3 s/poll
+
+    // Un poll de descubrimiento. Devuelve true solo cuando hay que
+    // desalojar la sesión confirmada AHORA.
+    bool notePoll(int32_t confirmedSessionId, int32_t pollWinnerSessionId,
+                  bool beaconAvailable, uint64_t beaconFrames) noexcept {
+        if (confirmedSessionId <= 0) { reset(); return false; }
+        if (!beaconAvailable) { reset(); return false; }  // sin juez, sin veredicto
+        if (!haveFrames_) {
+            lastFrames_ = beaconFrames;
+            haveFrames_ = true;
+            advancedLastPoll_ = false;
+            silentPolls_ = 0;
+            return false;
+        }
+        if (beaconFrames != lastFrames_) {
+            // Actividad (o reinicio del efecto): la sesión vive.
+            lastFrames_ = beaconFrames;
+            advancedLastPoll_ = true;
+            silentPolls_ = 0;
+            return false;
+        }
+        ++silentPolls_;
+        advancedLastPoll_ = false;
+        if (silentPolls_ >= kSilentPollsToEvict && pollWinnerSessionId > 0 &&
+            pollWinnerSessionId != confirmedSessionId) {
+            reset();
+            return true;
+        }
+        return false;
+    }
+
+    int silentPolls() const noexcept { return silentPolls_; }
+    // true si en el último poll los frames del beacon AVANZARON (la sesión
+    // confirmada suena): el llamador redime la sesión en DemotedSessions.
+    bool advancedOnLastPoll() const noexcept { return advancedLastPoll_; }
+    void reset() noexcept { haveFrames_ = false; lastFrames_ = 0; silentPolls_ = 0; advancedLastPoll_ = false; }
+
+ private:
+    uint64_t lastFrames_ = 0;
+    bool haveFrames_ = false;
+    bool advancedLastPoll_ = false;
+    int silentPolls_ = 0;
+};
+
+// ── Sesiones degradadas (EVOL-LIVEPATH) ────────────────────────────────────
+// Lista pequeña (una o dos sesiones) que el vigilante de viveza degradó.
+// Una sesión degradada pierde la prioridad de música en selectMusicSession
+// hasta que (a) desaparece de las refs de dumpsys (la app la soltó: se
+// poda), o (b) vuelve a sonar con el efecto acoplado (redención: el
+// llamador la quita cuando sus frames avanzan siendo la confirmada).
+// Sin TTL de reloj: una sesión en pausa puede colgar su ref horas; lo que
+// la rehabilita es sonar de verdad, no el paso del tiempo.
+struct DemotedSessions {
+    void add(int32_t id) noexcept {
+        if (id <= 0 || contains(id)) return;
+        ids_.push_back(id);
+    }
+    void redeem(int32_t id) noexcept {
+        ids_.erase(std::remove(ids_.begin(), ids_.end(), id), ids_.end());
+    }
+    void pruneAbsent(const std::vector<AudioSessionRef>& refs) noexcept {
+        ids_.erase(std::remove_if(ids_.begin(), ids_.end(), [&](int32_t id) {
+                       for (const auto& r : refs)
+                           if (r.sessionId == id) return false;
+                       return true;
+                   }),
+                   ids_.end());
+    }
+    bool contains(int32_t id) const noexcept {
+        return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
+    }
+    const std::vector<int32_t>& ids() const noexcept { return ids_; }
+    bool empty() const noexcept { return ids_.empty(); }
+
+ private:
+    std::vector<int32_t> ids_;
 };
 
 // ── Cableado del gate en el bucle del daemon (CORONA Frente A, defecto 4) ──
@@ -491,8 +634,12 @@ inline bool applyDiscoveryPoll(SessionChangeGate& gate,
 // dumpsys funciona pero no hay sesión de música: el llamador SÍ debe
 // publicar 0 (la música paró). Lectura acotada (256 KB): la sección de
 // sesiones está cerca del inicio del dump.
+// EVOL-LIVEPATH: `demoted` (in/out) poda las sesiones degradadas que ya
+// no aparecen en las refs y se pasa al selector para que no ganen por el
+// hint de música. Sin él (overload de 1 arg) el comportamiento es el de
+// antes.
 inline SessionDiscoveryOutcome discoverMusicSession(
-        const std::string& ownPackage = "com.ivanna.omega") noexcept {
+        const std::string& ownPackage, DemotedSessions& demoted) noexcept {
     SessionDiscoveryOutcome out;
     FILE* pipe = ::popen("/system/bin/dumpsys media.audio_flinger 2>/dev/null", "r");
     if (pipe == nullptr) return out;  // kError
@@ -512,17 +659,25 @@ inline SessionDiscoveryOutcome discoverMusicSession(
     const int rc = ::pclose(pipe);
     if (rc != 0 && text.empty()) return out;  // kError (dumpsys falló sin salida)
     const auto refs = parseAudioFlingerSessionRefs(text);
+    demoted.pruneAbsent(refs);
     // FASE A: el foreground se lee en el mismo ciclo (~3 s) para que el
     // selector prefiera la sesión de la app que el usuario tiene delante.
     // Si /proc no se puede leer, foreground queda "" y el ranking es el
     // viejo (cnt, sessionId): fail-closed, nunca se inventa un foreground.
     out.foregroundPackage = readForegroundPackage();
-    const auto choice = selectMusicSession(refs, ownPackage, out.foregroundPackage);
+    const auto choice = selectMusicSession(refs, ownPackage, out.foregroundPackage,
+                                           demoted.ids());
     const int32_t sid = choice.sessionId;
     out.status = (sid > 0) ? SessionDiscoveryStatus::kFound : SessionDiscoveryStatus::kNone;
     out.sessionId = sid;
     out.packageName = sanitizePackageName(choice.packageName);
     return out;
+}
+
+inline SessionDiscoveryOutcome discoverMusicSession(
+        const std::string& ownPackage = "com.ivanna.omega") noexcept {
+    DemotedSessions none;
+    return discoverMusicSession(ownPackage, none);
 }
 
 } // namespace ivanna::daemon

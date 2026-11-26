@@ -1470,6 +1470,24 @@ Java_com_ivanna_omega_dsp_DSPBridge_nativeSetNewPhysicsParams(
     syncNewPhysicsRouteA();
 }
 
+// ── Calibración medida del Genezi (tri21 + H_b 24 + headroom 24) ─────────
+// ADMISIÓN P1+P4 (2026-11-26, verificada por grep en todo el árbol):
+// este JNI EXISTE y funciona (lo usa el test
+// test_new_physics_consolidated.cpp), pero NINGÚN llamador Kotlin lo
+// invoca en vivo: DSPBridge.loadNewPhysicsCalibration() y
+// NewPhysicsBridge.applyCalibration() no tienen call-site (grep:
+// cero usos fuera de su propia definición). No existe ningún
+// genezi_np_cal.json ni arreglo tri21 medido en el repo o en assets.
+// Consecuencia: el kernel Genezi MEDIDO del MHC-PZ1D real NUNCA se
+// carga en el teléfono. Lo que Volterra corre en vivo es el kernel
+// Klippel APROXIMADO (H2 0.50% @85 dB SPL, Σ|k| = 0.0031, polo
+// 0.9983 — el mismo polo calibrado del Genezi, reutilizado para el
+// kernel aproximado) cargado por wakeV3Organs()/np483_defaults.hpp —
+// "Genezi" del slider Volterra y la telemetría "kernelGeneziMedido"
+// (false por defecto) deben leerse así. Para cargar un kernel medido
+// haría falta: barrido Farina en el G85 → tools/genezi_calibrate.py →
+// genezi_np_cal.json → un call-site que llame a applyCalibration()
+// (hoy no existe). Ver tests/p1p4_golden_rule.md §Genezi.
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_ivanna_omega_dsp_DSPBridge_nativeLoadNewPhysicsCalibration(
         JNIEnv* env, jobject, jfloatArray tri21L, jfloatArray tri21R,

@@ -498,4 +498,50 @@ class RouteBDeviceGateTest {
             RouteBDeviceGate.gatePerceptualCommandJson(colored, RouteBOutput.GENEZI)
         )
     }
+
+    @Test fun outputModeStampFollowsResolvedDevice() {
+        // evol-holos: el outputMode que viaja al daemon sigue al
+        // DISPOSITIVO resuelto, no al spatial.mode guardado del push que
+        // lo emite. Un push fusionado con outputMode 2 (SPEAKERS) en el
+        // Genezi sale con 3; en bocina plana queda en 2; en audífonos en 1.
+        val stale = "{\"action\":\"SET_PERCEPTUAL_STATE\",\"outputMode\":2.0,\"holosAmount\":1.0}"
+        assertEquals(
+            "{\"action\":\"SET_PERCEPTUAL_STATE\",\"outputMode\":3,\"holosAmount\":1.0}",
+            RouteBDeviceGate.gatePerceptualCommandJson(stale, RouteBOutput.GENEZI)
+        )
+        assertEquals(
+            "{\"action\":\"SET_PERCEPTUAL_STATE\",\"outputMode\":2,\"holosAmount\":0}",
+            RouteBDeviceGate.gatePerceptualCommandJson(stale, RouteBOutput.SPEAKERS)
+        )
+        assertEquals(
+            "{\"action\":\"SET_PERCEPTUAL_STATE\",\"outputMode\":1,\"holosAmount\":1.0}",
+            RouteBDeviceGate.gatePerceptualCommandJson(stale, RouteBOutput.HEADPHONES)
+        )
+        // La sobrecarga booleana hereda el sello (false = SPEAKERS).
+        assertEquals(
+            "{\"action\":\"SET_PERCEPTUAL_STATE\",\"outputMode\":2,\"holosAmount\":0}",
+            RouteBDeviceGate.gatePerceptualCommandJson(stale, false)
+        )
+        assertEquals(
+            "{\"action\":\"SET_PERCEPTUAL_STATE\",\"outputMode\":1,\"holosAmount\":1.0}",
+            RouteBDeviceGate.gatePerceptualCommandJson(stale, true)
+        )
+    }
+
+    @Test fun outputModeAbsentIsNotAdded() {
+        // Sin outputMode en el comando, el gate NO lo inventa en ningún
+        // modo (mismo contrato que el resto de campos:
+        // missingFieldsNotAdded).
+        assertEquals(
+            coloredPerceptual,
+            RouteBDeviceGate.gatePerceptualCommandJson(coloredPerceptual, RouteBOutput.HEADPHONES)
+        )
+        assertEquals(
+            "{\"action\":\"SET_PERCEPTUAL_STATE\",\"orbeAmount\":1.0,\"holosAmount\":1.0," +
+            "\"spatialWidth\":1.55,\"harmonicGain\":0.78,\"antiDolby\":0.85," +
+            "\"compressor\":0,\"loudnessTarget\":0,\"exciterRed\":0," +
+            "\"highCut\":19500.0}",
+            RouteBDeviceGate.gatePerceptualCommandJson(coloredPerceptual, RouteBOutput.GENEZI)
+        )
+    }
 }

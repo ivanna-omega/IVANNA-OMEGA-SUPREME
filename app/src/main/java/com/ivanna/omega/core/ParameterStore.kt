@@ -1270,12 +1270,14 @@ class ParameterStore(context: Context) {
 /** Techos del sobre 380 — subidos por la ATREVIDA 502 (directiva Esse
  * 2026-11-24): los techos 380 (amount 0.5 / diffuse 0.5) clamparían el
  * nuevo default de fábrica (1.0 / 0.85) en la migración única de una
- * instalación limpia. Los techos de width (1.0) y orbeSpread (1.0) no
- * cambian: siguen deshaciendo los valores 384 (1.25 / 1.2). */
+ * instalación limpia. CORONA (evol-holos, 2026-11-26): orbeSpread sube
+ * a 1.2, el valor del preset (el sobre viejo recortaba el 1.2
+ * persistido de la 384 a 1.0). El techo de width (1.0) no cambia:
+ * sigue deshaciendo el 1.25 de la 384. */
 const val ENVELOPE_380_HOLOS_AMOUNT = 1.0f
 const val ENVELOPE_380_HOLOS_WIDTH = 1.0f
 const val ENVELOPE_380_HOLOS_DIFFUSE = 0.85f
-const val ENVELOPE_380_ORBE_SPREAD = 1.0f
+const val ENVELOPE_380_ORBE_SPREAD = 1.2f
 
 /** Los cuatro valores persistidos que la migración 386 clampa. */
 data class Envelope380(

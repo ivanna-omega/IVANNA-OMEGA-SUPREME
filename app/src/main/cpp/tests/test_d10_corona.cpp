@@ -171,10 +171,13 @@ TEST(D10Corona, TΩ2_ZeroSidebandsOn1kHz) {
     EXPECT_TRUE(lti.morphComplete) << "el morph del kernel LTI no completó en régimen";
     EXPECT_GE(lti.tOmegaCompiles, 1) << "compileTOmega no corrió";
     EXPECT_FALSE(legacy.kernelEngaged) << "el kernel LTI no debería engancharse con D10 OFF";
-    // UMBRAL MEDIDO (2026-11-25, g++-14 Release, este host): peor banda
-    // LTI -152.46 dB (1375 Hz L); legacy -47.08 dB. Umbral -142 dB =
-    // medido + 10.5 dB de margen. NO es el -260 dB del brinco: ese
+    // UMBRAL MEDIDO (2026-11-26, g++-14 Release, este host): peor banda
+    // LTI -153.87 dB (1375 Hz L); legacy -47.08 dB. Umbral -142 dB =
+    // medido + 11.9 dB de margen. NO es el -260 dB del brinco: ese
     // objetivo no está medido y no se afirma aquí.
+    // (El -152.46 dB citado antes era la medición pre-FIR; el valor
+    // vigente es -153.87 dB, medido en vivo 2026-11-26. El -151.57 dB
+    // no tiene fuente en el repo y no se cita.)
     EXPECT_LT(lti.worst, -142.0)
         << "bandas laterales LTI peores que -142 dB (peor " << lti.worst << " dB)";
     std::printf("[D10] TΩ2 mejora de bandas: legacy %+.2f dB -> LTI %+.2f dB (%.1f dB)\n",
@@ -242,13 +245,18 @@ TEST(D10Corona, NeutralIsBitExactZeroCost) {
 // MEDICIÓN. El árbitro YA NO corrige ganancia (su autoridad era ±3 dB
 // y la brecha medida es ~18 dB: con él ON netL=-17.86 dB, y el modelo
 // nominal P8 afirma netGainNominal=+0.000 dB mientras la cadena real
-// pierde ~20 dB con 7 operadores a 1.0 sobre tono dual-mono). Este test
-// sigue FALLANDO y queda como marcador del defecto REAL: el modelo
-// nominal P8 no describe la ganancia real de la cadena. Arreglarlo es
-// trabajo P8 (medir la ganancia real por operador en P2/P3 y corregir
-// los coeficientes nominales), NO del árbitro: ninguna ganancia del
-// árbitro puede cerrar 18 dB sin romper P0 y el techo. No se maquilla
-// el umbral.
+// pierde ~20 dB con 7 operadores a 1.0 sobre tono dual-mono).
+// ACTUALIZACIÓN 2026-11-26 (P1+P4): el test YA NO FALLA a 1 kHz — con el
+// trim compilado (+19.482 dB) la ganancia neta MEDIDA a 1 kHz es
+// −0.077/+0.076 dB, dentro de ±0.10 dB. Lo que sigue refutado es el
+// MODELO NOMINAL (la cadena sin trim pierde −14.18 dB a 1 kHz, no 0.0 dB)
+// y la regla POR BANDA: el trim es escalar y la pérdida es espectral
+// (ALL7-trim0: −7.6…−16.0 dB por banda ERB), así que el mismo trim que
+// cierra 1 kHz deja las demás bandas abiertas — ver
+// tests/p1p4_golden_rule.md §1 y P1P4Ablation.CompiledTrimClosesOnly1kHz.
+// Arreglarlo es trabajo P8 (trim por banda, no escalar), NO del árbitro:
+// ninguna ganancia del árbitro puede cerrar 18 dB sin romper P0 y el
+// techo. No se maquilla el umbral.
 TEST(D10Corona, MatchedLufsInvariantAcross7Operators) {
     FusedChain chain;
     chain.prepare(kFs);

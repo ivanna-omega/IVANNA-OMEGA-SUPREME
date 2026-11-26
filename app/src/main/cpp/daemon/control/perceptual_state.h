@@ -513,11 +513,11 @@ inline void applyPendingPerceptual(ivanna::OmegaDspSnapshot& s,
         s.upmixing_immersivity = p.upmixingImmersivity;
 
     if (!std::isnan(p.orbeAmount))
-        s.orbe_amount = std::clamp(p.orbeAmount, 0.f, 1.f);
+        s.orbe_amount = ivanna::omega_clamp_orbe_amount(p.orbeAmount);
     if (!std::isnan(p.orbeDistanceM))
         s.orbe_distance_m = std::clamp(p.orbeDistanceM, 0.15f, 2.0f);
     if (!std::isnan(p.orbeSpread))
-        s.orbe_spread = std::clamp(p.orbeSpread, 0.f, 1.5f);
+        s.orbe_spread = ivanna::omega_clamp_orbe_spread(p.orbeSpread);
     if (!std::isnan(p.orbeProximityDb))
         s.orbe_proximity_db = std::clamp(p.orbeProximityDb, 0.f, 6.f);
     if (!std::isnan(p.orbeDiffuse))
@@ -526,7 +526,7 @@ inline void applyPendingPerceptual(ivanna::OmegaDspSnapshot& s,
         s.orbe_head_tracking = (p.orbeHeadTracking >= 0.5f) ? 1u : 0u;
 
     if (!std::isnan(p.holosAmount))
-        s.holos_amount = std::clamp(p.holosAmount, 0.f, 1.f);
+        s.holos_amount = ivanna::omega_clamp_holos_amount(p.holosAmount);
     if (!std::isnan(p.holosDistanceM))
         s.holos_distance_m = std::clamp(p.holosDistanceM, 0.15f, 2.0f);
     if (!std::isnan(p.holosSpread))
@@ -534,7 +534,7 @@ inline void applyPendingPerceptual(ivanna::OmegaDspSnapshot& s,
     if (!std::isnan(p.holosProximityDb))
         s.holos_proximity_db = std::clamp(p.holosProximityDb, 0.f, 6.f);
     if (!std::isnan(p.holosDiffuse))
-        s.holos_diffuse = std::clamp(p.holosDiffuse, 0.f, 1.f);
+        s.holos_diffuse = ivanna::omega_clamp_holos_diffuse(p.holosDiffuse);
     if (!std::isnan(p.holosHarmonics))
         s.holos_harmonics = std::clamp(p.holosHarmonics, 0.f, 1.f);
     if (!std::isnan(p.holosWarmth))
@@ -829,12 +829,16 @@ inline void applyPendingPerceptual(ivanna::OmegaDspSnapshot& s,
     // FIX 1 (bofo Genezi, v2.5.465): modo de salida a temporal_field
     // bits 18..19 (omega_output_mode_encode). Solo esos dos bits se
     // tocan: el resto de temporal_field (temporal 0..4, XTC, FotoHolo,
-    // features 16..17) se conserva. Fuera de rango (>= 2.5 o < 0) =
+    // features 16..17) se conserva. Fuera de rango (>= 3.5 o < 0) =
     // UNKNOWN (fail-closed: el efecto aplica el snapshot tal cual).
+    // TERCER MODO — GENEZI (evol-holos, 2026-11-26): la app lo emite
+    // como outputMode 3 (PersistedStateRestorer.outputModeFor); 2 sigue
+    // siendo bocina plana.
     if (!std::isnan(p.outputMode)) {
         ivanna::OmegaOutputMode mode = ivanna::OmegaOutputMode::UNKNOWN;
         if (p.outputMode >= 0.5f && p.outputMode < 1.5f) mode = ivanna::OmegaOutputMode::HEADPHONES;
         else if (p.outputMode >= 1.5f && p.outputMode < 2.5f) mode = ivanna::OmegaOutputMode::SPEAKERS;
+        else if (p.outputMode >= 2.5f && p.outputMode < 3.5f) mode = ivanna::OmegaOutputMode::GENEZI;
         s.temporal_field = (s.temporal_field & ~ivanna::OMEGA_OUTPUT_MODE_MASK) |
                            ivanna::omega_output_mode_encode(mode);
     }

@@ -438,11 +438,19 @@ object PersistedStateRestorer {
 
     // FIX 1 (bofo Genezi, v2.5.465): modo de salida para el snapshot
     // (OmegaOutputMode en omega_control_bus.h: 0 = desconocido, 1 =
-    // audífonos, 2 = bocinas/Genezi). Lo resuelve RouteBDeviceGate +
-    // usbDacTarget (resolveRouteBMode); el EFECTO lo hace cumplir en
-    // omega_apply_snapshot. SPEAKERS cubre Genezi y bocina genérica.
+    // audífonos, 2 = bocinas planas, 3 = Genezi). Lo resuelve
+    // RouteBDeviceGate + usbDacTarget (resolveRouteBMode); el EFECTO lo
+    // hace cumplir en omega_apply_snapshot. TERCER MODO — GENEZI
+    // (evol-holos, 2026-11-26): el Genezi ya NO codifica como bocina
+    // plana (2): con 3 el efecto deja pasar el holograma del usuario y
+    // solo neutraliza lo general. Un daemon viejo decodifica 3 como
+    // UNKNOWN (aplica el snapshot tal cual: compatible).
     private fun outputModeFor(mode: TransducerMode): Int =
-        if (mode == TransducerMode.HEADPHONES) 1 else 2
+        when (mode) {
+            TransducerMode.HEADPHONES -> 1
+            TransducerMode.SPEAKERS_GENEZI -> 3
+            TransducerMode.SPEAKERS_GENERIC -> 2
+        }
 
     // Tronidos 493 (d): ORBE y HOLOS viajan en UN SOLO comando atómico.
     // Antes eran 2 SET_PERCEPTUAL_STATE separados (cada uno con su

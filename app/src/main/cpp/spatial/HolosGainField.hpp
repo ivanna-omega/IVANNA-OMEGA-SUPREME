@@ -37,6 +37,15 @@
 #include <algorithm>
 #include <cmath>
 
+// Techo único −0.1 dBFS (P3/3.5, 2026-11-26): FusedDynamics::kLimiterCeiling
+// (0.9885531f, el float32 más cercano a 10^(−0.1/20)). Antes estos dos
+// defaults usaban el literal viejo de 5 decimales (−0.1000271 dB); el techo final
+// de fused_chain.cpp ya usaba la constante, así que softCeil/Γ_techo y el
+// techo final divergían 2.7e-5 dB. El include resuelve en todos los TUs que
+// incluyen este header (Android: ${CMAKE_SOURCE_DIR} en el path; host:
+// `-I ..`; ver tests/CMakeLists.txt).
+#include "fused/fused_dynamics.hpp"
+
 namespace ivanna {
 namespace holos {
 
@@ -281,7 +290,8 @@ inline double widthFromState(double coherence, double widthScale) noexcept {
 // softCeil: identidad ≤0.97·ceiling; racional (continua en valor y
 // pendiente) por encima; nunca supera el ceiling. Copia exacta de
 // SafetyLimiter::softCeil (dsp/SafetyLimiter.cpp).
-inline double softCeil(double x, double ceiling = 0.98855) noexcept {
+inline double softCeil(double x, double ceiling = static_cast<double>(
+                                            ivanna::fused::FusedDynamics::kLimiterCeiling)) noexcept {
     if (!std::isfinite(x)) return 0.0;
     const double knee = ceiling * 0.97;
     const double ax = std::fabs(x);
@@ -295,7 +305,8 @@ inline double softCeil(double x, double ceiling = 0.98855) noexcept {
 // Ganancia objetivo (≤1) para un pico lineal: la curva de
 // SafetyLimiter::computeGainForPeak (threshold −1 dBFS, ceiling −0.1 dBFS).
 inline double limiterGainForPeak(double peakLin, double threshold = 0.891251,
-                                double ceiling = 0.98855) noexcept {
+                                double ceiling = static_cast<double>(
+                                    ivanna::fused::FusedDynamics::kLimiterCeiling)) noexcept {
     if (!std::isfinite(peakLin) || peakLin <= threshold) return 1.0;
     const double excess = peakLin - threshold;
     double limited = threshold + excess / (1.0 + excess * 8.0);

@@ -18,9 +18,12 @@
 // upmixer (PULSO.upmixImmersivity) se enruta a ORBE·Ω (el upmixer HOA vive
 // ahí, unidad indivisible con el decoder).
 //
-// Matched-LUFS: ganancia neta 0.0 dB. En neutro toda la cadena es
-// bit-transparente (cada operador no toca el buffer; el puente float↔double
-// es exacto en ambos sentidos para valores float).
+// Matched-LUFS: ganancia neta 0.0 dB SOLO EN NEUTRO (bit-transparente:
+// cada operador no toca el buffer; el puente float↔double es exacto en
+// ambos sentidos para valores float) y como objetivo NOMINAL de P8 (el
+// trim compensa la pérdida medida). La cadena enganchada sin trim NO es
+// 0.0 dB: P0 mide −6.065/−6.274 dB en banda ancha y ALL7 −14.18 dB
+// (test_p1p4_ablation.cpp; ver tests/p1p4_golden_rule.md).
 //
 // NOTA HONESTA — DOUBLE INTERNO EN LOS 8 OPERADORES (v2.5.486, 2026-11-20;
 // reemplaza la nota "DOUBLE SOLO EN LAS FRONTERAS" del 2026-11-18, que ya
@@ -204,11 +207,12 @@ public:
     // ── TΩ (F1/472): telemetría de la etapa espectral ────────────────────
     // Compilaciones Reloj 2 acumuladas (0 = la matriz aún no se compiló)
     // y si la etapa está enganchada ahora mismo (puerta: volumetricEnabled
-    // && !neutral && SPEAKERS). Solo lectura; sin locks.
+    // && !neutral && altavoz — bocina plana o Genezi, evol-holos).
+    // Solo lectura; sin locks.
     int tOmegaCompiles() const noexcept { return tOmegaCompiles_; }
     bool tOmegaActive() const noexcept {
         return volumetricEnabled_.load(std::memory_order_relaxed) && !isNeutral() &&
-               userControls_.spatial.mode == OmegaOutputMode::SPEAKERS;
+               ivanna::omega_output_is_speakers_like(userControls_.spatial.mode);
     }
 
     // Camino en double (núcleo). En neutro ningún operador toca el buffer.
@@ -482,6 +486,17 @@ private:
     double modeFadeGain_ = 1.0;              // ganancia de salida del fundido de modo
     FusedControls modeFadePending_;          // controles nuevos en espera (cambio de modo)
     bool modeFadePendingValid_ = false;      // true = hay un pendiente por aplicar
+    // 6.4 (refinamiento 2026-11-26) — fundido al apagar el D10 en caliente.
+    // d10EnabledSeen_ recuerda el último valor visto de D10 (process() lo
+    // compara para detectar el apagado; default true = default de D10Config).
+    // d10DisableFadePending_ = true mientras el fundido de salida por
+    // apagado del D10 está en curso: la rama TΩ sigue usando el kernel LTI
+    // (caliente, amplitud completa) y solo cambia a la ruta espectral cuando
+    // la ganancia llega a 0 (applyModeFadePending limpia el flag): la ruta
+    // espectral (WOLA, acumulador frío) se rellena durante el fundido de
+    // entrada (512 muestras) en vez de sonar a ~1/4 de amplitud.
+    bool d10EnabledSeen_ = true;
+    bool d10DisableFadePending_ = false;
 
     FusedControls userControls_;
     double sampleRate_ = 48000.0;

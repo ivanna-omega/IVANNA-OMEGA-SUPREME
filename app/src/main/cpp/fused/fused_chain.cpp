@@ -78,9 +78,10 @@ void FusedChain::setControls(const FusedControls& c) noexcept {
     // reinicia a 1.0 (eso sería un escalón hacia arriba).
     const bool oldTOmega = tOmegaActive();
     const OmegaOutputMode oldMode = userControls_.spatial.mode;
+    // TΩ: trayecto de altavoz = bocina plana o Genezi (evol-holos).
     const bool newTOmega = volumetricEnabled_.load(std::memory_order_relaxed) &&
                            !nc.isNeutral() &&
-                           nc.spatial.mode == OmegaOutputMode::SPEAKERS;
+                           ivanna::omega_output_is_speakers_like(nc.spatial.mode);
     // EXCEPCIÓN (bit-exactitud en neutro): si AMBOS estados son neutros,
     // el modo no cambia nada audible (passthrough en ambos; TΩ exige
     // !neutral) y NO se difiere: aplicar de inmediato preserva la
@@ -163,6 +164,8 @@ void FusedChain::reset() noexcept {
     modeFadePhase_ = ModeFadePhase::DONE;
     modeFadeGain_ = 1.0;
     modeFadePendingValid_ = false;
+    d10DisableFadePending_ = false;  // 6.4: sin fundido de D10 pendiente
+    d10EnabledSeen_ = d10Engine_.isEnabled();  // 6.4: re-sincronizar
     opWet_[0] = brain_.isNeutral() ? 0.0 : 1.0;
     opWet_[1] = spatial_.isNeutral() ? 0.0 : 1.0;
     opWet_[2] = field_.isNeutral() ? 0.0 : 1.0;
@@ -251,6 +254,10 @@ void FusedChain::warmTOmegaHistory(const double* l, const double* r,
 }
 
 void FusedChain::applyModeFadePending() noexcept {
+    // 6.4: el fundido de salida por apagado del D10 termina aquí (ganancia
+    // 0): la rama TΩ ya puede cambiar a la ruta espectral — su WOLA se
+    // rellena durante el fundido de entrada.
+    d10DisableFadePending_ = false;
     if (!modeFadePendingValid_) {
         modeFadePhase_ = ModeFadePhase::IN;
         return;
@@ -438,7 +445,7 @@ void FusedChain::compileTOmega() noexcept {
     apex::buildMinimumPhaseSpectrum64(magDb.data(), kVolFft,
                                       tOmegaWs_.minPhaseBuf.data(), tOmegaWs_);
 
-    const bool speakers = tOmegaSnapshot_.mode == OmegaOutputMode::SPEAKERS;
+    const bool speakers = ivanna::omega_output_is_speakers_like(tOmegaSnapshot_.mode);
     for (int k = 0; k < kVolBins; ++k) {
         const double freq = static_cast<double>(k) * sampleRate_ / static_cast<double>(kVolFft);
         const std::complex<double> gEq =
@@ -714,7 +721,7 @@ void FusedChain::refreshTwinCalibration(OmegaOutputMode mode) noexcept {
     twinCalMode_ = mode;
     twinCalReady_ = true;
 
-    if (mode == OmegaOutputMode::SPEAKERS) {
+    if (ivanna::omega_output_is_speakers_like(mode)) {
         // Trayecto Genezi: calibración con la respuesta MEDIDA desde el
         // barrido Farina de la app (2026-11-22 05:54, TwinCalibration::
         // geneziPz1dMeasured(), confianza honesta 0.80), o la
@@ -955,6 +962,27 @@ void FusedChain::pushEffectiveControls() noexcept {
 
 void FusedChain::process(double* left, double* right, int frames) noexcept {
     if (!left || !right || frames <= 0) return;
+    // 6.4 (refinamiento 2026-11-26) — FUNDIDO AL APAGAR EL D10 EN CALIENTE.
+    // Apagar el D10 conmuta la rama TΩ de LTI (anillo caliente) a espectral
+    // (WOLA con acumulador frío): sin fundido, la salida caía ~-25 dB RMS
+    // ~512 muestras (medido: excess -22.8 dB en hot_d10_disable). El
+    // fundido de modo (256 fuera / 512 dentro, el mismo que cubre los
+    // cambios de modo) tapa la conmutación; la rama sigue en LTI durante
+    // la salida (d10DisableFadePending_) y cambia a espectral en ganancia
+    // 0, rellenando el WOLA durante la entrada. Solo al APAGAR con el
+    // kernel enganchado y TΩ activa: encender solo no cambia la ruta
+    // (el kernel no se engancha sin recompilar) y no necesita fundido.
+    // No corre en neutro (tOmegaActive() exige !neutral).
+    {
+        const bool d10Now = d10Engine_.isEnabled();
+        if (d10EnabledSeen_ && !d10Now && d10Engine_.ltiKernel().engaged() &&
+            tOmegaActive() && modeFadePhase_ == ModeFadePhase::DONE) {
+            modeFadePhase_ = ModeFadePhase::OUT;
+            if (!std::isfinite(modeFadeGain_)) modeFadeGain_ = 1.0;
+            d10DisableFadePending_ = true;
+        }
+        d10EnabledSeen_ = d10Now;
+    }
     int remaining = frames;
     int offset = 0;
     while (remaining > 0) {
@@ -1002,8 +1030,9 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
         // La implementación es la TΩ (compileTOmega + applyTOmega, hop 128
         // empaquetado, double); el WOLA volumétrico queda LEGACY. Sin toggle
         // propio de TΩ: el interruptor de la etapa es setVolumetricEnabled().
+        // Trayecto de altavoz = bocina plana o Genezi (evol-holos).
         const bool tOmega = volumetricEnabled_.load(std::memory_order_relaxed) && !isNeutral() &&
-                            userControls_.spatial.mode == OmegaOutputMode::SPEAKERS;
+                            ivanna::omega_output_is_speakers_like(userControls_.spatial.mode);
         if (tOmega) {
             // Reloj 2: recompilar solo si cambió lo que la matriz refleja.
             TOmegaSnapshot snap;
@@ -1206,8 +1235,22 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
         // chunk), así que la ruta espectral prácticamente no llega a
         // sonar con D10 ON: la conmutación solo se ve al habilitar el
         // D10 en caliente o tras un reset.
-        if (tOmega && d10Engine_.isEnabled() &&
-            d10Engine_.ltiKernel().engaged()) {
+        // 6.4: mientras el fundido por apagado del D10 está en salida, la
+        // rama sigue en LTI (d10DisableFadePending_): el cambio a espectral
+        // ocurre en ganancia 0 (applyModeFadePending limpia el flag).
+        const bool ltiHold = d10DisableFadePending_ &&
+                             modeFadePhase_ == ModeFadePhase::OUT;
+        if (tOmega && ((d10Engine_.isEnabled() &&
+                        d10Engine_.ltiKernel().engaged()) ||
+                       ltiHold)) {
+            // 6.4 (refinamiento 2026-11-26) — HISTORIA ESPECTRAL CALIENTE
+            // MIENTRAS EL LTI CORRE: si el D10 se apaga en caliente, la rama
+            // cae a applyTOmega; sin este warm, su FIFO llevaba fría desde
+            // que el kernel se enganchó. El warm va ANTES del kernel (l/r
+            // aún son la entrada pre-TΩ: lo que applyTOmega habría recibido)
+            // y solo alimenta la historia (no toca el buffer): con el D10
+            // encendido es no-op audible.
+            warmTOmegaHistory(l, r, chunk);
             d10Engine_.ltiKernel().process(l, r, chunk);
         } else if (tOmega) {
             applyTOmega(l, r, chunk);  // LEGACY (ver arriba)

@@ -484,6 +484,20 @@ allow untrusted_app_34 vendor_data_file dir { search getattr }
 allow untrusted_app_35 vendor_data_file dir { search getattr }
 allow audioserver vendor_data_file dir { search getattr }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# EVOL-LIVEPATH (2026-11-26) — Lector del snapshot de reloj HAL en audioserver
+#
+# hardware_rate_millihz del beacon estaba en 0: el efecto ya tenía
+# HardwareClockReader para /data/vendor/ivanna_audio/clock_snapshot.v2,
+# pero el archivo no existía (sin publicador) y, cuando el daemon lo
+# publique, audioserver debe poder leerlo. El directorio se etiqueta
+# vendor_audio_data_file (tipo stock, asrc_link.sh); el archivo hereda ese
+# tipo y el daemon lo deja en 0666. Solo lectura + mmap del snapshot de
+# reloj (sin escritura, sin crear archivos, sin tocar asrc_state).
+# ═══════════════════════════════════════════════════════════════════════════════
+allow audioserver vendor_audio_data_file dir { search getattr open }
+allow audioserver vendor_audio_data_file file { open read getattr map }
+
 # ═══════════════════════════════════════════════════════════════════════
 # v3.6 — ASRC v5 write-stage por LD_PRELOAD en vendor.audio-hal
 #

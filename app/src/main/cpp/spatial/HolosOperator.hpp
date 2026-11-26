@@ -85,6 +85,7 @@
 #include "HolosStateEstimator.hpp"
 #include "HolosVolterraKernel.hpp"
 #include "NearFieldHeadModel.hpp"
+#include "PowerMix.hpp"  // P3/3.1: mezcla seco/wet de potencia constante
 #include "RirConvolver.hpp"
 #include "fft_radix2.hpp"
 
@@ -325,6 +326,11 @@ private:
     // 1 seco retardado (alineado con el STFT).
     double wet_ = 0.0;
     double blend_ = 0.0;
+    // P3/3.1: mezcladores de potencia constante (uno por fundido; misma
+    // regla que en OrbeBinaural: el blend usa extremos exactos, el wet
+    // usa el mixer en todo w ∈ [0,1]).
+    ivanna::spatial::PowerMixer mixBlend_;
+    ivanna::spatial::PowerMixer mixWet_;
     bool flushPending_ = false;
     // Re-sondeo de la puerta de coherencia (v2.5.415, bandera 5): el
     // estimador solo se actualiza en runFrame() (solo cuando la etapa está

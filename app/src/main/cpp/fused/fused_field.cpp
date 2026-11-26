@@ -29,9 +29,13 @@ void FusedField::setControls(const FieldControls& c) noexcept {
 void FusedField::setOutputMode(OmegaOutputMode mode) noexcept {
     // PARCHE v2.6: escribe en controls_.mode (única fuente de verdad);
     // outputMode_ queda como espejo. UNKNOWN (0) fail-closed a HEADPHONES.
+    // GENEZI se conserva como tal (evol-holos): el holograma pasa en
+    // Genezi; solo SPEAKERS lo apaga (isSpeakers()).
     const OmegaOutputMode m = (mode == OmegaOutputMode::SPEAKERS)
                       ? OmegaOutputMode::SPEAKERS
-                      : OmegaOutputMode::HEADPHONES;
+                      : (mode == OmegaOutputMode::GENEZI)
+                          ? OmegaOutputMode::GENEZI
+                          : OmegaOutputMode::HEADPHONES;
     controls_.mode = m;
     outputMode_ = m;
     pushParamsToEngines();

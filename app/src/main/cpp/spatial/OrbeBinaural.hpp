@@ -45,6 +45,7 @@
 
 #include "BandPowerConserver.hpp"
 #include "NearFieldHeadModel.hpp"
+#include "PowerMix.hpp"  // P3/3.1: mezcla seco/wet de potencia constante
 #include "fft_radix2.hpp"
 
 namespace ivanna {
@@ -206,6 +207,12 @@ private:
     // 1 seco retardado (alineado con el STFT).
     Scalar wet_ = Scalar(0.0);
     Scalar blend_ = Scalar(0.0);
+    // P3/3.1: mezcladores de potencia constante (uno por fundido). El
+    // blend usa extremos exactos (w = 0 → vivo, w = 1 → dryQ) porque
+    // compara potencia actual con la de hace 512 muestras; el wet usa el
+    // mixer en todo w ∈ [0,1] (seco y wet llevan el mismo retardo).
+    ivanna::spatial::PowerMixer mixBlend_;
+    ivanna::spatial::PowerMixer mixWet_;
     bool flushPending_ = false;  // vaciar colas una vez al reactivar
     // Re-sondeo de la puerta de coherencia (v2.5.415, bandera 5): el
     // estimador solo se actualiza en runFrame() (solo cuando la etapa está

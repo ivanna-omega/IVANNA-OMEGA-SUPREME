@@ -202,7 +202,8 @@ void HrtfManagerT<Scalar>::synthesizeHrtf(float yaw, float pitch, float roll, in
         baseR[n] = r;
     }
 
-    // NOTA PEDESTAL DE ITD (2026-11-18): el par base (p0 + V·q) es una
+    // NOTA PEDESTAL DE ITD (2026-11-18, LEGACY — superada por la reparación
+    // de abajo, evol-hrtf 2026-11-26): el par base (p0 + V·q) es una
     // reconstrucción PCA difusa y asimétrica; no hay un ITD bien definido
     // para alinearlo (xcorr dice +416 µs, centroide dice -102 µs, y
     // alinear por centroide EMPEORA el ITD sintetizado a -13 muestras).
@@ -210,6 +211,30 @@ void HrtfManagerT<Scalar>::synthesizeHrtf(float yaw, float pitch, float roll, in
     // alineado del par PCA. Queda pendiente (SofaHRTFLoader no lee el
     // SOFA). El ITD de azimut (Ley de Curvatura, abajo) sí es correcto y
     // se suma sobre el par tal cual.
+    //
+    // MEDICIÓN evol-hrtf (2026-11-26, Python sobre la base viva): la
+    // asimetría NO es un desfase corregible — la base PCA es MONOAURAL.
+    // p0: E_L=8.7e-5, E_R≈0 (pico R 0.0001 vs L 0.0045). Cada PC:
+    // E_L≈0.995, E_R≈0.003–0.007 (99.6% de la energía en L). El par
+    // reconstruido: E_L=3.58e-4, E_R=2e-6 (ILD +23.31 dB crudo),
+    // correlación L/R 0.183. La normalización de energía (normL/normR)
+    // amplifica ese residuo 23 dB y lo vuelve un IR fuerte e
+    // incorrelado: por eso ningún alineado funciona (medido: xcorr
+    // −417 µs crudo / −1083 µs con pabellón, centroide −102/+335 µs,
+    // retardo de grupo 150–500 Hz +545 µs, rho_xcorr 0.07–0.14 — los
+    // estimadores ni coinciden en el SIGNO del desplazamiento).
+    // REPARACIÓN (abajo): el oído derecho usa la MISMA reconstrucción
+    // válida que el izquierdo (baseL). El frontal medido (MIT KEMAR a
+    // 0°) es L≡R por construcción, así que esto reproduce la verdad
+    // medida; las diferencias interaurales las crean la Ley de
+    // Curvatura (ITD) y el ILD (ganancia), que ya están en el código.
+    // Verificado en Python: a 0° xcorr/centroide/grupo = 0/0/0 µs
+    // (rho=1.000); a ±30° los tres estimadores dan ±271 µs (ley: 261);
+    // a ±90° ±646 µs (ley: 656). La vía medida (SOFA) sigue siendo la
+    // correcta cuando hay dataset (SofaHRTFLoader ya lee v0, evol-hrtf).
+    for (int n = 0; n < kSofaLen; ++n) {
+        baseR[n] = baseL[n];  // base PCA monoaural: el par válido es (L, L)
+    }
 
     // ── LGN — LEY GEODÉSICA DEL NOTCH (física nueva, cableada 2026-11-18) ──
     // El pabellón se aplica como FIR de 3 taps al HRIR base, ANTES de

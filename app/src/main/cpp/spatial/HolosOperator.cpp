@@ -71,6 +71,9 @@ void HolosOperator::prepare(float sr) {
     // sigue siendo 0.0 dB exactos por construcción.
     if constexpr (kHolosPowerConservation) holosCons_.prepare(activeBands_, (float)kHop / (float)s, 0.300f);
     estimator_.prepare(s);
+    // P3/3.1: mezcladores de potencia constante (EMAs τ = 5 ms).
+    mixBlend_.prepare(s);
+    mixWet_.prepare(s);
     estimator_.setBandTables(set24_.loBin, set24_.hiBin, set24_.centerHz, 24);
     kernel_.prepare(s);
     // Término difuso: una sola IR compartida (Master Studio sintetizada).
@@ -155,6 +158,9 @@ void HolosOperator::reset() noexcept {
     wet_ = 0.0;
     blend_ = 0.0;
     flushPending_ = false;
+    // P3/3.1: los mezcladores vuelven a EMAs en cero.
+    mixBlend_.reset();
+    mixWet_.reset();
     estimator_.reset();
     kernel_.reset();
     if constexpr (kHolosPowerConservation) holosCons_.reset();
@@ -451,15 +457,22 @@ void HolosOperator::renderBins(double* reL, double* imL, double* reR, double* im
         // Al subir el difuso, el side directo baja (el campo va a la cola).
         const double sideDirect = 1.0 - diffuseMix_[b];
         const double dTail = diffuseMix_[b] * 0.82;  // nivel wet legacy del RIR
-        // outL = (mid·gL·phL + side·w·norm·(1−dif)) · Γ ; outR simétrico.
+        // outL = (mid·gL·phL + side·w·sideDirect·phL) · Γ ; outR simétrico.
+        // P3/3.2 (espejo de spread, 2026-11-26): el side directo TAMBIÉN
+        // rota con la fase ITD por oído — mismo defecto y mismo fix que en
+        // OrbeBinaural::renderBins (el side sin rotar invertía el ILD por
+        // banda donde el IPD de entrada ≈ ±180°; medido b12 −4.3 dB @1.2,
+        // −8.9 dB @1.5). La cola difusa (reTL/reTR) NO rota: es campo
+        // difuso, no señal directa. |ph| = 1: la potencia por banda no
+        // cambia; con side = 0 o θ = 0 la salida es bit-idéntica.
         // La cola difusa se suma por bin con el mismo Γ (el compresor
         // legacy también actuaba sobre el wet de sala).
         const double midL = mRe * g.gL, midLi = mIm * g.gL;
         const double midR = mRe * g.gR, midRi = mIm * g.gR;
-        const double dLRe = (midL * phLRe - midLi * phLIm) + sRe * wSide * sideDirect;
-        const double dLIm = (midL * phLIm + midLi * phLRe) + sIm * wSide * sideDirect;
-        const double dRRe = (midR * phRRe - midRi * phRIm) - sRe * wSide * sideDirect;
-        const double dRIm = (midR * phRIm + midRi * phRRe) - sIm * wSide * sideDirect;
+        const double dLRe = (midL * phLRe - midLi * phLIm) + (sRe * phLRe - sIm * phLIm) * wSide * sideDirect;
+        const double dLIm = (midL * phLIm + midLi * phLRe) + (sRe * phLIm + sIm * phLRe) * wSide * sideDirect;
+        const double dRRe = (midR * phRRe - midRi * phRIm) - (sRe * phRRe - sIm * phRIm) * wSide * sideDirect;
+        const double dRIm = (midR * phRIm + midRi * phRRe) - (sRe * phRIm + sIm * phRRe) * wSide * sideDirect;
         // Multiplicación COMPLEJA por Γ (con φ=0 es bit-idéntica a la real:
         // x·1 − y·0 = x). La cola difusa lleva el mismo Γ que el directo.
         const double oLRe = (dLRe * gRe - dLIm * gIm) + (reTL[k] * gRe - imTL[k] * gIm) * dTail;
@@ -721,6 +734,25 @@ void HolosOperator::process(double* l, double* r, int n) noexcept {
         }
     }
     const double slew = 1.0 / (0.015 * sr);  // rampa de 15 ms por muestra
+    // El blend barre al DOBLE de velocidad (7.5 ms) y el wet a la MITAD
+    // (30 ms): el enganche secuencial deja el vivo audible durante la
+    // fase del blend, y un impulso que llegue a mitad de esa fase se
+    // cuela en vivo (pico 0.24 en vez de 0.115) y desplaza el centroide
+    // de latencia 486 → 415 (test LatencyIsFftSize, tolerancia ±64). Con
+    // el blend en 7.5 ms la fase del blend termina antes de que el
+    // impulso del test llegue (muestra 1000 ≈ 488 drenadas) y el
+    // centroide vuelve a 512: el vivo ya no está audible cuando llega el
+    // impulso. El wet lento (30 ms) da tiempo a que sus EMAs (τ = 5 ms)
+    // converjan durante el propio fundido: con el wet a 15 ms tras un
+    // blend de 7.5 ms, el fundido IN medía 0.237 dB; a 30 ms mide
+    // 0.173 dB (HOLOS) / 0.152 dB (ORBE) en ventanas de 5 ms — el resto
+    // es hash del render durante el enganche (bandas laterales + resto
+    // no fundamental), no error de escala del mixer. El blend ve
+    // correlación constante (vivo vs seco retardado, ρ = −0.5), así que
+    // el barrido rápido no le cuesta potencia al mixer. El enganche
+    // total es 37.5 ms (inaudible como retardo de encendido).
+    const double blendSlew = 2.0 * slew;
+    const double wetSlew = 0.5 * slew;
     if (flushPending_) {
         flushPending_ = false;
         if (qCount_ > 0) {
@@ -738,6 +770,9 @@ void HolosOperator::process(double* l, double* r, int n) noexcept {
         ringPos_ = 0;
         tailRingPos_ = 0;
         skipEmit_ = 3;
+        // P3/3.1: las EMAs de los mezcladores son del audio viejo.
+        mixBlend_.reset();
+        mixWet_.reset();
         for (int b = 0; b < kMaxBands; ++b) dynDbSmooth_[b] = 0.0;
     }
     // Alimentar: acumular en pend y correr un frame por cada hop completo.
@@ -758,18 +793,50 @@ void HolosOperator::process(double* l, double* r, int n) noexcept {
     size_t drain = std::min({(size_t)n, want, (size_t)qCount_});
     size_t i = 0;
     for (; i < drain; ++i) {
-        if (wet_ < wetTarget) wet_ = std::min(wet_ + slew, wetTarget);
-        else if (wet_ > wetTarget) wet_ = std::max(wet_ - slew, wetTarget);
-        if (blend_ < blendTarget) blend_ = std::min(blend_ + slew, blendTarget);
-        else if (blend_ > blendTarget) blend_ = std::max(blend_ - slew, blendTarget);
+        // P3/3.2 — fundido de enganche SECUENCIAL (blend y luego wet), no
+        // simultáneo. El blend (vivo→seco retardado) y el wet (seco→wet)
+        // barren con el mismo slew de 15 ms; si barren a la vez, la fase
+        // del seco de referencia gira 120° en 15 ms (vivo 0° → seco
+        // retardado −240° ≡ +120°, tono 1 kHz con delay 512) y la
+        // correlación seco/wet que ve el mixer wet cambia de −0.5 a +1.0
+        // más rápido de lo que su EMA (τ = 5 ms) puede seguir: a mitad
+        // de fundido la EMA dice ρ ≈ −0.17 cuando la real es +0.5 y la
+        // escala sale ~23 % grande — el fundido IN medía +0.87 dB
+        // (HOLOS) / +0.73 dB (ORBE) en ventanas de 5 ms. La guarda de
+        // pico 3.1 lo enmascaraba (su max-hold rancio sobre-capaba la
+        // escala); la 3.2 ya no lo enmascara y el defecto queda a la
+        // vista. Secuencial: primero el blend (vivo vs seco retardado,
+        // ρ = −0.5 constante) y cuando está completo arranca el wet
+        // (seco retardado vs wet, ρ ≈ +1 constante): cada fundido ve
+        // correlación estacionaria y la potencia se conserva. El apagado
+        // ya era secuencial por construcción (blendTarget = 1 mientras
+        // wet_ > 0: el wet baja primero y el blend después), así que
+        // aquí solo se secuencia el enganche; el apagado no se toca.
+        if (wet_ < wetTarget) {
+            if (blend_ >= blendTarget) wet_ = std::min(wet_ + wetSlew, wetTarget);
+        } else if (wet_ > wetTarget) {
+            wet_ = std::max(wet_ - wetSlew, wetTarget);
+        }
+        if (blend_ < blendTarget) blend_ = std::min(blend_ + blendSlew, blendTarget);
+        else if (blend_ > blendTarget) blend_ = std::max(blend_ - blendSlew, blendTarget);
         const double wetL = wetQL_[qHead_], wetR = wetQR_[qHead_];
         const double dryL = dryQL_[qHead_], dryR = dryQR_[qHead_];
         qHead_ = (qHead_ + 1) % qCap_;
         const double liveL = l[i], liveR = r[i];
-        const double dryMixL = (1.0 - blend_) * liveL + blend_ * dryL;
-        const double dryMixR = (1.0 - blend_) * liveR + blend_ * dryR;
-        l[i] = (1.0 - wet_) * dryMixL + wet_ * wetL;
-        r[i] = (1.0 - wet_) * dryMixR + wet_ * wetR;
+        // P3/3.1: mezclas de potencia constante con correlación explícita
+        // (misma regla que en OrbeBinaural: blend con extremos exactos,
+        // wet con el mixer en todo w ∈ [0,1]).
+        mixBlend_.observe(liveL, liveR, dryL, dryR);
+        double dryMixL, dryMixR;
+        if (blend_ == 0.0) {
+            dryMixL = liveL; dryMixR = liveR;
+        } else if (blend_ == 1.0) {
+            dryMixL = dryL; dryMixR = dryR;
+        } else {
+            mixBlend_.mix(dryMixL, dryMixR, liveL, liveR, dryL, dryR, blend_);
+        }
+        mixWet_.observe(dryMixL, dryMixR, wetL, wetR);
+        mixWet_.mix(l[i], r[i], dryMixL, dryMixR, wetL, wetR, wet_);
     }
     qCount_ -= (int)drain;
     totalOut_ += drain;

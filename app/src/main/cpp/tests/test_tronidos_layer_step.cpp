@@ -40,6 +40,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -160,16 +161,24 @@ struct LayerResult {
     // Ventana del cambio: estadística de la salida (distingue silencio
     // de congelado: RMS 0 = silencio; RMS > 0 con step 0 = congelado).
     double winMin = 0.0, winMax = 0.0, winMean = 0.0, winRms = 0.0;
+    double baseWinRms = 0.0;  // 6.4: RMS en la ventana de régimen (t = 1 s)
     size_t winZeros = 0;       // muestras exactamente 0 en la ventana
     bool bitExact = false;     // solo para el control neutro
     bool finite = true;
+    bool kernelEngaged = false;  // 6.4: kernel LTI D10 enganchado al final
+    bool morphComplete = false;  // 6.4: morph hActive->hTarget terminado
 };
 
 // Corre un caso: controles A hasta el cambio, controles B desde el cambio.
 // apexEnabled=false aísla la contribución del splitter APEX (que también
 // engancha al pasar de neutro a activo y no lo cubre el wet por operador).
-LayerResult runCase(const std::string& name, const FusedControls& before,
-                    const FusedControls& after, bool apexEnabled = true) {
+// beforeHook corre tras prepare() (p. ej. apagar el D10 antes del stream);
+// changeHook corre en el punto de cambio, ANTES de setControls(after)
+// (p. ej. encender/apagar el D10 en caliente). Ambos pueden ser nulos.
+LayerResult runCaseHook(const std::string& name, const FusedControls& before,
+                        const FusedControls& after, bool apexEnabled,
+                        const std::function<void(FusedChain&)>& beforeHook,
+                        const std::function<void(FusedChain&)>& changeHook) {
     std::vector<double> inL, inR;
     makeSignal(inL, inR);
     std::vector<double> l = inL, r = inR;
@@ -177,6 +186,7 @@ LayerResult runCase(const std::string& name, const FusedControls& before,
     FusedChain chain;
     chain.prepare(kFs);
     chain.setApexEnabled(apexEnabled);
+    if (beforeHook) beforeHook(chain);
     chain.setControls(before);
 
     std::vector<double> cbUs;
@@ -186,6 +196,7 @@ LayerResult runCase(const std::string& name, const FusedControls& before,
     for (size_t off = 0; off < kN; off += static_cast<size_t>(kHop)) {
         const int chunk = static_cast<int>(std::min<size_t>(kHop, kN - off));
         if (!changed && off >= kChangeAt) {
+            if (changeHook) changeHook(chain);
             chain.setControls(after);
             changed = true;
         }
@@ -230,6 +241,17 @@ LayerResult runCase(const std::string& name, const FusedControls& before,
         peak = std::max(peak, std::fabs(l[n]));
         peak = std::max(peak, std::fabs(r[n]));
     }
+    // 6.4: RMS en la ventana de régimen (misma longitud que la del cambio):
+    // el guarda de hueco compara winRms contra esta referencia.
+    {
+        double sq = 0.0;
+        size_t cnt = 0;
+        for (size_t n = kBaselineAt; n < kBaselineAt + kHop && n < kN; ++n) {
+            sq += l[n] * l[n] + r[n] * r[n];
+            cnt += 2;
+        }
+        res.baseWinRms = cnt ? std::sqrt(sq / cnt) : 0.0;
+    }
     res.peakDb = dbfs(peak);
     std::sort(cbUs.begin(), cbUs.end());
     double sum = 0.0;
@@ -239,18 +261,30 @@ LayerResult runCase(const std::string& name, const FusedControls& before,
     res.cbMaxUs = cbUs.empty() ? 0.0 : cbUs.back();
     res.cbChangeUs = cbChangeUs;
     res.bitExact = (l == inL && r == inR);
+    res.kernelEngaged = chain.d10Engine().ltiKernel().engaged();
+    res.morphComplete = chain.d10Engine().ltiKernel().morphComplete();
     return res;
+}
+
+// Corre un caso: controles A hasta el cambio, controles B desde el cambio.
+// apexEnabled=false aísla la contribución del splitter APEX (que también
+// engancha al pasar de neutro a activo y no lo cubre el wet por operador).
+LayerResult runCase(const std::string& name, const FusedControls& before,
+                    const FusedControls& after, bool apexEnabled = true) {
+    return runCaseHook(name, before, after, apexEnabled, nullptr, nullptr);
 }
 
 void printRow(const LayerResult& r) {
     std::printf("%-18s step %8s dBFS  base %8s  excess %7s dB  vsIn %7s dB  peak %8s  "
-                "cb mean %7.1f p99 %7.1f max %7.1f chg %7.1f us  win[%s..%s] rms %s zeros %zu%s\n",
+                "cb mean %7.1f p99 %7.1f max %7.1f chg %7.1f us  win[%s..%s] rms %s baseRms %s zeros %zu kern %d morph %d%s\n",
                 r.name.c_str(), fmt(r.stepDb).c_str(), fmt(r.baselineDb).c_str(),
                 fmt(r.excessDb).c_str(), fmt(r.excessVsInputDb).c_str(),
                 fmt(r.peakDb).c_str(), r.cbMeanUs,
                 r.cbP99Us, r.cbMaxUs, r.cbChangeUs,
                 fmt(r.winMin).c_str(), fmt(r.winMax).c_str(), fmt(r.winRms).c_str(),
-                r.winZeros, r.finite ? "" : "  [NO FINITO]");
+                fmt(r.baseWinRms).c_str(),
+                r.winZeros, static_cast<int>(r.kernelEngaged),
+                static_cast<int>(r.morphComplete), r.finite ? "" : "  [NO FINITO]");
 }
 
 }  // namespace
@@ -463,4 +497,117 @@ TEST(TronidosLayerStep, ApexOffProbe) {
     for (const auto& x : r) printRow(x);
     std::printf("=== fin ===\n");
     for (const auto& x : r) EXPECT_TRUE(x.finite) << x.name << ": salida no finita";
+}
+
+// ── 6.4 (refinamiento 2026-11-26) — cambio de coeficientes / D10 en caliente ─
+// Auditoría previa (código, no suposición):
+//   ARMONÍA: RoomCorrectionEq::setTarget() solo guarda objetivos; process()
+//     acerca cur_ a tgt_ a 0.25 dB POR BLOQUE (kSlewDbPerBlock) y re-calcula
+//     los biquads RBJ una vez por bloque con la ganancia ya limitada. NO hay
+//     rampa por muestra de coeficientes, pero el escalón por bloque es de
+//     0.25 dB como máximo: este test mide si ese escalón es un clic.
+//   D10: el kernel LTI tiene morph por muestra (512 muestras, morphAlpha_)
+//     pero la conmutación espectral→LTI es una rama dura por chunk
+//     (fused_chain.cpp, TΩ/LTI) y el anillo del kernel NACE FRÍO (la historia
+//     espectral no se alimenta mientras el LTI corre: warmTOmegaHistory solo
+//     corre en la rama else). El cambio de modo HEADPHONES→SPEAKERS sí está
+//     cubierto por el fundido de modo (256 muestras fuera / 512 dentro).
+//     El toggle de D10 solo (setConfig en caliente) NO tiene llamador en
+//     producción (solo FusedChain::prepare lo fija): se mide igual para
+//     dejar el comportamiento documentado.
+// Casos (todos con música estacionaria, cambio a t = 2.0 s):
+//   hot_eq_max_swing — low +12 → -12 dB (24 dB: el mayor salto posible;
+//     96 bloques de slew). Si el escalón de 0.25 dB/bloque es clic, aquí sale.
+//   hot_eq_curve_flip — curve 1 (Harman) → 2 (élite-lean): cambian los 10
+//     objetivos a la vez por el delta élite−Harman.
+//   hot_d10_disable — SPEAKERS + D10 ON → D10 OFF en caliente: la rama cae
+//     a applyTOmega con la historia espectral FRÍA (no se alimentó mientras
+//     el LTI corría). Mide el hueco/clic de esa vuelta.
+//   hot_d10_enable_via_mode — HEADPHONES + D10 OFF → SPEAKERS + D10 ON: el
+//     kernel se engancha desde anillo frío DURANTE el fundido de modo.
+//   hot_d10_enable_alone — SPEAKERS + D10 OFF → D10 ON sin cambio de modo:
+//     sin recompilación de TΩ el kernel NO se engancha (el toggle solo es
+//     no-op audible); documenta que encender el D10 en caliente no suena
+//     hasta el próximo cambio de modo/reset.
+// Umbral: excess en [-6.0, +2.0] dB (el piso caza huecos: un excess de
+// -22.8 dB es silencio, no "ausencia de clic"), winRms ≥ 50% del RMS en
+// régimen (−6 dB) y ≤ 8 muestras en 0 exacto en la ventana del cambio.
+// Fix 6.4 aplicado en fused_chain.cpp: warmTOmegaHistory ANTES del kernel
+// LTI (historia espectral caliente mientras el LTI corre).
+TEST(TronidosLayerStep, HotCoefficientSwitchNoClick) {
+    const FusedControls neutral = [] {
+        FusedControls c;
+        c.setNeutral();
+        return c;
+    }();
+    const FusedControls engaged = engagedControls();
+    (void)neutral;
+
+    const auto d10Off = [](FusedChain& chain) {
+        d10::D10Config cfg;
+        cfg.enabled = false;
+        chain.d10Engine().setConfig(cfg);
+    };
+    const auto d10On = [](FusedChain& chain) {
+        d10::D10Config cfg;
+        cfg.enabled = true;
+        chain.d10Engine().setConfig(cfg);
+    };
+
+    std::vector<LayerResult> r;
+    // 1. ARMONÍA: mayor salto de EQ posible en caliente.
+    {
+        FusedControls before = engaged; before.tonal.lowDb = 12.0f; before.clamp();
+        FusedControls after = engaged; after.tonal.lowDb = -12.0f; after.clamp();
+        r.push_back(runCase("hot_eq_max_swing", before, after));
+    }
+    // 2. ARMONÍA: cambio de curva (los 10 objetivos a la vez).
+    {
+        FusedControls before = engaged; before.tonal.curve = 1; before.clamp();
+        FusedControls after = engaged; after.tonal.curve = 2; after.clamp();
+        r.push_back(runCase("hot_eq_curve_flip", before, after));
+    }
+    // 3. D10: apagar en caliente en SPEAKERS (vuelta a la ruta espectral fría).
+    {
+        FusedControls spk = engaged;
+        spk.spatial.mode = ivanna::OmegaOutputMode::SPEAKERS; spk.clamp();
+        r.push_back(runCaseHook("hot_d10_disable", spk, spk, true, nullptr, d10Off));
+    }
+    // 4. D10: encender vía cambio de modo (enganche con fundido de modo).
+    {
+        FusedControls spk = engaged;
+        spk.spatial.mode = ivanna::OmegaOutputMode::SPEAKERS; spk.clamp();
+        r.push_back(runCaseHook("hot_d10_enable_via_mode", engaged, spk, true,
+                                d10Off, d10On));
+    }
+    // 5. D10: encender solo, sin cambio de modo (debe ser no-op audible).
+    {
+        FusedControls spk = engaged;
+        spk.spatial.mode = ivanna::OmegaOutputMode::SPEAKERS; spk.clamp();
+        r.push_back(runCaseHook("hot_d10_enable_alone", spk, spk, true,
+                                d10Off, d10On));
+    }
+
+    std::printf("\n=== TRONIDOS 6.4 — coeficientes / D10 en caliente ===\n");
+    for (const auto& x : r) printRow(x);
+    std::printf("=== fin ===\n");
+
+    for (const auto& x : r) {
+        EXPECT_TRUE(x.finite) << x.name << ": salida no finita";
+        EXPECT_LE(x.excessDb, 2.0) << x.name << ": escalón en caliente (clic)";
+        // 6.4: el excess TAMBIÉN tiene piso — un desplome del salto máximo
+        // es un hueco de silencio, no "ausencia de clic": hot_d10_disable
+        // medía excess -22.8 dB (salida ~-25 dB RMS 512 muestras) y el
+        // guarda superior lo dejaba pasar. El guarda de RMS (winRms ≥ 50%
+        // del RMS en régimen, −6 dB) caza el hueco directamente.
+        EXPECT_GE(x.excessDb, -6.0) << x.name << ": hueco en el cambio (el salto máximo se desploma)";
+        EXPECT_GE(x.winRms, 0.5 * x.baseWinRms)
+            << x.name << ": hueco de silencio en el cambio (RMS cae > 6 dB vs régimen)";
+        EXPECT_LE(x.winZeros, 8u) << x.name << ": hueco de silencio en el cambio";
+    }
+    // 4: el kernel debe quedar enganchado tras el cambio de modo con D10 ON.
+    EXPECT_TRUE(r[3].kernelEngaged) << "hot_d10_enable_via_mode: el kernel LTI no se enganchó";
+    EXPECT_TRUE(r[3].morphComplete) << "hot_d10_enable_via_mode: el morph no completó en 2 s";
+    // 5: sin recompilación de TΩ el toggle solo NO engancha el kernel.
+    EXPECT_FALSE(r[4].kernelEngaged) << "hot_d10_enable_alone: el kernel se enganchó sin cambio de modo";
 }

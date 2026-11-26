@@ -55,9 +55,12 @@
 #include <sys/un.h>
 
 #include "control/daemon_command_responder.h"
+#include "control/effect_telemetry_mirror.h"  // P2 (2026-11-26): reflejar RMS/pico/frames medidos por el efecto en el snapshot de control
 #include "daemon_paths.h"
 #include "daemon/session_discovery.hpp"
+#include "daemon/hardware_clock_from_muscle.hpp"  // EVOL-LIVEPATH: muestra de reloj HAL desde el músculo ASRC (hardware_rate_millihz)
 #include "effect_local_files.h"
+#include "include/audio_hardware_clock_bridge.hpp"  // EVOL-LIVEPATH: HardwareClockPublisher (único publicador del snapshot de reloj)
 #include "include/omega_control_bus.h"
 #include "include/omega_effect_beacon.h"
 #include "include/omega_effect_evidence.h"
@@ -370,6 +373,27 @@ int main() {
     // publique, coloreaba el audio aunque nadie pidiera nada.
     ivanna::OmegaDspSnapshot lastSnap = ivanna::OmegaDspSnapshot::makeNeutral();
     uint64_t snapGeneration = 0;
+    // P2 (2026-11-26, RMS=0 en vivo): el snapshot de control mostraba
+    // RMS/pico/frames en 0 con música sonando porque el daemon nunca leía
+    // el bus local de telemetría del efecto. El espejo lee ese bus (solo
+    // lectura) y refleja los niveles medidos en lastSnap antes de publicar;
+    // el daemon sigue siendo el único escritor del bus de control. Si el
+    // bus local no existe, el espejo se salta (fail-closed, ceros como hoy).
+    ivanna::OmegaControlBus localTelemetryBus;
+    ivanna::daemon::EffectTelemetryMirror telemetryMirror;
+    bool localTelemetryOpen = false;
+    uint64_t lastLocalOpenAttemptMs = 0;
+    // EVOL-LIVEPATH (hardware_rate_millihz en 0): publicador del snapshot
+    // de reloj HAL (/data/vendor/ivanna_audio/clock_snapshot.v2). El daemon
+    // es el único publicador: el músculo mide el reloj, el daemon
+    // re-publica la muestra para que omega_effect la lea. Apertura
+    // perezosa con reintento espaciado 5 s; solo se publica cuando la
+    // muestra AVANZA (con el músculo parado no se refresca nada).
+    ivanna::audio::HardwareClockPublisher hwClockPublisher;
+    bool hwClockPublisherOpen = false;
+    uint64_t lastHwClockOpenAttemptMs = 0;
+    uint64_t lastHwClockTimestampNs = 0;
+    uint64_t lastHwClockFrames = 0;
     Kalman3 servo;
     // El núcleo Ψ vivo: el cerebro corre el campo (Ec. 4 η + Ec. 2 ILD +
     // Ec. 3 personalización) y publica sus ganancias por banda en el estado.
@@ -391,6 +415,13 @@ int main() {
     // del efecto). Instancia persistente: el gate acumula polls; solo un
     // cambio confirmado (3 polls seguidos) publica sesión y resetea.
     ivanna::daemon::SessionChangeGate sessionGate;
+    // EVOL-LIVEPATH (sesión rancia 4057): vigilante de viveza + sesiones
+    // degradadas. El gate solo filtra el ruido de dumpsys; el tracker
+    // desaloja la sesión confirmada cuando el beacon prueba que no suena
+    // y hay otra ganadora, y la degradación impide que el ranking la
+    // re-elija por el hint de música. Ver session_discovery.hpp.
+    ivanna::daemon::SessionLivenessTracker sessionLiveness;
+    ivanna::daemon::DemotedSessions demotedSessions;
     // FASE A: package de la sesión descubierta + app en foreground (del
     // mismo ciclo de descubrimiento; se publican en GET_STATUS vía cmdState).
     std::string sessionPackage;
@@ -562,7 +593,8 @@ int main() {
         bool resetSnapForSessionChange = false;
         if (--sessionCountdown <= 0) {
             sessionCountdown = 60;
-            const auto out = ivanna::daemon::discoverMusicSession();
+            const auto out = ivanna::daemon::discoverMusicSession("com.ivanna.omega",
+                                                                  demotedSessions);
             // FASE A: el foreground se refresca en CADA ciclo (aunque la
             // sesión no cambie): la app expira la guarda de huérfano al
             // cambiar la app en foreground, y eso no espera a que cambie
@@ -570,8 +602,45 @@ int main() {
             if (out.status != ivanna::daemon::SessionDiscoveryStatus::kError) {
                 foregroundPackage = out.foregroundPackage;
             }
+            // EVOL-LIVEPATH (sesión rancia 4057): el beacon es el juez de
+            // "esta sesión suena". Se lee en cada poll (~3 s); si la
+            // confirmada lleva >= 5 polls muda y el poll trae otra
+            // ganadora, se desaloja + degrada ANTES de alimentar el gate
+            // (el gate confirmaría la viva desde cero en <= 9 s).
+            // Sin beacon no se juzga; sin otra ganadora no se desaloja.
+            {
+                uint64_t beaconFrames = 0, beaconAppliedGen = 0;
+                const auto beaconState = ivanna::readEffectBeacon(
+                    2000ull, ivanna::OMEGA_EFFECT_BEACON_PATH,
+                    &beaconFrames, &beaconAppliedGen);
+                const bool beaconAvailable =
+                    beaconState != ivanna::EffectBeaconState::Unavailable;
+                const int32_t pollWinner =
+                    (out.status == ivanna::daemon::SessionDiscoveryStatus::kFound)
+                        ? out.sessionId : 0;
+                if (sessionLiveness.notePoll(sessionId, pollWinner,
+                                             beaconAvailable, beaconFrames)) {
+                    const int32_t evicted = sessionId;
+                    demotedSessions.add(evicted);
+                    sessionGate.evict();
+                    sessionId = 0;
+                    ++sessionGen;
+                    resetSnapForSessionChange = true;
+                    char evictBuf[128];
+                    std::snprintf(evictBuf, sizeof(evictBuf),
+                                  "sesión desalojada por silencio del beacon: %d (ganadora %d)",
+                                  static_cast<int>(evicted),
+                                  static_cast<int>(pollWinner));
+                    logLine(evictBuf);
+                } else if (sessionLiveness.advancedOnLastPoll() && sessionId > 0) {
+                    // La confirmada suena: redención (si estaba degradada
+                    // por un silencio viejo, vuelve a competir normal).
+                    demotedSessions.redeem(sessionId);
+                }
+            }
             resetSnapForSessionChange = ivanna::daemon::applyDiscoveryPoll(
-                sessionGate, out, sessionId, sessionGen, sessionPackage);
+                sessionGate, out, sessionId, sessionGen, sessionPackage) ||
+                resetSnapForSessionChange;
             // kError: el gate congela todo (se conserva la sesión anterior).
         }
 
@@ -678,6 +747,41 @@ int main() {
             ivanna_fusion_write(fusion, &w);
         }
 
+        // EVOL-LIVEPATH (hardware_rate_millihz en 0): re-publicar el reloj
+        // real del músculo como snapshot HAL para omega_effect. Sin músculo
+        // fresco no hay muestra (fail-closed: el beacon sigue en 0 y la
+        // app muestra "—", nunca una tasa inventada). Sin sesión
+        // confirmada todavía, la muestra lleva identidad 1/1 (ver el
+        // helper). Solo publica si la muestra avanzó: un músculo parado
+        // no refresca el snapshot y el tracker del efecto deja de
+        // validar en vez de sostener una tasa rancia.
+        if (muscleFresh) {
+            ivanna::audio::HardwareClockSample hwSample{};
+            if (ivanna::daemon::buildHardwareClockSample(st, sessionId, sessionGen,
+                                                         hwSample)) {
+                if (!hwClockPublisherOpen &&
+                    (nowMs - lastHwClockOpenAttemptMs) >= 5000ULL) {
+                    lastHwClockOpenAttemptMs = nowMs;
+                    hwClockPublisherOpen = hwClockPublisher.open();
+                    if (hwClockPublisherOpen) {
+                        // 0666 como el beacon: el efecto (audioserver,
+                        // otro uid) debe poder leerlo. asrc_link_fixperms
+                        // lo deja en 0664 solo si su watcher sigue vivo
+                        // tras el arranque; esto no depende de él.
+                        ::chmod(ivanna::audio::kHardwareClockSnapshotPath, 0666);
+                    }
+                }
+                if (hwClockPublisherOpen &&
+                    (hwSample.hardwareTimestampNs != lastHwClockTimestampNs ||
+                     hwSample.presentedFrames != lastHwClockFrames)) {
+                    if (hwClockPublisher.publish(hwSample)) {
+                        lastHwClockTimestampNs = hwSample.hardwareTimestampNs;
+                        lastHwClockFrames = hwSample.presentedFrames;
+                    }
+                }
+            }
+        }
+
         // Estado vivo para el hilo de comandos (GET_STATUS): la app lee la
         // sesión descubierta de aquí, no del bucle. Stores atómicos baratos.
         cmdState.sessionId.store(sessionId, std::memory_order_relaxed);
@@ -739,6 +843,40 @@ int main() {
                                       static_cast<int32_t>(st.clock_source),
                                       psi.eta, psi.coupling(), psiActive,
                                       static_cast<uint64_t>(st.sequence));
+                // P2 (2026-11-26, RMS=0 en vivo): reflejar la telemetría
+                // medida por el efecto (bus local) en el snapshot de
+                // control antes de publicar. Apertura best-effort con
+                // reintento espaciado 5 s; si el bus local no abre, el
+                // snapshot publica ceros como hoy (fail-closed). El espejo
+                // solo toca campos de telemetría; publish() estampa
+                // generación/timestamp/CRC después.
+                if (!localTelemetryOpen &&
+                    (nowMs - lastLocalOpenAttemptMs) >= 5000ULL) {
+                    lastLocalOpenAttemptMs = nowMs;
+                    localTelemetryOpen = localTelemetryBus.openReader(
+                        ivanna::OMEGA_EFFECT_LOCAL_BUS_PATH);
+                }
+                // EVOL-LIVEPATH (consumer_generation muerto): el beacon
+                // lleva la generación que el efecto confirmó aplicar. Se
+                // lee en cada publicación (~1/s) y se anota en el espejo
+                // ANTES de applyTo, para que lastSnap.consumer_generation
+                // avance con lo que el efecto aplica de verdad. Sin
+                // beacon (efecto apagado) no se anota nada y el campo
+                // conserva su último valor (0 si nunca aplicó nada).
+                bool telFresh = false;
+                if (localTelemetryOpen) {
+                    telFresh = telemetryMirror.poll(localTelemetryBus, nowMs);
+                }
+                {
+                    uint64_t beaconFrames = 0, beaconAppliedGen = 0;
+                    const auto beaconState = ivanna::readEffectBeacon(
+                        2000ull, ivanna::OMEGA_EFFECT_BEACON_PATH,
+                        &beaconFrames, &beaconAppliedGen);
+                    if (beaconState != ivanna::EffectBeaconState::Unavailable) {
+                        telemetryMirror.noteBeaconAppliedGeneration(beaconAppliedGen);
+                    }
+                }
+                telemetryMirror.applyTo(lastSnap, telFresh);
                 if (!bus.publish(lastSnap)) {
                     shmOk = false;
                 } else {

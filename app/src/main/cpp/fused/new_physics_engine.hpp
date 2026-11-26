@@ -9,7 +9,9 @@
 //   6) Solver integrado Kirkeby-Nelson 2x2 (para IR medidas por Farina ESS)
 //   7) Banco Modal Sub-100 Hz IIR en 64-bit double (resuelve 68.5 Hz, 0 lat.)
 //   8) Klippel Volterra H2 + H3 O(M) Laguerre + Red Térmica Dual-RC (Tv, Tm)
-//   9) Lazo variacional F (MOC + Onsets) independiente de sampleRate
+//   9) Lazo F heurístico (MOC + Onsets) independiente de sampleRate
+//       [P1+P4 2026-11-26: antes "Lazo variacional F" — no hay funcional
+//       F ni ∂F/∂Γ; ver free_energy_loop.hpp]
 //  10) Crossfade matricial anti-zipper + rodilla suave anti-clip en Overdrive
 // Bypass bit-exacto fail-closed intacto. Cero malloc en process().
 //
@@ -338,6 +340,12 @@ public:
     }
 
     const NewPhysicsTelemetry& telemetry() const noexcept { return telemetry_; }
+
+    // Telemetría P1+P4 (2026-11-26): γ del lazo F por banda ERB (dB).
+    // Es la salida observable del lazo (además de feGain_ interno).
+    float freeEnergyGammaModDb(int band) const noexcept {
+        return freeEnergy_.gammaModDb(band);
+    }
     float coilTempCL() const noexcept { return static_cast<float>(25.0 + dTvL_); }
     float coilTempCR() const noexcept { return static_cast<float>(25.0 + dTvR_); }
 
@@ -641,7 +649,8 @@ private:
             }
         }
 
-        // Lazo variacional F (MOC + Onsets) con tasa independiente de sampleRate_
+        // Lazo F heurístico (MOC + Onsets) con tasa independiente de
+        // sampleRate_ [P1+P4 2026-11-26: antes "Lazo variacional F"].
         const float oneMinusA = 1.0f - envAlpha_;
         std::array<float, 24> transRatio{};
         for (int b = 0; b < 24; ++b) {

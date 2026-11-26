@@ -43,7 +43,7 @@
 //     (0 dB en voice == 0 → bypass, el filtro ni se ejecuta).
 //   - safety (0..1): 0 = limitador en bypass; > 0 = activo, con los
 //     parámetros de ruta reales (-1 dBFS umbral / -0.1 dBFS techo,
-//     los mismos que usan Ruta A y Ruta B). El techo es 0.98855
+//     los mismos que usan Ruta A y Ruta B). El techo es 0.9885531f
 //     lineal (-0.1 dBFS): la salida nunca pasa de 1.0.
 //   - upmixImmersivity: este operador lo GUARDA pero NO lo procesa:
 //     el upmixer HOA vive en el Operador Espacial y la cadena
@@ -89,7 +89,7 @@ public:
     // Valores EXACTOS a precisión float32 (no redondeos a 5 decimales):
     //   threshold = float32 más cercano a 10^(-1/20)   → -0.9999991 dB
     //   ceiling   = float32 más cercano a 10^(-0.1/20) → -0.0999999 dB
-    // El literal anterior 0.98855f era -0.1000271 dB (2.7e-5 dB más
+    // El literal anterior de 5 decimales era -0.1000271 dB (2.7e-5 dB más
     // estricto que el -0.1 dB nominal); el techo final de fused_chain.cpp
     // usa ESTA misma constante, así que limiter y techo final no divergen.
     static constexpr float kLimiterThreshold = 0.891251f;

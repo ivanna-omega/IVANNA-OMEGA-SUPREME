@@ -105,6 +105,39 @@ std::pair<double, double> itdIld(const std::vector<float>& l, const std::vector<
     for (int i = from; i < to; ++i) { pL += (double)l[i] * l[i]; pR += (double)r[i] * r[i]; }
     return {bestLag / kFs, 10.0 * std::log10((pL + 1e-30) / (pR + 1e-30))};
 }
+
+// ITD (s) por correlación de ENVOLVENTES (|x| pasabajo 200 Hz, argmax
+// ±1 ms). Inmune al salto de ciclo de la portadora: con IPD envuelto
+// (retardo total > medio periodo por encima de ~700 Hz) el argmax crudo
+// puede caer en un lóbulo lateral (ver GreenMatchesOrbeSpreadSweep),
+// mientras la envolvente sigue el retardo de grupo. Se usa como segunda
+// pata de la degeneración G, no como sustituto del argmax.
+double itdEnvelope(const std::vector<float>& l, const std::vector<float>& r,
+                   int from, int to) {
+    const double a = 1.0 - std::exp(-2.0 * kPi * 200.0 / kFs);
+    std::vector<double> el(to - from), er(to - from);
+    double sL = 0.0, sR = 0.0;
+    for (int i = from; i < to; ++i) {
+        sL += a * (std::fabs((double)l[i]) - sL);
+        sR += a * (std::fabs((double)r[i]) - sR);
+        el[i - from] = sL;
+        er[i - from] = sR;
+    }
+    double mL = 0.0, mR = 0.0;
+    for (size_t i = 0; i < el.size(); ++i) { mL += el[i]; mR += er[i]; }
+    mL /= el.size(); mR /= er.size();
+    double best = -1e30, bestLag = 0.0;
+    for (int lag = -48; lag <= 48; ++lag) {
+        double c = 0.0;
+        for (size_t i = 0; i < el.size(); ++i) {
+            const long j = (long)i + lag;
+            if (j < 0 || j >= (long)el.size()) continue;
+            c += (el[i] - mL) * (er[j] - mR);
+        }
+        if (c > best) { best = c; bestLag = lag; }
+    }
+    return bestLag / kFs;
+}
 }  // namespace
 
 TEST(HolosChain, ThdnOffIsBitExact) {
@@ -259,7 +292,7 @@ TEST(HolosChain, GreenMatchesOrbe) {
     // widthFromState(coh≈1)=0.3 × norma 1.354 = 0.406. Se lee el wSide
     // de HOLOS y se pone como diffuse de ORBE; si no, la diferencia de
     // ITD (208 µs medida) es el side, no G.
-    // ── ACANTILADO DE SPREAD (medido 2026-11-25, clang++-18, M1 ON) ──
+    // ── ACANTILADO DE SPREAD — RESUELTO (P3/3.2, 2026-11-26) ──
     // linearParams() NO fija spread/proximity: hereda los defaults del
     // struct. Con el side de HOLOS en 0.406 (antes del fix), ORBE con M1
     // ON daba +312 µs / +2.2 dB y HOLOS: spread 1.0 → +375 µs (dif 62 µs,
@@ -275,6 +308,28 @@ TEST(HolosChain, GreenMatchesOrbe) {
     // ≥1.3. El fix del estimador (θ×spread con clamp ±90° +
     // realimentación por r) queda como trabajo futuro. El default del
     // struct es 1.2 desde fix(holos) 2026-11-25.
+    // ── MECANISMO REAL (sondas probe_mirror/probe_mirror2, 2026-11-26) ──
+    // El estimador era INOCENTE: θ se queda a la izquierda en todas las
+    // bandas y es monótono en spread (b2 −32°→−60° de 0.8 a 1.5); el
+    // θ×spread con clamp y la realimentación por r YA existían en el
+    // código. El defecto estaba en el RENDER: el side pasaba SIN la
+    // rotación de fase ITD por oído (y sin ganancia ILD), así que en
+    // bandas donde el IPD de entrada ≈ ±180° (f ≳ 1.5 kHz para τ = 0.29 ms)
+    // la señal es casi todo side y el render perdía esas bandas — el ILD
+    // por banda se invertía (b12 ~2.1 kHz: −4.3 dB @1.2, −8.9 dB @1.5) y
+    // el lóbulo lateral de la correlación superaba al pico verdadero
+    // (argmax −333 µs @≥1.3). FIX: el side también rota con phL/phR
+    // (OrbeBinaural::renderBins, HolosOperator::renderBins; |ph| = 1, la
+    // potencia por banda no cambia). Medido tras el fix: ILD por banda
+    // +5…+17 dB en todas las bandas, ILD de banda ancha +7.6 dB, θ de
+    // salida re-medido negativo en todas las bandas y todos los spreads,
+    // ITD de envolvente +271…+354 µs monótono en spread. El argmax crudo
+    // sigue siendo ambiguo en valor ABSOLUTO para esta señal (el lóbulo
+    // principal de la correlación es negativo en el retardo verdadero por
+    // la inversión de polaridad mid/side); por eso este test compara
+    // HOLOS contra ORBE con el MISMO spread (antes comparaba 1.2 contra
+    // 1.0, escenas distintas) y el barrido GreenMatchesOrbeSpreadSweep
+    // cubre 0.8–1.5 con las dos patas (argmax + envolvente).
     // NO relajar la tolerancia: el test está cazando un defecto real.
     auto mkInput = []() {
         auto base = noiseBp(0.4, 3.0, 61);
@@ -300,6 +355,9 @@ TEST(HolosChain, GreenMatchesOrbe) {
     OrbeParams op_;
     op_.amount = 1.0f;
     op_.diffuse = sideGain;  // igualar la ganancia de side (ver arriba)
+    op_.spread = 1.2f;       // P3/3.2: MISMO spread que HOLOS (linearParams
+                             // hereda el default 1.2 del struct); comparar
+                             // 1.2 contra 1.0 era comparar escenas distintas.
     orbe.setParams(op_);
     std::vector<float> ol = in.first, orr = in.second;
     runOrbe(orbe, ol, orr);
@@ -311,6 +369,64 @@ TEST(HolosChain, GreenMatchesOrbe) {
                 h.first * 1e6, h.second);
     EXPECT_NEAR(h.first, o.first, 50e-6);
     EXPECT_NEAR(h.second, o.second, 2.0);
+}
+
+TEST(HolosChain, GreenMatchesOrbeSpreadSweep) {
+    // P3/3.2 (2026-11-26): la degeneración G debe valer en TODO el rango
+    // de spread 0.8–1.5, no solo en el default 1.2 — el espejo vivía en
+    // ≥1.3. Misma escena en ambos operadores (MISMO spread por fila) y
+    // dos patas de ITD: argmax crudo (el medidor histórico) y envolvente
+    // (inmune al salto de ciclo). Medido con el fix del side rotado
+    // (g++-14): dif argmax 0 µs, dif envolvente 0 µs, dif ILD 0.0 dB en
+    // las 8 filas (HOLOS y ORBE coinciden muestra a muestra en modo
+    // lineal). Sin el fix del render, la fila 1.3 daba HOLOS −333 µs
+    // contra ORBE +312 µs (dif 645 µs) y la ILD de HOLOS caía a −0.0 dB.
+    auto mkInput = []() {
+        auto base = noiseBp(0.4, 3.0, 61);
+        std::vector<float> l(144000), r(144000);
+        const int delay = 14;  // 0.29 ms @48 kHz, L antes que R
+        for (int i = 0; i < 144000; ++i) {
+            l[i] = base[i];
+            r[i] = (i >= delay) ? 0.5f * base[i - delay] : 0.0f;  // ILD 6 dB
+        }
+        return std::pair<std::vector<float>, std::vector<float>>{l, r};
+    };
+    for (double spread : {0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5}) {
+        auto in2 = mkInput();
+        HolosOperator holos;
+        holos.prepare(48000.0f);
+        HolosParams hp = linearParams();
+        hp.spread = (float)spread;
+        holos.setParams(hp);
+        std::vector<float> hl = in2.first, hr = in2.second;
+        runHolos(holos, hl, hr);
+        const float sideGain = holos.bandWidthGain(12);
+        auto in = mkInput();
+        OrbeBinaural orbe;
+        orbe.prepare(48000.0f);
+        OrbeParams op_;
+        op_.amount = 1.0f;
+        op_.diffuse = sideGain;
+        op_.spread = (float)spread;
+        orbe.setParams(op_);
+        std::vector<float> ol = in.first, orr = in.second;
+        runOrbe(orbe, ol, orr);
+        const auto o = itdIld(ol, orr, 96000, 144000);
+        const auto h = itdIld(hl, hr, 96000, 144000);
+        const double oEnv = itdEnvelope(ol, orr, 96000, 144000);
+        const double hEnv = itdEnvelope(hl, hr, 96000, 144000);
+        std::printf("[holos-chain] spread %.1f: ORBE ITD %+.0f µs (env %+.0f) ILD %+.1f dB | "
+                    "HOLOS ITD %+.0f µs (env %+.0f) ILD %+.1f dB\n",
+                    spread, o.first * 1e6, oEnv * 1e6, o.second,
+                    h.first * 1e6, hEnv * 1e6, h.second);
+        EXPECT_NEAR(h.first, o.first, 50e-6) << "spread=" << spread;
+        EXPECT_NEAR(hEnv, oEnv, 50e-6) << "spread=" << spread;
+        EXPECT_NEAR(h.second, o.second, 2.0) << "spread=" << spread;
+        // La imagen no cambia de signo en ningún spread: ambas salidas
+        // siguen a la izquierda (ITD de envolvente > 0, ILD L−R > 0).
+        EXPECT_GT(hEnv, 0.0) << "spread=" << spread;
+        EXPECT_GT(h.second, 0.0) << "spread=" << spread;
+    }
 }
 
 // ═══ OMNI-FIELD (v2.5.375) — fusión OmniSpatial + HRTF-MAA + AudioSphere + INAF ═══

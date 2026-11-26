@@ -173,9 +173,15 @@ ivanna_add_test(test_bridgeplayer_level_control)
 ivanna_add_test(test_bridgeplayer_lufs_trim)
 # Monotonic software clock monitor for callback cadence (diagnostic only, not DAC phase).
 ivanna_add_test(test_audio_callback_clock)
+# EVOL-LIVEPATH (2026-11-26): tasa del FusionCore desde el reloj de
+# callback medido (SET_CONFIG jamás llega en este HAL).
+ivanna_add_test(test_effect_sample_rate)
 # Estimator fed only by real HAL/driver presentation timestamps and frame positions.
 ivanna_add_test(test_audio_hardware_clock)
 ivanna_add_test(test_audio_hardware_clock_bridge)
+# EVOL-LIVEPATH (2026-11-26): muestra de reloj HAL desde el músculo ASRC
+# (hardware_rate_millihz en 0 por falta de publicador en vivo).
+ivanna_add_test(test_hardware_clock_from_muscle)
 # IVANNA-ASRC-X1: núcleo variable y control fail-closed (sin ruta productiva habilitada).
 ivanna_add_test(test_variable_asrc)
 ivanna_add_test(test_hal_output_rate_control)
@@ -208,6 +214,7 @@ add_executable(test_adaptive_engine
 )
 target_include_directories(test_adaptive_engine PRIVATE
   ../experimental/adaptive_engine
+  ..  # P3/3.5: adaptive_decision_engine.hpp incluye fused/fused_dynamics.hpp
 )
 target_compile_options(test_adaptive_engine PRIVATE -Wall -Wextra)
 target_link_libraries(test_adaptive_engine PRIVATE Threads::Threads)
@@ -326,6 +333,52 @@ target_include_directories(test_route_b_output_mode PRIVATE
 target_compile_options(test_route_b_output_mode PRIVATE -Wall -Wextra)
 target_link_libraries(test_route_b_output_mode PRIVATE Threads::Threads)
 add_test(NAME test_route_b_output_mode COMMAND test_route_b_output_mode)
+
+# ── test_corona_control_route: HOLOS EN VIVO (evol-holos, 2026-11-26) ──────
+# El preset CORONA (HOLOS 1.0 / diffuse 0.85 / spread 1.2) no llegaba al
+# engine: el efecto lo clampaba a 0.5/0.5/1.0 y el Genezi codificaba como
+# SPEAKERS (puerta -> 0.0). Este test fija la ruta completa (responder +
+# apply + clamps canónicos + puertas GENEZI): el engine recibe 1.0/0.85/1.2.
+add_executable(test_corona_control_route test_corona_control_route.cpp
+    ../daemon/core/omega_control_bus.cpp)
+target_include_directories(test_corona_control_route PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/..
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include
+)
+target_compile_options(test_corona_control_route PRIVATE -Wall -Wextra)
+target_link_libraries(test_corona_control_route PRIVATE Threads::Threads)
+add_test(NAME test_corona_control_route COMMAND test_corona_control_route)
+
+# ── test_p2_telemetry_preserve: P2 (2026-11-26, RMS=0 en vivo) ──────────
+# El efecto medía RMS/pico por bloque pero cada adopción del snapshot del
+# daemon borraba la telemetría con sus ceros (el daemon nunca escribe esos
+# campos). omega_preserve_effect_telemetry() (include/) conserva los campos
+# medidos al adoptar. Header-only: no necesita omega_control_bus.cpp.
+ivanna_add_test(test_p2_telemetry_preserve)
+
+# ── test_p2_telemetry_mirror: P2 (2026-11-26, RMS=0 en vivo) ─────────────
+# El daemon nunca leía el bus local del efecto: el snapshot de control
+# publicaba RMS/pico/frames en 0 con música sonando. EffectTelemetryMirror
+# (daemon/control/) refleja esa telemetría antes de publicar. Compila el
+# omega_control_bus.cpp REAL (writer/reader seqlock + CRC32) sobre SHM en
+# /tmp, mismo patrón que test_upmixing_control_plane.
+add_executable(test_p2_telemetry_mirror
+  test_p2_telemetry_mirror.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../daemon/core/omega_control_bus.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../daemon/core/android_log_compat.cpp
+)
+target_include_directories(test_p2_telemetry_mirror PRIVATE .. ../include)
+target_compile_options(test_p2_telemetry_mirror PRIVATE -Wall -Wextra)
+target_link_libraries(test_p2_telemetry_mirror PRIVATE GTest::gtest_main Threads::Threads)
+gtest_discover_tests(test_p2_telemetry_mirror)
+
+# ── test_p2_snapshot_watchdog: P2 (2026-11-26) ────────────────────────────
+# Si el daemon deja de publicar, el efecto seguía eternamente con los
+# controles viejos. El watchdog (include/omega_snapshot_freshness.h) cae
+# a defaults seguros con rampa de 100 ms tras 3000 ms sin snapshot nuevo
+# y recupera con la misma rampa. Header-only, simulación de daemon muerto
+# en host con bloques de 40 ms.
+ivanna_add_test(test_p2_snapshot_watchdog)
 
 # ── test_route_b_snapshot_status: GET_STATUS expone el snapshot (2026-11-14)
 # 4 campos aditivos (snapshot_generation, perceptual_generation,
@@ -557,6 +610,7 @@ add_executable(test_close_loop
 )
 target_include_directories(test_close_loop PRIVATE
   ../experimental/adaptive_engine
+  ..  # P3/3.5: adaptive_decision_engine.hpp incluye fused/fused_dynamics.hpp
 )
 target_compile_options(test_close_loop PRIVATE -Wall -Wextra)
 if(IVANNA_SAN_FLAGS)
@@ -583,6 +637,7 @@ if(DEFINED ENV{IVANNA_CI_FAST})
 endif()
 target_include_directories(test_stability PRIVATE
   ../experimental/adaptive_engine
+  ..  # P3/3.5: adaptive_decision_engine.hpp incluye fused/fused_dynamics.hpp
 )
 target_compile_options(test_stability PRIVATE -Wall -Wextra)
 target_link_libraries(test_stability PRIVATE Threads::Threads)
@@ -1094,6 +1149,47 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_holos_operator PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 gtest_discover_tests(test_holos_operator)
+
+# ── test_power_mix: mezcla seco/wet de potencia constante (P3/3.1) ──
+# PowerMixer en ORBE y HOLOS: unidad (coherente/incorrelado/antifase/
+# extremos exactos), fundido 15 ms del operador con tonos (ventanas 5 ms),
+# régimen permanente con ruido (ventanas 1 s) y potencia por banda ERB
+# (Goertzel a la fundamental, 100 Hz / 1 kHz).
+add_executable(test_power_mix
+  test_power_mix.cpp
+  ../spatial/OrbeBinaural.cpp
+  ../spatial/HolosOperator.cpp
+  ../spatial/HolosVolterraKernel.cpp
+  ../spatial/RirConvolver.cpp
+)
+target_link_libraries(test_power_mix PRIVATE GTest::gtest_main ivanna_dsp_under_test)
+target_include_directories(test_power_mix PRIVATE .. ../include host_stubs)
+target_compile_options(test_power_mix PRIVATE -Wall -Wextra)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_power_mix PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_power_mix PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_power_mix)
+
+# ── test_holos_multidim: HOLOS multidimensional (P3/3.3) ──
+# Equivalente a test_orbe_power_conservation pero para HOLOS: energía
+# total, balance L/R (ILD) y coherencia por banda ERB (24 bandas,
+# 60 Hz–16 kHz), con tono coherente, ruido dual-mono e independiente,
+# estéreo asimétrico y transitorios.
+add_executable(test_holos_multidim
+  test_holos_multidim.cpp
+  ../spatial/HolosOperator.cpp
+  ../spatial/HolosVolterraKernel.cpp
+  ../spatial/RirConvolver.cpp
+)
+target_link_libraries(test_holos_multidim PRIVATE GTest::gtest_main ivanna_dsp_under_test)
+target_include_directories(test_holos_multidim PRIVATE .. ../include host_stubs)
+target_compile_options(test_holos_multidim PRIVATE -Wall -Wextra)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_holos_multidim PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_holos_multidim PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_holos_multidim)
 
 # Perfil de coste de HOLOS por componente (F2 / v2.5.453): imprime
 # media/p99 por bloque de 320 f con distintos parámetros. No es un test
@@ -3281,6 +3377,91 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_d10_corona PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 gtest_discover_tests(test_d10_corona)
+
+# ── REFINAMIENTO TOTAL MAGISTRAL P1+P4 (2026-11-26) ───────────────────────
+# Ablación por operador + Regla de Oro por banda ERB (test_p1p4_ablation),
+# descomposición del −15.570 dB de NEURO + lazo F (test_p1p4_neuro) y
+# verificación HRTF con telemetría de camino (test_p1p4_hrtf).
+# Mismo patrón que test_d10_corona (FusedChain solo vive en
+# ${FUSED_CHAIN_SOURCES}); test_p1p4_neuro es header-only (FreeEnergy /
+# NewPhysicsEngine / NpeStereoCore) y usa ivanna_add_test; test_p1p4_hrtf
+# enlaza la pipeline unificada (SofaHRTFLoader.cpp, como
+# test_sofa_hrtf_loader).
+add_executable(test_p1p4_ablation
+  test_p1p4_ablation.cpp
+  ${FUSED_CHAIN_SOURCES}
+)
+target_include_directories(test_p1p4_ablation PRIVATE .. ../include ../neuromorphic ../dsp host_stubs)
+target_compile_options(test_p1p4_ablation PRIVATE -Wall -Wextra)
+target_link_libraries(test_p1p4_ablation PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_p1p4_ablation PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_p1p4_ablation PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_p1p4_ablation)
+
+# ── MEJORA EVOLUTIVA, bloque GENEZI + NOTCH + 11.5 kHz (2026-11-26) ──────
+# Carga real del asset .ivk1 Genezi en el motor fusionado + diferencia
+# medible de salida + reemplazo en caliente sin clic; atribución del
+# notch de enganche −15.8 dB a 977 Hz y de la interacción −25 dB a
+# 11.5 kHz. Mismo patrón que test_p1p4_ablation (FusedChain solo vive
+# en ${FUSED_CHAIN_SOURCES}).
+add_executable(test_evol_genezi
+  test_evol_genezi.cpp
+  ${FUSED_CHAIN_SOURCES}
+)
+target_include_directories(test_evol_genezi PRIVATE .. ../include ../neuromorphic ../dsp host_stubs)
+target_compile_options(test_evol_genezi PRIVATE -Wall -Wextra)
+target_link_libraries(test_evol_genezi PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_evol_genezi PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_evol_genezi PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_evol_genezi)
+
+# test_p1p4_neuro: explícito (no ivanna_add_test) porque phase_oracle.cpp
+# necesita el stub JNI de host (host_stubs/jni.h) y BiquadEnvelopeBank
+# (dentro de NpeStereoCore) llama phase_oracle_tick — phase_oracle.cpp
+# no está en ivanna_dsp_under_test (mismo patrón que
+# test_hyper_state_operator / test_npe_core).
+add_executable(test_p1p4_neuro
+  test_p1p4_neuro.cpp
+  ../phase_oracle.cpp
+)
+target_include_directories(test_p1p4_neuro PRIVATE .. ../include ../neuromorphic ../dsp host_stubs)
+target_compile_options(test_p1p4_neuro PRIVATE -Wall -Wextra)
+target_link_libraries(test_p1p4_neuro PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_p1p4_neuro PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_p1p4_neuro PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_p1p4_neuro)
+
+add_executable(test_p1p4_hrtf test_p1p4_hrtf.cpp)
+target_link_libraries(test_p1p4_hrtf PRIVATE ivanna_unified_pipeline_under_test GTest::gtest_main Threads::Threads m dl)
+target_compile_options(test_p1p4_hrtf PRIVATE -Wall -Wextra)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_p1p4_hrtf PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_p1p4_hrtf PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_p1p4_hrtf)
+
+# ── Calibración P8 medida (P3, 3.4, 2026-11-26) ─────────────────────────────
+# Bloquea la tabla medida operador x banda x canal x estímulo x nivel y
+# documenta que la brecha nominal-real es estructural (dependiente de
+# señal), no cerrable con un trim estático. kNominalGainDb NO se toca.
+add_executable(test_p8_calibration
+  test_p8_calibration.cpp
+  ${FUSED_CHAIN_SOURCES}
+)
+target_include_directories(test_p8_calibration PRIVATE .. ../include ../neuromorphic ../dsp host_stubs)
+target_compile_options(test_p8_calibration PRIVATE -Wall -Wextra)
+target_link_libraries(test_p8_calibration PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_p8_calibration PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_p8_calibration PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_p8_calibration)
 
 # ── Capa de conservación perceptual (árbitro de campo, 2026-11-21) ─────────
 # Solver (nunca crea energía, techo, silencio) + capa standalone (bypass

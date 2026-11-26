@@ -97,7 +97,8 @@ void FusedSpatial::setControls(const SpatialControls& c) noexcept {
 }
 
 void FusedSpatial::applyControls() noexcept {
-    const bool speakers = isSpeakers();
+    // XTC/AuxField: bocina plana o Genezi (trayecto de altavoz).
+    const bool speakers = isSpeakersLike();
     upmixer_.setUpmixingEnabled(controls_.upmixEnabled);
     upmixer_.setImmersivity(controls_.upmixImmersivity);
 
@@ -183,7 +184,7 @@ void FusedSpatial::applyPose(bool force) noexcept {
     // El XTC sigue a la cabeza: azimut + corrimiento lateral estimado.
     // El azimut también se escala por parallaxAmount (con 0, el XTC no
     // sigue a la cabeza).
-    if (isSpeakers() && controls_.headTracking) {
+    if (isSpeakersLike() && controls_.headTracking) {
         float az = 0.0f, lat = 0.0f;
         trackerFusion_.offsetForSpatial(az, lat);
         az *= controls_.parallaxAmount;
@@ -386,7 +387,10 @@ FusedSpatial::BinauralStage FusedSpatial::selectBinauralStage() const noexcept {
 
 void FusedSpatial::processChunk(double* l, double* r, int n) noexcept {
     // n == kChunk SIEMPRE (lo garantiza process() con el acumulador).
-    const bool speakers = isSpeakers();
+    // XTC/AuxField: bocina plana o Genezi. La selección de etapa binaural
+    // (selectBinauralStage) sigue siendo solo-SPEAKERS: en GENEZI ORBE
+    // renderiza (tercer modo), no None.
+    const bool speakers = isSpeakersLike();
     applyPose(false);
     const BinauralStage stage = selectBinauralStage();
 
