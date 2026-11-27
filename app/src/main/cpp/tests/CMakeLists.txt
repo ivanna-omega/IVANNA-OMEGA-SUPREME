@@ -3758,3 +3758,16 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_mpc_shadow PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 gtest_discover_tests(test_mpc_shadow)
+
+# ── FASE 3 — MODELO ACOPLADO NO LINEAL (D10) ─────────────────────────────
+# 17 tests (test_coupled_model): modos de sala (35 exactos), Gamma_k
+# corregido, Westervelt (-56.6 dB F2 / -53.6 dB Beyer-pico, divergencia
+# registrada), P-A (Delta phi 2.71°; Delta f_s modal 0.017 Hz — F2 decía
+# 0.2-0.8 Hz y la suma exacta NO lo reproduce), P-C, P-B2 (tau_1/2),
+# balance energético por hop <= 1e-6, integrador exponencial exacto vs
+# RK4 (fase exacta [D7]), aliasing Duffing (DC a 48 kHz, limpio a 192 kHz),
+# tensor C_ijk disperso (1614 tripletes), J-A (3.28%), presupuesto RT
+# (us/hop), modos RIR (rir_0000), Sabine/Z_w desde RIR, y lectura
+# KEMAR dos oídos + 2.1 (mismo estado, varios receptores).
+# Header-only: ivanna_add_test vale (sin FUSED_CHAIN_SOURCES).
+ivanna_add_test(test_coupled_model)
