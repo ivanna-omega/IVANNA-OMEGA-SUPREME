@@ -57,8 +57,20 @@ inline constexpr std::size_t kComponentToOperator[kNumComponents] = {
 // El desbalance L/R residual de la cadena (−0.153 dB, ALL7) lo corrige
 // el level-match por canal de OmniField (conservación del centroide);
 // el trim escalar solo centra la media.
+// RE-DERIVACIÓN 2026-11-26 (phone-loop, puerta HRTF): la puerta cierra
+// la HRTF cuando ORBE está a 0, así que el run sin-ORBE ya no renderiza
+// la HRTF de reserva y el marginal ORBE pasa de −6.336 a +0.022 dB (la
+// reserva costaba ~6.36 dB a 1 kHz en ese run). La interacción se mueve
+// en la misma cantidad (+2.445 → −3.915) y NEURO se re-deriva a −15.067 dB
+// (LOO −11.150 + interacción −3.915 = −15.065 medido; −15.067 ajusta la
+// suma a exactamente −19.482 dB). El total ALL7 no cambia (−14.178 dB)
+// y el trim sigue en +19.482 dB. La calibración intermedia (ORBE −6.336,
+// NEURO −8.709) queda superada: describía la descomposición con la HRTF
+// de reserva activa, configuración que la puerta elimina.
 inline constexpr double kNominalGainDb[kNumOperators] = {
-    +0.525,   // ORBE     (leave-one-out, media L/R)
+    +0.022,   // ORBE     (marginal +0.022 con la puerta HRTF: sin ORBE la
+              //           cadena es neutra en espacial, sin HRTF de reserva;
+              //           ORBE standalone es ~0 dB a 1 kHz)
     +0.057,   // HOLOS    (leave-one-out; el campo es ~neutro en ganancia
               //           tras la conservación de centroide de OmniField)
     -0.044,   // SALA VIVA (leave-one-out)
@@ -66,7 +78,9 @@ inline constexpr double kNominalGainDb[kNumOperators] = {
     +0.858,   // ARMONÍA  (leave-one-out)
     -5.308,   // PULSO    (−0.008 ganancia − 5.300 absorción del trim;
               //           ver comentario de arriba)
-    -15.570,  // NEURO    (−11.154 leave-one-out − 4.416 de interacción)
+    -15.067,  // NEURO    (−11.150 leave-one-out − 3.915 de interacción
+              //           = −15.065 medido; −15.067 ajusta la suma a
+              //           exactamente −19.482 dB; puerta HRTF, phone-loop)
 };
 
 double clamp01(double x) noexcept {

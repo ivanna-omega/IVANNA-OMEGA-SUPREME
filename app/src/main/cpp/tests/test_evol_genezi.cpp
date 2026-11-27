@@ -750,11 +750,12 @@ TEST(EvolGenezi, Interaction11500Attribution) {
     }
     const double interaction = all7m - sumLoo;
     std::printf("[11K5] suma marginales=%+.3f total=%+.3f interacción=%+.3f dB "
-                "(ref ablación pre-HRTF-fix: -25 dB; tras el fix HRTF: -17.35 dB)\n", sumLoo, all7m, interaction);
-    // Tras el fix HRTF (evol-hrtf: el oído derecho usa la reconstrucción
-    // válida y la reserva es simétrica), la interacción con el harness
-    // contaminado baja de -25.0 a -17.35 dB. El LOO limpio sigue en -3.81.
-    EXPECT_NEAR(interaction, -17.35, 3.0);
+                "(ref puerta-HRTF: -4.08 dB; antes -17.35 dB con la reserva activa)\n", sumLoo, all7m, interaction);
+    // Tras la puerta HRTF (phone-loop): el run sin-ORBE ya no renderiza
+    // la HRTF de reserva, así que la interacción "contaminada" colapsa
+    // de -17.35 a -4.08 dB — el valor del LOO limpio (-3.90 dB). La
+    // puerta hace que el LOO normal sea limpio por construcción.
+    EXPECT_NEAR(interaction, -4.08, 3.0);
 
     // ── VEREDICTO (corrida 8): la "interacción" es la etapa HRTF de
     // reserva. Quitar ORBE (amount=0) con hrtfWet=1.0 (default) NO lo
@@ -863,6 +864,11 @@ TEST(EvolGenezi, Interaction11500Attribution) {
 // (APEX off, D10 off, safety off). Candidato: la mezcla seco/procesado
 // de las rampas de wet de 30 ms cuando el procesado desfasa el tono
 // (ORBE/HRTF), que cancela parcialmente durante la rampa.
+// FIX (phone-loop, mezcla de potencia constante en blendWetCore): el dip
+// baja de −6.14 dB medido a −2.32 dB medido. La pérdida por mezcla lineal
+// desaparece; queda el residuo de fase por la latencia del procesado
+// (HOLOS solo −4.06 dB domina el residuo). APEX/D10/safety siguen sin
+// moverlo (deltas < 1 dB).
 TEST(EvolGenezi, EngageDipAttribution977) {
     const double dipAll7 = engageDipDb(all7Controls(), 977.0);
     std::printf("[DIP] ALL7 977 Hz hueco transitorio = %+.2f dB\n", dipAll7);
@@ -892,7 +898,10 @@ TEST(EvolGenezi, EngageDipAttribution977) {
     // El hueco de ALL7 se reproduce (±1 dB) y se atribuye al operador
     // cuyo solo muestra el mismo hueco. APEX/D10/safety no lo mueven
     // (sus deltas son <1 dB): el hueco vive en las rampas de wet.
-    EXPECT_NEAR(dipAll7, -5.37, 1.0);
+    // Post-fix (mezcla de potencia constante, phone-loop): −2.32 dB
+    // medido (era −5.37 dB de referencia / −6.14 dB medido pre-fix);
+    // el residuo es fase por latencia del procesado (HOLOS solo −4.06).
+    EXPECT_NEAR(dipAll7, -2.32, 1.0);
     EXPECT_LT(std::abs(dipNoApex - dipAll7), 1.0);
     EXPECT_LT(std::abs(dipNoD10 - dipAll7), 1.0);
     EXPECT_LT(std::abs(dipNoSafety - dipAll7), 1.0);
@@ -972,31 +981,32 @@ TEST(EvolGenezi, EngageDipFrequencySweep) {
         std::printf("[DIPF] %5.0f Hz: ALL7 hueco=%+.2f dB | HOLOS solo hueco=%+.2f dB\n",
                     f, dipAll7, dipHolos);
     }
-    // Valores medidos (corrida 9, zero7 limpio — veredicto HRTF):
-    // ALL7: 250 Hz +0.90, 500 Hz +1.99, 977 Hz −5.37, 2000 Hz −1.60,
-    // 4000 Hz −1.04 dB (2000 Hz era −5.04 antes del fix de mezcla:
-    // el enganche secuencial redujo el dip). HOLOS solo: 250 Hz −2.09,
-    // 977 Hz −8.55, 2000 Hz −3.29, 4000 Hz −4.04 dB.
-    // El hueco es peor en 977–2000 Hz (ALL7) y en 500 Hz (HOLOS solo);
-    // a 250/500 Hz el ALL7 sale POSITIVO (el inicio suena más fuerte que
-    // el régimen: el AGC de NEURO se asienta desde arriba, no hay hueco).
+    // Valores medidos (phone-loop, mezcla de potencia constante):
+    // ALL7: 250 Hz +2.60, 500 Hz −1.37, 977 Hz −2.32, 2000 Hz +0.48,
+    // 4000 Hz +1.43 dB (antes: +0.90, +1.99, −5.37, −1.60, −1.04).
+    // HOLOS solo: 250 Hz −1.72, 500 Hz −8.46, 977 Hz −4.06,
+    // 2000 Hz −0.93, 4000 Hz −1.04 dB (antes: −2.09, −13.94, −8.55,
+    // −3.29, −4.04). El hueco sigue variando fuerte con la frecuencia
+    // (patrón de peine) y HOLOS domina; a 500 Hz el ALL7 ya no sale
+    // positivo (el overshoot del AGC se atenuó con la mezcla nueva:
+    // ahora hay un hueco pequeño de −1.37 dB en vez de +1.99 dB).
     // Firma de cancelación por fase/latencia del wet, no de fundido de
-    // nivel — y HOLOS domina (su STFT es la latencia mayor).
+    // nivel.
     const double d250 = engageDipDb(all7Controls(), 250.0);
     const double d500 = engageDipDb(all7Controls(), 500.0);
     const double d977 = engageDipDb(all7Controls(), 977.0);
     const double d2000 = engageDipDb(all7Controls(), 2000.0);
     const double d4000 = engageDipDb(all7Controls(), 4000.0);
     EXPECT_GT(d250, 0.0);
-    EXPECT_GT(d500, 0.0);
-    EXPECT_NEAR(d977, -5.37, 1.0);
-    EXPECT_NEAR(d2000, -1.60, 1.0);
-    EXPECT_NEAR(d4000, -1.04, 1.0);
+    EXPECT_NEAR(d500, -1.37, 1.0);
+    EXPECT_NEAR(d977, -2.32, 1.0);
+    EXPECT_NEAR(d2000, +0.48, 1.0);
+    EXPECT_NEAR(d4000, +1.43, 1.0);
     FusedControls h500;
     zero7(h500);
     setOp(h500, 1, 1.0f);
     h500.clamp();
-    EXPECT_NEAR(engageDipDb(h500, 500.0), -13.94, 1.5);
+    EXPECT_NEAR(engageDipDb(h500, 500.0), -8.46, 1.5);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1327,13 +1337,17 @@ TEST(EvolGenezi, Interaction11500HrtfGate) {
                 meanLr(tAll7.netL, tAll7.netR),
                 meanLr(tNoOrbe.netL, tNoOrbe.netR), margOrbe);
     // (e) El HRTF de reserva, aislado: amount=0, hrtfWet=1.0 (el config
-    // contaminado) — documenta su respuesta a 11.5 kHz.
+    // contaminado) — documenta su respuesta a 11.5 kHz. Con la puerta
+    // HRTF (phone-loop) ese config hace bypass, así que se llega a la
+    // etapa por la excepción de tracking (headTracking=true, sin pose:
+    // la pose por defecto es 0 y la respuesta es la misma).
     {
         FusedControls c;
         zero7(c);
         c.field.phiAmount = 0.0f;
         c.dynamics.safety = 0.0f;
         c.spatial.hrtfWet = 1.0f;  // default vivo
+        c.spatial.headTracking = true;  // puerta HRTF: excepción tracking
         c.brain.mode = 1;
         c.clamp();
         const ToneResult t = runTone(c, kF);

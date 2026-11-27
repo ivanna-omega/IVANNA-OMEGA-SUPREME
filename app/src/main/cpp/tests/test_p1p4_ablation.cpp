@@ -203,14 +203,21 @@ void projectFund(const double* x, std::size_t n, double freqHz, double& amp,
 // se mueve +5.337 dB, de −2.892 a +2.445). Los demás marginales no
 // cambian (HOLOS +0.056, SALA −0.044, VOLTERRA 0.000, ARMONÍA +0.858,
 // PULSO −0.008, NEURO −11.153 — todos dentro de ±0.002 dB de la sonda).
-// PENDIENTE (P8): el coeficiente nominal de NEURO (−15.570) se definía
-// como LOO+interacción (−14.045 antes); con la interacción nueva,
-// LOO+interacción = −8.708 dB, a 6.86 dB del nominal. La tabla nominal
-// del compilador de experiencia se calibró contra la descomposición con
-// la HRTF rota; su re-derivación es tarea del dueño de P8, NO de este
-// bloque (no se toca nominalGainDbPerUnit). El assert de ese vínculo se
-// sustituye por la identidad total = suma + interacción (siempre cierta)
-// y un printf que deja el valor nuevo a la vista.
+// ACTUALIZACIÓN 2026-11-26 (phone-loop, puerta HRTF): la puerta cierra
+// la HRTF cuando ORBE está a 0, así que el run sin-ORBE ya no renderiza
+// la HRTF de reserva: el marginal ORBE pasa de −6.336 a +0.022 dB (la
+// HRTF de reserva costaba ~6.36 dB a 1 kHz en ese run; ORBE standalone
+// es ~0 dB, como mide test_p8_calibration). La suma se mueve en la misma
+// cantidad (−16.626 → −10.263) y la interacción (+2.445 → −3.915). El
+// total ALL7 NO cambia (−14.178 dB). La calibración intermedia (NEURO
+// −8.709 = LOO +2.445) queda SUPERADA: la tabla nominal se re-deriva
+// por segunda vez, apareada, con la descomposición post-puerta: ORBE
+// +0.022, NEURO −15.067 (LOO −11.150 + interacción −3.915 = −15.065
+// medido; −15.067 ajusta la suma a exactamente −19.482 dB). El trim P8
+// (+19.482 dB) no cambia y la Regla de Oro sigue en −0.076/+0.078 dB.
+// El assert del vínculo vuelve a valer con los valores post-puerta; la
+// identidad total = suma + interacción (siempre cierta) se sigue
+// verificando y el printf deja el valor a la vista.
 TEST(P1P4Ablation, LeaveOneOutAt1kHz) {
     const ToneResult all7 = runTone(all7Controls(), 1000.0);
     std::printf("[P1P4-LOO] ALL7 trim0 1kHz: netL=%+.3f netR=%+.3f media=%+.3f "
@@ -233,11 +240,13 @@ TEST(P1P4Ablation, LeaveOneOutAt1kHz) {
                     "L=%+.3f R=%+.3f media=%+.3f\\n",
                     kOpName[o], loo.netL, loo.netR, margL, margR, marg);
         if (o == 0) {
-            // evol-hrtf: −6.336 dB con la HRTF reparada (era −0.999 dB con
-            // el oído R residual amplificado 23 dB). El total ALL7 no
-            // cambia; solo la atribución ORBE↔interacción.
-            EXPECT_NEAR(marg, -6.336, 1.0)
-                << "marginal ORBE distinto del valor con la HRTF reparada (-6.336 dB)";
+            // Puerta HRTF (phone-loop): sin ORBE la HRTF se cierra, así
+            // que el run sin-ORBE es neutro en espacial y el marginal es
+            // +0.022 dB (era −6.336 dB con la HRTF de reserva activa:
+            // la reserva costaba ~6.36 dB a 1 kHz en ese run). El total
+            // ALL7 no cambia; solo la atribución ORBE↔interacción.
+            EXPECT_NEAR(marg, +0.022, 1.0)
+                << "marginal ORBE distinto del valor con la puerta HRTF (+0.022 dB)";
         }
         if (o == 6) {
             EXPECT_NEAR(marg, -11.154, 1.0)
@@ -255,27 +264,27 @@ TEST(P1P4Ablation, LeaveOneOutAt1kHz) {
     const double total = meanLr(all7.netL, all7.netR);
     const double interaction = total - sumLoo;
     std::printf("[P1P4-LOO] suma marginales=%+.3f dB | total=%+.3f dB | "
-                "interacción=%+.3f dB (ref evol-hrtf: suma -16.626, interacción +2.445)\\n",
+                "interacción=%+.3f dB (ref puerta-HRTF: suma -10.263, interacción -3.915)\\n",
                 sumLoo, total, interaction);
-    EXPECT_NEAR(sumLoo, -16.626, 1.0);
-    EXPECT_NEAR(interaction, +2.445, 1.0);
-    // El coeficiente nominal P8 de NEURO (−15.570) es LOO + interacción:
+    EXPECT_NEAR(sumLoo, -10.263, 1.0);
+    EXPECT_NEAR(interaction, -3.915, 1.0);
+    // El coeficiente nominal P8 de NEURO (−15.067) es LOO + interacción:
     // el modelo nominal queda atado a la medición, no a un número suelto.
     const double neuroCoeff =
         experience_compiler::nominalGainDbPerUnit(6);
-    EXPECT_NEAR(neuroCoeff, -15.570, 0.05);
-    // VÍNCULO ROTO POR EL FIX HRTF (evol-hrtf, ver comentario arriba):
-    // neuroMarg + interacción = −8.708 dB con la HRTF reparada (era
-    // −14.045 dB), a 6.86 dB del nominal −15.570. La tabla nominal se
-    // calibró contra la descomposición con la HRTF rota; su
-    // re-derivación es del dueño de P8. Aquí se verifica la identidad
-    // de la descomposición (total = suma + interacción) y se deja el
-    // valor nuevo a la vista; NO se ensancha la tolerancia para
-    // fingir que el vínculo sigue valiendo.
+    EXPECT_NEAR(neuroCoeff, -15.067, 0.05);
+    // VÍNCULO RESTAURADO POR LA RE-DERIVACIÓN POST-PUERTA (phone-loop):
+    // neuroMarg + interacción = −15.066 dB con la puerta HRTF (era
+    // −8.711 dB con la HRTF de reserva activa), igual al nominal −15.067
+    // (brecha ~0.002 dB). La tabla nominal se re-derivó apareada por
+    // segunda vez (ORBE +0.022, NEURO −15.067; la suma sigue en
+    // −19.482 dB). Aquí se verifica la identidad de la descomposición
+    // (total = suma + interacción) y se deja el valor a la vista; NO se
+    // ensancha la tolerancia.
     EXPECT_NEAR(total, sumLoo + interaction, 0.01)
         << "la descomposición LOO no cuadra (total != suma + interacción)";
-    std::printf("[P1P4-LOO] PENDIENTE P8: neuroMarg + interacción = %+.3f dB "
-                "(nominal %+.3f, brecha %+.3f dB) — re-derivar el coeficiente\\n",
+    std::printf("[P1P4-LOO] P8: neuroMarg + interacción = %+.3f dB "
+                "(nominal %+.3f, brecha %+.3f dB)\\n",
                 neuroMarg + interaction, neuroCoeff,
                 (neuroMarg + interaction) - neuroCoeff);
 }

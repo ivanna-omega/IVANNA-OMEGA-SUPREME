@@ -67,6 +67,35 @@ TEST(FusedChain, NeutralIsBitExactDouble) {
     EXPECT_TRUE(nr.bitExact) << "residual R " << nr.residualDb << " dB";
 }
 
+// Puerta HRTF (phone-loop, 2026-11-26): FusedControls con ORBE apagado
+// (spatial.amount = 0) pero hrtfWet = 1.0 (como lo deja el slider) deben
+// salir de setControls() con la HRTF cerrada y la cadena neutra:
+// SpatialControls::clamp() fuerza hrtfWet = 0. Sin la puerta, el
+// operador espacial no era neutro y la cadena corría la HRTF sintética
+// de reserva (notch en R a 11.5 kHz) con ORBE apagado.
+TEST(FusedChain, HrtfGateWhenOrbeOff) {
+    FusedControls c;
+    c.setNeutral();
+    c.spatial.amount = 0.0f;
+    c.spatial.hrtfWet = 1.0f;  // como lo deja el slider al apagar ORBE
+    c.spatial.mode = ivanna::OmegaOutputMode::HEADPHONES;
+    FusedChain chain;
+    chain.prepare(kFs);
+    chain.setControls(c);
+    const FusedControls got = chain.controls();
+    EXPECT_FLOAT_EQ(got.spatial.hrtfWet, 0.0f);
+    EXPECT_TRUE(got.spatial.isNeutral());
+    EXPECT_TRUE(chain.isNeutral());
+    const std::size_t n = 48000;
+    std::vector<double> l = tone(n, kAmp, 11500.0), r = tone(n, kAmp, 11500.0);
+    const std::vector<double> lIn = l, rIn = r;
+    chain.process(l.data(), r.data(), static_cast<int>(n));
+    const NullResult nl = nullTest(lIn.data(), l.data(), n);
+    const NullResult nr = nullTest(rIn.data(), r.data(), n);
+    EXPECT_TRUE(nl.bitExact) << "residual L " << nl.residualDb << " dB";
+    EXPECT_TRUE(nr.bitExact) << "residual R " << nr.residualDb << " dB";
+}
+
 TEST(FusedChain, NeutralIsBitExactFloat) {
     FusedChain chain;
     chain.prepare(kFs);
@@ -1271,7 +1300,7 @@ TEST(FusedChainCoronaWiring, P8FlagOnAppliesWithZeroNetNominal) {
     EXPECT_FLOAT_EQ(c.dynamics.punch, 0.5f);       // PULSO (pegada)
     EXPECT_FLOAT_EQ(c.brain.adaptation, 0.5f);     // NEURO
     // Trim recomputado solo sobre lo aplicado:
-    // (0.525 + 0.057 − 0.044 + 0.000 + 0.858 − 5.308 − 15.570) * 0.5
+    // (+0.022 + 0.057 − 0.044 + 0.000 + 0.858 − 5.308 − 15.067) * 0.5
     // = −19.482 * 0.5 = −9.741 -> trim +9.741.
     // (Fix #1432, 2026-11-25: coeficientes NOMINALES sustituidos por los
     // MEDIDOS en la cadena real — antes la suma era +0.29 y el trim

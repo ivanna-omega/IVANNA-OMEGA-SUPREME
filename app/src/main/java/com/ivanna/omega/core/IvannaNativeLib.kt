@@ -773,6 +773,17 @@ object IvannaNativeLib {
     external fun nativeSensorLatestFrame(): FloatArray
     /** Contador de frames publicados por el sensor. */
     external fun nativeSensorFrameIndex(): Long
+    /** Ingiere UN snapshot versionado del sensor por el CANAL LATERAL
+     *  (v2.5.506). Lo llama SOLO el consumidor dedicado
+     *  (SensorSnapshotConsumer, hilo propio, nunca el hilo de audio).
+     *  erbFrame74: layout de nativeSensorLatestFrame. timestampUs:
+     *  CLOCK_MONOTONIC (µs). sequence: frame_index del sensor.
+     *  sourceId: 1 = Ruta A. Construye el snapshot, lo publica
+     *  (latest wins), lo valida (versión/fuente/frescura/rangos) y lo
+     *  entrega a Φ. Devuelve false si se rechaza, sin tocar el estado. */
+    external fun nativeSensorSnapshotIngest(
+        erbFrame: FloatArray, timestampUs: Long, sequence: Long, sourceId: Int
+    ): Boolean
     /** Activa/desactiva el bucle cerrado de corrección de sala en vivo
      *  (Ruta A). Apagado por defecto. Al apagar, el amount vuelve a 0. */
     external fun nativeSensorRoomCorrectionSetEnabled(enabled: Boolean)

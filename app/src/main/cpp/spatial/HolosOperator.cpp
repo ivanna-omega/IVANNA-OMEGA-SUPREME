@@ -157,6 +157,7 @@ void HolosOperator::reset() noexcept {
     totalOut_ = 0;
     wet_ = 0.0;
     blend_ = 0.0;
+    reseedPending_.store(false, std::memory_order_relaxed);
     flushPending_ = false;
     // P3/3.1: los mezcladores vuelven a EMAs en cero.
     mixBlend_.reset();
@@ -244,6 +245,14 @@ void HolosOperator::setOmegaBandGain(const float* gainsLin24) noexcept {
             std::isfinite(g) ? std::clamp(g, 0.0f, 8.0f) : 1.0f,
             std::memory_order_relaxed);
     }
+}
+
+void HolosOperator::requestEstimatorReseed() noexcept {
+    reseedPending_.store(true, std::memory_order_relaxed);
+}
+
+void HolosOperator::clearEstimatorReseedRequest() noexcept {
+    reseedPending_.store(false, std::memory_order_relaxed);
 }
 
 void HolosOperator::setAmount(float amount) noexcept {
@@ -600,6 +609,23 @@ void HolosOperator::runFrame() {
                          spread_.load(std::memory_order_relaxed));
     estimator_.estimate(reL_.data(), imL_.data(), reR_.data(), imR_.data(), n);
     computeBandGains();
+    // RE-SEED Γ: si FusedChain pidió re-sembrar al completar el enganche,
+    // el estimador se fija al espectro asentado de ESTE frame (aún vivo
+    // en reL_/imL_/reR_/imR_: renderBins no lo ha tocado) y Γ se
+    // recalcula desde el estado sembrado. El frame actual ya se
+    // renderiza con la Γ sembrada. La banda muerta y el estimador no se
+    // tocan; el objetivo no cambia, solo se alcanza sin retener el
+    // transitorio de la rampa en las EMAs de 260 ms.
+    if (reseedPending_.load(std::memory_order_relaxed)) {
+        reseedPending_.store(false, std::memory_order_relaxed);
+        estimator_.reseed(reL_.data(), imL_.data(), reR_.data(), imR_.data(), n);
+        // La Γ se recalcula desde el estado sembrado (el frame actual ya
+        // se renderiza con ella). dynDbSmooth_ NO se salta: persigue el
+        // objetivo sembrado con su slew/banda muerta naturales — saltarlo
+        // (variante A) restaura la Regla de Oro pero rompe P0 Thdn R
+        // (−30.24 vs −30.76 ± 0.5).
+        computeBandGains();
+    }
     // Fase 1 (M1 de HOLOS, L1): envolver el render con el conservador
     // de potencia por banda. addIn mide la potencia de entrada por banda
     // ERB (espectro directo), addOut la de salida (render + cola),

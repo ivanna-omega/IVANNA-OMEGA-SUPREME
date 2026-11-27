@@ -91,6 +91,17 @@ struct SpatialControls {
         if (mode != OmegaOutputMode::HEADPHONES && mode != OmegaOutputMode::SPEAKERS &&
             mode != OmegaOutputMode::GENEZI)
             mode = OmegaOutputMode::HEADPHONES;
+        // Puerta HRTF (phone-loop): sin ORBE no hay escena binaural que
+        // renderizar. Si amount es 0, la HRTF también es 0: la cadena hace
+        // bypass limpio en vez de sustituir por la HRTF sintética de reserva
+        // (notch audible). El clamp corre en FusedChain::setControls, así que
+        // cubre el slider, el JNI y el snapshot.
+        // Excepción: con headTracking el HRTF SÍ es la escena — la pose
+        // del tracker se renderiza por la etapa HRTF, que solo es
+        // alcanzable con amount = 0 (con amount > 0 la etapa es ORBE y
+        // el pitch no se oye por ella). Sin esta excepción la puerta
+        // mataba el pitch audible por tracking (test PitchAudibleViaHrtfStage).
+        if (amount <= 0.0f && !headTracking) hrtfWet = 0.0f;
     }
     // Neutro = nada de espacialización: la señal sale idéntica.
     // PARCHE v2.6 (Fallo 4, reemplaza el "nunca neutro en SPEAKERS" del

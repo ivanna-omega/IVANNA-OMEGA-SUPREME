@@ -281,6 +281,104 @@ public:
         meanCoherence_ = bandCount_ > 0 ? cohSum / (double)bandCount_ : 1.0;
     }
 
+    // ── RE-SEED Γ (2026-11-26, prototipo) ─────────────────────────────
+    // Fija TODOS los estados del estimador desde el espectro del frame
+    // actual, en un solo frame, SIN EMA. Se usa al completar el enganche
+    // de la cadena: el espectro asentado (post-rampa de 30 ms) sustituye
+    // el transitorio que las envolventes lentas retuvieron (envProgram64_
+    // release 65–280 ms, envSustained64_ 260 ms). La matemática por banda
+    // es LA MISMA que estimate() (Parseval, pico, cross, bisección
+    // θ/r, guarda antifase); solo cambia la actualización: asignación
+    // instantánea en vez de EMA. estimate() NO se toca.
+    // Fail-closed: espectros nulos o sin tablas → no-op. Si una banda no
+    // tiene energía (pL+pR ≤ 1e-10), su θ/r/coh se conservan (como en
+    // estimate()) y sus envolventes se siembran a mag ≈ 0.
+    void reseed(const double* reL, const double* imL, const double* reR, const double* imR,
+                int n) noexcept {
+        if (reL == nullptr || imL == nullptr || reR == nullptr || imR == nullptr ||
+            loBin_ == nullptr || hiBin_ == nullptr || centerHz_ == nullptr || n <= 0)
+            return;
+        const double spread = spread_;
+        const double distParam = distanceM_;
+        double cohSum = 0.0;
+        for (int b = 0; b < bandCount_; ++b) {
+            const int lo = loBin_[b], hi = hiBin_[b];
+            const double fc = static_cast<double>(centerHz_[b]);
+            double pL = 0.0, pR = 0.0, xRe = 0.0, xIm = 0.0;
+            double peakPow = 0.0;
+            for (int k = lo; k < hi && k <= n / 2; ++k) {
+                const double lRe = reL[k], lIm = imL[k], rRe = reR[k], rIm = imR[k];
+                const double powL = lRe * lRe + lIm * lIm;
+                const double powR = rRe * rRe + rIm * rIm;
+                pL += powL;
+                pR += powR;
+                xRe += lRe * rRe + lIm * rIm;
+                xIm += lRe * rIm - lIm * rRe;
+                peakPow = std::max(peakPow, std::max(powL, powR));
+            }
+            // Amplitud lineal de la banda (Parseval, ventana Hann) — misma
+            // fórmula que estimate().
+            const double mag = (double)std::sqrt(16.0 * (pL + pR) / (3.0 * (double)n * (double)n));
+            const double mag64 = std::isfinite(mag) ? static_cast<double>(mag) : 0.0;
+            HolosBandState& s = state_[b];
+            // Pico de banda (misma escala que mag) — asignación, no max-hold:
+            // el hold retendría el pico del transitorio de enganche.
+            s.lvl = (double)std::sqrt(peakPow) * (4.0 / (double)n);
+            // Envolventes: siembra directa al valor asentado actual.
+            envFast_[b] = mag64;
+            envSlow_[b] = mag64;
+            envProgram64_[b] = mag64;
+            envSustained64_[b] = mag64;
+            s.env = mag64;
+            s.envSlow = mag64;
+            // Crest desde el pico sembrado (en régimen envSustained → mag,
+            // así que este es el crest de régimen; para un tono ≈ 0 dB).
+            const double crestRatio = s.lvl / std::max(envSustained64_[b], 1.0e-6);
+            s.crestDb = std::clamp(20.0 * std::log10(std::max(crestRatio, 1.0)), 0.0, 24.0);
+            s.transient = false;
+            trHold_[b] = 0;
+            // Cross-espectro y potencias suavizadas: siembra al frame actual
+            // (la EMA de 20 ms de estimate() ya no tiene nada que converger).
+            xReS_[b] = xRe;
+            xImS_[b] = xIm;
+            pLS_[b] = pL;
+            pRS_[b] = pR;
+            // Escena instantánea (misma matemática que estimate(), sin EMA).
+            double coh = s.coh;
+            if (pL + pR > 1e-10) {
+                const double denom = std::sqrt(pLS_[b] * pRS_[b]);
+                coh = denom > 1e-12
+                          ? (double)(std::sqrt(xReS_[b] * xReS_[b] + xImS_[b] * xImS_[b]) / denom)
+                          : 0.0;
+                coh = std::clamp(coh, 0.0, 1.0);
+                const double ildMeas = 10.0 * (double)std::log10((pR + 1e-12) / (pL + 1e-12));
+                const double ipd = (double)std::atan2(xIm, xRe);
+                const double itdMeas = std::clamp(ipd / (2.0 * kHolosPiF * fc), -0.0008, 0.0008);
+                const double rCur = s.r;
+                double thetaEst;
+                const bool antiphase = std::fabs(ipd) > 2.9 && std::fabs(ildMeas) < 1.0;
+                if (antiphase) {
+                    thetaEst = 0.0;
+                } else if (fc < 700.0) {
+                    thetaEst = thetaFromItd(itdMeas, rCur);
+                } else {
+                    thetaEst = thetaFromIld(ildMeas, rCur, fc);
+                }
+                s.theta = std::clamp(thetaEst * spread, -kHolosPiF * 0.5, kHolosPiF * 0.5);
+                if (fc < 800.0 && coh > 0.5) {
+                    s.r = distanceFromIld(ildMeas, thetaEst, fc);
+                } else {
+                    s.r = distParam;
+                }
+            }
+            s.coh = coh;
+            const double c = std::clamp(s.coh, 0.001, 0.999);
+            s.drrDb = std::clamp(10.0 * std::log10(c / (1.0 - c)), -20.0, 20.0);
+            cohSum += s.coh;
+        }
+        meanCoherence_ = bandCount_ > 0 ? cohSum / (double)bandCount_ : 1.0;
+    }
+
     // Envoltorio float (compat: HolosOperator legacy / tests): convierte
     // los espectros por scratch y delega en el núcleo double. El estado
     // es compartido (double).

@@ -169,6 +169,15 @@ public:
     void setParams(const HolosParams& p) noexcept;
     void setAmount(float amount) noexcept;
     void setHeadPose(float yawRad) noexcept;
+    // RE-SEED Γ (2026-11-26, prototipo): pide re-sembrar el estimador Γ
+    // desde el espectro asentado en el próximo frame de runFrame() (la
+    // petición la pone FusedChain al detectar fin de rampa; el consumo
+    // vive en runFrame, donde el espectro del frame está vivo). No toca
+    // rings/wet/blend: un reset() completo en caliente glitchearía.
+    // clearEstimatorReseedRequest() cancela una petición pendiente (nueva
+    // rampa antes de consumirla). Hilo de audio en ambos casos.
+    void requestEstimatorReseed() noexcept;
+    void clearEstimatorReseedRequest() noexcept;
     void setThermalTier(HolosThermalTier tier) noexcept;
     void setThermalShed(bool shed) noexcept;  // compat: true = Bypass
     // Ω (v2.5.444) — ganancia de firma por banda (lineal, 10^(C_b/20)) que
@@ -326,6 +335,11 @@ private:
     // 1 seco retardado (alineado con el STFT).
     double wet_ = 0.0;
     double blend_ = 0.0;
+    // RE-SEED Γ: petición pendiente de re-sembrar el estimador (la pone
+    // FusedChain al detectar fin de rampa; la consume runFrame() en el
+    // próximo frame, con el espectro vivo). Atómica por si el hilo de
+    // control la pone (hoy la pone el mismo hilo de audio en process()).
+    std::atomic<bool> reseedPending_{false};
     // P3/3.1: mezcladores de potencia constante (uno por fundido; misma
     // regla que en OrbeBinaural: el blend usa extremos exactos, el wet
     // usa el mixer en todo w ∈ [0,1]).

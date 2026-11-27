@@ -304,6 +304,14 @@ object PersistedStateRestorer {
             // silencio). La corrección de sala en vivo (RoomCorrectionEq)
             // sigue apagada por defecto y requiere acción explícita.
             runCatching { com.ivanna.omega.audio.RealAcousticSensor.start(ctx) }
+            // Organismo (v2.5.506, cableado mic → organismo): arranca
+            // solo al abrir la app si el interruptor maestro está ON
+            // (default ON, revocable desde CONTROL). Consumidor de
+            // snapshots + agregador (ventanas 1–5 s) + cola durable +
+            // envío HTTPS. Si el token no está provisionado, la cola se
+            // conserva local y el estado dice "Sin token". El audio
+            // nunca depende de este arranque.
+            runCatching { com.ivanna.omega.organism.OrganismController.start(ctx) }
             // 4D temporal: restaura estado y profundidad (ruta A + daemon/ruta B).
             runCatching { IvannaNativeLib.nativeSetTemporalField(paramStore.isTemporalFieldEnabled(), paramStore.getTemporalFieldAmount(), paramStore.isTemporalFieldAdaptive()) }
             // Háptica de graves (4D): vive en Kotlin (ruta A), no depende de la librería nativa.

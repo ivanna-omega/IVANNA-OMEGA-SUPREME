@@ -174,6 +174,9 @@ void FusedChain::reset() noexcept {
     opWet_[5] = tonal_.isNeutral() ? 0.0 : 1.0;
     opWet_[6] = dynamics_.isNeutral() ? 0.0 : 1.0;
     chainWet_ = isNeutral() ? 0.0 : 1.0;
+    // RE-SEED Γ: tras reset() no se pide (ver holosReseedDone_).
+    holosReseedDone_ = true;
+    field_.clearHolosReseedRequest();
 }
 
 void FusedChain::resetStats() noexcept { stats_ = FusedChainStats{}; }
@@ -190,6 +193,39 @@ static double blendWetCore(double* l, double* r, const double* dryL,
     if (wet == target) return target;         // régimen: nada que mezclar
     if (!(step > 0.0) || !std::isfinite(step)) return target;
     if (dryL == nullptr || dryR == nullptr) return target;
+    // ── Mezcla compensada por correlación (2026-11-27, fix Tronidos) ──
+    // La mezcla de potencia constante (cos/sin) es exacta solo si seco y
+    // procesado son INCORRELADOS (ρ≈0): con ρ≈1 (mismo tono en fase, el
+    // caso del test Tronidos: senos 110/440/1000/3000 Hz) da +3 dB de
+    // sobre-impulso a mitad de rampa (excess 1.8–2.9 dB, cota 1.0 dB);
+    // la lineal es exacta solo con ρ≈1 y pierde −3 dB con ρ≈0 (el dip
+    // de −6.14 dB a 977 Hz que motivó la potencia constante). La ley
+    // compensada es exacta para cualquier ρ: gDry=cos θ·s, gWet=sin θ·s
+    // con s = 1/√(1 + ρ·sin 2θ), porque la potencia de salida es
+    // s²·(cos²θ + sin²θ + 2·ρ·cosθ·sinθ) = s²·(1 + ρ·sin 2θ) = 1.
+    // ρ se estima sobre el chunk (L+R) ANTES del bucle (el bucle
+    // sobrescribe l/r). Silencio (energía ~0) → ρ=0 (potencia
+    // constante, comportamiento anterior). ρ→−1 con θ→45° haría
+    // s→∞ (cancelación perfecta, irrecuperable con ganancias finitas):
+    // el denominador se fija en 0.25 (s ≤ 2, +6 dB máx) y el hueco
+    // queda acotado, no explosivo.
+    double rho = 0.0;
+    {
+        double eDry = 0.0, eWet = 0.0, cross = 0.0;
+        for (int i = 0; i < frames; ++i) {
+            const double dl = dryL[i], dr = dryR[i];
+            const double wl = l[i], wr = r[i];
+            eDry += dl * dl + dr * dr;
+            eWet += wl * wl + wr * wr;
+            cross += dl * wl + dr * wr;
+        }
+        const double denom = std::sqrt(eDry * eWet);
+        if (denom > 1e-30 && std::isfinite(denom)) {
+            rho = cross / denom;
+            if (!std::isfinite(rho)) rho = 0.0;
+            rho = std::clamp(rho, -1.0, 1.0);
+        }
+    }
     for (int i = 0; i < frames; ++i) {
         if (target > wet) {
             wet += step;
@@ -212,8 +248,21 @@ static double blendWetCore(double* l, double* r, const double* dryL,
             }
             return 0.0;
         }
-        l[i] = dryL[i] + wet * (l[i] - dryL[i]);
-        r[i] = dryR[i] + wet * (r[i] - dryR[i]);
+        // Mezcla compensada por correlación (ver pre-pase ρ arriba):
+        // ρ≈0 → potencia constante (cos/sin, sin dip por decorrelación);
+        // ρ≈1 → cuasi-lineal (sin sobre-impulso +3 dB en tono en fase);
+        // ρ intermedio → exacta en potencia para ese ρ. En wet == 1.0 /
+        // 0.0 los cortocircuitos de arriba ya devolvieron; aquí wet está
+        // en (0, 1) estricto.
+        const double theta = wet * (apex::kPi / 2.0);  // 0 → π/2
+        const double sin2 = std::sin(2.0 * theta);     // 0 → 1 → 0
+        double sDen = 1.0 + rho * sin2;
+        if (sDen < 0.25) sDen = 0.25;                  // anticorrelación: acotar
+        const double s = 1.0 / std::sqrt(sDen);
+        const double gDry = std::cos(theta) * s;       // 1 → 0
+        const double gWet = std::sin(theta) * s;       // 0 → 1
+        l[i] = gDry * dryL[i] + gWet * l[i];
+        r[i] = gDry * dryR[i] + gWet * r[i];
     }
     return wet;
 }
@@ -1371,6 +1420,41 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
 
         ++stats_.totalBlocks;
         for (int i = 0; i < kNumOperators; ++i) telemetry_.active[i] = active[i];
+
+        // ── RE-SEED Γ (HOLOS, 2026-11-26) ───────────────────────────────
+        // Al completar el enganche (todos los wets en objetivo y fundido
+        // de modo terminado), el estimador Γ de HOLOS retiene el
+        // transitorio de la rampa de 30 ms (envolventes de 260 ms) y la
+        // Regla de Oro sale +0.104 dB en el 2º segundo. Se pide UN re-seed
+        // (el próximo frame de HOLOS siembra sus envolventes desde el
+        // espectro asentado): el blend queda bit-idéntico (dip + barrido
+        // intactos) y Γ nunca aprende el transitorio. Se re-arme en cada
+        // rampa nueva o fundido de modo (el siguiente fin de rampa vuelve
+        // a pedirlo). No se pide en neutro ni con HOLOS inactivo. Una
+        // petición pendiente de un enganche anterior que no se consumió
+        // (HOLOS en bypass por coherencia) se cancela al re-armar; si se
+        // consumiera en el primer frame de un enganche nuevo, sembraría
+        // desde la rampa viva — el re-seed propio del enganche nuevo la
+        // corrige al terminar su rampa.
+        {
+            bool allAtTarget = (chainWet_ == (chainTargetActive ? 1.0 : 0.0));
+            for (int i = 0; i < kNumOperators; ++i) {
+                if (opWet_[static_cast<std::size_t>(i)] != (active[i] ? 1.0 : 0.0)) {
+                    allAtTarget = false;
+                    break;
+                }
+            }
+            if (!isNeutral() && active[2] && allAtTarget &&
+                modeFadePhase_ == ModeFadePhase::DONE) {
+                if (!holosReseedDone_) {
+                    field_.requestHolosReseed();
+                    holosReseedDone_ = true;
+                }
+            } else if (!allAtTarget || modeFadePhase_ != ModeFadePhase::DONE) {
+                holosReseedDone_ = false;
+                field_.clearHolosReseedRequest();
+            }
+        }
 
         offset += chunk;
         remaining -= chunk;

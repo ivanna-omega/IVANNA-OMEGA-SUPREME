@@ -61,6 +61,7 @@
 #include "../include/acoustic_unity_engine.hpp"      // Ruta A: coordinacion acustica medida (v2.5.15)
 #include "../spatial/RoomProbe.hpp"
 #include "../spatial/RealAcousticSensor.hpp"   // sensor acústico real por micrófono (v2.5.369, Ruta A)
+#include "../spatial/SensorSnapshot.hpp"    // snapshot versionado, canal lateral (v2.5.506)
 #include "../spatial/HyperStateOperator.hpp"  // Hiper-Operador de Estado Φ (v2.5.369, Ruta A)
 #include "../spatial/RoomCorrectionEq.hpp"     // corrección de sala en vivo por el sensor (v2.5.369, Ruta A)
 #include "../spatial/SceneGeometryRenderer.hpp"
@@ -334,6 +335,12 @@ static std::atomic<float> g_sensorRoomCorrAmountA{0.0f};
 // (balance espectral hacia el mismo target, solo corte). Para cualquier
 // Android 13+; el Moto G85 es solo el dispositivo de desarrollo.
 static ivanna::spatial::HyperStateOperator g_hyperRouteA;
+// Canal lateral del sensor (v2.5.506): el consumidor dedicado de Kotlin
+// (SensorSnapshotConsumer, hilo propio, NUNCA el hilo de audio) publica
+// aquí cada snapshot versionado que lee del sensor; nativeSensorSnapshotIngest
+// lo valida y lo entrega a Φ. Latest value wins: si el consumidor se
+// retrasa, los snapshots viejos se descartan sin bloquear a nadie.
+static ivanna::spatial::SensorSnapshotChannel g_sensorSnapshotChannelA;
 // g_hyperMeasuredA es local al JNI (guarda anti-doble-corrección). Los
 // parámetros (amount/preset/xtc) viven en hyper_controls_bridge.cpp
 // (patrón HOLOS: una sola fuente para Ruta A (JNI) y Ruta B (FusionCore);
@@ -4867,7 +4874,9 @@ Java_com_ivanna_omega_core_IvannaNativeLib_nativeOmegaStatus(
 // nativeSetNeuroLoopEnabled: apagado por defecto. Al apagar, el controlador
 // se resetea y la ganancia por banda vuelve a 0 (bypass bit-exacto).
 // nativeNeuroLoopIngest: frames REALES de sensor (kind 2=EEG en auricular,
-// 3=ABR, 4=fNIRS, 5=micrófono del teléfono — este último solo llega por
+// 3=ABR, 4=fNIRS, 5=micrófono del teléfono — v2.5.506 admite kind 5 por
+// esta vía con la misma puerta de validación que el motor (rangos +
+// frescura 1 s); el camino preferido del mic sigue siendo
 // nativeNeuroLoopIngestMic, que recibe el frame ERB[74] del sensor y lo
 // mapea en C++). kind 0/1 se rechaza en C++. timestampUs es
 // CLOCK_MONOTONIC en microsegundos (Kotlin: SystemClock.uptimeMillis()*1000).
@@ -4897,7 +4906,6 @@ Java_com_ivanna_omega_core_IvannaNativeLib_nativeNeuroLoopIngest(
         jfloatArray response, jfloatArray coherence, jfloat quality,
         jfloat abrWaveVLatencyMs, jfloat fnirsHbO) {
     if (!g_neuroLoopEnabledA.load(std::memory_order_relaxed)) return JNI_FALSE;
-    if (kind != 2 && kind != 3 && kind != 4) return JNI_FALSE;
     if (!response || !coherence) return JNI_FALSE;
     if (env->GetArrayLength(response) < 8 ||
         env->GetArrayLength(coherence) < 8) return JNI_FALSE;
@@ -4905,6 +4913,12 @@ Java_com_ivanna_omega_core_IvannaNativeLib_nativeNeuroLoopIngest(
     jfloat coh[8] = {};
     env->GetFloatArrayRegion(response, 0, 8, resp);
     env->GetFloatArrayRegion(coherence, 0, 8, coh);
+    // Puerta de ingestión (v2.5.506): kind 5 admitido solo tras validar
+    // rangos y frescura; el rechazo no toca el estado.
+    if (!ivanna::neuromorphic::validateNeuroIngestArgs(
+            kind, static_cast<std::uint64_t>(timestampUs), resp, coh, quality,
+            ivanna::neuromorphic::monotonicNowUs()))
+        return JNI_FALSE;
     ivanna::neuromorphic::NeuroFrame frame{};
     frame.kind = static_cast<ivanna::neuromorphic::NeuroSensorKind>(kind);
     frame.timestampUs = static_cast<std::uint64_t>(timestampUs);
@@ -4950,6 +4964,50 @@ Java_com_ivanna_omega_core_IvannaNativeLib_nativeNeuroLoopIngestMic(
     const bool okLoop = g_neuroLoopRouteA.ingest(frame);
     g_hyperRouteA.setNeuroFrame(frame);
     return okLoop ? JNI_TRUE : JNI_FALSE;
+}
+
+// nativeSensorSnapshotIngest (v2.5.506) — CANAL LATERAL del sensor.
+// Lo llama SOLO el consumidor dedicado de Kotlin (SensorSnapshotConsumer,
+// hilo propio, nunca el hilo de audio), con cada frame nuevo del sensor:
+// erbFrame74 con el layout de nativeSensorLatestFrame, timestampUs en
+// CLOCK_MONOTONIC (µs), sequence = frame_index del sensor, sourceId 1
+// (Ruta A). Flujo: construir snapshot → publicar en el canal (latest
+// wins) → leer el último → validar (versión/fuente/frescura/rangos).
+// Devuelve true si el snapshot se publicó y valida; false si se rechaza,
+// sin tocar el estado.
+//
+// OJO (consejo 2026-11-26, defecto #1): esta JNI NO llama a
+// g_hyperRouteA.setSensorFrame. El hilo de audio YA alimenta a Φ en cada
+// bloque (hyperProcessRouteA lee latestFrame() lock-free y llama él mismo
+// a setSensorFrame); si el consumidor también escribiera stageFrame_,
+// habría DOS escritores concurrentes sobre el staging (data race: el
+// framePending_ atómico no protege la escritura del struct). El canal
+// es, por ahora, el registro observacional de Ruta B (ver defecto #10:
+// sin productor en el proceso del efecto, Ruta B es "API lista"). La
+// misma puerta que Ruta B usa en el motor (ingestHyperSensorSnapshot)
+// sigue existiendo y validada por tests; el audio nunca depende de este
+// camino.
+JNIEXPORT jboolean JNICALL
+Java_com_ivanna_omega_core_IvannaNativeLib_nativeSensorSnapshotIngest(
+        JNIEnv* env, jobject, jfloatArray erbFrame74, jlong timestampUs,
+        jlong sequence, jint sourceId) {
+    if (!erbFrame74) return JNI_FALSE;
+    if (env->GetArrayLength(erbFrame74) < 74) return JNI_FALSE;
+    jfloat f74[74] = {};
+    env->GetFloatArrayRegion(erbFrame74, 0, 74, f74);
+    ivanna::spatial::SensorSnapshot snap{};
+    if (!ivanna::spatial::snapshotFromErb74(
+            f74, static_cast<std::uint32_t>(sourceId),
+            static_cast<std::uint64_t>(sequence),
+            static_cast<std::uint64_t>(timestampUs), snap))
+        return JNI_FALSE;
+    g_sensorSnapshotChannelA.publish(snap);
+    ivanna::spatial::SensorSnapshot latest{};
+    if (!g_sensorSnapshotChannelA.latest(latest)) return JNI_FALSE;
+    return ivanna::spatial::validateSensorSnapshot(
+            latest, ivanna::neuromorphic::monotonicNowUs())
+            ? JNI_TRUE
+            : JNI_FALSE;
 }
 
 JNIEXPORT jfloatArray JNICALL

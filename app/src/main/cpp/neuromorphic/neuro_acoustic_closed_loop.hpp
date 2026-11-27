@@ -319,6 +319,52 @@ inline std::uint64_t monotonicNowUs() noexcept {
     return 0;
 }
 
+// ── Puerta de ingestión (v2.5.506, cableado mic → organismo) ───────────────
+// Validación PURA (sin estado) para ingestHyperNeuroFrame /
+// nativeNeuroLoopIngest, ANTES de construir el NeuroFrame y de tocar el
+// controlador. Admite kind 5 (AcousticMic, micrófono del teléfono) con
+// las mismas exigencias que los kinds 2/3/4, más frescura:
+//
+//   * punteros no nulos; kind ∈ {2,3,4,5} (0/1/Unknown se rechazan);
+//   * quality finita en [0,1]; response/coherence finitas en [0,1];
+//   * timestampUs != 0 y fresco: no más viejo de 1 s (kIngestMaxAgeUs)
+//     ni más de 100 ms en el futuro respecto a nowUs (CLOCK_MONOTONIC).
+//     nowUs == 0 desactiva solo el chequeo de frescura (tests/host).
+//
+// La frescura de 1 s es la PUERTA DE ENTRADA. La ACTIVACIÓN del bucle
+// sigue exigiendo la ventana estricta de 250 ms (kStaleTimeoutUs en
+// compute()): un frame aceptado pero viejo se aprende y luego decae a
+// identidad sin mover el audio. Rechazar aquí NO toca el estado: el
+// controlador no se entera del frame (ni framesLearned, ni firma, ni
+// confianza). La defensa en profundidad sigue dentro de
+// ClosedLoopController::ingest (calidad ≥ 0.40, coherencia media ≥ 0.30,
+// orden temporal).
+inline constexpr std::uint64_t kIngestMaxAgeUs = 1000000;      // 1 s
+inline constexpr std::uint64_t kIngestMaxFutureUs = 100000;    // 100 ms
+
+inline bool validateNeuroIngestArgs(int kind, std::uint64_t timestampUs,
+                                    const float* response8,
+                                    const float* coherence8, float quality,
+                                    std::uint64_t nowUs) noexcept {
+    if (response8 == nullptr || coherence8 == nullptr) return false;
+    if (kind != 2 && kind != 3 && kind != 4 && kind != 5) return false;
+    if (!std::isfinite(quality) || quality < 0.0f || quality > 1.0f)
+        return false;
+    if (timestampUs == 0) return false;
+    if (nowUs != 0) {
+        if (timestampUs > nowUs + kIngestMaxFutureUs) return false;
+        if (nowUs >= timestampUs && nowUs - timestampUs > kIngestMaxAgeUs)
+            return false;
+    }
+    for (int b = 0; b < kNeuroBands; ++b) {
+        const float r = response8[static_cast<std::size_t>(b)];
+        const float c = coherence8[static_cast<std::size_t>(b)];
+        if (!std::isfinite(r) || !std::isfinite(c)) return false;
+        if (r < 0.0f || r > 1.0f || c < 0.0f || c > 1.0f) return false;
+    }
+    return true;
+}
+
 // ── Controlador del bucle cerrado ──────────────────────────────────────────
 class ClosedLoopController {
 public:

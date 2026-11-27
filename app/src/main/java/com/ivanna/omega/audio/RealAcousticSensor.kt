@@ -4,12 +4,16 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Process
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.ivanna.omega.core.IvannaNativeLib
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * RealAcousticSensor — sensor acústico REAL por micrófono del teléfono
@@ -69,6 +73,20 @@ object RealAcousticSensor {
     @Volatile
     var audioSourceUsed: String = "none"
         private set
+
+    // ── Mic con DAC conectado (v2.5.506, requisito de Esse) ────────────────
+    // Al conectar el DAC USB (JieLi → Genezi), Android puede enrutar la
+    // entrada al USB y el micrófono se cancela. El ancla fija el mic
+    // interno como dispositivo preferido (setPreferredDevice) y lo
+    // verifica ~1 s en el hilo de captura; si la ruta deriva al USB, se
+    // re-ancla solo y se cuenta aquí. El indicador del organismo lee
+    // este estado. El ancla NUNCA bloquea la captura: si falla, el sensor
+    // sigue con la fuente que Android elija y Φ falla cerrado.
+    private val _micRouteStatus = MutableStateFlow(MicRouteAnchor.RouteStatus())
+    val micRouteStatus: StateFlow<MicRouteAnchor.RouteStatus> = _micRouteStatus.asStateFlow()
+
+    @Volatile
+    private var micPort: MicRouteAnchor.MicDevicePort? = null
 
     /** Listener de frames nuevos (gancho para el Hiper-Operador Φ).
      *  El array es FloatArray[74]: [0..23] mag, [24..47] err, [48..71]
@@ -141,10 +159,44 @@ object RealAcousticSensor {
         audioSourceUsed = source
         stopRequested = false
         this.recorder = rcd
+        // Mic con DAC (v2.5.506): anclar el mic interno ANTES de grabar.
+        // Si no hay AudioManager o el ancla falla, se registra y se sigue:
+        // la captura no depende del ancla.
+        val port = runCatching {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            if (am != null) MicRouteAnchor.AndroidMicDevicePort(rcd, am) else null
+        }.getOrNull()
+        micPort = port
+        if (port != null) {
+            when (val outcome = MicRouteAnchor.anchor(port)) {
+                is MicRouteAnchor.AnchorOutcome.Anchored -> {
+                    val routed = runCatching { port.routedDevice() }.getOrNull()
+                    _micRouteStatus.value = MicRouteAnchor.RouteStatus(
+                        anchored = true,
+                        routedType = routed?.type ?: android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC,
+                        routedTypeName = MicRouteAnchor.deviceTypeName(
+                            routed?.type ?: android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC
+                        ),
+                        lastCheckMs = System.currentTimeMillis()
+                    )
+                }
+                is MicRouteAnchor.AnchorOutcome.AnchorFailed ->
+                    _micRouteStatus.value = MicRouteAnchor.RouteStatus(
+                        anchored = false, lastCheckMs = System.currentTimeMillis(),
+                        lastError = outcome.reason
+                    )
+                MicRouteAnchor.AnchorOutcome.NoBuiltinMic ->
+                    _micRouteStatus.value = MicRouteAnchor.RouteStatus(
+                        anchored = false, lastCheckMs = System.currentTimeMillis(),
+                        lastError = "sin mic interno"
+                    )
+            }
+        }
         val thread = Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             val buf = FloatArray(READ_CHUNK)
             var lastIndex = -1L
+            var readsSinceRouteCheck = 0
             try {
                 rcd.startRecording()
                 Log.i(TAG, "Captura de micrófono en vivo ($source @ $SAMPLE_RATE Hz)")
@@ -155,6 +207,37 @@ object RealAcousticSensor {
                         break
                     }
                     if (read == 0) continue
+                    // Verificación de ruta ~1 s (24 lecturas × 2048 @48 kHz):
+                    // si el DAC se conectó y la entrada derivó al USB,
+                    // re-anclar al mic interno y contarlo en el estado.
+                    if (++readsSinceRouteCheck >= 24) {
+                        readsSinceRouteCheck = 0
+                        val p = micPort
+                        if (p != null) {
+                            when (val v = MicRouteAnchor.verify(p)) {
+                                is MicRouteAnchor.VerifyOutcome.Drifted -> {
+                                    Log.w(TAG, "Ruta del mic derivó a ${v.device?.name} — re-anclando al interno")
+                                    _micRouteStatus.value = MicRouteAnchor.reanchor(
+                                        p, _micRouteStatus.value, System.currentTimeMillis()
+                                    )
+                                }
+                                is MicRouteAnchor.VerifyOutcome.Ok -> {
+                                    val routed = v.device
+                                    if (routed != null) {
+                                        _micRouteStatus.value = _micRouteStatus.value.copy(
+                                            routedType = routed.type,
+                                            routedTypeName = MicRouteAnchor.deviceTypeName(routed.type),
+                                            lastCheckMs = System.currentTimeMillis()
+                                        )
+                                    }
+                                }
+                                // Defecto #6: ruta desconocida (routed null) —
+                                // se conserva el último estado conocido, sin
+                                // afirmar una ruta que no se ha visto.
+                                MicRouteAnchor.VerifyOutcome.Unknown -> Unit
+                            }
+                        }
+                    }
                     IvannaNativeLib.guardedNative(false) {
                         IvannaNativeLib.nativeSensorFeedMic(buf, read)
                     }
@@ -179,6 +262,7 @@ object RealAcousticSensor {
                 try { rcd.stop() } catch (_: Exception) {}
                 rcd.release()
                 this.recorder = null
+                micPort = null
                 isRunning = false
                 captureThread = null
                 Log.i(TAG, "Captura de micrófono detenida")

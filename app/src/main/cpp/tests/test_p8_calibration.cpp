@@ -18,15 +18,21 @@
 //       NO se pueden "corregir" operador por operador sin romper el
 //       punto de calibracion del tono.
 //
-//   (2) EL COEFICIENTE NEURO ES OBSOLETO. kNominalGainDb[NEURO] =
-//       -15.570 dB, pero NEURO standalone mide 0.000 dB en todos los
-//       estimulos y niveles, y su marginal LOO es solo -0.9 dB.
-//       Sin embargo es LOAD-BEARING: la suma de coeficientes debe
-//       seguir siendo -19.482 dB (el trim = +19.482 dB) o el tono
-//       1 kHz se rompe (-14.7 dB). La descomposicion es arbitraria
-//       mientras la suma sea correcta PARA EL TONO; cambiar NEURO
-//       sin re-derivar toda la descomposicion rompe D10. Por eso
-//       kNominalGainDb NO se toca en 3.4.
+//   (2) EL COEFICIENTE NEURO, RE-DERIVADO DOS VECES (phone-loop).
+//       kNominalGainDb[NEURO] = -15.067 dB = LOO -11.150 + interaccion
+//       -3.915 (puerta HRTF: sin ORBE la HRTF se cierra y el run
+//       sin-ORBE es neutro en espacial), apareado con ORBE +0.022
+//       (su marginal medido; ORBE standalone es ~0 dB). La calibracion
+//       intermedia era -8.709 dB (LOO -11.154 + 2.445, con la HRTF de
+//       reserva activa en el run sin-ORBE); la puerta la supero. NEURO
+//       standalone sigue midiendo 0.000 dB en todos los estimulos y
+//       niveles: el coeficiente nominal NO es su ganancia standalone.
+//       La SUMA es load-bearing: debe seguir siendo -19.482 dB (el
+//       trim = +19.482 dB) o el tono 1 kHz se rompe (-14.7 dB). La
+//       descomposicion es arbitraria mientras la suma sea correcta
+//       PARA EL TONO; cambiar NEURO SOLO, sin re-derivar toda la
+//       descomposicion, rompe D10. Por eso cada re-derivacion es
+//       apareada (ORBE + NEURO) y la suma no se mueve.
 //
 //   (3) LA GANANCIA POR BANDA ES DEPENDIENTE DE SENAL. La misma
 //       banda (1 kHz) necesita +0.08 dB para un tono coherente y
@@ -313,10 +319,11 @@ TEST(P8Calibration, LevelDependence) {
 }
 
 TEST(P8Calibration, NeuroStandaloneIsZero) {
-    // kNominalGainDb[NEURO] = -15.570 dB, pero NEURO solo (trim 0) mide
-    // 0.000 dB en todo estimulo y nivel. El coeficiente es obsoleto
-    // (de una configuracion anterior del cerebro); se deja intacto
-    // porque la SUMA es load-bearing para el tono (ver cabecera).
+    // kNominalGainDb[NEURO] = -15.067 dB (re-derivado apareado con ORBE
+    // en phone-loop, post-puerta HRTF: LOO -11.150 + interaccion -3.915),
+    // pero NEURO solo (trim 0) mide 0.000 dB en todo estimulo y nivel.
+    // El coeficiente nominal NO es la ganancia standalone: la SUMA
+    // (-19.482 dB) es load-bearing para el tono (ver cabecera).
     FusedControls c;
     c.setNeutral();
     c.tonal.trimDb = 0.0f;

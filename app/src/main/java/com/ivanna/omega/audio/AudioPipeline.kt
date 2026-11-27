@@ -83,6 +83,20 @@ class AudioPipeline {
                                       inferenceUs: Long, source: String) {
             _sharedYamnet.value = SharedYamnetResult(speech, music, bass, true, inferenceUs, source)
         }
+
+        // Ruta del mic de Ruta A (defecto #7): el pipeline también ancla
+        // el mic interno y vigila derivas; su estado se publica aquí para
+        // que el indicador del organismo lo vea (igual que
+        // RealAcousticSensor.micRouteStatus). Sin esto, el re-ancla de
+        // Ruta A era a ciegas: solo un log, sin contador ni estado.
+        private val _sharedMicRouteStatus =
+            MutableStateFlow(MicRouteAnchor.RouteStatus())
+        val sharedMicRouteStatus: StateFlow<MicRouteAnchor.RouteStatus> =
+            _sharedMicRouteStatus.asStateFlow()
+
+        fun publishMicRouteStatus(status: MicRouteAnchor.RouteStatus) {
+            _sharedMicRouteStatus.value = status
+        }
     }
 
     private val tag = "IVANNA.Pipeline"
@@ -206,6 +220,44 @@ class AudioPipeline {
             record.release(); isRunning = false; return
         }
         audioRecord = record
+        // Mic con DAC (v2.5.506): el AudioRecord de Ruta A también se
+        // ancla al mic interno — si el DAC USB se conecta, Android no
+        // debe llevarse la entrada al USB. Si el ancla falla, la
+        // captura sigue (el ancla nunca bloquea el audio); la deriva se
+        // vigila en el loop (~1 s) y se re-ancla sola.
+        val micPort: MicRouteAnchor.MicDevicePort? = runCatching {
+            val am = captureContext.getSystemService(android.content.Context.AUDIO_SERVICE) as? android.media.AudioManager
+            if (am != null) MicRouteAnchor.AndroidMicDevicePort(record, am) else null
+        }.getOrNull()
+        if (micPort != null) {
+            when (val outcome = MicRouteAnchor.anchor(micPort)) {
+                is MicRouteAnchor.AnchorOutcome.Anchored -> {
+                    Log.i(tag, "Mic de Ruta A anclado al interno")
+                    val routed = runCatching { micPort.routedDevice() }.getOrNull()
+                    publishMicRouteStatus(
+                        MicRouteAnchor.RouteStatus(
+                            anchored = true,
+                            routedType = routed?.type
+                                ?: android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC,
+                            routedTypeName = MicRouteAnchor.deviceTypeName(
+                                routed?.type ?: android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC
+                            ),
+                            lastCheckMs = System.currentTimeMillis()
+                        )
+                    )
+                }
+                else -> {
+                    Log.w(tag, "Ancla de mic de Ruta A: $outcome (la captura sigue)")
+                    publishMicRouteStatus(
+                        MicRouteAnchor.RouteStatus(
+                            anchored = false,
+                            lastCheckMs = System.currentTimeMillis(),
+                            lastError = outcome.toString()
+                        )
+                    )
+                }
+            }
+        }
 
         val track = AudioTrack.Builder()
             .setAudioAttributes(AudioAttributes.Builder()
@@ -244,10 +296,44 @@ class AudioPipeline {
             record.startRecording()
             track.play()
             val buf = FloatArray(BUFFER_SIZE)
+            var blocksSinceRouteCheck = 0
 
             while (isRunning && currentCoroutineContext().isActive) {
                 val read = record.read(buf, 0, buf.size, AudioRecord.READ_BLOCKING)
                 if (read <= 0) continue
+
+                // Vigilancia de ruta del mic ~1 s (192 bloques × 256 @48 kHz):
+                // si la entrada derivó al USB al conectar el DAC, re-anclar.
+                // El resultado SÍ se propaga al estado compartido (defecto
+                // #7): re-anclas contadas y dispositivo enrutado visible,
+                // como en RealAcousticSensor. Unknown conserva el estado.
+                if (micPort != null && ++blocksSinceRouteCheck >= 192) {
+                    blocksSinceRouteCheck = 0
+                    when (val v = MicRouteAnchor.verify(micPort)) {
+                        is MicRouteAnchor.VerifyOutcome.Drifted -> {
+                            Log.w(tag, "Ruta A: mic derivó — re-anclando al interno")
+                            publishMicRouteStatus(
+                                MicRouteAnchor.reanchor(
+                                    micPort, sharedMicRouteStatus.value,
+                                    System.currentTimeMillis()
+                                )
+                            )
+                        }
+                        is MicRouteAnchor.VerifyOutcome.Ok -> {
+                            val routed = v.device
+                            if (routed != null) {
+                                publishMicRouteStatus(
+                                    sharedMicRouteStatus.value.copy(
+                                        routedType = routed.type,
+                                        routedTypeName = MicRouteAnchor.deviceTypeName(routed.type),
+                                        lastCheckMs = System.currentTimeMillis()
+                                    )
+                                )
+                            }
+                        }
+                        MicRouteAnchor.VerifyOutcome.Unknown -> Unit
+                    }
+                }
 
                 var sumSq = 0f
                 for (s in buf) sumSq += s * s

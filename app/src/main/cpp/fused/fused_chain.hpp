@@ -480,6 +480,12 @@ private:
     // no es neutra, 0 si lo es. En régimen no se mezcla nada (bit-exacto).
     double chainWet_ = 0.0;  // wet vigente de la cadena
     std::vector<double> chainDryL_, chainDryR_;  // seco de entrada de la cadena (scratch por chunk)
+    // RE-SEED Γ (2026-11-26): true = el re-seed de HOLOS ya se pidió para
+    // el enganche vigente (un solo re-seed por enganche). Se re-arme a
+    // false en cada rampa nueva o fundido de modo; reset() lo deja en
+    // true (sin rampa no hay transitorio que retener: los wets saltan
+    // a objetivo y el estimador recién reseteado converge solo).
+    bool holosReseedDone_ = false;
     // Fundido de modo: fase DONE = sin fundido (ganancia 1.0, sin coste).
     enum class ModeFadePhase { DONE, OUT, IN };
     ModeFadePhase modeFadePhase_ = ModeFadePhase::DONE;

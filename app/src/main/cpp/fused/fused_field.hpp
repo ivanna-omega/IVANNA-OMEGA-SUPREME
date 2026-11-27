@@ -132,6 +132,11 @@ public:
     void process(double* left, double* right, int frames) noexcept;
     bool isNeutral() const noexcept { return controls_.isNeutral(); }
     void reset() noexcept;
+    // RE-SEED Γ (2026-11-26): pide/cancela el re-seed del estimador Γ de
+    // HOLOS (passthrough a holos_). Lo pide FusedChain al detectar fin
+    // de rampa de enganche.
+    void requestHolosReseed() noexcept { holos_.requestEstimatorReseed(); }
+    void clearHolosReseedRequest() noexcept { holos_.clearEstimatorReseedRequest(); }
     static const char* name() noexcept { return "HOLOS·Ω"; }
 
     // Telemetría: coherencia media estimada por HOLOS (0..1). Medida,

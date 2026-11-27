@@ -306,6 +306,16 @@ fun IvannaControlPanel(
     bassHapticSupported: Boolean = true,
     initialAuxXoverHz: Float = 120f,
     initialAuxCoherence: Float = 1f,
+    // ── Organismo (v2.5.506, cableado mic → organismo) ─────────────────────
+    // UI mínima: UN interruptor maestro + UN indicador de estado. El
+    // estado vive en OrganismController (StateFlow); ControlTabScreen lo
+    // observa y lo pasa aquí. Defaults = organismo apagado en el panel
+    // si el llamador no lo cablea (el controlador sigue autónomo).
+    organismState: com.ivanna.omega.organism.OrganismController.State =
+        com.ivanna.omega.organism.OrganismController.State(),
+    onOrganismToggle: (Boolean) -> Unit = {},
+    onOrganismSaveToken: (String) -> Unit = {},
+    onOrganismClearQueue: () -> Unit = {},
     initialPunchAmount: Float = 0f,
     initialCrossfeed: Float = 0f,
     // ORBE — Binaural Esférico de Campo Cercano (v2.5.363). ACTIVO por defecto en v2.5.369 (amount 1.0).
@@ -940,6 +950,16 @@ fun IvannaControlPanel(
         )
 
         EngineStatusCard(metrics = metrics)
+
+        // ── v2.5.506 · ORGANISMO ───────────────────────────────────────────
+        // Interruptor maestro + indicador de estado (nada más). El cableado
+        // mic → organismo arranca solo al abrir la app (OrganismController).
+        OrganismCard(
+            state = organismState,
+            onToggle = onOrganismToggle,
+            onSaveToken = onOrganismSaveToken,
+            onClearQueue = onOrganismClearQueue
+        )
 
         // ── v2.5.483 · FÍSICA NUEVA v3 ─────────────────────────────────────
         // Las tarjetas NP estaban HUÉRFANAS (definidas pero nunca colocadas:

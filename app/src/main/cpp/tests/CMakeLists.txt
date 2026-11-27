@@ -2359,6 +2359,19 @@ if(IVANNA_SAN_FLAGS)
 endif()
 gtest_discover_tests(test_real_acoustic_sensor)
 
+# Canal lateral del sensor (v2.5.506, cableado mic → organismo): snapshot
+# versionado + puerta kind 5 + fail-closed. Header-only (SensorSnapshot +
+# neuro_acoustic_closed_loop), sin ivanna_dsp_under_test.
+add_executable(test_sensor_snapshot test_sensor_snapshot.cpp)
+target_link_libraries(test_sensor_snapshot PRIVATE GTest::gtest_main)
+target_include_directories(test_sensor_snapshot PRIVATE .. ../include ../spatial ../neuromorphic ../dsp host_stubs)
+target_compile_options(test_sensor_snapshot PRIVATE -Wall -Wextra)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_sensor_snapshot PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_sensor_snapshot PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_sensor_snapshot)
+
 add_executable(test_ab_harness test_ab_harness.cpp)
 target_link_libraries(test_ab_harness PRIVATE GTest::gtest_main)
 target_include_directories(test_ab_harness PRIVATE .. ../include ../spatial ../dsp host_stubs)

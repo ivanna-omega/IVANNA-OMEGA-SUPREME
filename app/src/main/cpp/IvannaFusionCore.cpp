@@ -492,12 +492,31 @@ bool IvannaFusionEngine::ingestHyperSensorFrame(const ivanna::spatial::SensorFra
     // como API lista. Cuando llegue, el operador pasará a modo MEDIDO.
     return m_hyper.setSensorFrame(frame);
 }
+bool IvannaFusionEngine::ingestHyperSensorSnapshot(
+        const ivanna::spatial::SensorSnapshot& snapshot) noexcept {
+    // Canal lateral Ruta B (v2.5.506): el snapshot se valida ENTERO
+    // (versión, fuente, secuencia, frescura, rangos) ANTES de tocar el
+    // estado. Rechazo = false, operador intacto. Ruta B inicialmente
+    // solo observacional: aceptar el frame alimenta Φ/NEURO con sus
+    // propios topes, nunca aplica directo al audio.
+    if (!ivanna::spatial::validateSensorSnapshot(
+            snapshot, ivanna::neuromorphic::monotonicNowUs()))
+        return false;
+    return ingestHyperSensorFrame(snapshot.frame);
+}
 bool IvannaFusionEngine::ingestHyperNeuroFrame(int kind, std::uint64_t timestampUs,
                                                const float* response8, const float* coherence8,
                                                float quality, float abrWaveVLatencyMs,
                                                float fnirsHbO) noexcept {
-    if (!response8 || !coherence8) return false;
-    if (kind != 2 && kind != 3 && kind != 4) return false;
+    // Puerta de ingestión (v2.5.506): kind 5 (AcousticMic) admitido solo
+    // tras validar rangos y frescura; el rechazo no toca el estado
+    // (la validación corre ANTES de construir el frame). La defensa en
+    // profundidad sigue en ClosedLoopController::ingest (calidad ≥ 0.40,
+    // coherencia media ≥ 0.30, orden temporal).
+    if (!ivanna::neuromorphic::validateNeuroIngestArgs(
+            kind, timestampUs, response8, coherence8, quality,
+            ivanna::neuromorphic::monotonicNowUs()))
+        return false;
     ivanna::neuromorphic::NeuroFrame frame{};
     frame.kind = static_cast<ivanna::neuromorphic::NeuroSensorKind>(kind);
     frame.timestampUs = timestampUs;

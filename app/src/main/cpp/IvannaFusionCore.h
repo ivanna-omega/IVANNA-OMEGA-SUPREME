@@ -9,6 +9,7 @@
 #include "spatial/HoaBinauralDecoder.hpp"
 #include "spatial/HolosOperator.hpp"
 #include "spatial/HyperStateOperator.hpp"
+#include "spatial/SensorSnapshot.hpp"
 #include "spatial/OmniField.hpp"
 #include "spatial/OrbeBinaural.hpp"
 #include "spatial/WfsRenderer.hpp"
@@ -210,15 +211,29 @@ public:
     // 2026-11-08; la puerta GREEN quedó anulada para este release).
     // amount=0 = bypass bit-exacto. Los parámetros viven en los atomics
     // g_hyper_* (hyper_controls_bridge.cpp / hyper_globals_effect.cpp).
-    // En Ruta B hoy NO llegan frames de sensor (el snapshot del daemon
-    // no transporta SensorFrame/NeuroFrame): el operador corre en modo
-    // APROXIMADO (balance espectral hacia Harman 2018) hasta que el
-    // transporte exista. ingestHyperSensorFrame/ingestHyperNeuroFrame son
-    // la API lista para ese transporte (mismo patrón que ingestNeuroFrame).
+    // En Ruta B los frames de sensor llegan por el canal lateral
+    // (SensorSnapshot, spatial/SensorSnapshot.hpp): el efecto publica un
+    // snapshot versionado y un consumidor dedicado lo ingiere con
+    // ingestHyperSensorSnapshot, que valida versión/fuente/frescura/
+    // rangos ANTES de tocar el estado. ingestHyperSensorFrame/
+    // ingestHyperNeuroFrame son la API lista para ese transporte (mismo
+    // patrón que ingestNeuroFrame). Ruta B es inicialmente SOLO
+    // observacional: aceptar un frame no aplica su salida al audio.
+    // ESTADO 2026-11-26 (consejo, defecto #10): Ruta B es "API LISTA",
+    // sin productor en el proceso del efecto (audioserver) — ningún
+    // llamador alimenta hoy este camino; la Ruta A viva es la JNI del
+    // consumidor Kotlin (que solo PUBLICA en el canal, defecto #1: el
+    // único escritor de stageFrame_ es el hilo de audio). Cuando se
+    // cablee un productor en el efecto, DEBE ser el único escritor del
+    // staging o el staging debe hacerse thread-safe; mientras tanto,
+    // esta API se conserva y se testea, no se elimina.
     void setHyperEnabled(bool enable) noexcept;
     void setHyperAmount(float amount, int preset, bool xtcEnabled) noexcept;
     bool isHyperEnabled() const noexcept;
     bool ingestHyperSensorFrame(const ivanna::spatial::SensorFrame& frame) noexcept;
+    // Canal lateral Ruta B: valida el snapshot y, solo si pasa, ingiere
+    // su frame. Rechazo = false sin tocar el estado.
+    bool ingestHyperSensorSnapshot(const ivanna::spatial::SensorSnapshot& snapshot) noexcept;
     bool ingestHyperNeuroFrame(int kind, std::uint64_t timestampUs,
                                const float* response8, const float* coherence8,
                                float quality, float abrWaveVLatencyMs,

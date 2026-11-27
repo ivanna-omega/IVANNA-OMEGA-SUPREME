@@ -85,6 +85,10 @@ fun ControlTabScreen(
         onDispose { adaptiveBack.stopTelemetry() }
     }
     val routeState by com.ivanna.omega.audio.IvannaUnifiedPipeline.state.collectAsState()
+    // ── Organismo (v2.5.506): interruptor maestro + indicador de estado ────
+    // El controlador arranca solo al abrir la app (PersistedStateRestorer);
+    // aquí solo se observa su estado y se cablean sus dos acciones.
+    val organismState by com.ivanna.omega.organism.OrganismController.state.collectAsState()
     val voiceActive by voiceMgr.voiceProtectionActive.observeAsState(false)
     // FIX (persistencia): el bypass NPE arrancaba siempre en false aunque el
     // usuario lo hubiera activado y ParameterStore ya lo guardara
@@ -341,6 +345,17 @@ fun ControlTabScreen(
         },
         onToggleCapture = onToggleCapture,
         onOpenFusion = onOpenAdaptiveTab,
+        // ── Organismo (v2.5.506): interruptor maestro + indicador ──────────
+        organismState = organismState,
+        onOrganismToggle = { en ->
+            com.ivanna.omega.organism.OrganismController.setEnabled(context, en)
+        },
+        onOrganismSaveToken = { token ->
+            com.ivanna.omega.organism.OrganismController.saveToken(token)
+        },
+        onOrganismClearQueue = {
+            com.ivanna.omega.organism.OrganismController.clearQueue()
+        },
         onAuxFieldChange = { en, xo, co ->
             paramStore.setAuxField(en, xo, co)
             if (IvannaNativeLib.isLoaded)

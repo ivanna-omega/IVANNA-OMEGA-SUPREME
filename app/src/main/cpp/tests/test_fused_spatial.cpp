@@ -473,6 +473,10 @@ TEST(FusedSpatial, PitchAudibleViaHrtfStage) {
     const std::vector<double> in = makeTone();
 
     SpatialControls c = engagedControls();
+    // ORBE fuera → etapa HRTF: con amount = 0 la etapa binaural es la
+    // HRTF y el pitch del tracker se oye por ella. La puerta HRTF
+    // (phone-loop) NO cierra hrtfWet aquí porque headTracking está
+    // activo: con tracking, la pose ES la escena binaural.
     c.amount = 0.0f;       // ORBE fuera → etapa HRTF
     c.azimuthDeg = 0.0f;
     c.wfsSpread = 0.0f;
@@ -578,6 +582,63 @@ TEST(FusedSpatial, WfsStageGoldenWithPoincareOff) {
     }
     EXPECT_NEAR(rmsL, kGoldenRmsL, kGoldenTol) << "RMS dorado L";
     EXPECT_NEAR(rmsR, kGoldenRmsR, kGoldenTol) << "RMS dorado R";
+}
+
+// Puerta HRTF (phone-loop, 2026-11-26): con ORBE apagado (amount = 0) la
+// HRTF no tiene escena binaural que renderizar. El slider dejaba
+// hrtfWet = 1.0, así que el operador no era neutro y la cadena seguía
+// corriendo la HRTF sintética de reserva (notch de −44 dB en R a
+// 11.5 kHz). SpatialControls::clamp() fuerza hrtfWet = 0 cuando
+// amount = 0: el operador es neutro y el bypass es bit-exacto.
+TEST(FusedSpatial, HrtfGateWhenOrbeOff) {
+    // (a) El clamp cierra la puerta: hrtfWet 1.0 -> 0.0 y neutro.
+    SpatialControls c;
+    c.amount = 0.0f;
+    c.hrtfWet = 1.0f;  // como lo deja el slider al apagar ORBE
+    c.mode = OmegaOutputMode::HEADPHONES;
+    c.clamp();
+    EXPECT_FLOAT_EQ(c.hrtfWet, 0.0f);
+    EXPECT_TRUE(c.isNeutral());
+
+    // (b) Tono de 11.5 kHz (frecuencia del notch de reserva) por el
+    // operador: salida bit-idéntica a la entrada en L y R.
+    FusedSpatial s;
+    s.prepare(kSr);
+    s.setControls(c);
+    ASSERT_TRUE(s.isNeutral());
+    EXPECT_FLOAT_EQ(s.controls().hrtfWet, 0.0f);
+    const std::vector<double> inL = makeTone(kToneAmp, 11500.0);
+    const std::vector<double> inR = makeTone(kToneAmp, 11500.0);
+    std::vector<double> outL = inL, outR = inR;
+    processBoth(s, outL, outR);
+    const NullResult nl = nullTest(inL.data(), outL.data(), inL.size());
+    const NullResult nr = nullTest(inR.data(), outR.data(), inR.size());
+    ASSERT_TRUE(nl.valid && nr.valid);
+    EXPECT_TRUE(nl.bitExact) << "residuo L: " << nl.residualDb << " dB";
+    EXPECT_TRUE(nr.bitExact) << "residuo R: " << nr.residualDb << " dB";
+
+    // (c) Regresión: con amount = 1.0 y hrtfWet = 1.0 el comportamiento
+    // no cambia: la HRTF sigue activa y la salida difiere de la entrada.
+    SpatialControls e;
+    e.amount = 1.0f;
+    e.azimuthDeg = 30.0f;
+    e.distanceM = 1.0f;
+    e.mode = OmegaOutputMode::HEADPHONES;  // resto: defaults (hrtfWet 1)
+    e.clamp();
+    EXPECT_FLOAT_EQ(e.hrtfWet, 1.0f);
+    FusedSpatial sE;
+    sE.prepare(kSr);
+    sE.setControls(e);
+    ASSERT_FALSE(sE.isNeutral());
+    const std::vector<double> in1k = makeTone();
+    std::vector<double> outEL = in1k, outER = in1k;
+    processBoth(sE, outEL, outER);
+    const NullResult ne = nullTest(in1k.data(), outEL.data(), in1k.size());
+    ASSERT_TRUE(ne.valid);
+    EXPECT_FALSE(ne.bitExact);
+    EXPECT_GT(ne.maxAbsDiff, 1e-6);
+    EXPECT_TRUE(isFiniteBuffer(outEL.data(), outEL.size()));
+    EXPECT_TRUE(isFiniteBuffer(outER.data(), outER.size()));
 }
 
 }  // namespace
