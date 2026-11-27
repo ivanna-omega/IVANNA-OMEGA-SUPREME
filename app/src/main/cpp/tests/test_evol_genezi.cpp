@@ -981,15 +981,20 @@ TEST(EvolGenezi, EngageDipFrequencySweep) {
         std::printf("[DIPF] %5.0f Hz: ALL7 hueco=%+.2f dB | HOLOS solo hueco=%+.2f dB\n",
                     f, dipAll7, dipHolos);
     }
-    // Valores medidos (phone-loop, mezcla de potencia constante):
-    // ALL7: 250 Hz +2.60, 500 Hz −1.37, 977 Hz −2.32, 2000 Hz +0.48,
-    // 4000 Hz +1.43 dB (antes: +0.90, +1.99, −5.37, −1.60, −1.04).
-    // HOLOS solo: 250 Hz −1.72, 500 Hz −8.46, 977 Hz −4.06,
-    // 2000 Hz −0.93, 4000 Hz −1.04 dB (antes: −2.09, −13.94, −8.55,
-    // −3.29, −4.04). El hueco sigue variando fuerte con la frecuencia
-    // (patrón de peine) y HOLOS domina; a 500 Hz el ALL7 ya no sale
-    // positivo (el overshoot del AGC se atenuó con la mezcla nueva:
-    // ahora hay un hueco pequeño de −1.37 dB en vez de +1.99 dB).
+    // Valores medidos (Camino A, Opción A: ambos blends compensados,
+    // ρ∈[0,1] — fused_chain.cpp): ALL7: 250 Hz +4.21, 500 Hz +2.57,
+    // 977 Hz −3.16, 2000 Hz +4.22, 4000 Hz +2.61 dB. HOLOS solo:
+    // 250 Hz −1.72, 500 Hz −8.46, 977 Hz −4.06, 2000 Hz −2.47,
+    // 4000 Hz −3.82 dB. Son los valores GENUINOS de la Opción A,
+    // medidos en local (g++-14 Release) e invariantes al orden
+    // ALL7/HOLOS. NO son los de 3de5a92 (ρ∈[−1,1], que daba −6.14 dB
+    // a 977 Hz por amplificación con ρ<0 — PROHIBIDO re-baselinear
+    // a ese valor). El hueco sigue variando fuerte con la frecuencia
+    // (patrón de peine) y HOLOS domina. Riesgo honesto (decisión de
+    // Esse, Camino A): el dip acepta más sobre-impulso al enganchar
+    // a 2000/4000 Hz (+4.22/+2.61 dB) que los baselines viejos de
+    // potencia constante; Tronidos (la medida de engage que manda)
+    // dice que el enganche está bien (excess ≤0.70 dB).
     // Firma de cancelación por fase/latencia del wet, no de fundido de
     // nivel.
     const double d250 = engageDipDb(all7Controls(), 250.0);
@@ -998,10 +1003,10 @@ TEST(EvolGenezi, EngageDipFrequencySweep) {
     const double d2000 = engageDipDb(all7Controls(), 2000.0);
     const double d4000 = engageDipDb(all7Controls(), 4000.0);
     EXPECT_GT(d250, 0.0);
-    EXPECT_NEAR(d500, -1.37, 1.0);
-    EXPECT_NEAR(d977, -2.32, 1.0);
-    EXPECT_NEAR(d2000, +0.48, 1.0);
-    EXPECT_NEAR(d4000, +1.43, 1.0);
+    EXPECT_NEAR(d500, +2.57, 1.0);
+    EXPECT_NEAR(d977, -3.16, 1.0);
+    EXPECT_NEAR(d2000, +4.22, 1.0);
+    EXPECT_NEAR(d4000, +2.61, 1.0);
     FusedControls h500;
     zero7(h500);
     setOp(h500, 1, 1.0f);

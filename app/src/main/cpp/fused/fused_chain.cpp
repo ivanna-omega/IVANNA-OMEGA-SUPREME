@@ -185,32 +185,34 @@ void FusedChain::resetStats() noexcept { stats_ = FusedChainStats{}; }
 // Núcleo de la mezcla wet: avanza `wet` por muestra hacia `target` con
 // paso `step` y mezcla seco/procesado. Devuelve el wet nuevo. Fail-closed:
 // paso inválido, wet no finito o seco nulo → devuelve el objetivo sin mezclar.
+// `compensate` (2026-11-27, fix Tronidos, OPCIÓN A): AMBOS blends
+// (por operador y de cadena) compensan por correlación. La potencia
+// constante (cos/sin) es exacta con seco y procesado INCORRELADOS,
+// pero con ρ≈1 da +3 dB de sobre-impulso a mitad de rampa; la ley
+// compensada (gDry=cos θ·s, gWet=sin θ·s, s=1/√(1+ρ·sin 2θ),
+// ρ ∈ [0, 1]) es exacta en potencia para cualquier ρ y nunca sube
+// ganancias por encima de la potencia constante. Camino A (2026-11-27,
+// decisión de Esse): 7 variantes medidas y ninguna ley de mezcla pasa
+// Tronidos, dip y P8FlagOff a la vez; la Opción A pasa Tronidos
+// (excess 0.55–0.70 dB) y el dip se re-baselinea a sus valores genuinos
+// (ver test_evol_genezi.cpp::EngageDipFrequencySweep).
 static double blendWetCore(double* l, double* r, const double* dryL,
                            const double* dryR, int frames, double wet,
-                           double target, double step) noexcept {
+                           double target, double step,
+                           bool compensate) noexcept {
     if (!l || !r || frames <= 0) return target;
     if (!std::isfinite(wet)) return target;  // estado inválido: salto al objetivo
     if (wet == target) return target;         // régimen: nada que mezclar
     if (!(step > 0.0) || !std::isfinite(step)) return target;
     if (dryL == nullptr || dryR == nullptr) return target;
-    // ── Mezcla compensada por correlación (2026-11-27, fix Tronidos) ──
-    // La mezcla de potencia constante (cos/sin) es exacta solo si seco y
-    // procesado son INCORRELADOS (ρ≈0): con ρ≈1 (mismo tono en fase, el
-    // caso del test Tronidos: senos 110/440/1000/3000 Hz) da +3 dB de
-    // sobre-impulso a mitad de rampa (excess 1.8–2.9 dB, cota 1.0 dB);
-    // la lineal es exacta solo con ρ≈1 y pierde −3 dB con ρ≈0 (el dip
-    // de −6.14 dB a 977 Hz que motivó la potencia constante). La ley
-    // compensada es exacta para cualquier ρ: gDry=cos θ·s, gWet=sin θ·s
-    // con s = 1/√(1 + ρ·sin 2θ), porque la potencia de salida es
-    // s²·(cos²θ + sin²θ + 2·ρ·cosθ·sinθ) = s²·(1 + ρ·sin 2θ) = 1.
+    // ── Correlación seco↔procesado del chunk (solo si compensate) ──
     // ρ se estima sobre el chunk (L+R) ANTES del bucle (el bucle
     // sobrescribe l/r). Silencio (energía ~0) → ρ=0 (potencia
-    // constante, comportamiento anterior). ρ→−1 con θ→45° haría
-    // s→∞ (cancelación perfecta, irrecuperable con ganancias finitas):
-    // el denominador se fija en 0.25 (s ≤ 2, +6 dB máx) y el hueco
-    // queda acotado, no explosivo.
+    // constante). ρ se fija a [0, 1]: ρ<0 haría s>1 (ganancias por
+    // encima de la potencia constante) y el pico del enganche se
+    // dispara; la compensación solo REDUCE ganancias, jamás las sube.
     double rho = 0.0;
-    {
+    if (compensate) {
         double eDry = 0.0, eWet = 0.0, cross = 0.0;
         for (int i = 0; i < frames; ++i) {
             const double dl = dryL[i], dr = dryR[i];
@@ -223,7 +225,7 @@ static double blendWetCore(double* l, double* r, const double* dryL,
         if (denom > 1e-30 && std::isfinite(denom)) {
             rho = cross / denom;
             if (!std::isfinite(rho)) rho = 0.0;
-            rho = std::clamp(rho, -1.0, 1.0);
+            rho = std::clamp(rho, 0.0, 1.0);  // OPCIÓN A: solo correlación positiva
         }
     }
     for (int i = 0; i < frames; ++i) {
@@ -248,16 +250,19 @@ static double blendWetCore(double* l, double* r, const double* dryL,
             }
             return 0.0;
         }
-        // Mezcla compensada por correlación (ver pre-pase ρ arriba):
-        // ρ≈0 → potencia constante (cos/sin, sin dip por decorrelación);
-        // ρ≈1 → cuasi-lineal (sin sobre-impulso +3 dB en tono en fase);
-        // ρ intermedio → exacta en potencia para ese ρ. En wet == 1.0 /
-        // 0.0 los cortocircuitos de arriba ya devolvieron; aquí wet está
-        // en (0, 1) estricto.
+        // Mezcla de potencia constante, compensada por correlación si
+        // `compensate` (Opción A: ambos blends): ρ≈0 → cos/sin puros
+        // (sin dip por decorrelación); ρ≈1 → cuasi-lineal (sin
+        // sobre-impulso +3 dB en contenido correlado). Sin compensar
+        // ρ=0 y esto es la potencia constante de a83738f, bit-idéntica.
+        // En wet == 1.0 / 0.0 los cortocircuitos de arriba ya
+        // devolvieron; aquí wet está en (0, 1) estricto.
         const double theta = wet * (apex::kPi / 2.0);  // 0 → π/2
         const double sin2 = std::sin(2.0 * theta);     // 0 → 1 → 0
+        // Con ρ ∈ [0, 1] el denominador ∈ [1, 2] (s ∈ [0.707, 1]). El
+        // piso 0.25 es red de seguridad (nunca se alcanza con ρ ≥ 0).
         double sDen = 1.0 + rho * sin2;
-        if (sDen < 0.25) sDen = 0.25;                  // anticorrelación: acotar
+        if (sDen < 0.25) sDen = 0.25;
         const double s = 1.0 / std::sqrt(sDen);
         const double gDry = std::cos(theta) * s;       // 1 → 0
         const double gWet = std::sin(theta) * s;       // 0 → 1
@@ -281,7 +286,7 @@ void FusedChain::blendOperatorWet(double* l, double* r, const double* dryL,
     const double target = targetActive ? 1.0 : 0.0;
     opWet_[static_cast<std::size_t>(op)] = blendWetCore(
         l, r, dryL, dryR, frames, opWet_[static_cast<std::size_t>(op)], target,
-        wetRampStep());
+        wetRampStep(), true);  // OPCIÓN A: operador compensado (ρ∈[0,1])
 }
 
 void FusedChain::warmTOmegaHistory(const double* l, const double* r,
@@ -1353,7 +1358,7 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
             chainWet_ = blendWetCore(l, r, chainDryPtrL, chainDryPtrR, chunk,
                                      chainWet_,
                                      chainTargetActive ? 1.0 : 0.0,
-                                     wetRampStep());
+                                     wetRampStep(), true);  // OPCIÓN A: cadena compensada (ρ∈[0,1])
         }
 
         // ── TRONIDOS 493 — fundido de modo ───────────────────────────────
