@@ -186,6 +186,26 @@ STANDALONE_HEADERS = {
     "fused/closed_loop/twin_confidence.hpp",
     "fused/closed_loop/twin_estimator.hpp",
     "fused/closed_loop/uncertainty_supervisor.hpp",
+    # --- Fase 0 (2026-11-27, release 2.5.509): 2 huérfanos clasificados
+    # (informe Ronda 2 del consejo, H1: header_wiring era la causa exacta
+    # del fallo determinista de Fase 0 en Tests host). ---
+    # Modelo acoplado no lineal D10 (herramienta offline, v2.5.507):
+    # header-only con la ecuación de estado acoplada (FORMULACION.md F1);
+    # sus únicos consumidores son el CLI offline coupled_predict.cpp y
+    # el test host test_coupled_model.cpp (17/17, TU de tests/,
+    # excluida del grafo por diseño). NO va en la ruta PCM del APK: el
+    # modelo completo es herramienta offline por latencia (5.2–8.5 ms/hop
+    # vs presupuesto 2.67 ms/hop). Se QUITA de esta lista cuando un
+    # caller de producción lo necesite.
+    "fused/coupled_model/coupled_model.hpp",
+    # Gemelo Humano P10 (módulo standalone `fused/human_twin/`): banco
+    # de pruebas de calibración de Esse (8 pruebas breves, cada una con
+    # su eje). Sin caller de producción: P10.2/P10.3/P10.4 están
+    # BLOQUEADOS en las sesiones de Esse y en P7/P8/P9 (lo dice el
+    # header). Su único consumidor hoy es su test host (TU de tests/,
+    # excluida del grafo por diseño). NO se borra. Se QUITA de esta
+    # lista cuando un caller de producción lo instancie.
+    "fused/human_twin/human_twin.hpp",
 }
 
 INCLUDE_DIRS = [

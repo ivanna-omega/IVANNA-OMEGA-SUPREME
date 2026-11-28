@@ -38,6 +38,9 @@ FusedControls engagedControls() {
     c.spatial.distanceM = 1.0f;
     c.spatial.hrtfWet = 0.5f;
     c.field.amount = 0.5f;
+    c.field.omniAmount = 0.5f;  // Unificación 2.5.509 (paso 5): OmniField ya NO sigue a HOLOS —
+    // su amount es propio; el helper fija el valor explícito para
+    // preservar la configuración medida (antes lo ponía field.amount).
     c.field.phiAmount = 0.5f;
     c.listenerRoom.roomWet = 0.22f;
     c.transducer.correction = 1.0f;
@@ -800,7 +803,13 @@ TEST(FusedChain, TOmegaDspUs) {
         std::printf("[FusedChain] dsp_us %s: mean=%.1f p50=%.1f p95=%.1f "
                     "max=%.1f us/bloque(%d) compiles=%d\n",
                     name, mean, p50, p95, mx, kBlock, chain.tOmegaCompiles());
+        // Bajo ASan/TSan el CPU se infla 2-3x por diseño: el presupuesto
+        // por bloque NO se impone (el sanitizador mide seguridad de
+        // memoria, no rendimiento). La medición sigue (se reporta arriba)
+        // y el presupuesto sigue vigente en builds sin sanitizador.
+#if !defined(__SANITIZE_ADDRESS__) && !defined(IVANNA_SANITIZER_ACTIVE)
         EXPECT_LT(p50, 6666.67) << "mediana dsp_us " << name << " supera 1 periodo";
+#endif
         return mean;
     };
     const FusedControls hp = engagedControls();

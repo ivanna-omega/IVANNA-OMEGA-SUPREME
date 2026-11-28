@@ -50,10 +50,11 @@ void FusedField::pushParamsToEngines() noexcept {
     // deja a HolosOperator en passthrough tras su fade de salida, y
     // diffuse → 0 corta la alimentación del término difuso. En
     // HEADPHONES, valores vivos de siempre (amount del usuario,
-    // diffuse 0.85 por defecto de HolosParams — ATREVIDA 502, directiva
-    // Esse 2026-11-24).
+    // diffuse del campo — ATREVIDA 502, directiva Esse 2026-11-24).
+    // Unificación 2.5.509 (paso 5): diffuse ya NO es un 0.85f fijo aquí;
+    // lo manda FieldControls.diffuse (default 0.85, mismo valor vivo).
     hp.amount = isSpeakers() ? 0.0f : controls_.amount;
-    hp.diffuse = isSpeakers() ? 0.0f : 0.85f;
+    hp.diffuse = isSpeakers() ? 0.0f : controls_.diffuse;
     hp.gamma = controls_.gamma;
     hp.roomRt60 = controls_.roomRt60;
     // Guarda validada (v2.5.411): el K nunca recibe más de 0.002.
@@ -68,8 +69,11 @@ void FusedField::pushParamsToEngines() noexcept {
     holos_.setParams(hp);
 
     // ── OmniField (campo unificado IVANNA, después de HOLOS) ─────────────
+    // Unificación 2.5.509 (paso 5): OmniField tiene su propio amount
+    // (FieldControls.omniAmount, default 1.0 = valor vivo); antes tomaba
+    // el amount de HOLOS. Ver nota de comportamiento en fused_controls.hpp.
     ivanna::omnifield::OmniParams op;
-    op.amount = controls_.amount;  // mismo amount de campo que HOLOS
+    op.amount = controls_.omniAmount;  // amount propio de OmniField
     op.headTracking = false;       // sin pose: la escena se auto-estima
     omni_.setParams(op);
 

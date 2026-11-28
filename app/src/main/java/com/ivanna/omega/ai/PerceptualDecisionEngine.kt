@@ -1,6 +1,9 @@
 package com.ivanna.omega.ai
 import com.ivanna.omega.ai.SAFCore
 
+import com.ivanna.omega.audio.FusedControls
+import com.ivanna.omega.audio.FusedControlsBridge
+import com.ivanna.omega.audio.RouteBOutput
 import com.ivanna.omega.magisk.OmegaEngineBridge
 import com.ivanna.omega.saf.SaFRoomBridge
 // coerceIn is stdlib — no import needed
@@ -118,7 +121,7 @@ class PerceptualDecisionEngine {
         )
     }
 
-    fun dispatchDecision(decision: DSPDecision, rt60: Float = 0.3f) {
+    fun dispatchDecision(decision: DSPDecision, rt60: Float = 0.3f, fused: FusedControls? = null) {
         // FIX: usar SAFCore.stepRoom() — Φ_SAF-Room^∞ con M_t = G_t + λ_t·I.
         // dispatchDecision usaba SAFCore.update() directamente (sin acoplamiento
         // de sala). Ahora M_t se regula según rt60 (T60 de la sala), hMismatch
@@ -150,15 +153,52 @@ class PerceptualDecisionEngine {
             (safTelemetry[3] * alphaRoom.coerceIn(0f, 1f)).toFloat()
         )
 
-        OmegaEngineBridge.sendPerceptualState(
-            compressor     = safState[0].toFloat(),
-            exciterRed     = safState[1].toFloat(),
-            highCut        = safState[2].toFloat(),
-            spatialWidth   = safState[3].toFloat(),
-            loudnessTarget = decision.loudnessTarget,
-            harmonicGain   = decision.harmonicGain,
-            antiDolby      = decision.antiDolbyIntensity
-        )
+        // Unificación 2.5.509 (paso 6): el cerebro publica SOLO AL CAMBIAR.
+        // SAFCore.stepRoom SIEMPRE corre (la dinámica M_t debe avanzar) y
+        // pushSAFState es incondicional; pero el SEND al daemon se deduplica
+        // EN EL ORIGEN: se construye el payload COMPLETO (fusionado + los
+        // 7 campos del cerebro superpuestos, incluido outputMode) y solo se
+        // envía si cambió más allá de epsilon Y pasó ≥1 s desde el último
+        // envío (cadencia mínima 1 Hz). Antes, cada tick de 500 ms mandaba
+        // un SEND de 7 campos aunque nada hubiera cambiado (~2/s), y el
+        // daemon republicaba el snapshot en cada generación.
+        // El payload completo (no mínimo) es deliberado: el SEND re-publica
+        // el estado entero, así que un daemon que perdió un SET lo recupera
+        // en el próximo cambio. La parte del daemon (no republicar
+        // generación si nada cambió) queda fuera de alcance: requiere
+        // rebuild del daemon + verificación en vivo.
+        runCatching {
+            val controls = fused ?: runCatching {
+                com.ivanna.omega.core.ParameterStore(
+                    com.ivanna.omega.core.IVANNAApplication.instance
+                ).loadFusedControls()
+            }.getOrNull() ?: FusedControls()
+            val fields = FusedControlsBridge.buildFusedPerceptualFields(controls)
+                .toMutableMap().apply {
+                    put("compressor", safState[0].toFloat())
+                    put("exciterRed", safState[1].toFloat())
+                    put("highCut", safState[2].toFloat())
+                    put("spatialWidth", safState[3].toFloat())
+                    put("loudnessTarget", decision.loudnessTarget)
+                    put("harmonicGain", decision.harmonicGain)
+                    put("antiDolby", decision.antiDolbyIntensity)
+                }
+            val output = runCatching {
+                com.ivanna.omega.audio.AudioRouteManager
+                    .routeBState(com.ivanna.omega.core.IVANNAApplication.instance).output
+            }.getOrNull() ?: RouteBOutput.SPEAKERS
+            val nowMs = android.os.SystemClock.elapsedRealtime()
+            val changed = lastDispatchedFields == null ||
+                !payloadsEqualWithinEpsilon(lastDispatchedFields!!, fields)
+            val due = nowMs - lastDispatchMs >= MIN_DISPATCH_INTERVAL_MS
+            if (changed && due) {
+                val json = com.ivanna.omega.magisk.PerceptualStatePayload.buildSend(fields, output)
+                if (OmegaEngineBridge.sendCommand(json)) {
+                    lastDispatchedFields = fields
+                    lastDispatchMs = nowMs
+                }
+            }
+        }.onFailure { android.util.Log.w("PerceptualDecisionEngine", "dispatch SEND falló: ${it.message}") }
 
         // Actualizar SaFRoomBridge con el resultado de la decisión perceptual
         runCatching {
@@ -166,5 +206,24 @@ class PerceptualDecisionEngine {
             SaFRoomBridge.setHrtfState(mismatchEnergy = hMismatch)
             SaFRoomBridge.setSoundFieldState(diffuseness = diffuseness)
         }
+    }
+
+    companion object {
+        /** Cadencia mínima entre SENDs del cerebro (1 Hz). */
+        const val MIN_DISPATCH_INTERVAL_MS = 1000L
+        /** Epsilon de cambio de payload (comparación por campo). */
+        const val DISPATCH_EPSILON = 1e-3f
+    }
+
+    private var lastDispatchedFields: Map<String, Float>? = null
+    private var lastDispatchMs: Long = 0L
+
+    private fun payloadsEqualWithinEpsilon(a: Map<String, Float>, b: Map<String, Float>): Boolean {
+        if (a.keys != b.keys) return false
+        for ((key, va) in a) {
+            val vb = b[key] ?: return false
+            if (kotlin.math.abs(va - vb) > DISPATCH_EPSILON) return false
+        }
+        return true
     }
 }

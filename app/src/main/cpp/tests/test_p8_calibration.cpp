@@ -374,6 +374,7 @@ TEST(P8Calibration, OtherOperatorsStandaloneAreNeutral) {
     c.setNeutral();
     c.tonal.trimDb = 0.0f;
     c.field.amount = 1.0f;
+    c.field.omniAmount = 1.0f;  // Unificación 2.5.509 (paso 5): op campo entero a 1.0.
     runChain(c, in, in, outL, outR);
     EXPECT_LE(std::fabs(rmsDb(outL, kSec, kDur) - inDb), 0.05);
     EXPECT_LE(std::fabs(rmsDb(outR, kSec, kDur) - inDb), 0.05);

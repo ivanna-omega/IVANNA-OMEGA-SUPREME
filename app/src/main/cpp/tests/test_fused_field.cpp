@@ -26,6 +26,9 @@ constexpr int kFrames = 48000;  // 1 s = 1000 ciclos exactos a 1 kHz
 FieldControls engagedControls() {
     FieldControls c;
     c.amount = 0.5f;
+    c.omniAmount = 0.5f;  // Unificación 2.5.509 (paso 5): OmniField ya NO sigue a HOLOS —
+    // su amount es propio; el helper fija el valor explícito para
+    // preservar la configuración medida (antes lo ponía field.amount).
     c.phiAmount = 0.5f;
     c.phiPreset = 0;
     c.pumping = 0.0f;
@@ -163,12 +166,15 @@ TEST(FusedField, ControlClamping) {
     field.prepare(kFs);
     FieldControls c;
     c.amount = 5.0f;
+    c.omniAmount = 5.0f;  // Unificación 2.5.509 (paso 5): el campo nuevo también se clampa.
     c.harmonics = 1.0f;
     c.phiPreset = 99;
     field.setControls(c);
     const FieldControls got = field.controls();
     EXPECT_LE(got.amount, 1.0f);
     EXPECT_GE(got.amount, 0.0f);
+    EXPECT_LE(got.omniAmount, 1.0f);
+    EXPECT_GE(got.omniAmount, 0.0f);
     EXPECT_LE(got.harmonics, 0.002f);  // guarda validada kHolosHarmonicsMaxValidated
     EXPECT_GE(got.harmonics, 0.0f);
     EXPECT_LE(got.phiPreset, 2);

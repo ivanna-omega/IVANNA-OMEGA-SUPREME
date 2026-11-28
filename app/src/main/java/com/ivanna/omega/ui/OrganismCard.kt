@@ -46,12 +46,13 @@ import com.ivanna.omega.organism.OrganismController
 fun OrganismCard(
     state: OrganismController.State,
     onToggle: (Boolean) -> Unit,
-    onSaveToken: (String) -> Unit,
+    onSaveToken: (String) -> Boolean,
     onClearQueue: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var tokenDraft by remember { mutableStateOf("") }
     var tokenSaved by remember { mutableStateOf(false) }
+    var tokenSaveFailed by remember { mutableStateOf(false) }
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -111,7 +112,7 @@ fun OrganismCard(
                 Spacer(modifier = Modifier.height(8.dp))
                 OutlinedTextField(
                     value = tokenDraft,
-                    onValueChange = { tokenDraft = it; tokenSaved = false },
+                    onValueChange = { tokenDraft = it; tokenSaved = false; tokenSaveFailed = false },
                     label = { Text("Token de Muselink (una vez)") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
@@ -120,13 +121,30 @@ fun OrganismCard(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Button(onClick = {
-                    onSaveToken(tokenDraft)
-                    tokenDraft = ""
-                    tokenSaved = true
+                    // El resultado real del guardado: antes se mostraba
+                    // "Token guardado" aunque el guardado fallara (el
+                    // Boolean se descartaba). Solo se limpia el campo si
+                    // se guardó de verdad; si falló, el texto queda para
+                    // que Esse lo revise.
+                    val ok = onSaveToken(tokenDraft)
+                    if (ok) {
+                        tokenDraft = ""
+                        tokenSaved = true
+                        tokenSaveFailed = false
+                    } else {
+                        tokenSaved = false
+                        tokenSaveFailed = true
+                    }
                 }) { Text("Guardar token cifrado") }
                 if (tokenSaved) {
                     Text(
                         "Token guardado. El envío se reintenta solo.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                if (tokenSaveFailed) {
+                    Text(
+                        "No se pudo guardar el token. Revisa el valor.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }

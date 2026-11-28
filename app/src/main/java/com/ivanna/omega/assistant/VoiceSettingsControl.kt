@@ -57,11 +57,11 @@ import com.ivanna.omega.neuromorphic.IvannaNpeEngine
  * Ampliado: graves del sensor, volumen maestro, corrección de sala.
  *
  * Notas de implementación:
- *  - ORBE/HOLOS: mismo patrón que la UI — setOrbeParams/setHolosParams
- *    (persist) + nativeSetOrbeParams/nativeSetHolosParams (vivo, Ruta A).
- *    La sincronización al daemon (Ruta B) la hace PersistedStateRestorer
- *    en su ciclo desde los valores persistidos; aquí no se envía al
- *    daemon directamente (la asistente no tiene ese canal).
+ *  - ORBE/HOLOS: por el puente fusionado — saveFusedControls (persist) +
+ *    FusedControlsBridge.safeSetFusedControls (vivo: Ruta A por JNI +
+ *    Ruta B por SET_PERCEPTUAL_STATE). Unificación 2.5.509 (paso 1): ya
+ *    NO se escribe por setOrbeParams/setHolosParams ni por los JNI
+ *    legacy. La sincronización al daemon la hace el propio puente.
  *  - Φ: IvannaNpeEngine.setPhi() (nuevo en la 445; reutiliza los últimos
  *    parámetros de setParameters). Runtime solamente: NO se persiste;
  *    al reiniciar vuelve a 0.5 (valor de la directiva). El readback es
@@ -555,12 +555,22 @@ object VoiceSettingsControl {
         return (if (db > 0f) "+" else "") + s + " dB"
     }
 
-    /** ORBE / HOLOS: mismo patrón que la UI (persist + JNI + resto igual). */
+    /** ORBE / HOLOS: por el puente fusionado (saveFusedControls +
+     * safeSetFusedControls: Ruta A por JNI + Ruta B por SET). Unificación
+     * 2.5.509 (paso 1): ya NO se escribe por setOrbeParams/setHolosParams
+     * ni por los JNI legacy (el motor legacy del proceso app está muerto
+     * en la práctica; el vivo es la cadena fusionada). */
     private fun applyAmount(context: Context, command: VoiceSettingCommand, isOrbe: Boolean): VoiceSettingResult {
         val store = ParameterStore(context)
         val name = if (isOrbe) "ORBE" else "HOLOS"
-        val onValue = if (isOrbe) 1.0f else 0.5f // defaults de la directiva
-        val current = if (isOrbe) store.getOrbeAmount() else store.getHolosAmount()
+        // Unificación 2.5.509 (paso 1): el onValue de HOLOS para ENABLE
+        // pasa de 0.5f a 1.0f (ATREVIDA 502, directiva Esse 2026-11-24).
+        val onValue = 1.0f
+        // Unificación 2.5.509 (paso 1): el amount actual se lee de la
+        // fuente única (loadFusedControls); los getters legacy delegan
+        // ahí, pero aquí se afirma la fuente, no el delegado.
+        val fusedNow = store.loadFusedControls()
+        val current = if (isOrbe) fusedNow.spatial.amount else fusedNow.field.amount
         val target: Float = when (command.action) {
             Action.SET -> command.value ?: current
             Action.RAISE -> (current + (command.value ?: 0.1f)).coerceIn(0f, 1f)
@@ -570,46 +580,14 @@ object VoiceSettingsControl {
             else -> return VoiceSettingResult(false, "No sé cómo aplicar esa orden a $name.", command.target, command.action)
         }
         return runCatching {
-            if (isOrbe) {
-                store.setOrbeParams(
-                    target, store.getOrbeDistanceM(), store.getOrbeSpread(),
-                    store.getOrbeProximityDb(), store.getOrbeDiffuse(),
-                    store.isOrbeHeadTrackingEnabled()
-                )
-                if (IvannaNativeLib.isLoaded) {
-                    // ENABLE/DISABLE es exactamente la semántica del atajo
-                    // (amount 1.0/0.0, resto de params intacto). SET/RAISE/
-                    // LOWER llevan amount arbitrario y siguen por params.
-                    if (command.action == Action.ENABLE || command.action == Action.DISABLE) {
-                        IvannaNativeLib.nativeSetOrbeEnabled(command.action == Action.ENABLE)
-                    } else {
-                        IvannaNativeLib.nativeSetOrbeParams(
-                            target, store.getOrbeDistanceM(), store.getOrbeSpread(),
-                            store.getOrbeProximityDb(), store.getOrbeDiffuse(),
-                            store.isOrbeHeadTrackingEnabled()
-                        )
-                    }
-                }
+            val fused = store.loadFusedControls()
+            val updated = if (isOrbe) {
+                fused.copy(spatial = fused.spatial.copy(amount = target))
             } else {
-                store.setHolosParams(
-                    target, store.getHolosDistanceM(), store.getHolosSpread(),
-                    store.getHolosProximityDb(), store.getHolosDiffuse(),
-                    store.getHolosHarmonics(), store.getHolosWarmth(),
-                    store.getHolosDynamics(), store.getHolosWidth(),
-                    store.getHolosGamma(), store.getHolosRoomRt60(),
-                    store.isHolosHeadTrackingEnabled(), store.getHolosBandCount()
-                )
-                if (IvannaNativeLib.isLoaded) {
-                    IvannaNativeLib.nativeSetHolosParams(
-                        target, store.getHolosDistanceM(), store.getHolosSpread(),
-                        store.getHolosProximityDb(), store.getHolosDiffuse(),
-                        store.getHolosHarmonics(), store.getHolosWarmth(),
-                        store.getHolosDynamics(), store.getHolosWidth(),
-                        store.getHolosGamma(), store.getHolosRoomRt60(),
-                        store.isHolosHeadTrackingEnabled(), store.getHolosBandCount()
-                    )
-                }
+                fused.copy(field = fused.field.copy(amount = target))
             }
+            store.saveFusedControls(updated)
+            com.ivanna.omega.audio.FusedControlsBridge.safeSetFusedControls(updated)
             // P2 (2.5.461): re-evaluar "todo apagado" tras persistir el amount.
             EffectsOffTransition.evaluate(context)
             // READBACK: lo que el motor tiene de verdad (no lo pedido).

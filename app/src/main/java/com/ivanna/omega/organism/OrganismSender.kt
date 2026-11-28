@@ -2,10 +2,14 @@ package com.ivanna.omega.organism
 
 import android.util.Log
 import com.google.gson.JsonObject
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.util.concurrent.TimeUnit
 
 /**
@@ -76,6 +80,7 @@ class OrganismSender(
         private val JSON = "application/json; charset=utf-8".toMediaType()
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
+            .dns(OrganismDns()) // DNS propio: no depende de netd/MagicDNS
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
@@ -171,4 +176,169 @@ class OrganismSender(
         }
         return lastOutcome
     }
+}
+
+// ── DNS PROPIO DEL ORGANISMO ──────────────────────────────────────────────
+// Por qué existe: la app corre bajo el VPN de Tailscale y su MagicDNS
+// (100.100.100.100) NO resuelve hosts públicos para la app
+// (UnknownHostException aunque la red esté bien); el /etc/hosts del
+// teléfono no lo ve netd (que es quien resuelve para las apps), así que
+// ningún arreglo por /etc/hosts es fiable. El sender DEBE resolver por sí
+// mismo: pregunta directo por UDP a 8.8.8.8 (respaldo 1.1.1.1) con un
+// cliente DNS mínimo (RFC 1035, sin dependencias). Si el DNS directo
+// falla, cae al DNS del sistema como ÚLTIMO recurso (no al revés). Los
+// hosts que no son de MuseLink usan el DNS del sistema siempre.
+//
+// El Dns es inyectable (constructor) para que los tests verifiquen el
+// enrutado y el fallback sin tocar la red real.
+/**
+ * Resuelve los hosts de MuseLink por DNS directo (UDP a 8.8.8.8/1.1.1.1)
+ * sin pasar por netd/MagicDNS; resto de hosts y fallback usan el DNS del
+ * sistema. IPv4 primero (el camino que se sabe que pasa por el VPN).
+ */
+class OrganismDns(
+    private val systemDns: Dns = Dns.SYSTEM,
+    private val directServers: List<InetAddress> = DEFAULT_DNS_SERVERS,
+    private val timeoutMs: Int = 3000,
+    private val directQuery: (hostname: String, server: InetAddress) -> List<InetAddress> =
+        { host, server -> queryDirectDns(host, server, timeoutMs) }
+) : Dns {
+
+    companion object {
+        /** Hosts que se resuelven por DNS directo (no por el sistema). */
+        val MUSELINK_HOSTS: Set<String> = setOf(
+            "muselink.ai.studio",
+            "muselink-667333806336.us-west1.run.app"
+        )
+
+        /** Servidores DNS directos (IP literal, sin resolver). */
+        val DEFAULT_DNS_SERVERS: List<InetAddress> = listOf(
+            InetAddress.getByAddress(byteArrayOf(8, 8, 8, 8)),
+            InetAddress.getByAddress(byteArrayOf(1, 1, 1, 1))
+        )
+    }
+
+    override fun lookup(hostname: String): List<InetAddress> {
+        if (hostname !in MUSELINK_HOSTS) return systemDns.lookup(hostname)
+        // DNS directo primero (no depende de netd/MagicDNS).
+        for (server in directServers) {
+            try {
+                val addrs = directQuery(hostname, server)
+                if (addrs.isNotEmpty()) return addrs
+            } catch (e: Exception) {
+                // Probar el siguiente servidor directo.
+            }
+        }
+        // Último recurso: DNS del sistema.
+        return systemDns.lookup(hostname)
+    }
+}
+
+/** Protocolo DNS mínimo (RFC 1035) para el Dns propio. Sin dependencias. */
+internal object OrganismDnsWire {
+
+    /** Construye un query DNS estándar (RD=1) para A (1) o AAAA (28). */
+    fun buildQuery(hostname: String, qtype: Int, id: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        out.write(id shr 8)
+        out.write(id and 0xFF)
+        out.write(0x01) // flags: RD=1
+        out.write(0x00)
+        out.write(0x00)
+        out.write(0x01) // QDCOUNT=1
+        out.write(0x00)
+        out.write(0x00) // ANCOUNT=0
+        out.write(0x00)
+        out.write(0x00) // NSCOUNT=0
+        out.write(0x00)
+        out.write(0x00) // ARCOUNT=0
+        for (label in hostname.split(".")) {
+            out.write(label.length)
+            out.write(label.toByteArray(Charsets.US_ASCII))
+        }
+        out.write(0x00) // fin de QNAME
+        out.write(qtype shr 8)
+        out.write(qtype and 0xFF)
+        out.write(0x00)
+        out.write(0x01) // QCLASS=IN
+        return out.toByteArray()
+    }
+
+    /**
+     * Extrae las direcciones del tipo pedido (1=A, 28=AAAA) de una
+     * respuesta DNS. Tolera CNAME (el resolver recursivo ya trae los
+     * A/AAAA del destino en la misma respuesta) y punteros de compresión
+     * (0xC0xx). RCODE != 0 o paquete corto → lista vacía.
+     */
+    fun parseResponse(data: ByteArray, wantType: Int): List<InetAddress> {
+        if (data.size < 12) return emptyList()
+        val rcode = data[3].toInt() and 0x0F
+        if (rcode != 0) return emptyList()
+        val qd = ((data[4].toInt() and 0xFF) shl 8) or (data[5].toInt() and 0xFF)
+        val an = ((data[6].toInt() and 0xFF) shl 8) or (data[7].toInt() and 0xFF)
+        var off = 12
+        repeat(qd) {
+            off = skipName(data, off)
+            off += 4 // QTYPE + QCLASS
+        }
+        val out = mutableListOf<InetAddress>()
+        repeat(an) {
+            if (off >= data.size) return out
+            off = skipName(data, off)
+            if (off + 10 > data.size) return out
+            val type = ((data[off].toInt() and 0xFF) shl 8) or
+                (data[off + 1].toInt() and 0xFF)
+            val rdlen = ((data[off + 8].toInt() and 0xFF) shl 8) or
+                (data[off + 9].toInt() and 0xFF)
+            val rdataOff = off + 10
+            if (rdataOff + rdlen <= data.size && type == wantType) {
+                if (wantType == 1 && rdlen == 4) {
+                    out += InetAddress.getByAddress(data.copyOfRange(rdataOff, rdataOff + 4))
+                } else if (wantType == 28 && rdlen == 16) {
+                    out += InetAddress.getByAddress(data.copyOfRange(rdataOff, rdataOff + 16))
+                }
+            }
+            off = rdataOff + rdlen
+        }
+        return out
+    }
+
+    /** Salta un nombre DNS (etiquetas o puntero de compresión 0xC0xx). */
+    fun skipName(data: ByteArray, off: Int): Int {
+        var i = off
+        while (i < data.size) {
+            val len = data[i].toInt() and 0xFF
+            if (len == 0) return i + 1
+            if (len and 0xC0 == 0xC0) return i + 2 // puntero: 2 bytes
+            i += 1 + len
+        }
+        return i
+    }
+}
+
+/** Query DNS directo por UDP (A y luego AAAA; IPv4 primero). */
+private fun queryDirectDns(
+    hostname: String,
+    server: InetAddress,
+    timeoutMs: Int
+): List<InetAddress> {
+    val out = mutableListOf<InetAddress>()
+    for (qtype in intArrayOf(1, 28)) {
+        try {
+            val id = (Math.random() * 65536).toInt()
+            val query = OrganismDnsWire.buildQuery(hostname, qtype, id)
+            DatagramSocket().use { sock ->
+                sock.soTimeout = timeoutMs
+                sock.connect(server, 53)
+                sock.send(DatagramPacket(query, query.size))
+                val buf = ByteArray(2048)
+                val pkt = DatagramPacket(buf, buf.size)
+                sock.receive(pkt)
+                out += OrganismDnsWire.parseResponse(pkt.data.copyOf(pkt.length), qtype)
+            }
+        } catch (e: Exception) {
+            // Un tipo falló (timeout): el otro aún puede responder.
+        }
+    }
+    return out
 }

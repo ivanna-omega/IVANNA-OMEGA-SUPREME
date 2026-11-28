@@ -4,7 +4,6 @@ import android.content.Context
 import android.util.Log
 import androidx.compose.runtime.Immutable
 import com.ivanna.omega.magisk.OmegaEngineBridge
-import org.json.JSONObject
 
 /**
  * FÍSICA NUEVA (Fase 2, v2.5.472) — Puente Kotlin <-> JNI + persistencia.
@@ -466,12 +465,12 @@ object NewPhysicsStore {
     fun pushToDaemon(s: NewPhysicsState) {
         try {
             val fields = buildNewPhysicsPerceptualFields(s)
-            val json = JSONObject().apply {
-                put("action", "SET_PERCEPTUAL_STATE")
-                for ((key, value) in fields) {
-                    put(key, value.toDouble())
-                }
-            }
+            // Unificación 2.5.509 (paso 3): el SET lo arma el constructor
+            // único (outputMode desde el modo publicado).
+            val json = com.ivanna.omega.magisk.PerceptualStatePayload.buildSet(
+                fields,
+                com.ivanna.omega.audio.AudioRouteManager.routeBStateFlow.value.output
+            )
             val ok = OmegaEngineBridge.sendCommand(json)
             if (!ok) Log.w(TAG, "pushToDaemon: SET_PERCEPTUAL_STATE (np_*) no llegó al daemon")
         } catch (t: Throwable) {

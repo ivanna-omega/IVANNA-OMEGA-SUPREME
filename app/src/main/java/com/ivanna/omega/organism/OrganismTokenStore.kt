@@ -52,10 +52,14 @@ class OrganismTokenStore(context: Context) : TokenStore {
 
     override fun setToken(raw: String): Boolean {
         val token = raw.trim().trim('"', '\'', '`').filter { !it.isWhitespace() }
-        if (token.length < 10) {
-            Log.w(TAG, "Token rechazado: demasiado corto")
+        if (token.isEmpty()) {
+            Log.w(TAG, "Token rechazado: vacío")
             return false
         }
+        // Sin piso de longitud: el servidor valida el token (401 si es
+        // incorrecto). El MUSE_CONNECTOR_TOKEN real es corto (6 caracteres)
+        // y el piso viejo de 10 lo rechazaba antes de guardarlo, así que el
+        // pegado correcto nunca llegaba al almacén cifrado.
         return runCatching {
             prefs?.edit()?.putString(KEY_TOKEN, token)?.apply() ?: return false
             Log.i(TAG, "Token del organismo guardado cifrado")
@@ -78,7 +82,9 @@ class InMemoryTokenStore(initialToken: String? = null) : TokenStore {
     override fun getToken(): String? = storedToken
     override fun setToken(raw: String): Boolean {
         storedToken = raw.trim()
-        return storedToken!!.length >= 10
+        // Sin piso de longitud (igual que el almacén real): cualquier token
+        // no vacío se guarda; el servidor lo valida (401 si es incorrecto).
+        return storedToken!!.isNotEmpty()
     }
 
     override fun clearToken() {

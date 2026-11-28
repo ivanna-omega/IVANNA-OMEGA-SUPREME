@@ -77,6 +77,9 @@ FusedControls engagedControls() {
     c.spatial.distanceM = 1.0f;
     c.spatial.hrtfWet = 0.5f;
     c.field.amount = 0.5f;
+    c.field.omniAmount = 0.5f;  // Unificación 2.5.509 (paso 5): OmniField ya NO sigue a HOLOS —
+    // su amount es propio; el helper fija el valor explícito para
+    // preservar la configuración medida (antes lo ponía field.amount).
     c.field.phiAmount = 0.5f;
     c.listenerRoom.roomWet = 0.22f;
     c.transducer.correction = 1.0f;
@@ -101,7 +104,7 @@ FusedControls operatorOnlyControls(int op) {
         case 1:
             c.spatial.amount = 1.0f; c.spatial.azimuthDeg = 30.0f;
             c.spatial.distanceM = 1.0f; c.spatial.hrtfWet = 0.5f; break;
-        case 2: c.field.amount = 0.5f; c.field.phiAmount = 0.5f; break;
+        case 2: c.field.amount = 0.5f; c.field.omniAmount = 0.5f; c.field.phiAmount = 0.5f; break;  // Unif. 2.5.509 paso 5
         case 3: c.listenerRoom.roomWet = 0.22f; break;
         case 4: c.transducer.correction = 1.0f; break;
         case 5: c.tonal.curve = 1; c.tonal.lowDb = 2.0f; break;
@@ -315,7 +318,7 @@ TEST(TronidosLayerStep, AllLayers) {
         results.push_back(runCase("step_orbe_off", engaged, c));
     }
     {
-        FusedControls c = engaged; c.field.amount = 0.0f; c.clamp();
+        FusedControls c = engaged; c.field.amount = 0.0f; c.field.omniAmount = 0.0f; c.clamp();  // Unif. 2.5.509 paso 5
         results.push_back(runCase("step_holos_off", engaged, c));
     }
     {
@@ -427,7 +430,7 @@ TEST(TronidosLayerStep, FixEngageNoStepAndModeNoSilence) {
         r.push_back(runCase("fix_orbe_on_engaged", before, engaged));
     }
     {
-        FusedControls before = engaged; before.field.amount = 0.0f; before.clamp();
+        FusedControls before = engaged; before.field.amount = 0.0f; before.field.omniAmount = 0.0f; before.clamp();  // Unif. 2.5.509 paso 5
         r.push_back(runCase("fix_holos_on_engaged", before, engaged));
     }
     {

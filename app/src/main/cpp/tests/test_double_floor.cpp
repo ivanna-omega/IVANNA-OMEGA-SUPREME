@@ -115,6 +115,7 @@ FusedControls linearEngagedControls() {
     c.spatial.hrtfWet = 0.5f;
     c.spatial.mode = ivanna::OmegaOutputMode::HEADPHONES;
     c.field.amount = 0.0f;        // campo FUERA del test de piso (ver cabecera)
+    c.field.omniAmount = 0.0f;  // Unificación 2.5.509 (paso 5): campo FUERA = también OmniField en 0.
     c.field.phiAmount = 0.0f;
     c.field.harmonics = 0.0f;
     c.listenerRoom.roomWet = 0.22f;
@@ -231,12 +232,12 @@ TEST(DoubleFloor, BisectLinearEngaged) {
     // del hallazgo): el tono emergente domina.
     {
         FusedControls c = base;
-        c.field.amount = 0.5f; c.field.phiAmount = 0.5f;
+        c.field.amount = 0.5f; c.field.omniAmount = 0.5f; c.field.phiAmount = 0.5f;  // Unif. 2.5.509 paso 5
         measureFloor(c, true, "BISECT con campo 0.5/0.5 (tono emergente)");
     }
     {
         FusedControls c = base;
-        c.field.amount = 0.5f; c.field.phiAmount = 0.0f;
+        c.field.amount = 0.5f; c.field.omniAmount = 0.5f; c.field.phiAmount = 0.0f;  // Unif. 2.5.509 paso 5
         measureFloor(c, true, "BISECT HOLOS solo (phi 0)");
     }
     {

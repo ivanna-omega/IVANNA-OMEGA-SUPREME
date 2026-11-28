@@ -660,7 +660,15 @@ class ParameterStore(context: Context) {
     // ── ORBE — Binaural Esférico de Campo Cercano (v2.5.363) ── ACTIVO por defecto
     // (v2.5.369, directiva explícita: amount 1.0; THD+N −139.33 dB @1 kHz,
     // 23× RT, limpio sin retuneo). amount 0 = bypass bit-exacto.
-    fun getOrbeAmount(): Float = safeGetFloat(KEY_ORBE_AMOUNT, BOOT_PROFILE.orbeAmount)
+    //
+    // Unificación 2.5.509 (paso 1): FusedControls es el ÚNICO DUEÑO.
+    // Los getters con contraparte fusionada DELEGAN en loadFusedControls();
+    // las claves legacy se conservan (compatibilidad + migración) pero ya
+    // no mandan. Criterio: grep getOrbeAmount|getHolosAmount fuera de
+    // ParameterStore = 0. Los getters SIN contraparte fusionada (distancia,
+    // spread, proximidad, diffuse de ORBE, width/bandCount/headTracking de
+    // HOLOS, tilt/freq del EQ) siguen leyendo su clave legacy.
+    fun getOrbeAmount(): Float = loadFusedControls().spatial.amount
     fun getOrbeDistanceM(): Float = safeGetFloat(KEY_ORBE_DISTANCE_M, BOOT_PROFILE.orbeDistanceM)
     fun getOrbeSpread(): Float = safeGetFloat(KEY_ORBE_SPREAD, BOOT_PROFILE.orbeSpread)
     fun getOrbeProximityDb(): Float = safeGetFloat(KEY_ORBE_PROXIMITY_DB, BOOT_PROFILE.orbeProximityDb)
@@ -675,14 +683,27 @@ class ParameterStore(context: Context) {
     fun setOrbeParams(
         amount: Float, distanceM: Float, spread: Float,
         proximityDb: Float, diffuse: Float, headTracking: Boolean
-    ) = prefs.edit()
-        .putFloat(KEY_ORBE_AMOUNT, if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0f)
-        .putFloat(KEY_ORBE_DISTANCE_M, if (distanceM.isFinite()) distanceM.coerceIn(0.15f, 2.0f) else 0.35f)
-        .putFloat(KEY_ORBE_SPREAD, if (spread.isFinite()) spread.coerceIn(0f, 1.5f) else 1.0f)
-        .putFloat(KEY_ORBE_PROXIMITY_DB, if (proximityDb.isFinite()) proximityDb.coerceIn(0f, 6f) else 3.0f)
-        .putFloat(KEY_ORBE_DIFFUSE, if (diffuse.isFinite()) diffuse.coerceIn(0f, 1f) else 0.5f)
-        .putBoolean(KEY_ORBE_HEAD_TRACKING, headTracking)
-        .apply()
+    ) {
+        prefs.edit()
+            .putFloat(KEY_ORBE_AMOUNT, if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0f)
+            .putFloat(KEY_ORBE_DISTANCE_M, if (distanceM.isFinite()) distanceM.coerceIn(0.15f, 2.0f) else 0.35f)
+            .putFloat(KEY_ORBE_SPREAD, if (spread.isFinite()) spread.coerceIn(0f, 1.5f) else 1.0f)
+            .putFloat(KEY_ORBE_PROXIMITY_DB, if (proximityDb.isFinite()) proximityDb.coerceIn(0f, 6f) else 3.0f)
+            .putFloat(KEY_ORBE_DIFFUSE, if (diffuse.isFinite()) diffuse.coerceIn(0f, 1f) else 0.5f)
+            .putBoolean(KEY_ORBE_HEAD_TRACKING, headTracking)
+            .apply()
+        // Unificación 2.5.509 (paso 1): write-through al fusionado.
+        updateFused {
+            it.copy(
+                spatial = it.spatial.copy(
+                    amount = if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0f,
+                    distanceM = if (distanceM.isFinite()) distanceM.coerceIn(0.15f, 2.0f) else 0.35f,
+                    width = if (spread.isFinite()) spread.coerceIn(0f, 1.5f) else 1.0f,
+                    headTracking = headTracking,
+                )
+            )
+        }
+    }
 
     // ── HOLOS — Operador Único de Campo Acústico (v2.5.364) ── ACTIVO por defecto
     // (v2.5.369, directiva explícita, CON RETUNEO: amount 0.5, harmonics 0.0.
@@ -691,56 +712,88 @@ class ParameterStore(context: Context) {
     // IMD SMPTE −159.5 dB. El término K (harmonics) es el que distorsionaba;
     // con K=0 el render espacial G y el campo Γ siguen activos y limpios.)
     // Los 13 parámetros de FUSION.md §6; band_count 12 o 24 (24 = default).
-    fun getHolosAmount(): Float = safeGetFloat(KEY_HOLOS_AMOUNT, BOOT_PROFILE.holosAmount)
+    // Unificación 2.5.509 (paso 1): delegan en lo fusionado (ver ORBE).
+    fun getHolosAmount(): Float = loadFusedControls().field.amount
     fun getHolosDistanceM(): Float = safeGetFloat(KEY_HOLOS_DISTANCE_M, BOOT_PROFILE.holosDistanceM)
     fun getHolosSpread(): Float = safeGetFloat(KEY_HOLOS_SPREAD, BOOT_PROFILE.holosSpread)
     fun getHolosProximityDb(): Float = safeGetFloat(KEY_HOLOS_PROXIMITY_DB, BOOT_PROFILE.holosProximityDb)
-    fun getHolosDiffuse(): Float = safeGetFloat(KEY_HOLOS_DIFFUSE, BOOT_PROFILE.holosDiffuse)
-    fun getHolosHarmonics(): Float = safeGetFloat(KEY_HOLOS_HARMONICS, BOOT_PROFILE.holosHarmonics)
-    fun getHolosWarmth(): Float = safeGetFloat(KEY_HOLOS_WARMTH, BOOT_PROFILE.holosWarmth)
-    fun getHolosDynamics(): Float = safeGetFloat(KEY_HOLOS_DYNAMICS, BOOT_PROFILE.holosDynamics)
+    fun getHolosDiffuse(): Float = loadFusedControls().field.diffuse
+    fun getHolosHarmonics(): Float = loadFusedControls().field.harmonics
+    fun getHolosWarmth(): Float = loadFusedControls().field.warmth
+    fun getHolosDynamics(): Float = loadFusedControls().field.dynamics
     fun getHolosWidth(): Float = safeGetFloat(KEY_HOLOS_WIDTH, BOOT_PROFILE.holosWidth)
-    fun getHolosGamma(): Float = safeGetFloat(KEY_HOLOS_GAMMA, BOOT_PROFILE.holosGamma)
-    fun getHolosRoomRt60(): Float = safeGetFloat(KEY_HOLOS_ROOM_RT60, BOOT_PROFILE.holosRoomRt60)
+    fun getHolosGamma(): Float = loadFusedControls().field.gamma
+    fun getHolosRoomRt60(): Float = loadFusedControls().field.roomRt60
     fun isHolosHeadTrackingEnabled(): Boolean = safeGetBoolean(KEY_HOLOS_HEAD_TRACKING, BOOT_PROFILE.holosHeadTracking)
     fun getHolosBandCount(): Int = safeGetInt(KEY_HOLOS_BAND_COUNT, BOOT_PROFILE.holosBandCount).let { if (it == 12) 12 else 24 }
     // EQ estático de Γ (dB -12..12; frecuencia del tilt 20..20000 Hz). Plano = no-op.
-    fun getHolosEqLow(): Float = safeGetFloat(KEY_HOLOS_EQ_LOW, BOOT_PROFILE.holosEqLow)
-    fun getHolosEqMid(): Float = safeGetFloat(KEY_HOLOS_EQ_MID, BOOT_PROFILE.holosEqMid)
-    fun getHolosEqHigh(): Float = safeGetFloat(KEY_HOLOS_EQ_HIGH, BOOT_PROFILE.holosEqHigh)
-    fun getHolosEqPresence(): Float = safeGetFloat(KEY_HOLOS_EQ_PRESENCE, BOOT_PROFILE.holosEqPresence)
+    // Unificación 2.5.509 (paso 1): low/mid/high/presence delegan en tonal;
+    // tiltDb/freq NO tienen slot fusionado y siguen en legacy.
+    fun getHolosEqLow(): Float = loadFusedControls().tonal.lowDb
+    fun getHolosEqMid(): Float = loadFusedControls().tonal.midDb
+    fun getHolosEqHigh(): Float = loadFusedControls().tonal.highDb
+    fun getHolosEqPresence(): Float = loadFusedControls().tonal.presenceDb
     fun getHolosEqTiltDb(): Float = safeGetFloat(KEY_HOLOS_EQ_TILT_DB, BOOT_PROFILE.holosEqTiltDb)
     fun getHolosEqFreq(): Float = safeGetFloat(KEY_HOLOS_EQ_FREQ, BOOT_PROFILE.holosEqFreq)
     fun setHolosEq(
         low: Float, mid: Float, high: Float, presence: Float, tiltDb: Float, freq: Float
-    ) = prefs.edit()
-        .putFloat(KEY_HOLOS_EQ_LOW, if (low.isFinite()) low.coerceIn(-12f, 12f) else 0f)
-        .putFloat(KEY_HOLOS_EQ_MID, if (mid.isFinite()) mid.coerceIn(-12f, 12f) else 0f)
-        .putFloat(KEY_HOLOS_EQ_HIGH, if (high.isFinite()) high.coerceIn(-12f, 12f) else 0f)
-        .putFloat(KEY_HOLOS_EQ_PRESENCE, if (presence.isFinite()) presence.coerceIn(-12f, 12f) else 0f)
-        .putFloat(KEY_HOLOS_EQ_TILT_DB, if (tiltDb.isFinite()) tiltDb.coerceIn(-12f, 12f) else 0f)
-        .putFloat(KEY_HOLOS_EQ_FREQ, if (freq.isFinite()) freq.coerceIn(20f, 20000f) else 1000f)
-        .apply()
+    ) {
+        prefs.edit()
+            .putFloat(KEY_HOLOS_EQ_LOW, if (low.isFinite()) low.coerceIn(-12f, 12f) else 0f)
+            .putFloat(KEY_HOLOS_EQ_MID, if (mid.isFinite()) mid.coerceIn(-12f, 12f) else 0f)
+            .putFloat(KEY_HOLOS_EQ_HIGH, if (high.isFinite()) high.coerceIn(-12f, 12f) else 0f)
+            .putFloat(KEY_HOLOS_EQ_PRESENCE, if (presence.isFinite()) presence.coerceIn(-12f, 12f) else 0f)
+            .putFloat(KEY_HOLOS_EQ_TILT_DB, if (tiltDb.isFinite()) tiltDb.coerceIn(-12f, 12f) else 0f)
+            .putFloat(KEY_HOLOS_EQ_FREQ, if (freq.isFinite()) freq.coerceIn(20f, 20000f) else 1000f)
+            .apply()
+        // Unificación 2.5.509 (paso 1): write-through al fusionado.
+        updateFused {
+            it.copy(
+                tonal = it.tonal.copy(
+                    lowDb = if (low.isFinite()) low.coerceIn(-12f, 12f) else 0f,
+                    midDb = if (mid.isFinite()) mid.coerceIn(-12f, 12f) else 0f,
+                    highDb = if (high.isFinite()) high.coerceIn(-12f, 12f) else 0f,
+                    presenceDb = if (presence.isFinite()) presence.coerceIn(-12f, 12f) else 0f,
+                )
+            )
+        }
+    }
     fun setHolosParams(
         amount: Float, distanceM: Float, spread: Float,
         proximityDb: Float, diffuse: Float, harmonics: Float,
         warmth: Float, dynamics: Float, width: Float, gamma: Float,
         roomRt60: Float, headTracking: Boolean, bandCount: Int
-    ) = prefs.edit()
-        .putFloat(KEY_HOLOS_AMOUNT, if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0f)
-        .putFloat(KEY_HOLOS_DISTANCE_M, if (distanceM.isFinite()) distanceM.coerceIn(0.15f, 2.0f) else 0.35f)
-        .putFloat(KEY_HOLOS_SPREAD, if (spread.isFinite()) spread.coerceIn(0f, 1.5f) else 1.0f)
-        .putFloat(KEY_HOLOS_PROXIMITY_DB, if (proximityDb.isFinite()) proximityDb.coerceIn(0f, 6f) else 3.0f)
-        .putFloat(KEY_HOLOS_DIFFUSE, if (diffuse.isFinite()) diffuse.coerceIn(0f, 1f) else 0.5f)
-        .putFloat(KEY_HOLOS_HARMONICS, if (harmonics.isFinite()) harmonics.coerceIn(0f, 1f) else 0.32f)
-        .putFloat(KEY_HOLOS_WARMTH, if (warmth.isFinite()) warmth.coerceIn(0f, 1f) else 0.5f)
-        .putFloat(KEY_HOLOS_DYNAMICS, if (dynamics.isFinite()) dynamics.coerceIn(0f, 1f) else 1.0f)
-        .putFloat(KEY_HOLOS_WIDTH, if (width.isFinite()) width.coerceIn(0f, 1.5f) else 1.0f)
-        .putFloat(KEY_HOLOS_GAMMA, if (gamma.isFinite()) gamma.coerceIn(0.5f, 1f) else 1.0f)
-        .putFloat(KEY_HOLOS_ROOM_RT60, if (roomRt60.isFinite()) roomRt60.coerceIn(0.18f, 1.8f) else 0.34f)
-        .putBoolean(KEY_HOLOS_HEAD_TRACKING, headTracking)
-        .putInt(KEY_HOLOS_BAND_COUNT, if (bandCount == 12) 12 else 24)
-        .apply()
+    ) {
+        prefs.edit()
+            .putFloat(KEY_HOLOS_AMOUNT, if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0f)
+            .putFloat(KEY_HOLOS_DISTANCE_M, if (distanceM.isFinite()) distanceM.coerceIn(0.15f, 2.0f) else 0.35f)
+            .putFloat(KEY_HOLOS_SPREAD, if (spread.isFinite()) spread.coerceIn(0f, 1.5f) else 1.0f)
+            .putFloat(KEY_HOLOS_PROXIMITY_DB, if (proximityDb.isFinite()) proximityDb.coerceIn(0f, 6f) else 3.0f)
+            .putFloat(KEY_HOLOS_DIFFUSE, if (diffuse.isFinite()) diffuse.coerceIn(0f, 1f) else 0.5f)
+            .putFloat(KEY_HOLOS_HARMONICS, if (harmonics.isFinite()) harmonics.coerceIn(0f, 1f) else 0.32f)
+            .putFloat(KEY_HOLOS_WARMTH, if (warmth.isFinite()) warmth.coerceIn(0f, 1f) else 0.5f)
+            .putFloat(KEY_HOLOS_DYNAMICS, if (dynamics.isFinite()) dynamics.coerceIn(0f, 1f) else 1.0f)
+            .putFloat(KEY_HOLOS_WIDTH, if (width.isFinite()) width.coerceIn(0f, 1.5f) else 1.0f)
+            .putFloat(KEY_HOLOS_GAMMA, if (gamma.isFinite()) gamma.coerceIn(0.5f, 1f) else 1.0f)
+            .putFloat(KEY_HOLOS_ROOM_RT60, if (roomRt60.isFinite()) roomRt60.coerceIn(0.18f, 1.8f) else 0.34f)
+            .putBoolean(KEY_HOLOS_HEAD_TRACKING, headTracking)
+            .putInt(KEY_HOLOS_BAND_COUNT, if (bandCount == 12) 12 else 24)
+            .apply()
+        // Unificación 2.5.509 (paso 1): write-through al fusionado.
+        updateFused {
+            it.copy(
+                field = it.field.copy(
+                    amount = if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0f,
+                    diffuse = if (diffuse.isFinite()) diffuse.coerceIn(0f, 1f) else 0.5f,
+                    harmonics = if (harmonics.isFinite()) harmonics.coerceIn(0f, 1f) else 0.32f,
+                    warmth = if (warmth.isFinite()) warmth.coerceIn(0f, 1f) else 0.5f,
+                    dynamics = if (dynamics.isFinite()) dynamics.coerceIn(0f, 1f) else 1.0f,
+                    gamma = if (gamma.isFinite()) gamma.coerceIn(0.5f, 1f) else 1.0f,
+                    roomRt60 = if (roomRt60.isFinite()) roomRt60.coerceIn(0.18f, 1.8f) else 0.34f,
+                )
+            )
+        }
+    }
 
     // ── Ω — Operador Universal (v2.5.444) ── OFF por defecto (fail-closed).
     // La firma S_b es Harman 2018 (Δ insignia = 0 hasta medirlo, hueco #1).
@@ -777,6 +830,15 @@ class ParameterStore(context: Context) {
             .putFloat(KEY_ORBE_SPREAD, after.orbeSpread)
             .putBoolean(KEY_MIGRATION_386_ENVELOPE_DONE, true)
             .apply()
+        // Unificación 2.5.509 (paso 1): lo fusionado es el dueño — el
+        // sobre también se aplica a field.amount/diffuse (los getters ya
+        // delegan ahí; sin esto la migración no surtiría efecto).
+        val fused = loadFusedControls()
+        saveFusedControls(
+            fused.copy(
+                field = fused.field.copy(amount = after.holosAmount, diffuse = after.holosDiffuse)
+            )
+        )
         if (before != after) {
             android.util.Log.i("ParameterStore",
                 "Migración 386: sobre 380 aplicado (holos ${before.holosAmount}->${after.holosAmount}, " +
@@ -805,61 +867,98 @@ class ParameterStore(context: Context) {
             .putFloat(KEY_HOLOS_AMOUNT, 1.0f)
             .putBoolean(KEY_MIGRATION_437_AMOUNTS_DONE, true)
             .apply()
+        // Unificación 2.5.509 (paso 1): lo fusionado es el dueño — los
+        // amounts de la directiva también van a spatial/field.amount.
+        val fused = loadFusedControls()
+        saveFusedControls(
+            fused.copy(
+                spatial = fused.spatial.copy(amount = 1.0f),
+                field = fused.field.copy(amount = 1.0f),
+            )
+        )
         android.util.Log.i("ParameterStore",
             "Migración 437: amounts directiva restaurados (orbe $beforeOrbe->1.0, holos $beforeHolos->1.0)")
     }
 
-    // ── IVANNA — Operador Unificado de Campo Espacial (v2.5.375) ── BYPASS
-    // por defecto desde v2.5.410 (amount 0.0). Antes ACTIVO 1.0 por
-    // directiva explícita 2026-11-09; la medición host de la 410 lo
-    // revoca: con tonos decorrelados y pseudo-música estéreo, OmniField
-    // a 1.0 deja un residuo no-lineal añadido de −3.7/−6.1 dB (piso
-    // −43.4 dB) y colapsa la fundamental (0.30 → 0.12); la cadena
-    // completa termina con residuo L −2.08 / R +4.94 dB (más residuo que
-    // señal en R). En bypass la cadena queda en el nivel post-HOLOS
-    // (~−31.6/−34.4 dB) y se ahorran ~363 µs/bloque en el teléfono.
-    // amount 0 = bypass bit-exacto (verificado en host); se reactiva en
-    // un toque (setOmniParams / nativeSetOmniEnabled) si Esse lo pide
-    // tras escuchar. scenePull 0..1, distancia 0.5..2.0 m.
-    fun getOmniAmount(): Float = safeGetFloat(KEY_OMNI_AMOUNT, BOOT_PROFILE.omniAmount)
+    // ── IVANNA — Operador Unificado de Campo Espacial (v2.5.375) ──
+    // CORRECCIÓN 2.5.509 (paso 5): el comentario viejo decía «BYPASS por
+    // defecto desde v2.5.410 (amount 0.0)» — OBSOLETO. Desde la 473 el
+    // BOOT_PROFILE es COMPLETO (omniAmount 1.0) y el valor vivo es 1.0.
+    // El 0.0 sobrevive SOLO como default del atómico C++ g_omni_amount
+    // (estado pre-push fail-closed, antes de que el puente fusionado
+    // escriba FieldControls.omniAmount). La medición host de la 410
+    // (residuo −3.7/−6.1 dB, fundamental colapsada) era del OmniField
+    // LEGACY a 1.0; el fusionado tiene su propio amount (paso 5).
+    // amount 0 = bypass bit-exacto; scenePull 0..1, distancia 0.5..2.0 m.
+    // Unificación 2.5.509 (paso 1): getOmniAmount delega en field.omniAmount.
+    fun getOmniAmount(): Float = loadFusedControls().field.omniAmount
     fun getOmniScenePull(): Float = safeGetFloat(KEY_OMNI_SCENE_PULL, BOOT_PROFILE.omniScenePull)
     fun getOmniDistanceM(): Float = safeGetFloat(KEY_OMNI_DISTANCE_M, BOOT_PROFILE.omniDistanceM)
     fun isOmniHeadTrackingEnabled(): Boolean = safeGetBoolean(KEY_OMNI_HEAD_TRACKING, BOOT_PROFILE.omniHeadTracking)
     fun setOmniParams(
         amount: Float, scenePull: Float, distanceM: Float, headTracking: Boolean
-    ) = prefs.edit()
-        .putFloat(KEY_OMNI_AMOUNT, if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0.0f)
-        .putFloat(KEY_OMNI_SCENE_PULL, if (scenePull.isFinite()) scenePull.coerceIn(0f, 1f) else 0.3f)
-        .putFloat(KEY_OMNI_DISTANCE_M, if (distanceM.isFinite()) distanceM.coerceIn(0.5f, 2.0f) else 1.2f)
-        .putBoolean(KEY_OMNI_HEAD_TRACKING, headTracking)
-        .apply()
+    ) {
+        prefs.edit()
+            .putFloat(KEY_OMNI_AMOUNT, if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0.0f)
+            .putFloat(KEY_OMNI_SCENE_PULL, if (scenePull.isFinite()) scenePull.coerceIn(0f, 1f) else 0.3f)
+            .putFloat(KEY_OMNI_DISTANCE_M, if (distanceM.isFinite()) distanceM.coerceIn(0.5f, 2.0f) else 1.2f)
+            .putBoolean(KEY_OMNI_HEAD_TRACKING, headTracking)
+            .apply()
+        // Unificación 2.5.509 (paso 1): write-through al fusionado.
+        updateFused {
+            it.copy(
+                field = it.field.copy(
+                    omniAmount = if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0.0f
+                )
+            )
+        }
+    }
 
     // ── Hiper-Operador de Estado Φ (v2.5.369) ── ACTIVO por defecto
     // (amount 0.5, corrección claramente audible pero suave; en APROXIMADO
     // solo corta, máx ~-1.5 dB a 0.5). preset 0 teléfono / 1 sala Genezi /
     // 2 auto. target kind 0 Harman 2018 (default) / 1 élite-lean /
     // 2 campo difuso H&M / 3 altavoces en sala. bass trim ±3 dB.
-    fun getHyperAmount(): Float = safeGetFloat(KEY_HYPER_AMOUNT, BOOT_PROFILE.hyperAmount)
-    fun getHyperPreset(): Int = safeGetInt(KEY_HYPER_PRESET, BOOT_PROFILE.hyperPreset).let { if (it in 0..2) it else 0 }
-    fun isHyperXtcEnabled(): Boolean = safeGetBoolean(KEY_HYPER_XTC, BOOT_PROFILE.hyperXtc)
+    // Unificación 2.5.509 (paso 1): amount/preset/xtc delegan en lo
+    // fusionado; targetKind y bassTrimDb NO tienen slot fusionado.
+    fun getHyperAmount(): Float = loadFusedControls().field.phiAmount
+    fun getHyperPreset(): Int = loadFusedControls().field.phiPreset.jni
+    fun isHyperXtcEnabled(): Boolean = loadFusedControls().spatial.xtcEnabled
     fun getHyperTargetKind(): Int = safeGetInt(KEY_HYPER_TARGET_KIND, BOOT_PROFILE.hyperTargetKind).let { if (it in 0..3) it else 0 }
     fun getHyperBassTrimDb(): Float = safeGetFloat(KEY_HYPER_BASS_TRIM_DB, BOOT_PROFILE.hyperBassTrimDb)
     fun setHyperParams(
         amount: Float, preset: Int, xtcEnabled: Boolean,
         targetKind: Int, bassTrimDb: Float
-    ) = prefs.edit()
-        .putFloat(KEY_HYPER_AMOUNT, if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0.5f)
-        .putInt(KEY_HYPER_PRESET, if (preset in 0..2) preset else 0)
-        .putBoolean(KEY_HYPER_XTC, xtcEnabled)
-        .putInt(KEY_HYPER_TARGET_KIND, if (targetKind in 0..3) targetKind else 0)
-        .putFloat(KEY_HYPER_BASS_TRIM_DB, if (bassTrimDb.isFinite()) bassTrimDb.coerceIn(-3f, 3f) else 0f)
-        .apply()
+    ) {
+        prefs.edit()
+            .putFloat(KEY_HYPER_AMOUNT, if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0.5f)
+            .putInt(KEY_HYPER_PRESET, if (preset in 0..2) preset else 0)
+            .putBoolean(KEY_HYPER_XTC, xtcEnabled)
+            .putInt(KEY_HYPER_TARGET_KIND, if (targetKind in 0..3) targetKind else 0)
+            .putFloat(KEY_HYPER_BASS_TRIM_DB, if (bassTrimDb.isFinite()) bassTrimDb.coerceIn(-3f, 3f) else 0f)
+            .apply()
+        // Unificación 2.5.509 (paso 1): write-through al fusionado.
+        updateFused {
+            it.copy(
+                field = it.field.copy(
+                    phiAmount = if (amount.isFinite()) amount.coerceIn(0f, 1f) else 0.5f,
+                    phiPreset = FusedPhiPreset.fromJni(if (preset in 0..2) preset else 0),
+                ),
+                spatial = it.spatial.copy(xtcEnabled = xtcEnabled),
+            )
+        }
+    }
 
     // ── Volterra H2 Genezi (v2.5.369) ── ON por defecto. Sin valor
     // persistido, el kernel se carga al arrancar y suena. Apagarlo en la
     // UI persiste y se respeta en el siguiente arranque.
-    fun isVolterraEnabled(): Boolean = safeGetBoolean(KEY_VOLTERRA_ENABLED, BOOT_PROFILE.volterraEnabled)
-    fun setVolterraEnabled(v: Boolean) = prefs.edit().putBoolean(KEY_VOLTERRA_ENABLED, v).apply()
+    // Unificación 2.5.509 (paso 1): delega en transducer.correction.
+    fun isVolterraEnabled(): Boolean = loadFusedControls().transducer.correction > 0f
+    fun setVolterraEnabled(v: Boolean) {
+        prefs.edit().putBoolean(KEY_VOLTERRA_ENABLED, v).apply()
+        // Unificación 2.5.509 (paso 1): write-through al fusionado.
+        updateFused { it.copy(transducer = it.transducer.copy(correction = if (v) 1.0f else 0.0f)) }
+    }
 
     // ── Selector de kernel Volterra (v2.5.369) ── device id del kernel
     // activo. Default PZ1D (el refinado); el Genezi es el alternativo.
@@ -1037,11 +1136,13 @@ class ParameterStore(context: Context) {
      * exista, copiar el valor. Las claves legacy NO se borran ni se vuelven
      * a leer (FUSIÓN es la única superficie que escribe). Idempotente: en
      * el segundo arranque los destinos ya existen y no se copia nada.
-     * Sin slot fused no hay copia: orbe/holos proximity+diffuse, holos
+     * Sin slot fused no hay copia: orbe proximity+diffuse, holos
      * distance/spread/width/bandCount/headTracking, hyper targetKind y
      * bassTrimDb no tienen campo fusionado y se pierden (eran del motor
      * fusionado, no del usuario). El perfil activo (BOOT_PROFILE) los
-     * repone al aplicar el perfil.
+     * repone al aplicar el perfil. Unificación 2.5.509 (paso 5): omni y
+     * holos diffuse SÍ tienen slot fused desde la 509 (fused_field_
+     * omni_amount / fused_field_diffuse) y SÍ se copian.
      */
     fun migrateLegacyToFused() {
         val e = prefs.edit()
@@ -1074,6 +1175,9 @@ class ParameterStore(context: Context) {
         copyFloat(KEY_HOLOS_DYNAMICS, "fused_field_dynamics")
         copyFloat(KEY_HOLOS_GAMMA, "fused_field_gamma")
         copyFloat(KEY_HOLOS_ROOM_RT60, "fused_field_room_rt60")
+        // Unificación 2.5.509 (paso 5): omni y diffuse tienen slot fused.
+        copyFloat(KEY_OMNI_AMOUNT, "fused_field_omni_amount")
+        copyFloat(KEY_HOLOS_DIFFUSE, "fused_field_diffuse")
         copyFloat(KEY_HOLOS_EQ_LOW, "fused_tonal_low_db")
         copyFloat(KEY_HOLOS_EQ_MID, "fused_tonal_mid_db")
         copyFloat(KEY_HOLOS_EQ_HIGH, "fused_tonal_high_db")
@@ -1124,6 +1228,9 @@ class ParameterStore(context: Context) {
         e.putFloat("fused_field_warmth", cl.field.warmth)
         e.putFloat("fused_field_dynamics", cl.field.dynamics)
         e.putFloat("fused_field_room_rt60", cl.field.roomRt60)
+        // Unificación 2.5.509 (paso 5): OmniField y diffuse tienen slot.
+        e.putFloat("fused_field_omni_amount", cl.field.omniAmount)
+        e.putFloat("fused_field_diffuse", cl.field.diffuse)
         // SALA VIVA (oyente+sala)
         e.putFloat("fused_room_rt60_sec", cl.listenerRoom.rt60Sec)
         e.putFloat("fused_room_size_m", cl.listenerRoom.roomSizeM)
@@ -1164,7 +1271,22 @@ class ParameterStore(context: Context) {
         e.apply()
     }
 
+    /**
+     * Write-through legacy → fusionado (unificación 2.5.509, paso 1).
+     * Los setters legacy escriben su clave Y actualizan lo fusionado, que
+     * es el único dueño; sin esto un setter legacy dejaría de surtir efecto
+     * (los getters ya delegan en lo fusionado).
+     */
+    private fun updateFused(transform: (FusedControls) -> FusedControls) {
+        saveFusedControls(transform(loadFusedControls()))
+    }
+
     fun loadFusedControls(): FusedControls {
+        // Unificación 2.5.509 (paso 1): la migración legacy → fused corre
+        // perezosamente en cada carga (idempotente: tras la primera vez no
+        // copia nada). Así un getter nunca lee un fusionado vacío cuando
+        // hay valores legacy persistidos.
+        migrateLegacyToFused()
         val def = FusedControls()
         val corr = (0 until 10).map { i ->
             safeGetFloat("fused_room_corr_db_$i", 0f)
@@ -1202,6 +1324,8 @@ class ParameterStore(context: Context) {
                 warmth = safeGetFloat("fused_field_warmth", def.field.warmth),
                 dynamics = safeGetFloat("fused_field_dynamics", def.field.dynamics),
                 roomRt60 = safeGetFloat("fused_field_room_rt60", def.field.roomRt60),
+                omniAmount = safeGetFloat("fused_field_omni_amount", def.field.omniAmount),
+                diffuse = safeGetFloat("fused_field_diffuse", def.field.diffuse),
             ),
             listenerRoom = ListenerRoomControls(
                 rt60Sec = safeGetFloat("fused_room_rt60_sec", def.listenerRoom.rt60Sec),

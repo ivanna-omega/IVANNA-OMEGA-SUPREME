@@ -1,15 +1,12 @@
 package com.ivanna.omega.magisk
 
-import android.content.Context
-import android.media.AudioManager
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.util.Log
+import com.ivanna.omega.audio.AudioRouteManager
 import com.ivanna.omega.audio.RouteBDeviceGate
 import com.ivanna.omega.audio.RouteBOutput
-import com.ivanna.omega.audio.UsbDacTarget
 import com.ivanna.omega.core.IVANNAApplication
-import com.ivanna.omega.ui.SpatialAudioPrefs
 import java.io.File
 
 /**
@@ -188,24 +185,14 @@ val isDaemonRunning: Boolean
         // para bocinas/DAC antes de salir al daemon. El chequeo substring
         // va ANTES de tocar AudioManager (HELLO/GET_STATUS no pagan nada).
         val effectiveCommand = if (command.contains("SET_PERCEPTUAL_STATE") || command.contains("SEND_PERCEPTUAL_STATE")) {
-            // 0037 (fix compilación 2026-11-17): misma cadena runCatching/as?
-            // que rompía OmegaEngineBridge.kt — el compilador de CI no infiere
-            // R. Forma explícita, misma semántica (false ante cualquier fallo).
-            // FASE 2: el selector de DAC USB decide si el DAC alimenta
-            // audífonos o los bafles del Genezi (default bocinas, fail-closed).
-            val usbDacTarget = runCatching {
-                SpatialAudioPrefs.load(IVANNAApplication.instance).usbDacTarget
-            }.getOrDefault(UsbDacTarget.SPEAKERS)
-            // v2.5.483: tercer modo GENEZI (DAC USB → Genezi): el
-            // holograma pasa, lo general queda en neutro.
-            val output = try {
-                val audioManager = IVANNAApplication.instance
-                    .getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-                if (audioManager == null) RouteBOutput.SPEAKERS
-                else RouteBDeviceGate.routeBOutput(audioManager, usbDacTarget)
-            } catch (_: Exception) {
-                RouteBOutput.SPEAKERS
-            }
+            // Unificación 2.5.509 (paso 2): la puerta ya NO se evalúa aquí.
+            // El modo sale del estado PUBLICADO (AudioRouteManager.
+            // routeBStateFlow), evaluado una sola vez por cambio de
+            // dispositivo; en frío se evalúa una vez y se publica.
+            // Sin AudioManager dentro de sendCommand.
+            val output = runCatching {
+                AudioRouteManager.routeBState(IVANNAApplication.instance).output
+            }.getOrNull() ?: RouteBOutput.SPEAKERS
             RouteBDeviceGate.gatePerceptualCommandJson(command, output)
         } else {
             command

@@ -143,6 +143,18 @@ struct FieldControls {
     // en SPEAKERS, FusedField apaga el render binaural GreenKernel y
     // la cola rir_ (diffuse=0). Default HEADPHONES (fail-closed).
     OmegaOutputMode mode = OmegaOutputMode::HEADPHONES;
+    // Unificación espacial 2.5.509 (paso 5): OmniField y la cola difusa
+    // tienen DUEÑO ÚNICO — estos dos campos de FieldControls. Antes
+    // OmniField tomaba el amount de HOLOS (op.amount = controls_.amount)
+    // y diffuse era un 0.85f fijo en fused_field.cpp; dos fuentes para lo
+    // mismo. Defaults = valores vivos: omniAmount 1.0 (BOOT COMPLETO 473
+    // + cadena fusionada) y diffuse 0.85 (ATREVIDA 502). El atómico
+    // g_omni_amount conserva su default 0.0 SOLO como estado pre-push
+    // fail-closed; el valor vivo es el de aquí. NOTA DE COMPORTAMIENTO:
+    // al bajar HOLOS por debajo de 1.0, OmniField ya NO baja con él
+    // (antes sí, porque lo seguía); pendiente de escucha en vivo.
+    float omniAmount = 1.0f;  // OmniField amount 0..1 (1 = campo pleno).
+    float diffuse = 0.85f;    // cola difusa HOLOS 0..1 (0.85 ATREVIDA 502).
 
     void clamp() noexcept {
         amount = clampf(amount, 0.0f, 1.0f);
@@ -155,13 +167,15 @@ struct FieldControls {
         warmth = clampf(warmth, 0.0f, 1.0f);
         dynamics = clampf(dynamics, 0.0f, 1.0f);
         roomRt60 = clampf(roomRt60, 0.05f, 1.5f);
+        omniAmount = clampf(omniAmount, 0.0f, 1.0f);
+        diffuse = clampf(diffuse, 0.0f, 1.0f);
         // GENEZI (evol-holos, 2026-11-26) es modo válido: NO se reescribe
         // a HEADPHONES (ver SpatialControls::clamp).
         if (mode != OmegaOutputMode::HEADPHONES && mode != OmegaOutputMode::SPEAKERS &&
             mode != OmegaOutputMode::GENEZI)
             mode = OmegaOutputMode::HEADPHONES;
     }
-    bool isNeutral() const noexcept { return amount <= 0.0f && phiAmount <= 0.0f; }
+    bool isNeutral() const noexcept { return amount <= 0.0f && phiAmount <= 0.0f && omniAmount <= 0.0f; }
 };
 
 // ── 3. MODELO OYENTE+SALA ───────────────────────────────────────────────────
@@ -379,6 +393,7 @@ struct FusedControls {
         spatial.auxEnabled = false;  // PARCHE v2.6: sin coherencia AUX en neutro.
         field.amount = 0.0f;
         field.phiAmount = 0.0f;
+        field.omniAmount = 0.0f;  // Unificación 2.5.509 (paso 5): neutro apaga también OmniField.
         listenerRoom.roomWet = 0.0f;
         listenerRoom.hearingProfile = 0;
         listenerRoom.signatureRoom = 0;  // v2.5.472: sin sala firma en neutro.

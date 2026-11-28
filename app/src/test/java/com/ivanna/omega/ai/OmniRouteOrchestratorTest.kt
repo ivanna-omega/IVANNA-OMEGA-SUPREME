@@ -162,4 +162,20 @@ class OmniRouteOrchestratorTest {
         assertTrue(h.isHealthy)
         assertEquals(250, h.averageLatencyMs)
     }
+
+    // ── Health check vivo (v2.5.509, auto-enlace) ────────────────────────
+
+    @Test fun aliveResponseCodeTreats401AsAlive() {
+        // 200 = vivo con key; 401 = vivo sin key (la key es opcional para
+        // el chat ivanna-free) — un 401 NO es un fallo ni abre el circuito.
+        assertTrue(OmniRouteOrchestrator.isAliveResponseCode(200))
+        assertTrue(OmniRouteOrchestrator.isAliveResponseCode(201))
+        assertTrue(OmniRouteOrchestrator.isAliveResponseCode(401))
+        // Túnel caído / gateway caído / no encontrado = no vivo.
+        assertFalse(OmniRouteOrchestrator.isAliveResponseCode(502))
+        assertFalse(OmniRouteOrchestrator.isAliveResponseCode(503))
+        assertFalse(OmniRouteOrchestrator.isAliveResponseCode(500))
+        assertFalse(OmniRouteOrchestrator.isAliveResponseCode(404))
+        assertFalse(OmniRouteOrchestrator.isAliveResponseCode(429))
+    }
 }

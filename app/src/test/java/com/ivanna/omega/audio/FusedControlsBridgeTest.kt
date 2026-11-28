@@ -9,11 +9,20 @@
 // test_route_b_perceptual_state.cpp (sección 10, mismo JSON).
 package com.ivanna.omega.audio
 
+import com.ivanna.omega.magisk.PerceptualStatePayload
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+// Robolectric: el test de outputMode usa PerceptualStatePayload.build*,
+// que construye org.json.JSONObject — stub en el android.jar de los unit
+// tests sin Robolectric (el put no guarda nada y getDouble devuelve 0.0).
+// Mismo patrón que RouteBDoctorTest y PerceptualStateDedupJsonTest.
+@RunWith(RobolectricTestRunner::class)
 class FusedControlsBridgeTest {
 
     private fun distinctiveControls(): FusedControls = FusedControls(
@@ -91,8 +100,11 @@ class FusedControlsBridgeTest {
         assertEquals(1.0f, fields["orbeDistanceM"]!!, 0.0f)
         assertEquals(1.5f, fields["orbeSpread"]!!, 0.0f)
         assertEquals(0.0f, fields["orbeHeadTracking"]!!, 0.0f)
-        // Modo de salida: SPEAKERS (jni 1) → outputMode 2 del daemon.
-        assertEquals(2.0f, fields["outputMode"]!!, 0.0f)
+        // Unificación 2.5.509 (paso 3): el mapa YA NO lleva outputMode —
+        // lo estampa el constructor único (PerceptualStatePayload.buildSet)
+        // desde el modo publicado por AudioRouteManager. El mapa no debe
+        // contenerlo (si lo llevara, el constructor lo sobrescribiría).
+        assertNull(fields["outputMode"])
         assertEquals(0.0f, fields["upmixingEnabled"]!!, 0.0f)
         assertEquals(1.25f, fields["upmixingImmersivity"]!!, 0.0f)
         // HOLOS·Ω
@@ -125,15 +137,32 @@ class FusedControlsBridgeTest {
     }
 
     @Test
-    fun `outputMode traduce HEADPHONES a 1 y SPEAKERS a 2`() {
-        val hp = FusedControlsBridge.buildFusedPerceptualFields(
-            FusedControls().copy(spatial = SpatialControls(mode = FusedSpatialMode.HEADPHONES))
-        )
-        assertEquals(1.0f, hp["outputMode"]!!, 0.0f)
-        val sp = FusedControlsBridge.buildFusedPerceptualFields(
-            FusedControls().copy(spatial = SpatialControls(mode = FusedSpatialMode.SPEAKERS))
-        )
-        assertEquals(2.0f, sp["outputMode"]!!, 0.0f)
+    fun `el constructor unico estampa outputMode 1-2-3 y el mapa no lo lleva`() {
+        // Unificación 2.5.509 (paso 3): outputMode lo estampa
+        // PerceptualStatePayload.buildSet desde el modo publicado
+        // (HEADPHONES 1 / SPEAKERS 2 / GENEZI 3), no el mapa.
+        val fields = FusedControlsBridge.buildFusedPerceptualFields(FusedControls())
+        assertNull(fields["outputMode"])
+        val hp = PerceptualStatePayload.buildSet(fields, RouteBOutput.HEADPHONES)
+        assertEquals(1.0, hp.getDouble("outputMode"), 0.0)
+        val sp = PerceptualStatePayload.buildSet(fields, RouteBOutput.SPEAKERS)
+        assertEquals(2.0, sp.getDouble("outputMode"), 0.0)
+        val gz = PerceptualStatePayload.buildSet(fields, RouteBOutput.GENEZI)
+        assertEquals(3.0, gz.getDouble("outputMode"), 0.0)
+        // El constructor gana aunque el mapa trajera un outputMode viejo.
+        val stale = fields.toMutableMap().apply { put("outputMode", 99.0f) }
+        val fixed = PerceptualStatePayload.buildSet(stale, RouteBOutput.SPEAKERS)
+        assertEquals(2.0, fixed.getDouble("outputMode"), 0.0)
+        // buildNeutral: acción SET + mapa neutro + outputMode del modo.
+        val neutral = PerceptualStatePayload.buildNeutral(RouteBOutput.HEADPHONES)
+        assertEquals("SET_PERCEPTUAL_STATE", neutral.getString("action"))
+        assertEquals(1.0, neutral.getDouble("outputMode"), 0.0)
+        assertEquals(0.0, neutral.getDouble("orbeAmount"), 0.0)
+        assertEquals(0.0, neutral.getDouble("holosAmount"), 0.0)
+        // buildSend: acción SEND con el mismo sello de modo.
+        val send = PerceptualStatePayload.buildSend(fields, RouteBOutput.GENEZI)
+        assertEquals("SEND_PERCEPTUAL_STATE", send.getString("action"))
+        assertEquals(3.0, send.getDouble("outputMode"), 0.0)
     }
 
     @Test
