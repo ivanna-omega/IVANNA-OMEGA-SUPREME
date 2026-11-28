@@ -64,7 +64,10 @@ object RealAcousticSensor {
     const val SAMPLE_RATE = 48_000
     private const val READ_CHUNK = 2048
 
-    /** [0..23] mag, [24..47] err, [48..71] coh, [72] level, [73] valid. */
+    /** [0..23] mag, [24..47] err, [48..71] coh, [72] level, [73] valid,
+     *  [74] referenceFresh (1/0), [75] referenceLevelDb (dBFS, media del
+     *  mic en 250 Hz–2 kHz — NO es el nivel de la señal de referencia;
+     *  S1/510: la coherencia solo es dato de sala si [74] es 1). */
 
     @Volatile
     var isRunning: Boolean = false
@@ -89,8 +92,9 @@ object RealAcousticSensor {
     private var micPort: MicRouteAnchor.MicDevicePort? = null
 
     /** Listener de frames nuevos (gancho para el Hiper-Operador Φ).
-     *  El array es FloatArray[74]: [0..23] mag, [24..47] err, [48..71]
-     *  coh, [72] level, [73] valid (1/0). */
+     *  El array es FloatArray[76]: [0..23] mag, [24..47] err, [48..71]
+     *  coh, [72] level, [73] valid (1/0), [74] referenceFresh (1/0),
+     *  [75] referenceLevelDb (dBFS). */
     @Volatile
     var onFrame: ((FloatArray) -> Unit)? = null
 
@@ -252,7 +256,7 @@ object RealAcousticSensor {
                             val frame = IvannaNativeLib.guardedNative(FloatArray(0)) {
                                 IvannaNativeLib.nativeSensorLatestFrame()
                             }
-                            if (frame.size == 74) listener(frame)
+                            if (frame.size == 76) listener(frame)
                         }
                     }
                 }
@@ -311,7 +315,8 @@ object RealAcousticSensor {
     }
 
     /** Último frame: [0..23] mag, [24..47] err, [48..71] coh, [72] level,
-     *  [73] valid (1/0). Vacío si el nativo no está cargado. */
+     *  [73] valid (1/0), [74] referenceFresh (1/0),
+     *  [75] referenceLevelDb (dBFS). Vacío si el nativo no está cargado. */
     fun latestFrame(): FloatArray = IvannaNativeLib.guardedNative(FloatArray(0)) {
         IvannaNativeLib.nativeSensorLatestFrame()
     }

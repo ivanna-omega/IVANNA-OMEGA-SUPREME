@@ -14,7 +14,7 @@ class OrganismPayloadTest {
     private fun chunk(): SessionAggregator.SessionChunk {
         val agg = SessionAggregator(windowSeconds = 5f)
         var emitted: SessionAggregator.SessionChunk? = null
-        val f = FloatArray(74)
+        val f = FloatArray(76)
         for (b in 0 until 24) {
             f[b] = -40f
             f[24 + b] = 2f
@@ -22,6 +22,8 @@ class OrganismPayloadTest {
         }
         f[72] = -30f
         f[73] = 1f
+        f[74] = 1f
+        f[75] = -35f
         for (i in 0 until 60) {
             agg.addFrame(f, 1_000_000L + i * 85_000L, i.toLong())?.let { emitted = it }
         }
@@ -60,6 +62,10 @@ class OrganismPayloadTest {
         assertEquals(c.chunkId, telemetry.get("chunkId").asInt)
         assertEquals(60, telemetry.get("framesValid").asInt)
         assertEquals(60, telemetry.get("framesTotal").asInt)
+        // S1/510: frescura de referencia en telemetry.
+        assertEquals(1.0, telemetry.get("referenceFreshFrac").asDouble, 0.001)
+        assertEquals(60, telemetry.get("framesReferenceFresh").asInt)
+        assertEquals(-35.0, telemetry.get("referenceLevelMeanDbfs").asDouble, 0.001)
         assertFalse("sin WAV por defecto", body.has("wavBase64"))
     }
 

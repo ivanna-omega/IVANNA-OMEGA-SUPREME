@@ -6,8 +6,9 @@ import kotlin.math.sqrt
 /**
  * SessionAggregator — agregador local de sesión (v2.5.506, consejo Luna/Haiku).
  *
- * El sensor publica frames cada ~85 ms (FloatArray[74]: mag[0..23],
- * err[24..47], coh[48..71], level[72], valid[73]). Enviar cada frame
+ * El sensor publica frames cada ~85 ms (FloatArray[76]: mag[0..23],
+ * err[24..47], coh[48..71], level[72], valid[73], referenceFresh[74],
+ * referenceLevelDb[75]). Enviar cada frame
  * sería ruido de red, batería y exposición de datos. Aquí se agregan en
  * VENTANAS de 1–5 s (por defecto 5 s): por ventana, media y dispersión
  * por banda ERB, coherencia media, nivel medio/máximo, frames válidos y
@@ -73,6 +74,12 @@ class SessionAggregator(
         val levelMaxDbfs: Float,
         val framesValid: Int,
         val framesTotal: Int,
+        /** Fracción de frames válidos de la ventana con referencia fresca [0..1] (S1/510). */
+        val referenceFreshFrac: Float,
+        /** Nivel medio de referencia (media del mic en 250 Hz–2 kHz, dBFS) en la ventana (S1/510). */
+        val referenceLevelMeanDbfs: Float,
+        /** Frames válidos de la ventana con referencia fresca (conteo, no fracción) (S1/510). */
+        val framesReferenceFresh: Int,
         val engineVersion: String
     ) {
         /** Media de coherencia de todas las bandas [0..1]. */
@@ -106,6 +113,8 @@ class SessionAggregator(
     private val cohSum = FloatArray(BANDS)
     private var levelSum = 0f
     private var levelMax = Float.NEGATIVE_INFINITY
+    private var referenceLevelSum = 0f
+    private var framesReferenceFresh = 0
     private var windowValid = 0
     private var windowTotal = 0
 
@@ -127,7 +136,7 @@ class SessionAggregator(
     fun addFrame(frame74: FloatArray, timestampUs: Long, frameIndex: Long): SessionChunk? {
         synchronized(lock) {
             totalFrames++
-            if (frame74.size != 74) return null
+            if (frame74.size != 76) return null
             if (frame74[73] < 0.5f) {
                 windowTotal++
                 return null
@@ -151,6 +160,9 @@ class SessionAggregator(
             totalLevelSum += level
             levelSum += level
             if (level > levelMax) levelMax = level
+            // S1/510: frescura de referencia de este frame válido.
+            if (frame74[74] >= 0.5f) framesReferenceFresh++
+            referenceLevelSum += frame74[75]
             for (b in 0 until BANDS) {
                 val mag = frame74[b]
                 val err = frame74[24 + b]
@@ -206,6 +218,13 @@ class SessionAggregator(
             levelMaxDbfs = if (levelMax.isFinite()) levelMax else -120f,
             framesValid = windowValid,
             framesTotal = windowTotal,
+            // S1/510: fracción y media sobre los frames válidos de la
+            // ventana; −120 dB si no hay frames válidos. meanCoherence
+            // deja de interpretarse sola: su lectura válida exige
+            // referenceFreshFrac (ver S1-reference-audit.md §5.4).
+            referenceFreshFrac = if (windowValid > 0) framesReferenceFresh.toFloat() / windowValid else 0f,
+            referenceLevelMeanDbfs = if (windowValid > 0) referenceLevelSum / n else -120f,
+            framesReferenceFresh = framesReferenceFresh,
             engineVersion = engineVersion
         )
         emittedChunks++
@@ -217,6 +236,8 @@ class SessionAggregator(
         cohSum.fill(0f)
         levelSum = 0f
         levelMax = Float.NEGATIVE_INFINITY
+        referenceLevelSum = 0f
+        framesReferenceFresh = 0
         windowValid = 0
         windowTotal = 0
         onChunk?.invoke(chunk)

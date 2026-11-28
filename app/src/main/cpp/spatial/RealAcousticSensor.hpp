@@ -115,6 +115,11 @@ struct SensorFrame {
     float level_dbfs = -120.0f;       // nivel de banda ancha del mic (dBFS RMS)
     uint64_t frame_index = 0;         // contador de frames publicados
     bool valid = false;               // true = medición confiable, usarla
+    // S1/510: true = este análisis drenó referencia fresca del anillo
+    // (≥8192 muestras); sin ella la coherencia es 0 por diseño (no se
+    // finge). Se fija con el refFresh de cada análisis, también en el
+    // camino de silencio (ahí refleja el refFresh real, no false).
+    bool reference_fresh = false;
 };
 
 // Escala ERB-rate, IDÉNTICA a HOLOS (HolosOperator::rebuildBandTables):
@@ -458,6 +463,10 @@ private:
             // Silencio / nivel inútil: no corromper el estado suavizado.
             // Publicar valid=false con los últimos valores conocidos.
             out.valid = false;
+            // S1/510: en silencio reference_fresh refleja el refFresh
+            // real de este análisis (no false por defecto): la frescura
+            // de la referencia se evalúa aunque el mic esté en silencio.
+            out.reference_fresh = refFresh;
             const SensorFrame prev = slot_.frame;
             for (int b = 0; b < kBands; ++b) {
                 out.magnitude_db[b] = prev.magnitude_db[b];
@@ -528,6 +537,7 @@ private:
             out.coherence[b] = std::clamp(coh, 0.0f, 1.0f);
         }
         out.valid = true;
+        out.reference_fresh = refFresh;  // S1/510: frescura de este análisis
         publish(out);
         if (sink_) sink_(out);
     }

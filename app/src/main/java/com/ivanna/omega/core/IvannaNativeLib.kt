@@ -741,9 +741,10 @@ object IvannaNativeLib {
         abrWaveVLatencyMs: Float, fnirsHbO: Float
     ): Boolean
     /** Ingiere UN frame del MICRÓFONO DEL TELÉFONO (v2.5.449, sin root,
-     *  sin hardware extra). erbFrame: FloatArray[74] con el layout de
+     *  sin hardware extra). erbFrame: FloatArray[76] con el layout de
      *  nativeSensorLatestFrame — mag[0..23], err[24..47], coh[48..71],
-     *  level[72], valid[73] (1/0). El mapeo 24 ERB -> 8 Greenwood y la
+     *  level[72], valid[73] (1/0), referenceFresh[74] (1/0),
+     *  referenceLevelDb[75] (v2.5.510, S1). El mapeo 24 ERB -> 8 Greenwood y la
      *  validación viven en C++ (micErbToNeuroFrame). Devuelve true si el
      *  frame se aceptó y se aprendió. Solo lo llama NeuroMicDriver. */
     external fun nativeNeuroLoopIngestMic(
@@ -768,15 +769,17 @@ object IvannaNativeLib {
     external fun nativeSensorSetBassTrimDb(bassTrimDb: Float): Boolean
     /** Preset vigente del sensor (0..3, ver nativeSensorSetEliteTarget). */
     external fun nativeSensorTargetKind(): Int
-    /** Último frame: FloatArray[74] = mag[0..23], err[24..47], coh[48..71],
-     *  level[72], valid[73] (1/0). */
+    /** Último frame: FloatArray[76] = mag[0..23], err[24..47], coh[48..71],
+     *  level[72], valid[73] (1/0), referenceFresh[74] (1/0),
+     *  referenceLevelDb[75] (v2.5.510, S1). */
     external fun nativeSensorLatestFrame(): FloatArray
     /** Contador de frames publicados por el sensor. */
     external fun nativeSensorFrameIndex(): Long
     /** Ingiere UN snapshot versionado del sensor por el CANAL LATERAL
      *  (v2.5.506). Lo llama SOLO el consumidor dedicado
      *  (SensorSnapshotConsumer, hilo propio, nunca el hilo de audio).
-     *  erbFrame74: layout de nativeSensorLatestFrame. timestampUs:
+     *  erbFrame: layout de nativeSensorLatestFrame (FloatArray[76] desde
+     *  v2.5.510, S1; el nativo lee los primeros 74). timestampUs:
      *  CLOCK_MONOTONIC (µs). sequence: frame_index del sensor.
      *  sourceId: 1 = Ruta A. Construye el snapshot, lo publica
      *  (latest wins), lo valida (versión/fuente/frescura/rangos) y lo

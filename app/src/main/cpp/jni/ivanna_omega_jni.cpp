@@ -390,6 +390,10 @@ extern std::atomic<float> g_holos_room_rt60;
 extern std::atomic<float> g_holos_eq_low;
 extern std::atomic<float> g_holos_eq_mid;
 extern std::atomic<float> g_holos_eq_high;
+extern std::atomic<float> g_holos_eq_presence;  // S3/510: syncFusedControlsRouteA()
+                                                 // lo lee antes de su extern de
+                                                 // más abajo (~615); redeclarar
+                                                 // extern aquí es legal en C++.
 extern std::atomic<float> g_room_corr_db[10];
 // PARCHE v2.6 (punto 10): estos 3 atomics se usan en syncFusedControlsRouteA()
 // (líneas ~432-435) pero sus externs estaban más abajo (~576-582), después
@@ -469,6 +473,9 @@ static void syncFusedControlsRouteA() noexcept {
     c.tonal.lowDb = g_holos_eq_low.load(std::memory_order_relaxed);
     c.tonal.midDb = g_holos_eq_mid.load(std::memory_order_relaxed);
     c.tonal.highDb = g_holos_eq_high.load(std::memory_order_relaxed);
+    // S3/510: la presencia por fin tiene atomic en el sync (antes solo la
+    // leían los caminos legacy; la cadena fusionada la perdía).
+    c.tonal.presenceDb = g_holos_eq_presence.load(std::memory_order_relaxed);
     // PARCHE v2.6 (punto 10, espejo de Ruta B): coherencia AUX en SPEAKERS
     // y campo temporal — antes no llegaban a la cadena de Ruta A.
     c.spatial.auxEnabled = g_aux_field_enabled.load(std::memory_order_relaxed);
@@ -484,7 +491,8 @@ static void syncFusedControlsRouteA() noexcept {
         c.field.phiAmount <= 0.0f &&
         g_omni_amount.load(std::memory_order_relaxed) <= 0.0f &&
         roomCorrZero && c.tonal.lowDb == 0.0f &&
-        c.tonal.midDb == 0.0f && c.tonal.highDb == 0.0f;
+        c.tonal.midDb == 0.0f && c.tonal.highDb == 0.0f &&
+        c.tonal.presenceDb == 0.0f;  // S3/510: solo presencia tampoco es "todo apagado".
     if (allOperatorsOff) {
         c.setNeutral();
         c.tonal.loudnessComp = false;
@@ -3330,8 +3338,10 @@ JNIEXPORT void JNICALL Java_com_ivanna_omega_dsp_DSPBridge_nativeSetBypass(
 
 // ── FUSIÓN MAGISTRAL (2026-11-18) — puente JNI de controles fusionados ────
 // Corresponde a FusedControlsBridge (com.ivanna.omega.audio). La firma de
-// nativeSetFusedControls es la del Kotlin (50 parámetros, mismo orden;
-// 48 + fieldOmniAmount + fieldDiffuse, unificación 2.5.509 paso 5).
+// nativeSetFusedControls es la del Kotlin (61 parámetros, mismo orden;
+// 50 + tonalPresenceDb + roomCorrDb[10], S3/510 — antes la presencia no
+// tenía slot y la corrección de sala solo vivía en el espejo Kotlin y en
+// nativeSetRoomCorrection, así que el push fusionado no la empujaba).
 // TRAMPA DEL MODO: el contrato JNI es 0=HEADPHONES/1=SPEAKERS, pero el enum
 // C++ OmegaOutputMode es UNKNOWN=0/HEADPHONES=1/SPEAKERS=2 — se traduce
 // aquí (pasar el Int tal cual pondría UNKNOWN=fail-closed). Los valores que
@@ -3360,7 +3370,14 @@ Java_com_ivanna_omega_audio_FusedControlsBridge_nativeSetFusedControls(
     jint brainMode, jfloat brainAdaptation,
     jfloat consvAmount, jfloat consvEnergyCap, jfloat consvPhaseCoherence,
     jfloat consvInertia,
-    jfloat fieldOmniAmount, jfloat fieldDiffuse) {
+    jfloat fieldOmniAmount, jfloat fieldDiffuse,
+    // S3/510: presencia 4-8 kHz + corrección de sala cut-only (10 bandas).
+    // Al final para no mover los 50 parámetros existentes.
+    jfloat tonalPresenceDb,
+    jfloat roomCorrDb0, jfloat roomCorrDb1, jfloat roomCorrDb2,
+    jfloat roomCorrDb3, jfloat roomCorrDb4, jfloat roomCorrDb5,
+    jfloat roomCorrDb6, jfloat roomCorrDb7, jfloat roomCorrDb8,
+    jfloat roomCorrDb9) {
     using ivanna::fused::FusedControls;
     FusedControls c = g_fusedChainRouteA.controls();
     c.spatial.amount = spatialAmount;
@@ -3393,6 +3410,15 @@ Java_com_ivanna_omega_audio_FusedControlsBridge_nativeSetFusedControls(
     c.listenerRoom.roomSizeM = roomSizeM;
     c.listenerRoom.roomWet = roomWet;
     c.listenerRoom.hearingProfile = roomHearingProfile;
+    // S3/510 — corrección de sala cut-only (10 bandas): por fin con slot
+    // en la firma fusionada. El clamp (-12..0) lo hace c.clamp() abajo.
+    {
+        const jfloat roomCorrIn[10] = {roomCorrDb0, roomCorrDb1, roomCorrDb2,
+            roomCorrDb3, roomCorrDb4, roomCorrDb5, roomCorrDb6, roomCorrDb7,
+            roomCorrDb8, roomCorrDb9};
+        for (int i = 0; i < 10; ++i)
+            c.listenerRoom.roomCorrDb[i] = roomCorrIn[i];
+    }
     c.transducer.correction = transCorrection;
     c.transducer.temporalAmount = transTemporal;
     c.transducer.emfEnabled = (transEmf == JNI_TRUE);
@@ -3401,6 +3427,7 @@ Java_com_ivanna_omega_audio_FusedControlsBridge_nativeSetFusedControls(
     c.tonal.lowDb = tonalLowDb;
     c.tonal.midDb = tonalMidDb;
     c.tonal.highDb = tonalHighDb;
+    c.tonal.presenceDb = tonalPresenceDb;  // S3/510.
     c.tonal.loudnessComp = (tonalLoudness == JNI_TRUE);
     c.dynamics.punch = dynPunch;
     c.dynamics.width = dynWidth;
@@ -3449,6 +3476,12 @@ Java_com_ivanna_omega_audio_FusedControlsBridge_nativeSetFusedControls(
     g_holos_eq_low.store(c.tonal.lowDb, std::memory_order_relaxed);
     g_holos_eq_mid.store(c.tonal.midDb, std::memory_order_relaxed);
     g_holos_eq_high.store(c.tonal.highDb, std::memory_order_relaxed);
+    // S3/510: espejo de los dos campos nuevos; sin esto el sync por
+    // bloque los reescribiría con los valores viejos (la presencia) o
+    // la corrección medida se perdería en el siguiente push (roomCorr).
+    g_holos_eq_presence.store(c.tonal.presenceDb, std::memory_order_relaxed);
+    for (int i = 0; i < 10; ++i)
+        g_room_corr_db[i].store(c.listenerRoom.roomCorrDb[i], std::memory_order_relaxed);
 }
 
 JNIEXPORT void JNICALL
@@ -5045,8 +5078,10 @@ Java_com_ivanna_omega_core_IvannaNativeLib_nativeNeuroLoopStatus(
 // el bucle está habilitado (nativeSensorRoomCorrectionSetEnabled/Amount,
 // apagado por defecto). Sin micrófono no hay frames válidos y la
 // corrección se desvanece a 0 (fail-closed).
-// nativeSensorLatestFrame: FloatArray[74] = mag[0..23], err[24..47],
-// coh[48..71], level[72], valid[73] (1/0). nativeSensorFrameIndex: long.
+// nativeSensorLatestFrame: FloatArray[76] = mag[0..23], err[24..47],
+// coh[48..71], level[72], valid[73] (1/0), referenceFresh[74] (1/0),
+// referenceLevelDb[75] (media del mic 250 Hz–2 kHz, dBFS; S1/510).
+// nativeSensorFrameIndex: long.
 // nativeSensorRoomCorrectionStatus: [0] enabled 0/1, [1] amount 0..1,
 // [2] frame válido 0/1, [3] coherencia media 0..1.
 JNIEXPORT jboolean JNICALL
@@ -5122,7 +5157,11 @@ JNIEXPORT jfloatArray JNICALL
 Java_com_ivanna_omega_core_IvannaNativeLib_nativeSensorLatestFrame(
         JNIEnv* env, jobject) {
     const ivanna::spatial::SensorFrame fr = g_acousticSensorA.latestFrame();
-    jfloat v[74] = {};
+    // S1/510: FloatArray[76] = mag[0..23], err[24..47], coh[48..71],
+    // level[72], valid[73] (1/0), referenceFresh[74] (1/0),
+    // referenceLevelDb[75] (media del mic 250 Hz–2 kHz, dBFS — NO es el
+    // nivel de la señal de referencia; ver RealAcousticSensor.hpp:269).
+    jfloat v[76] = {};
     for (int b = 0; b < 24; ++b) {
         v[b] = fr.magnitude_db[b];
         v[24 + b] = fr.error_db[b];
@@ -5130,9 +5169,11 @@ Java_com_ivanna_omega_core_IvannaNativeLib_nativeSensorLatestFrame(
     }
     v[72] = fr.level_dbfs;
     v[73] = fr.valid ? 1.0f : 0.0f;
-    jfloatArray out = env->NewFloatArray(74);
+    v[74] = fr.reference_fresh ? 1.0f : 0.0f;
+    v[75] = g_acousticSensorA.referenceLevelDb();
+    jfloatArray out = env->NewFloatArray(76);
     if (!out) return nullptr;
-    env->SetFloatArrayRegion(out, 0, 74, v);
+    env->SetFloatArrayRegion(out, 0, 76, v);
     return out;
 }
 

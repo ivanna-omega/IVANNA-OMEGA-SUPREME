@@ -248,6 +248,12 @@ struct TonalControls {
     float lowDb = 0.0f;      // graves -12..+12 dB.
     float midDb = 0.0f;      // medios -12..+12 dB.
     float highDb = 0.0f;     // agudos -12..+12 dB.
+    // S3/510 — presencia 4-8 kHz -12..+12 dB. La v1.1 pone
+    // presence_4k_8k = +2.0 y el motor no tenía dónde recibirlo
+    // (sin campo en TonalControls ni slot JNI). Default 0.0 =
+    // idéntico a antes: se suma ENCIMA de highDb en las bandas
+    // 7-8 (4 kHz y 8 kHz) de FusedTonal::applyControls.
+    float presenceDb = 0.0f;  // presencia 4-8 kHz -12..+12 dB.
     bool loudnessComp = true;  // compensación de loudness (ISO 226).
     // P8 — CORONA D10 (2026-11-25): escalar tonal CONTINUO 0..1.
     // Default 1.0 = comportamiento actual, sin cambio. Escala las 10
@@ -262,12 +268,13 @@ struct TonalControls {
         lowDb = clampf(lowDb, -12.0f, 12.0f);
         midDb = clampf(midDb, -12.0f, 12.0f);
         highDb = clampf(highDb, -12.0f, 12.0f);
+        presenceDb = clampf(presenceDb, -12.0f, 12.0f);  // S3/510.
         amount = clampf(amount, 0.0f, 1.0f);
     }
     bool isNeutral() const noexcept {
         if (amount <= 0.0f) return true;  // P8: escalar 0 = neutro total.
         return curve == 0 && trimDb == 0.0f && lowDb == 0.0f &&
-               midDb == 0.0f && highDb == 0.0f;
+               midDb == 0.0f && highDb == 0.0f && presenceDb == 0.0f;
     }
 };
 
@@ -405,6 +412,7 @@ struct FusedControls {
         tonal.lowDb = 0.0f;
         tonal.midDb = 0.0f;
         tonal.highDb = 0.0f;
+        tonal.presenceDb = 0.0f;  // S3/510: sin esto el neutro dejaba la presencia vieja.
         dynamics.punch = 0.0f;
         dynamics.width = 1.0f;
         dynamics.compRatio = 1.0f;

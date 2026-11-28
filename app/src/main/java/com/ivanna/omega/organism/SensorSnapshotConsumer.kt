@@ -75,7 +75,7 @@ class SensorSnapshotConsumer(
                     if (idx > lastIndex) {
                         lastIndex = idx
                         val frame = RealAcousticSensor.latestFrame()
-                        if (frame.size == 74) {
+                        if (frame.size == 76) {
                             val tsUs = SystemClock.uptimeMillis() * 1000L
                             val ok = IvannaNativeLib.guardedNative(false) {
                                 IvannaNativeLib.nativeSensorSnapshotIngest(

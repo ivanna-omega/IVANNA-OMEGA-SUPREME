@@ -28,8 +28,10 @@
 //      sala del Modelo Oyente+Sala) — EQ de USUARIO de 10 bandas con el
 //      filtro AutoEq (cascada de 10 biquads peaking RBJ) como
 //      implementación. Mapeo: bandas 0-2 = lowDb, 3-6 = midDb, 7-9 =
-//      highDb; modo completo (±12 dB, sin cut-only: el usuario sí puede
-//      realzar). Sin ganancias es bypass bit-exacto.
+//      highDb, más presenceDb ADITIVO en 7-8 (4-8 kHz, S3/510; con
+//      presenceDb = 0 es idéntico a antes); modo completo (±12 dB,
+//      sin cut-only: el usuario sí puede realzar). Sin ganancias es
+//      bypass bit-exacto.
 //   5. Perceptual Loudness / trim LUFS — AL FINAL: el medidor K-weighted
 //      (LoudnessMeter) mide cada trozo y el trim ESTÁTICO controls.trimDb
 //      es la ÚNICA ganancia neta del operador (Matched-LUFS: neto 0.0 dB

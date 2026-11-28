@@ -72,6 +72,13 @@ object OrganismPayload {
         telemetry.addProperty("framesTotal", chunk.framesTotal)
         telemetry.addProperty("levelMeanDbfs", chunk.levelMeanDbfs.toDouble())
         telemetry.addProperty("levelMaxDbfs", chunk.levelMaxDbfs.toDouble())
+        // S1/510: frescura de referencia de la ventana. Sin estos campos
+        // la coherencia media es uninterpretable (0% puede ser sala o
+        // instrumentación). referenceLevelMeanDbfs es media del mic en
+        // 250 Hz–2 kHz, NO nivel de la señal de referencia.
+        telemetry.addProperty("referenceFreshFrac", chunk.referenceFreshFrac.toDouble())
+        telemetry.addProperty("framesReferenceFresh", chunk.framesReferenceFresh)
+        telemetry.addProperty("referenceLevelMeanDbfs", chunk.referenceLevelMeanDbfs.toDouble())
         telemetry.addProperty("engineVersion", chunk.engineVersion)
         body.add("telemetry", telemetry)
         return body
