@@ -78,6 +78,12 @@
 #include "fused/fused_chain.hpp"
 #include "fused/fused_controls.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace ivanna::fused;
 
 namespace {
@@ -161,7 +167,7 @@ std::vector<double> makeNoise(double rms) {
     // Como la sonda probe_p8_cal: uniforme [-0.5, 0.5], semilla 61,
     // dual-mono, escalado a RMS 0.5 (-6.02 dBFS).
     std::vector<double> v(kDur);
-    std::mt19937 rng(61);
+    std::mt19937 rng(ivanna::test::IvannaTestSeed32(1));
     std::uniform_real_distribution<double> d(-0.5, 0.5);
     for (int i = 0; i < kDur; ++i) v[i] = d(rng);
     double p = 0.0;

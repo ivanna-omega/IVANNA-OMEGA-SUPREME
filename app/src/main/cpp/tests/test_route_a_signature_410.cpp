@@ -61,6 +61,12 @@
 #include "differential_reinjector.hpp"
 #include "ivanna_measure.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 namespace {
 
 constexpr int kSr = 48000;
@@ -133,7 +139,7 @@ void buildTonesDecorr(std::vector<float>& l, std::vector<float>& r) {
 void buildPseudoMusicThdn(std::vector<float>& l, std::vector<float>& r) {
     l.assign(kThdnTotal, 0.0f);
     r.assign(kThdnTotal, 0.0f);
-    uint64_t sL = 0x123456789ABCDEF1ull, sR = 0xFEDCBA9876543210ull;
+    uint64_t sL = ivanna::test::IvannaTestSeedFor(1), sR = ivanna::test::IvannaTestSeedFor(2);
     auto rnd = [](uint64_t& s) {
         s ^= s >> 12; s ^= s << 25; s ^= s >> 27;
         return (double)((s * 0x2545F4914F6CDD1Dull) >> 11) / 9007199254740992.0 - 0.5;

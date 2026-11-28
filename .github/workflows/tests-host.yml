@@ -120,6 +120,27 @@ jobs:
           bash scripts/run_ctest.sh | tee /tmp/ctest_run.log
           python3 scripts/check_docs_claims.py --generate-from-log /tmp/ctest_run.log
 
+      # C5 (510) — publicar artefactos JUnit + log en CADA run, también al
+      # cancelar por timeout. Causa raíz: en la 509 el job ASan+UBSan murió
+      # por timeout a los 30 min (1515/1835 tests, 0 fallos) y el log murió
+      # con el runner — para saber qué 320 tests no corrieron había que
+      # re-correr. Diagnóstico sin re-correr: descargar el artefacto y
+      # grep -E "Failed|Timeout" ctest_last.log. `if-no-files-found: warn`
+      # porque si ctest muere por timeout del job, el JUnit (que ctest
+      # escribe al final) puede no existir; el log sí sobrevive (tee).
+      # Nombre por pata de la matriz: sin él, plain y ASan colisionarían
+      # en el mismo artefacto.
+      - name: Publicar artefactos CTest (log + JUnit)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-${{ matrix.san == 'asan' && 'asan' || 'plain' }}
+          path: |
+            build/tests-host/ctest_last.log
+            build/tests-host/ctest_junit.xml
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Fase 0 — Herramientas de verdad (0.1–0.5 + cppcheck + header_wiring)
         if: matrix.san == ''
         run: |
@@ -140,6 +161,7 @@ jobs:
           run_check jni_wiring            python3 scripts/check_jni_wiring.py
           run_check kotlin_wrapper_wiring python3 scripts/check_kotlin_wrapper_wiring.py
           run_check header_wiring         python3 scripts/check_header_wiring.py
+          run_check test_determinism      python3 scripts/check_test_determinism.py
           run_check rt_safety             python3 scripts/check_rt_safety.py
           run_check "Fase 0 — verdad de los 10 ejes (10D)" python3 scripts/check_10d_axis_truth.py
           run_check build_flags           python3 scripts/check_build_flags.py
@@ -231,6 +253,20 @@ jobs:
 
       - name: CTest completo con ThreadSanitizer
         run: bash scripts/run_ctest.sh
+
+      # C5 (510) — mismo artefacto que en el job `ctest`: el carril TSan
+      # también genera ctest_last.log + ctest_junit.xml vía run_ctest.sh
+      # y también puede morir por timeout (90 min).
+      - name: Publicar artefactos CTest (log + JUnit)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-tsan
+          path: |
+            build/tests-host/ctest_last.log
+            build/tests-host/ctest_junit.xml
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Resumen
         if: always()

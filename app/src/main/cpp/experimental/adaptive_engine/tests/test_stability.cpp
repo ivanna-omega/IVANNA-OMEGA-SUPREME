@@ -27,6 +27,12 @@
 #include <random>
 #include <thread>
 
+#include "../../../tests/ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace ivanna::experimental;
 
 namespace {
@@ -68,7 +74,7 @@ bool isHealthy(const AdaptiveState& s) {
 // motor a transicionar entre todos sus regímenes de decisión durante la
 // ventana del test, no solo mantenerse en un estado estable.
 void producerThread(AdaptiveDecisionEngine& engine, int duration_ms, std::atomic<bool>& stopFlag) {
-    std::mt19937 rng(12345);
+    std::mt19937 rng(ivanna::test::IvannaTestSeed32(1));
     std::uniform_real_distribution<float> jitter(-0.02f, 0.02f);
     const auto start = std::chrono::steady_clock::now();
     int tick = 0;

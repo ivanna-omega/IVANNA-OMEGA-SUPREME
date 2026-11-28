@@ -26,6 +26,12 @@
 #include <numeric>
 #include <algorithm>
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 static constexpr int   BLOCK   = 512;
 static constexpr float SR      = 48000.f;
 static constexpr float PI2     = 2.f * static_cast<float>(M_PI);
@@ -224,7 +230,7 @@ TEST(AudioQualityMetrics, NumericalFloor_NoNaNAfter1000Blocks) {
     p.alpha = 0.375f; p.beta = 0.105f; p.gamma = 0.72f;
     comp.setParams(p);
 
-    std::srand(0x1A26);  // seed determinista
+    std::srand(ivanna::test::IvannaTestSeed32(1));  // seed determinista
     int nanCount = 0;
 
     for (int blk = 0; blk < 1000; ++blk) {

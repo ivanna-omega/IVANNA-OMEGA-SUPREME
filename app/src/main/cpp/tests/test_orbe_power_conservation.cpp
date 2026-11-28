@@ -28,6 +28,12 @@
 #include "../spatial/BandPowerConserver.hpp"
 #include "../spatial/OrbeBinaural.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 namespace {
 constexpr float kFs = 48000.0f;
 constexpr int kDur = 96000;        // 2 s @48 kHz
@@ -56,20 +62,20 @@ Sig makeSignal(const std::string& kind) {
     s.l.assign(kDur, 0.0f);
     s.r.assign(kDur, 0.0f);
     if (kind == "decorr") {
-        std::mt19937 gL(1), gR(2);
+        std::mt19937 gL(ivanna::test::IvannaTestSeed32(1)), gR(ivanna::test::IvannaTestSeed32(2));
         std::uniform_real_distribution<float> u(-0.5f, 0.5f);
         for (int i = 0; i < kDur; ++i) { s.l[i] = u(gL); s.r[i] = u(gR); }
     } else if (kind == "side") {
-        std::mt19937 g(3);
+        std::mt19937 g(ivanna::test::IvannaTestSeed32(3));
         std::uniform_real_distribution<float> u(-0.5f, 0.5f);
         for (int i = 0; i < kDur; ++i) { float n = u(g); s.l[i] = n; s.r[i] = -n; }
     } else if (kind == "mid") {
-        std::mt19937 g(4);
+        std::mt19937 g(ivanna::test::IvannaTestSeed32(4));
         std::uniform_real_distribution<float> u(-0.5f, 0.5f);
         for (int i = 0; i < kDur; ++i) { float n = u(g); s.l[i] = n; s.r[i] = n; }
     } else if (kind == "corr08") {
         const float a = std::sqrt(0.8f), b = std::sqrt(0.2f);
-        std::mt19937 gC(5), gL(6), gR(7);
+        std::mt19937 gC(ivanna::test::IvannaTestSeed32(5)), gL(ivanna::test::IvannaTestSeed32(6)), gR(ivanna::test::IvannaTestSeed32(7));
         std::uniform_real_distribution<float> u(-0.5f, 0.5f);
         for (int i = 0; i < kDur; ++i) {
             float c = u(gC);
@@ -180,7 +186,7 @@ TEST(OrbePowerConservation, AmountZeroIsBitExactBypass) {
     ivanna::OrbeBinaural o;
     o.prepare(kFs);
     o.setAmount(0.0f);
-    std::mt19937 g(1);
+    std::mt19937 g(ivanna::test::IvannaTestSeed32(1));
     std::uniform_real_distribution<float> u(-1, 1);
     std::vector<float> l(48000), r(48000);
     for (auto& v : l) v = u(g);

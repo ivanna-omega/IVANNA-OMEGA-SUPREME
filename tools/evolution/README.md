@@ -164,3 +164,43 @@ coste desconocido): `tools/evolution/OMNIROUTE_VERIFICATION.md`.
 El artefacto en vivo no lee este JSON solo todavía: el operador lo
 publica/adjunta a la sonda cuando la Vista de Dios lo pida; el
 artefacto nunca recibe la API key ni accede al filesystem de la VM.
+
+## 9. Bloque `repro:` obligatorio en cada propuesta (C12, release 510)
+
+Un resultado sin su comando de reproducción no es un resultado. Desde
+C12, cada propuesta nueva de `tools/evolution/proposals/<id>/` trae un
+sidecar JSON `repro.json` con `command`/`commands`, `seed`, `fixtures`
+(rutas repo-relativas con sha256 del fixture REAL) y `expected` (salida
+literal que el comando debe producir). El chequeo
+`tools/evolution/check_repro.py` (solo stdlib) lo verifica y el job
+`repro-check` de `.github/workflows/evolution-council.yml` falla el PR
+si el bloque falta, si un fixture no existe o su sha256 no coincide, o
+si el comando no produce lo esperado.
+
+**Desviación documentada respecto a la propuesta:** el `repro:` NO es
+un bloque de texto en `REPORT.md`. Verificado contra el código vivo
+(2026-11-28): las propuestas reales son directorios con
+`<id>.patch` + `REPORT.md` + `validation.json`, sin YAML ni
+front-matter, y `council.py` nunca lee esos directorios (recibe un
+finding JSON por CLI) — no existe ningún campo `repro:` previo que
+reutilizar. El sidecar `repro.json` junto a `validation.json` es el
+encaje real, con exactamente las claves que pide C12. La forma de un
+solo comando (`command`/`seed`/`fixtures`/`expected` a nivel superior)
+también se acepta; `commands` (lista) cubre repros de varios pasos.
+
+**Alcance:** solo las propuestas tocadas por el PR (`--changed`). Las
+anteriores a C12 (0001-0033) están exentas: exigirlo retroactivamente
+pondría la CI en rojo el primer día y rellenarlo a posteriori sería
+fabricar evidencia. Los pasos aún no ejecutables van en
+`pending_commands` con `blocked_by` obligatorio; si el programa del
+paso ya existe, el chequeo falla (tripwire de promoción).
+
+**Ejemplo canónico:** `proposals/0034-v1.1-ab-candidate/repro.json`
+(C7+S4, ambos ejecutables; C7 sobre fixtures sintéticos — ver su
+REPORT.md). Verificación local:
+
+```bash
+python3 tools/evolution/check_repro.py --proposal 0034-v1.1-ab-candidate
+python3 tools/evolution/check_repro.py --changed --base <sha-del-base>
+python3 -m unittest tools.evolution.tests.test_check_repro -v
+```

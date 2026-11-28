@@ -1,0 +1,49 @@
+{
+  "proposal": "0034-v1.1-ab-candidate",
+  "version": 1,
+  "seed": 1795857152818,
+  "notes": "Ejemplo canónico C12 (primera candidata, v1.1). Desviación documentada respecto a la propuesta: el 'repro:' no es un bloque de texto en REPORT.md sino este sidecar JSON (ver check_repro.py: las propuestas reales no tienen YAML y council.py nunca las lee). Sin .patch: es una candidata de perfil A/B, no un parche de código; evolution_engine.validate_proposal / publish_proposal no le aplican (exigen parche) — su validación ES este repro (C7+S4). RECONCILIACIÓN C7 (2026-11-28, durante esta tarea C12 el agente C7 aterrizó scripts/check_muselink_ab.py y tools/evolution/fixtures/ab/): el comando C7 usa las rutas REALES tools/evolution/fixtures/ab/*, no fixtures/ab/* como decía el encargo documentado; --baseline-profile se omite porque el perfil v1.0 no existe en el repo y la ayuda de C7 lo marca opcional ('la puerta no lo necesita'). CAVEAT (del propio C7, AVISO en su salida): los fixtures ab/* son SINTÉTICOS (synthetic=true); la exportación ERB agregada de las 177 sesiones reales está pendiente del servidor. El PROMOTED aquí es reproducible y determinista (seed fijo, verificado 3 corridas idénticas), pero NO es evidencia de sesiones medidas: cuando lleguen los fixtures reales, sus sha256 sustituyen a estos y el expected se re-deriva de la corrida real.",
+  "commands": [
+    {
+      "name": "C7",
+      "command": "python3 scripts/check_muselink_ab.py --baseline tools/evolution/fixtures/ab/v1.0_sessions.json --candidate tools/evolution/fixtures/ab/v1.1_sessions.json --candidate-profile tools/evolution/fixtures/omega-1795857152818-9lec-v1.1.ivanna.json --seed 1795857152818",
+      "seed": 1795857152818,
+      "fixtures": [
+        {
+          "path": "tools/evolution/fixtures/ab/v1.0_sessions.json",
+          "sha256": "eadbf5c75b264d0327fb924c6e69767cf29221967932800166ef16341e2171e1"
+        },
+        {
+          "path": "tools/evolution/fixtures/ab/v1.1_sessions.json",
+          "sha256": "f4d329d2a22aea822d9b819d10f4c6314468478aa74cfecdba85d40d1be40c4a"
+        },
+        {
+          "path": "tools/evolution/fixtures/omega-1795857152818-9lec-v1.1.ivanna.json",
+          "sha256": "c6a15ecc2b18843e24188b6a7baf311fc363c628f9d97c859e4510bcf9a6ea48"
+        }
+      ],
+      "expected": [
+        "[PUERTA 1/5] mejora ERB: PASS — RMS base 10.56 dB -> candidato 7.92 dB (mejora 25.1%, exigida >= 20%; objetivo <= 8.37 dB desde linea base 10.46 dB)",
+        "[PUERTA 2/5] coherencia: PASS — media base 0.000 -> candidato 0.000 (caida permitida <= 0.05) — con base 0.0 esta puerta no discrimina hoy",
+        "[PUERTA 3/5] sin resonancia nueva: PASS — base [ERB-3 209 Hz +9.86 dB]; candidato [ninguna]",
+        "[PUERTA 4/5] sin clip: PASS — peor chunk candidato levelMaxDbfs -5.80 dBFS (clip en >= 0.0 dBFS); chunks con clip 0/36 (v1.1-s1: 0/12, v1.1-s2: 0/12, v1.1-s3: 0/12)",
+        "[PUERTA 5/5] S8 endurecido: PASS — (a) regiones: worst region medios worsened -1.30 dB (limit +1.0 dB); graves_medios_graves 4.86 -> 2.89 dB (-1.98); medios 5.35 -> 4.05 dB (-1.30); brillo 12.03 -> 9.11 dB (-2.92); presencia 12.03 -> 9.11 dB (-2.92); aire 16.04 -> 12.15 dB (-3.90); (b) APEX: crest telemetry absent; crest part of this gate skipped; levelMax pegged at -0.1 dBFS: base=False candidate=False; (c) sonoridad: |levelMean| -18.00 vs -18.20 dBFS (delta 0.20 dB, limit 3.0 dB); lufs() telemetry absent, LUFS part skipped",
+        "[PROMOTED] veredicto: PROMOTED (seed=1795857152818)"
+      ],
+      "expected_exit_code": 0
+    },
+    {
+      "name": "S4",
+      "command": "python3 scripts/validate_ivanna_profile.py --live-session tools/evolution/fixtures/omega-1795857152818-9lec-v1.1.ivanna.json",
+      "seed": 1795857152818,
+      "fixtures": [
+        {
+          "path": "tools/evolution/fixtures/omega-1795857152818-9lec-v1.1.ivanna.json",
+          "sha256": "c6a15ecc2b18843e24188b6a7baf311fc363c628f9d97c859e4510bcf9a6ea48"
+        }
+      ],
+      "expected": "VÁLIDO (schema v1.0 live-session, desconocido — Sesión en vivo IVANNA)",
+      "expected_exit_code": 0
+    }
+  ]
+}

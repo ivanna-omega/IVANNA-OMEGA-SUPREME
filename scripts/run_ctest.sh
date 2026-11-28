@@ -40,8 +40,15 @@ if [[ -z "${TIMEOUT_PER_TEST:-}" ]]; then
 fi
 # Los logs de job no son legibles vía API: al fallar, se publican los nombres de los
 # tests rotos y el cuerpo de su fallo como anotación ::error:: (visible en check-runs).
+# C5 (510): además se genera JUnit para que el workflow publique log + JUnit como
+# artefacto en cada run (if: always()). En la 509 el job murió por timeout a los
+# 30 min (1515/1835 tests, 0 fallos) y el log murió con el runner; con el artefacto
+# el diagnóstico no exige re-correr: grep -E "Failed|Timeout" ctest_last.log.
+# Nota: si ctest muere por timeout del job, el JUnit puede no existir (ctest lo
+# escribe al final); el paso de subida usa if-no-files-found: warn y el log sí
+# sobrevive porque tee lo escribe en continuo.
 rc=0
-ctest --test-dir "$BUILD" --output-on-failure -j"$CTEST_JOBS" --timeout "$TIMEOUT_PER_TEST" \
+ctest --test-dir "$BUILD" --output-on-failure --output-junit "$BUILD/ctest_junit.xml" -LE QUARANTINED -j"$CTEST_JOBS" --timeout "$TIMEOUT_PER_TEST" \
   2>&1 | tee "$BUILD/ctest_last.log" || rc=${PIPESTATUS[0]}
 if [[ "$rc" -ne 0 && "${GITHUB_ACTIONS:-}" == "true" ]]; then
   fails=$(grep -E "^\s*[0-9]+ - .*\((Failed|Timeout|SEGFAULT|Subprocess aborted|Exception)" "$BUILD/ctest_last.log" | sed 's/^ *//' | tr '\n' ';' | cut -c1-600)

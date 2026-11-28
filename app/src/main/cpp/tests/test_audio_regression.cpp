@@ -31,6 +31,12 @@
 #include <algorithm>
 #include <limits>
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 // ── Utilidades ───────────────────────────────────────────────────────────────
 
 static constexpr int   BLOCK = 512;
@@ -661,7 +667,7 @@ TEST_F(FullChainTest, Wideband_NoNaNNoClipping_500Blocks) {
     // Señal: mezcla de 440 Hz + 2 kHz + 5 kHz + ruido blanco filtrado.
     // Peor caso para el EQ: energy concentrada en la banda de presencia (+8.4 dB).
 
-    std::srand(0xDEADBEEF);
+    std::srand(ivanna::test::IvannaTestSeed32(1));
     int nanCount   = 0;
     int clipCount  = 0;
 

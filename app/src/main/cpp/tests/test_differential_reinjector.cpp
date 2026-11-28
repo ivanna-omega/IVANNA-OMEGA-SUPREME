@@ -24,6 +24,12 @@
 #include <random>
 #include <vector>
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 // ── contador de asignaciones (solo este ejecutable) ─────────────────────────
 #pragma GCC diagnostic ignored "-Wmismatched-new-delete"
 static std::atomic<long> g_allocs{0};
@@ -196,7 +202,7 @@ std::vector<float> plusSeries(const std::vector<float>& a, const std::vector<flo
 // Peor caso real: el compresor/limitador atenúa → delta = −k·x (anticorrelado con x al retardo L).
 TEST(DifferentialReinjector, ReducesCombFilteringWorstCase) {
     const size_t N = static_cast<size_t>(SR) * 20;
-    const auto x = noise(N, 1);
+    const auto x = noise(N, ivanna::test::IvannaTestSeed32(1));
     const auto wet = scaled(x, 0.6f);                     // limitador/compresor atenuando
     for (float Lms : {20.f, 30.f, 40.f}) {
         DifferentialReinjector r; r.prepare(SR, BLK);
@@ -242,7 +248,7 @@ TEST(DifferentialReinjector, EstimatesFractionalDspLagAndCancelsResidualDelta) {
 // ═══ 3. Estabilidad con distintas latencias y jitter ═════════════════════════
 TEST(DifferentialReinjector, StableAcrossLatenciesAndJitter) {
     const size_t N = static_cast<size_t>(SR) * 10;
-    const auto x = noise(N, 7), wet = scaled(x, 0.6f);
+    const auto x = noise(N, ivanna::test::IvannaTestSeed32(2)), wet = scaled(x, 0.6f);
     for (float Lms : {8.f, 15.f, 25.f, 40.f, 80.f, 150.f}) {
         DifferentialReinjector r; r.prepare(SR, BLK);
         std::mt19937 g(5); std::uniform_real_distribution<float> jit(-3.f, 3.f);
@@ -336,10 +342,10 @@ static double transmittedDb(const Run& r, size_t from) {
 }
 TEST(DifferentialReinjector, SpatialDeltaBoundedByCoherenceIncoherentPasses) {
     const size_t N = static_cast<size_t>(SR) * 20;
-    const auto x = noise(N, 11);
-    const auto wetLin = plusSeries(x, decorrelate(x, 3), 1.0f);       // espacial coherente (FIR estacionario)
+    const auto x = noise(N, ivanna::test::IvannaTestSeed32(3));
+    const auto wetLin = plusSeries(x, decorrelate(x, ivanna::test::IvannaTestSeed32(5)), 1.0f);       // espacial coherente (FIR estacionario)
     const auto wetDyn = plusSeries(x, modulatedDelay(x), 0.6f);       // espacial variante en el tiempo (chorus)
-    const auto wetInc = plusSeries(x, noise(N, 99), 0.4f);            // información NUEVA no derivable del original
+    const auto wetInc = plusSeries(x, noise(N, ivanna::test::IvannaTestSeed32(4)), 0.4f);            // información NUEVA no derivable del original
     const int Ls = toSamples(30.f);
     auto cut = [&](const std::vector<float>& v) { return std::vector<float>(v.begin() + 48000, v.end()); };
     double pass[3], comb[3], combFull[3]; const char* nm[3] = {"lineal", "chorus", "incoherente"};
@@ -360,8 +366,8 @@ TEST(DifferentialReinjector, SpatialDeltaBoundedByCoherenceIncoherentPasses) {
 // ═══ 7. Inmersión perceptual: sube con contexto seguro, baja con riesgo/latencia ═
 TEST(DifferentialReinjector, ImmersionTracksContext) {
     const size_t N = static_cast<size_t>(SR) * 6;
-    const auto x = noise(N, 21);
-    const auto fresh = plusSeries(x, noise(N, 5), 0.4f), correlated = scaled(x, 0.6f);
+    const auto x = noise(N, ivanna::test::IvannaTestSeed32(6));
+    const auto fresh = plusSeries(x, noise(N, ivanna::test::IvannaTestSeed32(7)), 0.4f), correlated = scaled(x, 0.6f);
     auto imm = [&](const std::vector<float>& wet, float L, float speech = 0.f) {
         DifferentialReinjector r; r.prepare(SR, BLK); r.setContentHint(speech, 0.f);
         return runReinjector(x, wet, L, 0.8f, r).tel.immersionCeiling;
@@ -387,7 +393,7 @@ TEST(DifferentialReinjector, SurvivesNaNInfAndHugeBlocks) {
     EXPECT_EQ(o[5], 0.f);
 }
 TEST(DifferentialReinjector, ProcessDoesNotAllocate) {
-    const auto x = noise(BLK * 400, 31);
+    const auto x = noise(BLK * 400, ivanna::test::IvannaTestSeed32(8));
     DifferentialReinjector r; r.prepare(SR, BLK);
     std::vector<float> d(2 * BLK), w(2 * BLK), o(2 * BLK);
     g_allocs = 0; g_count = true;
@@ -400,7 +406,7 @@ TEST(DifferentialReinjector, ProcessDoesNotAllocate) {
     EXPECT_EQ(g_allocs.load(), 0) << "process() no puede asignar memoria";
 }
 TEST(DifferentialReinjector, TransparentWhenIntensityZero) {
-    const auto x = noise(BLK * 200, 41);
+    const auto x = noise(BLK * 200, ivanna::test::IvannaTestSeed32(9));
     DifferentialReinjector r; r.prepare(SR, BLK); r.setIntensity(0.f);
     std::vector<float> d(2 * BLK), w(2 * BLK), o(2 * BLK);
     float peak = 0;

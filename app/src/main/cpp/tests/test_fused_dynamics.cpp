@@ -13,6 +13,12 @@
 #include <random>
 #include <vector>
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 namespace {
 
 using ivanna::fused::FusedDynamics;
@@ -121,7 +127,7 @@ TEST(FusedDynamics, NoNaNOrInf) {
     // Ruido blanco determinista.
     {
         Stereo s(8192);
-        std::mt19937 rng(1234u);
+        std::mt19937 rng(ivanna::test::IvannaTestSeed32(1));
         std::uniform_real_distribution<double> uni(-0.99, 0.99);
         for (int i = 0; i < 8192; ++i) {
             s.l[i] = uni(rng);

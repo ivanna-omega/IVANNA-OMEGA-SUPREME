@@ -6,6 +6,12 @@
 #include <vector>
 #include "../dsp/HeadphoneCrossfeed.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 namespace {
 constexpr float kFs = 48000.0f;
 constexpr double kPi = 3.14159265358979323846;
@@ -24,7 +30,7 @@ std::vector<float> tone(double f, double amp, size_t n) {
 
 TEST(HeadphoneCrossfeed, StrengthZeroIsBitExactBypass) {
     ivanna::HeadphoneCrossfeed x; x.setSampleRate(kFs); x.setStrength(0.0f);
-    std::mt19937 g(1); std::uniform_real_distribution<float> u(-1, 1);
+    std::mt19937 g(ivanna::test::IvannaTestSeed32(1)); std::uniform_real_distribution<float> u(-1, 1);
     std::vector<float> l(4800), r(4800);
     for (auto& v : l) v = u(g);
     for (auto& v : r) v = u(g);
@@ -42,7 +48,7 @@ TEST(HeadphoneCrossfeed, InvalidStrengthFallsBackToBypass) {
 
 TEST(HeadphoneCrossfeed, CenterAndMonoAreExactlyPreserved) {
     ivanna::HeadphoneCrossfeed x; x.setSampleRate(kFs); x.setStrength(1.0f);
-    std::mt19937 g(2); std::uniform_real_distribution<float> u(-0.9f, 0.9f);
+    std::mt19937 g(ivanna::test::IvannaTestSeed32(2)); std::uniform_real_distribution<float> u(-0.9f, 0.9f);
     std::vector<float> l(48000); for (auto& v : l) v = u(g);
     auto r = l; auto l0 = l;
     x.process(l.data(), r.data(), (int)l.size());
@@ -91,7 +97,7 @@ TEST(HeadphoneCrossfeed, CrossfeedArrivesWithItdDelay) {
 TEST(HeadphoneCrossfeed, StableAndBoundedAtAllSampleRates) {
     for (float sr : {44100.0f, 48000.0f, 96000.0f, 192000.0f, 384000.0f}) {
         ivanna::HeadphoneCrossfeed x; x.setSampleRate(sr); x.setStrength(1.0f);
-        std::mt19937 g(3); std::uniform_real_distribution<float> u(-1, 1);
+        std::mt19937 g(ivanna::test::IvannaTestSeed32(3)); std::uniform_real_distribution<float> u(-1, 1);
         std::vector<float> l(65536), r(65536);
         for (auto& v : l) v = u(g);
         for (auto& v : r) v = u(g);

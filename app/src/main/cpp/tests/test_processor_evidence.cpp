@@ -11,6 +11,12 @@
 #include <random>
 #include <vector>
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace Ivanna;
 
 namespace {
@@ -49,7 +55,7 @@ std::unique_ptr<HrtfManager> mkHrtf() {
 
 // ── HRTF ────────────────────────────────────────────────────────────────────
 TEST(ProcessorEvidence, HrtfWet1ChangesSignalWet0IsBitExact) {
-    const auto in = noise(BLOCK_SIZE * 64, 1), inR = noise(BLOCK_SIZE * 64, 2);
+    const auto in = noise(BLOCK_SIZE * 64, ivanna::test::IvannaTestSeed32(1)), inR = noise(BLOCK_SIZE * 64, ivanna::test::IvannaTestSeed32(2));
     auto h0 = mkHrtf(); h0->setWetDry(0.f);
     const auto o0 = runHrtf(*h0, in, inR);
     // bypass: L||R por bloque identico a la entrada
@@ -67,7 +73,7 @@ TEST(ProcessorEvidence, HrtfWet1ChangesSignalWet0IsBitExact) {
 }
 
 TEST(ProcessorEvidence, HrtfDependsOnHeadPose) {
-    const auto in = noise(BLOCK_SIZE * 64, 3), inR = noise(BLOCK_SIZE * 64, 4);
+    const auto in = noise(BLOCK_SIZE * 64, ivanna::test::IvannaTestSeed32(3)), inR = noise(BLOCK_SIZE * 64, ivanna::test::IvannaTestSeed32(4));
     auto a = mkHrtf(), b = mkHrtf();
     b->setHeadPose(1.0f, 0.f, 0.f);   // ~57 grados de yaw
     const auto oa = runHrtf(*a, in, inR), ob = runHrtf(*b, in, inR);
@@ -78,7 +84,7 @@ TEST(ProcessorEvidence, HrtfDependsOnHeadPose) {
 TEST(ProcessorEvidence, SafQReachesHrtfWithoutNewHeadPose) {
     // El refresh espera a que termine el crossfade vigente (XFADE_FRAMES=128 bloques) y luego
     // hace otro de 128: 480 bloques cubren ambos.
-    const auto in = noise(BLOCK_SIZE * 480, 5), inR = noise(BLOCK_SIZE * 480, 6);
+    const auto in = noise(BLOCK_SIZE * 480, ivanna::test::IvannaTestSeed32(5)), inR = noise(BLOCK_SIZE * 480, ivanna::test::IvannaTestSeed32(6));
     const float q0[7] = {0, 0, 0, 0, 0, 0, 0};
     const float q1[7] = {1.f, 1.f, 0, 0, 0, 0, 0};   // curvatura max + sesgo +10 grados
     auto ref = mkHrtf(); ref->setSafLatentQ(q0, 7);
@@ -134,7 +140,7 @@ std::unique_ptr<RirConvolver> mkRir(float wet = 1.f) {
 }  // namespace
 
 TEST(ProcessorEvidence, RirWetChangesSignalWet0IsBitExact) {
-    const auto in = noise(512 * 40, 11), inR = noise(512 * 40, 12);
+    const auto in = noise(512 * 40, ivanna::test::IvannaTestSeed32(7)), inR = noise(512 * 40, ivanna::test::IvannaTestSeed32(8));
     auto off = mkRir(0.f);
     const auto o0 = runRir(*off, in, inR);
     for (size_t b = 0; b < 40; ++b)
@@ -151,7 +157,7 @@ TEST(ProcessorEvidence, RirWetChangesSignalWet0IsBitExact) {
 }
 
 TEST(ProcessorEvidence, SafWetScaleIsApplied) {
-    const auto in = noise(512 * 40, 13), inR = noise(512 * 40, 14);
+    const auto in = noise(512 * 40, ivanna::test::IvannaTestSeed32(9)), inR = noise(512 * 40, ivanna::test::IvannaTestSeed32(10));
     // q con wetScale distinto de 1 (si el q elegido no lo mueve, el test falla visiblemente)
     const float qLo[7] = {-1, -1, -1, -1, -1, -1, -1}, qHi[7] = {1, 1, 1, 1, 1, 1, 1};
     float e, d, t, wLo = 1, wHi = 1;
@@ -167,7 +173,7 @@ TEST(ProcessorEvidence, SafWetScaleIsApplied) {
 }
 
 TEST(ProcessorEvidence, SafRecouplesLiveFromRawIr) {
-    const auto in = noise(512 * 60, 15), inR = noise(512 * 60, 16);
+    const auto in = noise(512 * 60, ivanna::test::IvannaTestSeed32(11)), inR = noise(512 * 60, ivanna::test::IvannaTestSeed32(12));
     const float qA[7] = {-1, -1, -1, -1, -1, -1, -1}, qB[7] = {1, 1, 1, 1, 1, 1, 1};
     auto rc = mkRir();
     rc->applySofaCoupling(qA);

@@ -35,6 +35,12 @@
 #include "../IvannaAudioClassifier.hpp"
 #include "../anti_dolby.h"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace ivanna::fused;
 
 namespace {
@@ -66,7 +72,7 @@ Signal generateSignal() {
     Signal s;
     s.l.resize(kN);
     s.r.resize(kN);
-    XorShift rng(0x12345678ULL);
+    XorShift rng(ivanna::test::IvannaTestSeedFor(1));
     for (size_t i = 0; i < kN; ++i) {
         const double t = static_cast<double>(i) / kFs;
         const double sine = 0.251189 * std::sin(kTwoPi * 1000.0 * t);  // -12 dBFS

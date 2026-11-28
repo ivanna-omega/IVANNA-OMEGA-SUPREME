@@ -99,7 +99,18 @@ foreach(tgt ivanna_dsp_under_test)
   endif()
 endforeach()
 
+# C11/510 — cuarentena de tests flaky de wall-clock: ivanna_add_test(<name>
+# LABELS QUARANTINED) etiqueta TODOS los tests descubiertos de ese binario
+# con QUARANTINED (propiedad CTest LABELS). Sin LABELS el comportamiento es
+# idéntico al de antes. Los tests en cuarentena NO bloquean la puerta por
+# push/PR (scripts/run_ctest.sh corre con -LE QUARANTINED — línea pendiente,
+# ver reporte C11) y corren en el carril semanal
+# (.github/workflows/tests-quarantined-weekly.yml, lunes 04:23 UTC, 90 min)
+# y en el self-hosted, donde la carga es conocida. Salida: N noches verdes
+# seguidas (se proponen 4, a confirmar por Esse — propuesta, no dato medido)
+# → se quita la etiqueta. Una noche roja mantiene el test en cuarentena.
 function(ivanna_add_test name)
+  cmake_parse_arguments(ARG "" "" "LABELS" ${ARGN})
   add_executable(${name} ${name}.cpp)
   target_link_libraries(${name} PRIVATE GTest::gtest_main ivanna_dsp_under_test)
   target_include_directories(${name} PRIVATE .. ../include ../visualizer)
@@ -108,7 +119,11 @@ function(ivanna_add_test name)
     target_compile_options(${name} PRIVATE ${IVANNA_SAN_FLAGS})
     target_link_options(${name} PRIVATE ${IVANNA_SAN_FLAGS})
   endif()
-  gtest_discover_tests(${name})
+  if(ARG_LABELS)
+    gtest_discover_tests(${name} PROPERTIES LABELS "${ARG_LABELS}")
+  else()
+    gtest_discover_tests(${name})
+  endif()
 endfunction()
 
 ivanna_add_test(gammatone_numerical_stability)
@@ -1529,6 +1544,18 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_perf_auditor PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_perf_auditor COMMAND test_perf_auditor)
+
+# C11/510 — CUARENTENA (wall-clock, verificado): WithinBudgetCompliance mide
+# 1 s de CPU de pared (cpu_pct_p99 ≤ 12 %) bajo ctest -j4; tests-host.yml
+# documenta que «pasa en solitario» y falla por carga del runner, no por
+# DSP. No bloquea la puerta por push/PR; corre en el carril semanal
+# (tests-quarantined-weekly.yml) y en el self-hosted, donde la carga es
+# conocida. Salida: 4 noches verdes seguidas (N=4, propuesta a confirmar,
+# no dato medido) → se quita esta etiqueta. Los otros 3 casos del binario
+# (latencia por muestras, estabilidad numérica) son deterministas y viajan
+# con el binario por granularidad CTest (add_test registra el binario
+# entero); si el consejo quiere afinarlo, se parte con --gtest_filter.
+set_tests_properties(test_perf_auditor PROPERTIES LABELS QUARANTINED)
 
 # EJE 2/4 — auditoria 2026-09-24: canal_resonance_boost_db e itdScale_
 # (HrtfPersonalizer) estaban calculados pero sin ningun consumidor real.
@@ -3409,6 +3436,16 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_acoustic_harness PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 gtest_discover_tests(test_acoustic_harness)
+
+# C11/510 — la puerta CPU por hop (AcousticHarness.CpuPerHopWithinBudget) NO
+# lleva etiqueta QUARANTINED aquí a propósito: gtest_discover_tests con
+# PROPERTIES etiquetaría los 5 casos del binario y sacaría de la puerta por
+# push 4 tests deterministas (NeutralIsBitExact, FieldOnlyMax,
+# LiveMaxFullChain, ErbSignaturePredictsRms — incl. la pre-pantalla S7).
+# Su cuarentena es el split métrica-vs-puerta dentro del .cpp: en hosted es
+# métrica registrada (se publica, no falla) y puerta dura solo con
+# IVANNA_CPU_GATE_HARD=1 (self-hosted, carga conocida). El carril semanal
+# la corre por nombre (-R AcousticHarness.CpuPerHopWithinBudget).
 
 # ── CORONA D10: 5 tests (2026-11-25) ──────────────────────────────────────
 # TΩ-2 LTI (bandas laterales ±375 Hz), neutro bit-exacto con D10 ON,

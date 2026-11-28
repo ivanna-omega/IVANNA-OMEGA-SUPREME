@@ -4,6 +4,12 @@
 #include <cstdlib>
 #include <vector>
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace Ivanna;
 
 // ── Regresión del fix de eco/desface (2026-09-17) ────────────────────────────
@@ -121,6 +127,7 @@ TEST(IntelligentUpmixerTest, IndependentNoiseEnergySpread) {
     upmixer.setImmersivity(1.0f);
 
     std::vector<float> inL(256), inR(256);
+    std::srand(ivanna::test::IvannaTestSeed32(1));  // C10: antes sin srand
     for (size_t i = 0; i < 256; ++i) {
         inL[i] = (static_cast<float>(rand()) / RAND_MAX) * 2.0f - 1.0f;
         inR[i] = (static_cast<float>(rand()) / RAND_MAX) * 2.0f - 1.0f;
@@ -163,8 +170,8 @@ std::vector<float> uncorrelatedNoise(size_t n, unsigned seed) {
 // (mismo material, sólo cambia el control) — y no tocar la energía ómnidireccional.
 TEST(IntelligentUpmixerTest, ImmersivityExpandsLateralFieldMonotonically) {
     constexpr size_t N = 8192;             // >> 15 ms: el suavizado converge
-    auto l = uncorrelatedNoise(N, 12345);
-    auto r = uncorrelatedNoise(N, 54321);
+    auto l = uncorrelatedNoise(N, ivanna::test::IvannaTestSeed32(2));
+    auto r = uncorrelatedNoise(N, ivanna::test::IvannaTestSeed32(3));
 
     auto run = [&](float imm) {
         IntelligentUpmixer u;
