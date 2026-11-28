@@ -25,6 +25,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.ivanna.omega.organism.OrganismController
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 /**
  * OrganismCard — la UI MÍNIMA indispensable del organismo (v2.5.506).
@@ -48,6 +51,7 @@ fun OrganismCard(
     onToggle: (Boolean) -> Unit,
     onSaveToken: (String) -> Boolean,
     onClearQueue: () -> Unit = {},
+    onDiagnoseToken: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var tokenDraft by remember { mutableStateOf("") }
@@ -105,6 +109,44 @@ fun OrganismCard(
                     "Mic re-anclado al interno ${state.micReanchors} vez/veces (DAC conectado).",
                     style = MaterialTheme.typography.bodySmall
                 )
+            }
+            // C21/510 — diagnóstico de un toque del token: cuando el
+            // estado huele a token o a red (Sin token / Token inválido /
+            // Sin conexión / Error), un toque dice si los hosts
+            // responden y si el DNS directo resuelve, para que el
+            // re-pegado sea de un minuto y no una investigación. No
+            // envía el token (el GET va sin Authorization).
+            if (state.status == OrganismController.Status.NO_TOKEN ||
+                state.status == OrganismController.Status.TOKEN_INVALID ||
+                state.status == OrganismController.Status.OFFLINE ||
+                state.status == OrganismController.Status.ERROR
+            ) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = onDiagnoseToken,
+                    enabled = !state.tokenDiagnosing
+                ) {
+                    Text(if (state.tokenDiagnosing) "Diagnosticando…" else "Diagnosticar conexión")
+                }
+            }
+            if (state.last401AtMs > 0L) {
+                Text(
+                    "Último 401: ${format401Date(state.last401AtMs)} (el token de entonces murió; si la red vive, pega uno nuevo).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            state.lastTokenDiagnosis?.let { diagnosis ->
+                Text(
+                    diagnosis.summary(),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (!diagnosis.anyReachable) {
+                    Text(
+                        "Ningún host responde: es la red, no el token. Revisa la conexión antes de re-pegar.",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
             if (state.status == OrganismController.Status.NO_TOKEN ||
                 state.status == OrganismController.Status.TOKEN_INVALID
@@ -166,3 +208,10 @@ fun statusText(status: OrganismController.Status): String = when (status) {
     OrganismController.Status.NO_TOKEN -> "Sin token"
     OrganismController.Status.TOKEN_INVALID -> "Token inválido"
 }
+
+/** C21: fecha del último 401 en hora local (día + hora, sin segundos). */
+private val formatter401: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault())
+
+fun format401Date(epochMs: Long): String =
+    Instant.ofEpochMilli(epochMs).atZone(ZoneId.systemDefault()).format(formatter401)

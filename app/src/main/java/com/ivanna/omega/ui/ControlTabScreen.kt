@@ -356,6 +356,10 @@ fun ControlTabScreen(
         onOrganismClearQueue = {
             com.ivanna.omega.organism.OrganismController.clearQueue()
         },
+        // C21/510: diagnóstico de un toque del token (sin enviar el token).
+        onOrganismDiagnoseToken = {
+            com.ivanna.omega.organism.OrganismController.runTokenDiagnosis()
+        },
         onAuxFieldChange = { en, xo, co ->
             paramStore.setAuxField(en, xo, co)
             if (IvannaNativeLib.isLoaded)

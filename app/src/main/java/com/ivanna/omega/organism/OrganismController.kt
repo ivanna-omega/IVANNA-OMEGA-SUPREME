@@ -56,6 +56,14 @@ import java.io.File
  *      (tipo microphone, notificación persistente) y stop() lo
  *      detiene al final. El servicio solo mantiene vivo el proceso;
  *      la captura y el envío siguen aquí.
+ *   7. DIAGNÓSTICO DEL TOKEN (C21/510, no auto-renovación mágica):
+ *      no hay endpoint de refresh y no se inventa uno. La tarjeta
+ *      tiene un diagnóstico de un toque (hosts alcanzables,
+ *      DNS directo OK/fallo, último 401 — ver
+ *      [OrganismTokenDiagnostics]) y al pegar un token nuevo se
+ *      re-valida con un GET barato de versión antes de reanudar el
+ *      sondeo. La fecha del último 401 se registra (sin el valor del
+ *      token, jamás) para distinguir «token muerto» de «red caída».
  *
  * ESTADO (el indicador de la UI):
  *   Capturando / En cola / Sin conexión / Error recuperable, más los
@@ -68,12 +76,17 @@ import java.io.File
  *     RECORD_AUDIO no se arranca el servicio y el organismo corre sin
  *     primer plano, como en la 509).
  *   * Si el token expira sin endpoint de refresh, hay que reautorizar
- *     una vez (el estado lo dice: "Token inválido").
+ *     una vez (el estado lo dice: "Token inválido"). La tarjeta tiene
+ *     el diagnóstico de un toque (C21) para que el re-pegado sea de un
+ *     minuto: si algún host responde, la red vive y el token es el
+ *     muerto; si ninguno responde, es la red.
  */
 object OrganismController {
     private const val TAG = "OrganismController"
     private const val PREFS = "organism_prefs"
     private const val KEY_ENABLED = "organism_enabled"
+    /** C21/510: fecha (epoch ms) del último 401 con el token actual (0 = ninguno). */
+    private const val KEY_LAST_401_MS = "organism_last_401_ms"
 
     /**
      * T1/510 — sondeo de perfil (VUELTA §3.2): cada 30 min se pide el
@@ -365,7 +378,20 @@ object OrganismController {
          */
         val lastApplyDefective: Boolean = false,
         /** Motivo del defecto: "" | "over_budget" | "xrun" | "over_budget+xrun" | "not_applied". */
-        val lastApplyDefectReason: String = APPLY_DEFECT_NONE
+        val lastApplyDefectReason: String = APPLY_DEFECT_NONE,
+        // ── C21/510 — diagnóstico de re-auth del token ───────────────
+        /**
+         * Fecha (epoch ms) del último 401 con el token actual; 0 =
+         * nunca hubo uno (o el token actual ya re-validó y lo limpió).
+         * Solo la fecha, jamás el valor del token. Persiste en
+         * SharedPreferences (sobrevive a reinicios) para distinguir
+         * «token muerto» de «red caída» aunque la app se cierre.
+         */
+        val last401AtMs: Long = 0L,
+        /** Resultado del último diagnóstico de un toque (null = aún no se pidió). */
+        val lastTokenDiagnosis: OrganismTokenDiagnostics.Diagnosis? = null,
+        /** true mientras corre el diagnóstico de un toque. */
+        val tokenDiagnosing: Boolean = false
     )
 
     private val _state = MutableStateFlow(State())
@@ -483,6 +509,9 @@ object OrganismController {
     fun start(context: Context) {
         val ctx = context.applicationContext
         appContext = ctx
+        // C21 (e): la fecha del último 401 sobrevive a reinicios.
+        last401AtMs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getLong(KEY_LAST_401_MS, 0L)
         if (!isEnabled(ctx)) {
             _state.value = State(status = Status.OFF, enabled = false)
             return
@@ -632,21 +661,95 @@ object OrganismController {
         return deleted
     }
 
-    /** Guarda el token (lo pega Esse una vez, en la tarjeta del organismo). */
+    /**
+     * Guarda el token (lo pega Esse una vez, en la tarjeta del organismo).
+     *
+     * C21 (d): guardar NO es validar. El token nuevo se re-valida con
+     * un GET barato de versión ([validateSavedToken]) ANTES de reanudar
+     * el sondeo: solo si el servidor lo acepta se limpia el estado de
+     * token inválido, se limpia el último 401 y se fuerza el sondeo +
+     * el vaciado de la cola. Si el GET dice 401, el token pegado es el
+     * incorrecto y el estado sigue en «Token inválido» (con la fecha
+     * del 401 registrada); si la red está caída, no se afirma nada y el
+     * sondeo normal lo reintentará. El token SOLO entra aquí, pegado
+     * por Esse: ningún endpoint puede entregar un token al teléfono
+     * (C21 (c)) y ningún camino de red llama a `setToken()`.
+     */
     fun saveToken(raw: String): Boolean {
         val store = tokenStore ?: return false
         val ok = store.setToken(raw)
         if (ok) {
-            // Defecto #4: un token nuevo re-valida el estado aunque la
-            // cola esté vacía (antes quedaba TOKEN_INVALID para siempre).
-            tokenInvalidSeen = false
-            // T1/510: con token nuevo, el próximo flushOnce sondea el
-            // perfil enseguida (sin esperar al ciclo de 30 min).
-            lastProfileCheckMs = 0L
-            scope?.launch(Dispatchers.IO) { flushOnce() }
+            // La validación decide el estado: no se limpia
+            // tokenInvalidSeen ni se fuerza el sondeo hasta que el
+            // servidor acepte el token (ver validateSavedToken).
+            // Sin scope (controlador no arrancado), el arranque normal
+            // sondea a los 60 s y el estado se corrige ahí.
+            scope?.launch(Dispatchers.IO) { validateSavedToken() }
             refreshState()
         }
         return ok
+    }
+
+    /**
+     * C21 (d) — re-validación del token recién pegado con el mismo GET
+     * del sondeo (`fetch(appliedVersionOrNull())`): es la comprobación
+     * de versión barata — si la versión es la aplicada, el servidor
+     * responde NotModified sin descargar el perfil; si hay versión
+     * nueva, el sobre llega pero NO se aplica aquí (eso lo hace el
+     * sondeo normal). Solo valida, no aplica ni confirma nada.
+     */
+    private fun validateSavedToken() {
+        val fetcher = profileFetcher ?: return
+        val result = runCatching { fetcher.fetch(appliedVersionOrNull()) }.getOrNull()
+        when (classifyTokenValidation(result)) {
+            TokenValidation.VALID -> {
+                tokenInvalidSeen = false
+                clear401()
+                // Token aceptado: reanudar el sondeo enseguida y vaciar
+                // la cola acumulada (el flushOnce además sondea).
+                lastProfileCheckMs = 0L
+                flushOnce()
+            }
+            TokenValidation.INVALID -> {
+                tokenInvalidSeen = true
+                record401()
+                Log.w(TAG, "C21: el token pegado no valida (401); sigue «Token inválido»")
+            }
+            TokenValidation.UNKNOWN -> {
+                // Red caída / excepción: no se pudo validar. No se
+                // afirma ni válido ni inválido; el sondeo normal (30
+                // min) lo reintentará. El estado previo se conserva.
+                Log.i(TAG, "C21: no se pudo re-validar el token (red); se conserva el estado")
+            }
+        }
+        refreshState()
+    }
+
+    /**
+     * C21 (a) — diagnóstico de un toque (lo dispara el botón de la
+     * tarjeta). Corre en Dispatchers.IO, no bloquea la UI, y no envía
+     * el token. Anti doble toque: si ya corre uno, no se lanza otro.
+     * El resultado queda en `State.lastTokenDiagnosis` y la tarjeta lo
+     * muestra; sin scope (controlador no arrancado) no hace nada.
+     */
+    fun runTokenDiagnosis() {
+        val s = scope ?: return
+        if (tokenDiagnosing) return
+        tokenDiagnosing = true
+        refreshState()
+        s.launch(Dispatchers.IO) {
+            val diag = runCatching {
+                (tokenDiagnostics ?: OrganismTokenDiagnostics()).diagnose(last401AtMs)
+            }.getOrNull()
+            if (diag != null) {
+                lastTokenDiagnosis = diag
+                Log.i(TAG, "C21 diagnóstico: ${diag.hosts.size} hosts, alcanzable=${diag.anyReachable}, DNS OK=${diag.anyDnsOk}")
+            } else {
+                Log.w(TAG, "C21 diagnóstico: falló sin resultado")
+            }
+            tokenDiagnosing = false
+            refreshState()
+        }
     }
 
     fun hasToken(): Boolean = tokenStore?.getToken()?.isNotBlank() == true
@@ -741,6 +844,71 @@ object OrganismController {
     @Volatile
     private var lastRoutedDevice: String = "desconocido"
 
+    // ── C21/510 — diagnóstico de re-auth del token ───────────────────
+    /**
+     * Fecha (epoch ms) del último 401 con el token actual (0 = ninguno).
+     * Se persiste en [PREFS]/[KEY_LAST_401_MS] (solo la fecha, jamás el
+     * valor del token) y se carga en start(). Se limpia cuando un token
+     * nuevo re-valida: el 401 pertenecía al token viejo.
+     */
+    @Volatile
+    private var last401AtMs: Long = 0L
+
+    /** Resultado del último diagnóstico de un toque (null = aún no se pidió). */
+    @Volatile
+    var lastTokenDiagnosis: OrganismTokenDiagnostics.Diagnosis? = null
+        private set
+
+    /** true mientras corre el diagnóstico de un toque (anti doble toque). */
+    @Volatile
+    private var tokenDiagnosing: Boolean = false
+
+    /**
+     * Diagnóstico inyectable (tests y sustitución futura). Null = se
+     * crea el real ([OrganismTokenDiagnostics]) al pedirlo.
+     */
+    @Volatile
+    var tokenDiagnostics: OrganismTokenDiagnostics? = null
+
+    /**
+     * C21 — veredicto puro de la re-validación de un token recién
+     * pegado (testeable en JVM). El GET barato de versión es el mismo
+     * `fetch()` del sondeo: si el servidor responde 2xx (perfil nuevo
+     * o sobre malformado — la auth pasó) o 404 (aún no hay perfil
+     * compilado — la auth también pasó), el token ES válido. 401 =
+     * inválido. Red caída / timeout / sin token / excepción = no se
+     * pudo validar: no se afirma ni válido ni inválido.
+     */
+    enum class TokenValidation { VALID, INVALID, UNKNOWN }
+
+    fun classifyTokenValidation(result: ProfileFetcher.Result?): TokenValidation =
+        when (result) {
+            is ProfileFetcher.Result.Current,
+            ProfileFetcher.Result.NotModified,
+            is ProfileFetcher.Result.Quarantine -> TokenValidation.VALID
+            ProfileFetcher.Result.TokenInvalid -> TokenValidation.INVALID
+            else -> TokenValidation.UNKNOWN
+        }
+
+    /**
+     * C21 (e) — registra la fecha del último 401 (sin el valor del
+     * token, jamás) y la persiste. La llama cualquier camino que vea
+     * un 401 (flush, sondeo, confirmación). No toca `tokenInvalidSeen`:
+     * cada llamador decide el estado visible.
+     */
+    private fun record401(nowMs: Long = System.currentTimeMillis()) {
+        last401AtMs = nowMs
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ?.edit()?.putLong(KEY_LAST_401_MS, nowMs)?.apply()
+    }
+
+    /** C21 (e) — el token actual re-validó: el 401 pertenecía al viejo. */
+    private fun clear401() {
+        last401AtMs = 0L
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ?.edit()?.remove(KEY_LAST_401_MS)?.apply()
+    }
+
     // C8: diario de aplicación. Un intento de restauración por arranque
     // como mucho (mitigación contra bucle de rollback).
     @Volatile
@@ -831,8 +999,11 @@ object OrganismController {
         lastFlushOutcome = result.outcome
         // Defecto #4: cualquier flush que NO sea 401 limpia el estado de
         // token inválido (el token se corrigió o el fallo era otro).
-        if (result.outcome == OrganismSender.Outcome.TOKEN_INVALID) tokenInvalidSeen = true
-        else tokenInvalidSeen = false
+        // C21 (e): un 401 registra su fecha (sin el valor del token).
+        if (result.outcome == OrganismSender.Outcome.TOKEN_INVALID) {
+            tokenInvalidSeen = true
+            record401()
+        } else tokenInvalidSeen = false
         if (result.outcome == OrganismSender.Outcome.RETRY) lastErrorAtMs = System.currentTimeMillis()
         if (result.sent > 0) {
             sentTotal += result.sent
@@ -898,7 +1069,12 @@ object OrganismController {
             lastApplyXrunSource = _state.value.lastApplyXrunSource,
             lastApplyOverBudget = _state.value.lastApplyOverBudget,
             lastApplyDefective = _state.value.lastApplyDefective,
-            lastApplyDefectReason = _state.value.lastApplyDefectReason
+            lastApplyDefectReason = _state.value.lastApplyDefectReason,
+            // C21/510: el diagnóstico del token se conserva igual (solo
+            // lo cambian record401/clear401/runTokenDiagnosis).
+            last401AtMs = last401AtMs,
+            lastTokenDiagnosis = lastTokenDiagnosis,
+            tokenDiagnosing = tokenDiagnosing
         )
     }
 
@@ -992,6 +1168,7 @@ object OrganismController {
                 is ProfileFetcher.Result.NoToken -> { /* sin token: nada que sondear */ }
                 is ProfileFetcher.Result.TokenInvalid -> {
                     tokenInvalidSeen = true
+                    record401()
                     refreshState()
                 }
                 is ProfileFetcher.Result.Retry ->
@@ -1269,6 +1446,15 @@ object OrganismController {
         when (runCatching { fetcher.confirmApplied(body) }.getOrNull()) {
             ProfileFetcher.ConfirmOutcome.Confirmed ->
                 Log.i(TAG, "confirmación applied enviada: ${applied.id} v${applied.version}")
+            // C21: un 401 en la confirmación también es token muerto
+            // (el mismo Bearer): marca el estado y registra la fecha.
+            ProfileFetcher.ConfirmOutcome.TokenInvalid -> {
+                tokenInvalidSeen = true
+                record401()
+                pendingConfirmation = body
+                Log.w(TAG, "confirmación applied con 401 (token inválido); queda pendiente hasta reponer el token")
+                refreshState()
+            }
             ProfileFetcher.ConfirmOutcome.Retry, null -> {
                 pendingConfirmation = body
                 Log.i(TAG, "confirmación applied pendiente (reintentable); se reintenta en el próximo sondeo")
@@ -1286,6 +1472,14 @@ object OrganismController {
             ProfileFetcher.ConfirmOutcome.Confirmed -> {
                 pendingConfirmation = null
                 Log.i(TAG, "confirmación applied pendiente enviada")
+            }
+            // C21: 401 = token muerto; la confirmación queda pendiente
+            // (no se descarta: con token nuevo debe salir) y el estado
+            // visible lo dice.
+            ProfileFetcher.ConfirmOutcome.TokenInvalid -> {
+                tokenInvalidSeen = true
+                record401()
+                refreshState()
             }
             ProfileFetcher.ConfirmOutcome.Retry, null -> { /* sigue pendiente; próximo ciclo */ }
             else -> {

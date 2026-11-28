@@ -281,4 +281,60 @@ class OrganismControllerTest {
         assertEquals(false, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = 5L))
         assertEquals(false, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = null))
     }
+
+    // C21/510 — veredicto puro de la re-validación del token recién pegado.
+
+    @Test
+    fun `State por defecto no lleva ultimo 401 ni diagnostico`() {
+        val state = OrganismController.State()
+        assertEquals(0L, state.last401AtMs)
+        assertEquals(null, state.lastTokenDiagnosis)
+        assertEquals(false, state.tokenDiagnosing)
+    }
+
+    @Test
+    fun `Current y NotModified validan el token pegado (el servidor lo acepto)`() {
+        val current = ProfileFetcher.Result.Current("omega-1", 3L, "stable", "promoted", "{}")
+        assertEquals(
+            OrganismController.TokenValidation.VALID,
+            OrganismController.classifyTokenValidation(current)
+        )
+        assertEquals(
+            OrganismController.TokenValidation.VALID,
+            OrganismController.classifyTokenValidation(ProfileFetcher.Result.NotModified)
+        )
+    }
+
+    @Test
+    fun `Quarantine tambien valida el token (404 = auth paso, aun no hay perfil)`() {
+        val quarantine = ProfileFetcher.Result.Quarantine("GET current → HTTP 404 (aún no hay perfil compilado)")
+        assertEquals(
+            OrganismController.TokenValidation.VALID,
+            OrganismController.classifyTokenValidation(quarantine)
+        )
+    }
+
+    @Test
+    fun `TokenInvalid es el unico veredicto invalido`() {
+        assertEquals(
+            OrganismController.TokenValidation.INVALID,
+            OrganismController.classifyTokenValidation(ProfileFetcher.Result.TokenInvalid)
+        )
+    }
+
+    @Test
+    fun `Retry NoToken y excepcion son desconocido, no invalido`() {
+        assertEquals(
+            OrganismController.TokenValidation.UNKNOWN,
+            OrganismController.classifyTokenValidation(ProfileFetcher.Result.Retry)
+        )
+        assertEquals(
+            OrganismController.TokenValidation.UNKNOWN,
+            OrganismController.classifyTokenValidation(ProfileFetcher.Result.NoToken)
+        )
+        assertEquals(
+            OrganismController.TokenValidation.UNKNOWN,
+            OrganismController.classifyTokenValidation(null)
+        )
+    }
 }
