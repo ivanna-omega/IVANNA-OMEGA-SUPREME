@@ -377,4 +377,91 @@ class OrganismControllerTest {
             )
         )
     }
+
+    // C16/510 — salud del LLM del cerebro.
+
+    @Test
+    fun `State por defecto no lleva salud LLM (desconocida)`() {
+        val state = OrganismController.State()
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, state.llmStatus)
+        assertNull(state.llmModel)
+        assertNull(state.llmDrafted)
+        assertEquals(0L, state.lastLlmStatusAtMs)
+    }
+
+    @Test
+    fun `parseLlmStatus normaliza nulo vacio y fuera de vocabulario a unknown`() {
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, OrganismController.parseLlmStatus(null))
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, OrganismController.parseLlmStatus(""))
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, OrganismController.parseLlmStatus("muerto"))
+        assertEquals(OrganismController.LLM_STATUS_OK, OrganismController.parseLlmStatus("ok"))
+        assertEquals(OrganismController.LLM_STATUS_DEGRADED, OrganismController.parseLlmStatus("degraded"))
+        assertEquals(OrganismController.LLM_STATUS_UNAVAILABLE, OrganismController.parseLlmStatus("unavailable"))
+    }
+
+    @Test
+    fun `applyLlmSignal registra la senal fresca en el State`() {
+        val state = OrganismController.applyLlmSignal(
+            OrganismController.State(),
+            status = "degraded",
+            model = "duckduckgo-web/claude-haiku-4-5",
+            drafted = true,
+            atMs = 1_000L
+        )
+        assertEquals(OrganismController.LLM_STATUS_DEGRADED, state.llmStatus)
+        assertEquals("duckduckgo-web/claude-haiku-4-5", state.llmModel)
+        assertEquals(true, state.llmDrafted)
+        assertEquals(1_000L, state.lastLlmStatusAtMs)
+    }
+
+    @Test
+    fun `applyLlmSignal sin senal deja unknown sin fecha`() {
+        val state = OrganismController.applyLlmSignal(
+            OrganismController.State(),
+            status = null,
+            model = null,
+            drafted = null,
+            atMs = 1_000L
+        )
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, state.llmStatus)
+        assertNull(state.llmModel)
+        assertNull(state.llmDrafted)
+        assertEquals(0L, state.lastLlmStatusAtMs)
+    }
+
+    @Test
+    fun `applyLlmSignal sin senal limpia una senal anterior (salud fresca o desconocida)`() {
+        val withSignal = OrganismController.applyLlmSignal(
+            OrganismController.State(),
+            status = "ok",
+            model = "gemini/gemini-3-flash-preview",
+            drafted = true,
+            atMs = 1_000L
+        )
+        val cleared = OrganismController.applyLlmSignal(
+            withSignal,
+            status = null,
+            model = null,
+            drafted = null,
+            atMs = 2_000L
+        )
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, cleared.llmStatus)
+        assertNull(cleared.llmModel)
+        assertNull(cleared.llmDrafted)
+        assertEquals(0L, cleared.lastLlmStatusAtMs)
+    }
+
+    @Test
+    fun `applyLlmSignal con drafted false marca sin redaccion LLM`() {
+        val state = OrganismController.applyLlmSignal(
+            OrganismController.State(),
+            status = "unavailable",
+            model = null,
+            drafted = false,
+            atMs = 1_000L
+        )
+        assertEquals(OrganismController.LLM_STATUS_UNAVAILABLE, state.llmStatus)
+        assertEquals(false, state.llmDrafted)
+        assertEquals(1_000L, state.lastLlmStatusAtMs)
+    }
 }

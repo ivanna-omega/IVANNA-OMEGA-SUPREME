@@ -100,6 +100,27 @@ fun OrganismCard(
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.SemiBold
             )
+            // C16/510 — versión del perfil aplicado + salud del LLM del
+            // cerebro, juntas (la propuesta pide el estado del LLM junto
+            // a la versión del perfil). La versión solo se muestra cuando
+            // hay un perfil aplicado (v > 0); la línea LLM solo cuando el
+            // servidor anuncia algo (estado conocido o drafted conocido).
+            // Sin señal del servidor no hay nada que mostrar: no se
+            // inventa un estado. Si el perfil se compiló solo con el
+            // analizador determinista, la línea dice «sin redacción LLM».
+            if (state.appliedProfileVersion > 0) {
+                Text(
+                    "Perfil: v${state.appliedProfileVersion} (${state.appliedProfileStatus})",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            if (state.llmStatus != OrganismController.LLM_STATUS_UNKNOWN || state.llmDrafted != null) {
+                Text(
+                    llmLine(state),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
             if (state.queued > 0) {
                 Text(
                     "En cola: ${state.queued} chunk(s) · Enviados: ${state.sentTotal}",
@@ -265,6 +286,22 @@ fun OrganismCard(
             )
         }
     }
+}
+
+/** C16: línea de salud del LLM del cerebro para la tarjeta. */
+fun llmLine(state: OrganismController.State): String {
+    val status = when (state.llmStatus) {
+        OrganismController.LLM_STATUS_OK -> "OK"
+        OrganismController.LLM_STATUS_DEGRADED -> "degradado (fallback)"
+        OrganismController.LLM_STATUS_UNAVAILABLE -> "no disponible"
+        else -> "desconocido"
+    }
+    val model = state.llmModel?.let { " · $it" } ?: ""
+    // Solo el caso que marca la propuesta: perfil compilado solo con el
+    // analizador determinista («sin redacción LLM»). Con drafted true el
+    // modelo ya lo dice; con null el servidor no lo dice.
+    val drafted = if (state.llmDrafted == false) " · sin redacción LLM" else ""
+    return "LLM del cerebro: $status$model$drafted"
 }
 
 fun statusText(status: OrganismController.Status): String = when (status) {

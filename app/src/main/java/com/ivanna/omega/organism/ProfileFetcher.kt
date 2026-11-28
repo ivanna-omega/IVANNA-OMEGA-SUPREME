@@ -31,6 +31,31 @@ import okhttp3.Response
  * [Result.NotModified] (el servidor puede subir su mínimo sin publicar
  * un perfil nuevo); el controlador descarta la cola vieja con ella.
  *
+ * C16/510 — el sobre puede traer además la salud del LLM del cerebro
+ * (`llmStatus` / `llmModel` / `llmDrafted`, opcionales): es la parte
+ * Android de C16. La parte del servidor (probar el modelo elegido
+ * antes de cada tarea LLM, caer al siguiente del combo, y si no hay
+ * ninguno seguir solo con el analizador determinista marcando el
+ * informe «sin redacción LLM») vive en el servidor (OmniRoute /
+ * MuseLink), NO en este repo: el teléfono no llama a ningún LLM en el
+ * ciclo del organismo, así que no puede hacer el health-check él
+ * mismo — solo consume y muestra la señal que publica el servidor.
+ * Va en [Result.Current] y en [Result.NotModified] (la salud del LLM
+ * puede cambiar sin publicar un perfil nuevo). Es SOLO telemetría de
+ * display: un valor inválido se IGNORA (se trata como ausente, con
+ * aviso en el log), jamás pone el perfil en cuarentena — un campo de
+ * display no puede matar un perfil válido (al contrario que
+ * `minSupportedPayloadVersion`, que sí dispara un descarte y por eso
+ * es fail-closed). Sin señal, todo es null/desconocido y nada cambia.
+ * Contrato de la señal (lo que debe publicar el servidor): `llmStatus`
+ * en `ok | degraded | unavailable` (`ok` = la última prueba del
+ * modelo elegido pasó; `degraded` = algún modelo del combo falló y
+ * corre en fallback; `unavailable` = ningún LLM respondió, informes
+ * solo deterministas); `llmModel` = modelo que redactó el perfil
+ * vigente (p. ej. `duckduckgo-web/claude-haiku-4-5`); `llmDrafted` =
+ * false si el perfil se compiló solo con el analizador determinista
+ * («sin redacción LLM»).
+ *
  * PUNTO DE ENGANCHE (C3, Fase 2 — verificación de firma Ed25519): en
  * [fetch], tras parsear el sobre y ANTES de devolver [Result.Current],
  * irá la verificación de la firma del sobre contra la clave pública del
@@ -78,6 +103,14 @@ class ProfileFetcher(
 
         /** Vocabulario de `abState` del sobre (VUELTA §3.1). */
         val KNOWN_AB_STATES: Set<String> = setOf("none", "candidate", "ab_running", "promoted", "rolled_back")
+
+        /**
+         * C16/510 — vocabulario de `llmStatus` del sobre (salud del LLM
+         * del cerebro, según la última prueba del servidor). Un valor
+         * fuera de este vocabulario se IGNORA (no es cuarentena: es
+         * solo display, ver cabecera).
+         */
+        val KNOWN_LLM_STATUSES: Set<String> = setOf("ok", "degraded", "unavailable")
     }
 
     sealed class Result {
@@ -92,6 +125,13 @@ class ProfileFetcher(
          * servidor: la versión mínima de payload (`telemetry.
          * payloadVersion`) que acepta. null = el servidor aún no la
          * anuncia (comportamiento previo: nada que descartar).
+         *
+         * C16/510 — [llmStatus] / [llmModel] / [llmDrafted] es la
+         * salud del LLM del cerebro según el último sondeo (ver
+         * cabecera y [KNOWN_LLM_STATUSES]): null = el servidor aún no
+         * la anuncia (desconocido, nada que mostrar). `llmDrafted`
+         * false = el perfil se compiló solo con el analizador
+         * determinista («sin redacción LLM»).
          */
         data class Current(
             val profileId: String,
@@ -99,7 +139,10 @@ class ProfileFetcher(
             val status: String,
             val abState: String,
             val profileBody: String,
-            val minSupportedPayloadVersion: Long? = null
+            val minSupportedPayloadVersion: Long? = null,
+            val llmStatus: String? = null,
+            val llmModel: String? = null,
+            val llmDrafted: Boolean? = null
         ) : Result()
 
         /**
@@ -108,9 +151,14 @@ class ProfileFetcher(
          * [minSupportedPayloadVersion]: el servidor puede subir su
          * mínimo sin publicar un perfil nuevo, y el teléfono debe
          * enterarse en este sondeo (no solo cuando llegue un Current).
+         * C16/510 — lleva igualmente la señal LLM por el mismo motivo:
+         * la salud del cerebro puede cambiar sin perfil nuevo.
          */
         data class NotModified(
-            val minSupportedPayloadVersion: Long? = null
+            val minSupportedPayloadVersion: Long? = null,
+            val llmStatus: String? = null,
+            val llmModel: String? = null,
+            val llmDrafted: Boolean? = null
         ) : Result()
 
         /** Red caída, timeout, 429, 5xx: reintentable en el próximo sondeo. */
@@ -302,12 +350,53 @@ class ProfileFetcher(
                 minV.toLong()
             }
         }
+        // C16/510 — señal OPCIONAL del servidor: salud del LLM del
+        // cerebro. A diferencia de minSupportedPayloadVersion, un valor
+        // inválido NO es sobre malformado: es solo display y se IGNORA
+        // (null = desconocido) con aviso en el log, para que un campo
+        // de display jamás ponga en cuarentena un perfil válido.
+        // `llmStatus` fuera de vocabulario, `llmModel` vacío y
+        // `llmDrafted` no booleano se tratan como ausentes.
+        val llmStatus: String? = when (val llmEl = data.get("llmStatus")) {
+            null -> null
+            else -> {
+                val raw = if (llmEl.isJsonPrimitive && llmEl.asJsonPrimitive.isString) llmEl.asString else null
+                if (raw != null && raw in KNOWN_LLM_STATUSES) raw else {
+                    logger.w("GET current: llmStatus '$raw' fuera de vocabulario; se ignora (display)")
+                    null
+                }
+            }
+        }
+        val llmModel: String? = when (val modelEl = data.get("llmModel")) {
+            null -> null
+            else -> {
+                val raw = if (modelEl.isJsonPrimitive && modelEl.asJsonPrimitive.isString) modelEl.asString else null
+                if (!raw.isNullOrBlank()) raw else {
+                    logger.w("GET current: llmModel vacío o no string; se ignora (display)")
+                    null
+                }
+            }
+        }
+        val llmDrafted: Boolean? = when (val draftedEl = data.get("llmDrafted")) {
+            null -> null
+            else -> {
+                if (draftedEl.isJsonPrimitive && draftedEl.asJsonPrimitive.isBoolean) draftedEl.asBoolean else {
+                    logger.w("GET current: llmDrafted no booleano; se ignora (display)")
+                    null
+                }
+            }
+        }
         // PUNTO DE ENGANCHE (C3, Fase 2 — verificación de firma Ed25519):
         // aquí se verificará la firma del sobre (campo `signature`,
         // clave pública del servidor) ANTES de devolver Current. Hoy el
         // sobre no trae firma y la verificación no existe (ver cabecera).
         if (appliedVersion != null && version == appliedVersion) {
-            return Result.NotModified(minSupportedPayloadVersion)
+            return Result.NotModified(
+                minSupportedPayloadVersion,
+                llmStatus = llmStatus,
+                llmModel = llmModel,
+                llmDrafted = llmDrafted
+            )
         }
         return Result.Current(
             profileId = profileId,
@@ -315,7 +404,10 @@ class ProfileFetcher(
             status = status,
             abState = abState,
             profileBody = profileEl.toString(),
-            minSupportedPayloadVersion = minSupportedPayloadVersion
+            minSupportedPayloadVersion = minSupportedPayloadVersion,
+            llmStatus = llmStatus,
+            llmModel = llmModel,
+            llmDrafted = llmDrafted
         )
     }
 }

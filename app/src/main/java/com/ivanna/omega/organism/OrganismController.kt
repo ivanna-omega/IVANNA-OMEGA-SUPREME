@@ -95,6 +95,24 @@ import java.io.File
  *      servidor vive en el endpoint de Muselink, no en este repo: hasta
  *      que la anuncie, `minSupportedPayloadVersion` es null y nada
  *      cambia (el descarte solo corre con señal explícita).
+ *  10. SALUD DEL LLM DEL CEREBRO (C16/510, parte Android): el sobre
+ *      del GET de perfil puede anunciar `llmStatus` / `llmModel` /
+ *      `llmDrafted` (ver [ProfileFetcher.KNOWN_LLM_STATUSES]). El
+ *      State los expone junto a la versión del perfil aplicado y la
+ *      tarjeta los muestra: si el perfil se compiló solo con el
+ *      analizador determinista (`llmDrafted` false), la tarjeta dice
+ *      «sin redacción LLM». La parte del SERVIDOR de C16 (probar el
+ *      modelo elegido antes de cada tarea LLM, caer al siguiente del
+ *      combo, y si no hay ninguno seguir solo con el determinista) NO
+ *      vive aquí: el teléfono no llama a ningún LLM en el ciclo del
+ *      organismo, así que no puede hacer el health-check él mismo —
+ *      solo consume la señal del servidor. Hasta que el servidor la
+ *      anuncie, el estado es `unknown` y la tarjeta no muestra nada
+ *      (un sobre sin señal la limpia, como C24: la salud es fresca o
+ *      es desconocida, nunca rancia). La señal es solo display: un
+ *      valor inválido se ignora en el fetcher, jamás pone el perfil
+ *      en cuarentena. No se persiste: tras un reinicio vuelve a
+ *      `unknown` hasta el primer sondeo (60 s).
  *
  * ESTADO (el indicador de la UI):
  *   Capturando / En cola / Sin conexión / Error recuperable, más los
@@ -231,6 +249,16 @@ object OrganismController {
     const val APPLY_DEFECT_OVER_BUDGET_AND_XRUN = "over_budget+xrun"
     /** El intento no llegó a aplicar (install false / read-back fallido). */
     const val APPLY_DEFECT_NOT_APPLIED = "not_applied"
+
+    // ── C16/510 — salud del LLM del cerebro (vocabulario de State.llmStatus) ──
+    /** El servidor aún no anuncia la salud del LLM (o el sobre no la traía). */
+    const val LLM_STATUS_UNKNOWN = "unknown"
+    /** La última prueba del modelo elegido pasó. */
+    const val LLM_STATUS_OK = "ok"
+    /** Algún modelo del combo falló; el cerebro corre en fallback. */
+    const val LLM_STATUS_DEGRADED = "degraded"
+    /** Ningún LLM del combo respondió; informes solo deterministas. */
+    const val LLM_STATUS_UNAVAILABLE = "unavailable"
 
     /**
      * S13 — veredicto puro de la guarda de aplicación (testeable en JVM).
@@ -479,7 +507,32 @@ object OrganismController {
          */
         val obsoleteChunksDiscarded: Int = 0,
         /** Fecha (epoch ms) del último descarte por obsolescencia; 0 = ninguno. */
-        val lastPayloadDiscardAtMs: Long = 0L
+        val lastPayloadDiscardAtMs: Long = 0L,
+        // ── C16/510 — salud del LLM del cerebro (señal del servidor) ──
+        /**
+         * Salud del LLM del cerebro según el último sobre del GET de
+         * perfil: [LLM_STATUS_UNKNOWN] | [LLM_STATUS_OK] |
+         * [LLM_STATUS_DEGRADED] | [LLM_STATUS_UNAVAILABLE]. `unknown`
+         * = el servidor aún no la anuncia (nada que mostrar). Se
+         * actualiza en cada sondeo con la señal fresca (un sobre sin
+         * señal la limpia: la salud es fresca o desconocida, nunca
+         * rancia). Solo vive en memoria.
+         */
+        val llmStatus: String = LLM_STATUS_UNKNOWN,
+        /**
+         * Modelo que redactó el perfil vigente, según el servidor
+         * (p. ej. `duckduckgo-web/claude-haiku-4-5`). null = el
+         * servidor no lo anuncia (desconocido).
+         */
+        val llmModel: String? = null,
+        /**
+         * true = el perfil vigente lo redactó el LLM; false = se
+         * compiló solo con el analizador determinista («sin redacción
+         * LLM»); null = el servidor no lo dice (desconocido).
+         */
+        val llmDrafted: Boolean? = null,
+        /** Fecha (epoch ms) de la última señal LLM recibida; 0 = ninguna. */
+        val lastLlmStatusAtMs: Long = 0L
     )
 
     private val _state = MutableStateFlow(State())
@@ -1274,7 +1327,13 @@ object OrganismController {
             minSupportedPayloadVersion = _state.value.minSupportedPayloadVersion,
             payloadObsolete = _state.value.payloadObsolete,
             obsoleteChunksDiscarded = obsoleteChunksDiscarded,
-            lastPayloadDiscardAtMs = lastPayloadDiscardAtMs
+            lastPayloadDiscardAtMs = lastPayloadDiscardAtMs,
+            // C16/510: la señal LLM solo la cambia el sondeo
+            // (handleLlmSignal); aquí se conserva igual.
+            llmStatus = _state.value.llmStatus,
+            llmModel = _state.value.llmModel,
+            llmDrafted = _state.value.llmDrafted,
+            lastLlmStatusAtMs = _state.value.lastLlmStatusAtMs
         )
     }
 
@@ -1322,6 +1381,58 @@ object OrganismController {
             Log.w(TAG, "C24: el servidor exige payload >= v$minSupported y este teléfono envía v${OrganismPayload.PAYLOAD_VERSION}: $discarded chunk(s) obsoletos descartados explícitamente (no se dejan pudrir 7 días en cuarentena)")
         } else {
             Log.i(TAG, "C24: el servidor exige payload >= v$minSupported (este teléfono envía v${OrganismPayload.PAYLOAD_VERSION}); cola sin chunks obsoletos que descartar")
+        }
+        refreshState()
+    }
+
+    /**
+     * C16/510 — normalización pura de la señal `llmStatus` (testeable
+     * en JVM). null / vacío / fuera de vocabulario = [LLM_STATUS_UNKNOWN]:
+     * el fetcher ya ignora los valores inválidos, así que esto es
+     * cinturón y tirantes para cualquier otro llamador.
+     */
+    fun parseLlmStatus(raw: String?): String =
+        if (raw != null && raw in setOf(LLM_STATUS_OK, LLM_STATUS_DEGRADED, LLM_STATUS_UNAVAILABLE)) raw
+        else LLM_STATUS_UNKNOWN
+
+    /**
+     * C16/510 — transición pura del [State] con la señal LLM fresca
+     * (testeable en JVM). La señal se registra tal cual llega: un
+     * sobre sin señal deja `unknown`/null (la salud es fresca o
+     * desconocida, nunca rancia). `atMs` es la fecha de recepción
+     * (0 = sin señal, para no fechar un desconocido).
+     */
+    fun applyLlmSignal(
+        state: State,
+        status: String?,
+        model: String?,
+        drafted: Boolean?,
+        atMs: Long
+    ): State {
+        val normalized = parseLlmStatus(status)
+        return state.copy(
+            llmStatus = normalized,
+            llmModel = model,
+            llmDrafted = drafted,
+            lastLlmStatusAtMs = if (normalized == LLM_STATUS_UNKNOWN && model == null && drafted == null) 0L else atMs
+        )
+    }
+
+    /**
+     * C16/510 — procesa la señal LLM del sobre del GET (la traen
+     * [ProfileFetcher.Result.Current] y [ProfileFetcher.Result.
+     * NotModified]). Solo registra en el State (con la fresca: un sobre
+     * sin señal la limpia) y deja constancia en el Log cuando hay algo
+     * que ver. No toca el perfil, la cola ni el audio: la salud del LLM
+     * es display, nunca una puerta.
+     */
+    private fun handleLlmSignal(status: String?, model: String?, drafted: Boolean?) {
+        _state.value = applyLlmSignal(_state.value, status, model, drafted, System.currentTimeMillis())
+        val s = _state.value
+        if (s.llmStatus != LLM_STATUS_UNKNOWN || s.llmDrafted != null) {
+            Log.i(TAG, "C16: LLM del cerebro: ${s.llmStatus}" +
+                (s.llmModel?.let { " ($it)" } ?: "") +
+                if (s.llmDrafted == false) " — sin redacción LLM" else "")
         }
         refreshState()
     }
@@ -1417,11 +1528,14 @@ object OrganismController {
                     Log.i(TAG, "sondeo de perfil: reintentable (red/429/5xx); próximo ciclo")
                 is ProfileFetcher.Result.Quarantine ->
                     Log.i(TAG, "sondeo de perfil: ${res.reason}; se conserva el último bueno")
-                is ProfileFetcher.Result.NotModified ->
+                is ProfileFetcher.Result.NotModified -> {
                     // C24/510: versión igual, pero el sobre puede traer
                     // la señal de payload mínimo (el servidor puede
                     // subirla sin publicar un perfil nuevo).
                     handlePayloadVersionSignal(res.minSupportedPayloadVersion)
+                    // C16/510: igual con la salud del LLM del cerebro.
+                    handleLlmSignal(res.llmStatus, res.llmModel, res.llmDrafted)
+                }
                 is ProfileFetcher.Result.Current -> handleCurrent(ctx, res)
             }
             retryPendingConfirmation()
@@ -1435,6 +1549,9 @@ object OrganismController {
         // decidir sobre el perfil (el descarte de la cola vieja no
         // depende de que el perfil nuevo se aplique o no).
         handlePayloadVersionSignal(current.minSupportedPayloadVersion)
+        // C16/510: la salud del LLM del cerebro se registra igual,
+        // se aplique el perfil o no (es display del organismo).
+        handleLlmSignal(current.llmStatus, current.llmModel, current.llmDrafted)
         val previousVersion = _state.value.appliedProfileVersion
         when (current.status) {
             "rolled_back" -> handleRollback(ctx, current, previousVersion)
@@ -1658,12 +1775,17 @@ object OrganismController {
         // Re-aplicar el estable verificado (versión menor, rollback explícito).
         // profileId: el del diario (el del estable); si el diario es
         // anterior a T1 (sin profileId), el del sobre como fallback.
+        // C16/510: el sobre sintético lleva la señal LLM del sobre real
+        // (fidelidad del envelope; handleCurrent ya la registró).
         val stableCurrent = ProfileFetcher.Result.Current(
             profileId = journal?.profileId?.ifBlank { current.profileId } ?: current.profileId,
             version = stableVersion,
             status = "rolled_back",
             abState = "rolled_back",
-            profileBody = stableBody
+            profileBody = stableBody,
+            llmStatus = current.llmStatus,
+            llmModel = current.llmModel,
+            llmDrafted = current.llmDrafted
         )
         val ok = applyServerProfile(
             ctx = ctx,
