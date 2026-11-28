@@ -1,0 +1,119 @@
+# muselink-ab — C7 (release 510, Fase 4): espejo reproducible de la
+# decision A/B en el repo. Job propio, NO dentro de ctest: corre
+# `scripts/check_muselink_ab.py` sobre fixtures y exige que el veredicto
+# del script coincida con el `expected_verdict` declarado en cada fixture
+# candidato (PROMOTED -> salida 0, ROLLED_BACK -> salida 1).
+#
+# Fixtures: SINTETICOS (synthetic=true). La exportacion de la tabla ERB
+# agregada de las 177 sesiones esta pendiente del servidor; cuando llegue,
+# los fixtures reales sustituyen a estos y el script lo dira en su salida
+# (no hace falta cambiar el workflow: el par base/candidato nuevo se
+# anade a la lista PAIRS). La ruta `fixtures/ab/` de la propuesta C7 es
+# `tools/evolution/fixtures/ab/` en este repo.
+#
+# Corre en el runner self-hosted ivanna-vm porque los runners hospedados
+# por GitHub estan bloqueados por facturacion en golozotns-art
+# (2026-11-23); ver .github/workflows/tests-selfhosted.yml. El checkout
+# es clon anonimo + checkout del SHA exacto (sin actions/checkout, que
+# falla por el scrub de hatch-git), y el fetch del SHA funciona tambien
+# para el merge commit de un pull_request.
+#
+# NOTA: aqui NO se corre la suite del analizador reutilizado
+# (`tools/muselink-analyzer/test_analyzer.py`): uno de sus tests abre
+# `~/workspace/your_files/omega-...-v1.1.ivanna.json`, un archivo fuera
+# del repo que no existe en el runner. Esa suite se corre en local; este
+# job solo verifica el espejo C7 y sus fixtures.
+
+name: MuseLink A/B mirror (C7)
+
+on:
+  push:
+    paths:
+      - 'scripts/check_muselink_ab.py'
+      - 'tools/evolution/fixtures/ab/**'
+      - 'tools/evolution/fixtures/omega-1795857152818-9lec-v1.1.ivanna.json'
+      - 'tools/muselink-analyzer/analyzer.py'
+      - '.github/workflows/muselink-ab.yml'
+  pull_request:
+    paths:
+      - 'scripts/check_muselink_ab.py'
+      - 'tools/evolution/fixtures/ab/**'
+      - 'tools/evolution/fixtures/omega-1795857152818-9lec-v1.1.ivanna.json'
+      - 'tools/muselink-analyzer/analyzer.py'
+      - '.github/workflows/muselink-ab.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  muselink-ab:
+    name: A/B verdict mirror (PROMOTED + one ROLLED_BACK per gate)
+    runs-on: [self-hosted, ivanna-vm]
+    timeout-minutes: 10
+    steps:
+      # Sin actions/checkout: ver tests-selfhosted.yml. El repo es publico:
+      # clon anonimo y checkout del SHA exacto que disparo el run.
+      - name: Clone anonimo del repo publico
+        run: |
+          if [ -d .git ]; then
+            git fetch --quiet origin ${{ github.sha }} || git fetch --quiet origin
+          else
+            git clone --quiet https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME.git .
+            git fetch --quiet origin ${{ github.sha }}
+          fi
+          git checkout --quiet ${{ github.sha }}
+      - name: Compile check (stdlib only)
+        run: python3 -m py_compile scripts/check_muselink_ab.py
+      - name: Verdicts — cada par base/candidato debe dar su expected_verdict
+        run: |
+          set -uo pipefail
+          AB=tools/evolution/fixtures/ab
+          # Pares "base:candidato". El candidato fail_gate2 se evalua
+          # contra la base coherente (0.30): con la base de coherencia
+          # 0.0 la puerta 2 no discrimina (ver C7 / puerta 2).
+          PAIRS="$AB/v1.0_sessions.json:$AB/v1.1_sessions.json
+          $AB/v1.0_sessions.json:$AB/v1.1_sessions_fail_gate1.json
+          $AB/v1.0_sessions_coherent.json:$AB/v1.1_sessions_fail_gate2.json
+          $AB/v1.0_sessions.json:$AB/v1.1_sessions_fail_gate3.json
+          $AB/v1.0_sessions.json:$AB/v1.1_sessions_fail_gate4.json
+          $AB/v1.0_sessions.json:$AB/v1.1_sessions_fail_gate5.json"
+          rc=0
+          for pair in $PAIRS; do
+            base="${pair%%:*}"
+            cand="${pair#*:}"
+            echo "== base=$base candidato=$cand"
+            out="$(mktemp)"
+            python3 scripts/check_muselink_ab.py \
+              --baseline "$base" --candidate "$cand" \
+              --candidate-profile tools/evolution/fixtures/omega-1795857152818-9lec-v1.1.ivanna.json \
+              --seed 1795857152818 --json-out "$out.json" | tee "$out"
+            verdict_rc=${PIPESTATUS[0]}  # PIPESTATUS: tee es [1], el script es [0]
+            python3 - "$out.json" "$cand" "$verdict_rc" <<'PYEOF'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding="utf-8"))
+          fixture = json.load(open(sys.argv[2], encoding="utf-8"))
+          expected = fixture["expected_verdict"]
+          rc = int(sys.argv[3])
+          ok = (report["verdict"] == expected
+                and (rc == 0) == (expected == "PROMOTED"))
+          print("veredicto=%s esperado=%s salida=%d -> %s"
+                % (report["verdict"], expected, rc,
+                   "OK" if ok else "MISMATCH"))
+          sys.exit(0 if ok else 1)
+          PYEOF
+            if [ $? -ne 0 ]; then rc=1; fi
+            rm -f "$out" "$out.json"
+          done
+          exit $rc
+      - name: Determinismo — dos corridas con la misma semilla, salida identica
+        run: |
+          set -uo pipefail
+          AB=tools/evolution/fixtures/ab
+          python3 scripts/check_muselink_ab.py \
+            --baseline $AB/v1.0_sessions.json --candidate $AB/v1.1_sessions.json \
+            --seed 1795857152818 > /tmp/muselink_ab_run1.txt
+          python3 scripts/check_muselink_ab.py \
+            --baseline $AB/v1.0_sessions.json --candidate $AB/v1.1_sessions.json \
+            --seed 1795857152818 > /tmp/muselink_ab_run2.txt
+          diff /tmp/muselink_ab_run1.txt /tmp/muselink_ab_run2.txt

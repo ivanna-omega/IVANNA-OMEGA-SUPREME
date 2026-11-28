@@ -69,8 +69,13 @@
 //     corr@0 ≥ 0.99) siguen siendo la referencia de la ruta neutra, no
 //     del campo. Medido en g++-14 (20 corridas): balance hasta −5.87 dB
 //     (impulso), corr@0 0.40–0.99, lag hasta −12, Δcrest hasta −8.8 dB.
-//     El Golden-Master congelará las líneas base del campo por banda.
-//   CPU: media y p95 ≤ 2667 µs/hop (presupuesto hop 128 @48 kHz).
+//     El Golden-Master (S7/510, tests/golden/acoustic_harness_baseline.json)
+//     congela las líneas base del campo por banda.
+//   CPU: media y p95 ≤ 2667 µs/hop (presupuesto hop 128 @48 kHz) — C11/510:
+//     MÉTRICA REGISTRADA en hosted (se publica, no falla) y PUERTA DURA solo
+//     en self-hosted (IVANNA_CPU_GATE_HARD=1). El p95 de pared mide la
+//     planificación del host, no el motor: L p95 2678.53 µs vs 2667 en VM
+//     compartida, re-run inmediato 1284 µs.
 //   Techo APEX 0.9885531f (−0.1 dBFS, fused_dynamics.hpp:96): 0 muestras
 //     por encima en TODAS las configuraciones de campo (F0/F/L) — puerta
 //     dura en expectCommon. En F/F0 (sin limitador) el campo llega al
@@ -89,13 +94,52 @@
 //   Ringing del impulso: F0 3.4 ms, F 3.5 ms, L 63.1 ms.
 //
 // LO QUE ESTE HARNESS NO CUBRE (ver frentes/harness-acustico.md):
-//   ruta SPEAKERS/TΩ · firmas espectrales por banda (Golden-Master) ·
+//   firmas espectrales por banda — RESUELTO en S7/510 (abajo) ·
 //   audio real grabado · telemetría del teléfono (SnapshotV18 JSON).
+//
+// S7/510 — MODO «FIRMA ERB» + GOLDEN-MASTER (§S7 de
+// evolucion-magistral-autonomia-completa.md):
+//   (a) Predictor lineal: la respuesta en magnitud del EQ candidato (10
+//       biquads RBJ de RoomCorrectionEq + TonalControls) se evalúa sobre
+//       los 24 centros ERB con LA MISMA matemática que el motor
+//       (ivanna::room::cascadeMagDb — los coeficientes RBJ de
+//       AutoEqFilter::setBand) y el mapeo EXACTO de FusedTonal::
+//       applyControls (bandas 0-2 lowDb, 3-6 midDb, 7-9 highDb,
+//       presenceDb aditivo en 7-8, delta élite×0.5 si curve==2, todo
+//       × amount; trimDb como término plano). El RMS predicho post-EQ es
+//       RMS(errorMeanDb + respuesta) con los clamps del motor aplicados
+//       (roomCorrDb cut-only [−12,0], slots tonales ±12; un candidato en
+//       formato .ivanna.json v1.0 se pre-clampea a ±2 dB por el llamador).
+//       Puerta: el RMS predicho debe bajar ≥20% respecto a la línea base
+//       (10.46 dB → objetivo ≤ 8.37 dB); si no, la candidata NO se emite.
+//       Es PRE-PANTALLA, no sustituto del A/B: el predictor es lineal y
+//       la cadena real no lo es.
+//   (b) Firma espectral por banda (Golden-Master, pendiente 2 del doc del
+//       harness): en el barrido se mide por cada una de las 24 bandas ERB
+//       el nivel L/R y la correlación intercanal (líneas HARNESS ERB) y se
+//       congela en tests/golden/acoustic_harness_baseline.json; el script
+//       scripts/check_acoustic_golden.py compara y falla si F0/F/L se
+//       desvían más que la tolerancia.
+//   Centros ERB: RÉPLICA EXACTA de SessionAggregator.erbCenterHz(48000)
+//       (Kotlin, misma escala que RealAcousticSensor, 60 Hz–16 kHz,
+//       Glasberg & Moore): 24 bandas, media geométrica de los bordes
+//       equiespaciados en tasa ERB. Verificación: la banda 3 da 209 Hz,
+//       el único centro medido/documentado (ERB-3 209 Hz, perfil v1.1).
+//   Pendientes (NO inventados aquí): ruta SPEAKERS/TΩ (TΩ/D10 son no-op
+//       en HEADPHONES por puerta; medirlos exige una configuración
+//       SPEAKERS que hoy no existe en el harness) · audio real grabado
+//       (la «música» sigue siendo sintética) · la tabla ERB completa de
+//       24 bandas del servidor: solo ERB-3 está documentada (+9.86 dB @
+//       209 Hz); sin esa exportación la puerta del §S7 para la candidata
+//       v1.1 es INDECIDIBLE (ver ErbSignaturePredictsRms) — no se
+//       inventa el vector.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -103,7 +147,15 @@
 #include "../fused/fused_chain.hpp"
 #include "../fused/fused_measure.hpp"
 #include "ivannalab/ivannalab.h"
+#include "spatial/RoomProbe.hpp"  // S7/510: cascadeMagDb (misma RBJ que AutoEqFilter)
+#include "spatial/EliteTargetCurves.hpp"  // S7/510: delta élite (curve==2)
 #include "spatial/fft_radix2.hpp"
+
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
 
 using namespace ivanna::fused;
 using namespace ivanna::fused::measure;
@@ -126,6 +178,61 @@ constexpr double kThdMaxDbNeutral = -200.0; // meta del proyecto
 constexpr double kEmergentToneMaxDb = -10.0;  // 7 dB sobre base −17.32 dB @0.5/0.5
 constexpr double kCpuMeanMaxUs = 2667.0;    // hop 128 @48 kHz
 constexpr double kCpuP95MaxUs = 2667.0;
+
+// C11/510 — cuarentena flaky (wall-clock): la CPU por hop es métrica
+// registrada en hosted y puerta dura SOLO en self-hosted, donde la carga es
+// conocida. Opt-in explícito por variable de entorno (default: métrica, no
+// falla). La variable la ponen los workflows que corren en self-hosted
+// (tests-quarantined-weekly.yml, job self-hosted; en tests-selfhosted.yml
+// es línea pendiente — ver reporte C11). Bajo sanitizador nunca es puerta
+// dura (el sanitizador infla el CPU 2-3x por diseño; ya estaba así).
+bool CpuGateHard() {
+    const char* v = std::getenv("IVANNA_CPU_GATE_HARD");
+    return v != nullptr && std::strcmp(v, "1") == 0;
+}
+
+// ── Centros ERB (S7/510; usados por Metrics y por el predictor) ───────────
+// RÉPLICA EXACTA de SessionAggregator.erbCenterHz(48000) (Kotlin; misma
+// escala que RealAcousticSensor, 60 Hz–16 kHz; Glasberg & Moore): bordes
+// equiespaciados en tasa ERB, centro = media geométrica. Verificación:
+// erbCenterHz(2) = 209 Hz (ERB-3, único centro medido/documentado).
+constexpr int kErbBands = 24;
+constexpr int kErbRegions = 6;
+double erbRate(double f) noexcept { return 21.4 * std::log10(1.0 + 0.00437 * f); }
+double erbInv(double r) noexcept { return (std::pow(10.0, r / 21.4) - 1.0) / 0.00437; }
+double erbEdgeHz(int e) noexcept {  // e = 0..24 (borde inferior de la banda e)
+    const double rLo = erbRate(60.0);
+    const double rHi = erbRate(16000.0);
+    return erbInv(rLo + (rHi - rLo) * static_cast<double>(e) / kErbBands);
+}
+double erbCenterHz(int b) noexcept {  // b = 0..23
+    return std::sqrt(erbEdgeHz(b) * erbEdgeHz(b + 1));
+}
+
+// Regiones espectrales (por frecuencia central; la v1.1 nombra subgraves,
+// graves, medios-graves, medios, presencia y brillo; S8 agrupa
+// graves/medios-graves — aquí se separan subgraves <100 Hz por claridad).
+//   0 subgraves <100 Hz · 1 graves 100–250 Hz · 2 medios 250–2000 Hz ·
+//   3 brillo 2000–4000 Hz · 4 presencia 4000–8000 Hz · 5 aire >8000 Hz.
+int erbRegion(int b) noexcept {
+    const double f = erbCenterHz(b);
+    if (f < 100.0) return 0;
+    if (f < 250.0) return 1;
+    if (f < 2000.0) return 2;
+    if (f < 4000.0) return 3;
+    if (f < 8000.0) return 4;
+    return 5;
+}
+const char* erbRegionName(int r) noexcept {
+    switch (r) {
+        case 0: return "subgraves";
+        case 1: return "graves";
+        case 2: return "medios";
+        case 3: return "brillo";
+        case 4: return "presencia";
+        default: return "aire";
+    }
+}
 
 enum class Stimulus { kTone, kSweep, kPink, kImpulse, kMusic };
 
@@ -167,7 +274,7 @@ std::uint64_t xorshift64star(std::uint64_t& s) noexcept {
 std::vector<double> makePink() {
     // Ruido rosa, filtro de Paul Kellet (b0..b6), semilla fija.
     std::vector<double> v(static_cast<std::size_t>(kTotalSamples));
-    std::uint64_t seed = 0x123456789ABCDEFULL;
+    std::uint64_t seed = ivanna::test::IvannaTestSeedFor(1);
     double b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
     double power = 0.0;
     for (int i = 0; i < kTotalSamples; ++i) {
@@ -314,6 +421,13 @@ struct Metrics {
     double peakDelaySamples = 0.0;  // solo impulso
     double cpuMeanUs = 0.0, cpuP95Us = 0.0, cpuMaxUs = 0.0;
     bool finite = false;
+    // S7/510 — firma espectral por banda (solo barrido): nivel L/R (dB) y
+    // correlación intercanal por cada una de las 24 bandas ERB. Es la
+    // línea base del Golden-Master (pendiente 2 del doc del harness).
+    bool hasErb = false;
+    double erbLvlLDb[kErbBands] = {};
+    double erbLvlRDb[kErbBands] = {};
+    double erbCorr[kErbBands] = {};
 };
 
 double percentile(std::vector<double> v, double p) {
@@ -437,6 +551,57 @@ Metrics computeMetrics(const std::vector<double>& in, const RunResult& run, Stim
         m.ringingMs = static_cast<double>(lastIdx - peakIdx) / 48.0;
         (void)peak;
     }
+    // Solo barrido (S7/510): firma espectral por banda ERB — nivel L/R y
+    // correlación intercanal por banda. FFT 131072 Hann con zero-padding
+    // sobre la ventana completa (2.0 s); los bins se agrupan por banda
+    // ERB (bordes erbEdgeHz). Nivel de banda:
+    // 20*log10(2*sqrt(P)/Nfft) con P = suma |X|² de la banda — para un tono
+    // puro recupera su amplitud (la ventana Hann tiene ganancia coherente
+    // 0.5); para banda ancha es un nivel equivalente comparable entre
+    // corridas. La regresión solo exige determinismo, no calibración
+    // absoluta: el barrido no es plano por banda. corr por banda =
+    // Re(Σ XL·conj(XR)) / sqrt(PL·PR).
+    if (s == Stimulus::kSweep) {
+        // FFT de 131072 con zero-padding de la ventana completa (96000
+        // muestras, 2.0 s): el barrido log recorre 20 Hz–20 kHz en los
+        // 2.5 s del estímulo, así que la ventana de medida (0.5–2.5 s)
+        // cubre todas las bandas ERB. Con 65536 puntos solo se verían
+        // los primeros 1.37 s (~hasta 3.5 kHz) y las bandas altas
+        // quedarían en el piso numérico.
+        constexpr int kNfft = 131072;
+        ivanna::FFTRadix2d fft(kNfft);
+        std::vector<double> reL(static_cast<std::size_t>(kNfft), 0.0),
+            imL(static_cast<std::size_t>(kNfft), 0.0),
+            reR(static_cast<std::size_t>(kNfft), 0.0),
+            imR(static_cast<std::size_t>(kNfft), 0.0);
+        for (int i = 0; i < kWindowSamples; ++i) {
+            const double w = 0.5 * (1.0 - std::cos(kTwoPi * i / (kWindowSamples - 1)));
+            reL[static_cast<std::size_t>(i)] = wL[i] * w;
+            reR[static_cast<std::size_t>(i)] = wR[i] * w;
+        }
+        fft.forward(reL.data(), imL.data());
+        fft.forward(reR.data(), imR.data());
+        const double df = kFs / kNfft;
+        for (int b = 0; b < kErbBands; ++b) {
+            const double lo = erbEdgeHz(b), hi = erbEdgeHz(b + 1);
+            double pL = 0.0, pR = 0.0, cross = 0.0;
+            for (int k = 1; k < kNfft / 2; ++k) {
+                const double f = k * df;
+                if (f < lo || f >= hi) continue;
+                const double xl = reL[static_cast<std::size_t>(k)];
+                const double yl = imL[static_cast<std::size_t>(k)];
+                const double xr = reR[static_cast<std::size_t>(k)];
+                const double yr = imR[static_cast<std::size_t>(k)];
+                pL += xl * xl + yl * yl;
+                pR += xr * xr + yr * yr;
+                cross += xl * xr + yl * yr;  // Re(XL · conj(XR))
+            }
+            m.erbLvlLDb[b] = 20.0 * std::log10(2.0 * std::sqrt(pL) / kNfft + 1e-32);
+            m.erbLvlRDb[b] = 20.0 * std::log10(2.0 * std::sqrt(pR) / kNfft + 1e-32);
+            m.erbCorr[b] = std::clamp(cross / (std::sqrt(pL * pR) + 1e-32), -1.0, 1.0);
+        }
+        m.hasErb = true;
+    }
     (void)in;
     return m;
 }
@@ -457,6 +622,15 @@ void printRow(const char* cfg, Stimulus s, const Metrics& m, double inCrestDb) {
         m.truePeakDbTP, m.thdLDb, m.thdRDb, m.emergentDb, m.emergentHz,
         m.crestLDb, m.crestRDb, inCrestDb, m.balanceDb, m.bestLag, m.corr0,
         m.ringingMs, m.cpuMeanUs, m.cpuP95Us, m.cpuMaxUs);
+    std::fflush(stdout);
+}
+
+void printErbSignature(const char* cfg, const Metrics& m) {
+    if (!m.hasErb) return;
+    for (int b = 0; b < kErbBands; ++b) {
+        std::printf("HARNESS ERB %-4s banda %2d %7.1f Hz lvl %+7.2f/%+7.2f dB corr %+0.4f\n",
+                    cfg, b + 1, erbCenterHz(b), m.erbLvlLDb[b], m.erbLvlRDb[b], m.erbCorr[b]);
+    }
     std::fflush(stdout);
 }
 
@@ -482,6 +656,118 @@ void expectCommon(const char* cfg, Stimulus s, const Metrics& m, double inCrestD
 
 const Stimulus kAllSignals[5] = {Stimulus::kTone, Stimulus::kSweep, Stimulus::kPink,
                                  Stimulus::kImpulse, Stimulus::kMusic};
+
+// ── S7/510 — MODO «FIRMA ERB»: PREDICTOR LINEAL + PUERTA ───────────────────
+// Línea base RMS ERB medida (perfil v1.1, fingerprint ERB, 177 sesiones en
+// vivo, 2026-11-28): spectralErrorRmsDb = 10.46 dB. La puerta exige una
+// mejora ≥20% → objetivo ≤ 8.37 dB (0.8 × 10.46 = 8.368).
+constexpr double kErbBaselineRmsDb = 10.46;
+constexpr double kErbGateMinImprovement = 0.20;  // fracción
+constexpr double kErbTargetRmsDb = 8.368;        // 0.8 × 10.46
+
+// Mapeo EXACTO de FusedTonal::applyControls (fused_tonal.cpp:56-94) a las
+// 10 ganancias de banda: 0-2 lowDb, 3-6 midDb, 7-9 highDb; presenceDb
+// aditivo en 7-8; curve==2 suma (élite − Harman) × 0.5 (kCurveTargetScale);
+// todo × amount. trimDb NO entra aquí: es ganancia plana y se suma aparte
+// en candidateEqResponseDb. Los clamps del motor se aplican sobre copias.
+void tonalBandGains(const TonalControls& cIn, float gains[10]) noexcept {
+    TonalControls c = cIn;
+    c.clamp();
+    for (int b = 0; b < 10; ++b) {
+        float g = (b <= 2) ? c.lowDb : (b <= 6) ? c.midDb : c.highDb;
+        if (c.presenceDb != 0.0f && (b == 7 || b == 8)) g += c.presenceDb;
+        if (c.curve == 2) {
+            const float f = ivanna::room::kBandHz[b];
+            g += (ivanna::spatial::eliteTargetDbAt(
+                      ivanna::spatial::EliteTargetKind::HarmanEliteLean, f) -
+                  ivanna::spatial::eliteTargetDbAt(
+                      ivanna::spatial::EliteTargetKind::Harman2018, f)) *
+                 0.5f;  // FusedTonal::kCurveTargetScale
+        }
+        gains[b] = g * c.amount;
+    }
+}
+
+// Respuesta en magnitud (dB) del EQ candidato a la frecuencia f: cascada
+// RoomCorrectionEq (roomCorrDb, cut-only [−12,0] por
+// ListenerRoomControls::clamp) + cascada de las 10 ganancias tonales +
+// trimDb plano. Usa ivanna::room::cascadeMagDb — la misma matemática RBJ
+// que AutoEqFilter::setBand — no una reimplementación paralela.
+// NO incluye EvoEQ ni la curva Harman/élite como tal (curve 1/0 no añade
+// nada al EQ de usuario; curve 2 añade solo su delta, ver arriba): el
+// predictor cubre el EQ candidato, no toda la cadena tonal.
+double candidateEqResponseDb(const ListenerRoomControls& roomIn,
+                             const TonalControls& tonalIn, double f) noexcept {
+    ListenerRoomControls room = roomIn;
+    room.clamp();  // cut-only [−12,0] por banda
+    TonalControls tonal = tonalIn;
+    tonal.clamp();  // slots ±12 dB, presence ±12 dB, amount 0..1
+    float tg[10];
+    tonalBandGains(tonal, tg);
+    return static_cast<double>(ivanna::room::cascadeMagDb(room.roomCorrDb, static_cast<float>(f),
+                                                          static_cast<float>(kFs))) +
+           static_cast<double>(ivanna::room::cascadeMagDb(tg, static_cast<float>(f),
+                                                          static_cast<float>(kFs))) +
+           static_cast<double>(tonal.trimDb);
+}
+
+struct ErbPrediction {
+    double rmsDb = 0.0;               // RMS post-EQ predicho (24 bandas)
+    double baselineRmsDb = 0.0;       // RMS pre-EQ del vector de entrada
+    double residualDb[kErbBands] = {};
+    double eqResponseDb[kErbBands] = {};
+    double regionRmsDb[kErbRegions] = {};
+    double regionBaselineRmsDb[kErbRegions] = {};
+};
+
+// RMS(errorMeanDb + respuesta EQ) por banda ERB, con el clamp aplicado.
+// El vector errorMeanDb[24] es el error MEDIDO (SessionChunk.errorMeanDb):
+// el llamador lo trae del servidor/perfil; aquí NUNCA se inventa.
+ErbPrediction predictErbRms(const double errorMeanDb[kErbBands],
+                            const ListenerRoomControls& room,
+                            const TonalControls& tonal) noexcept {
+    ErbPrediction p;
+    double sumBase = 0.0, sumRes = 0.0;
+    double regBase[kErbRegions] = {}, regRes[kErbRegions] = {};
+    int regN[kErbRegions] = {};
+    for (int b = 0; b < kErbBands; ++b) {
+        const double resp = candidateEqResponseDb(room, tonal, erbCenterHz(b));
+        p.eqResponseDb[b] = resp;
+        p.residualDb[b] = errorMeanDb[b] + resp;
+        sumBase += errorMeanDb[b] * errorMeanDb[b];
+        sumRes += p.residualDb[b] * p.residualDb[b];
+        const int r = erbRegion(b);
+        regBase[r] += errorMeanDb[b] * errorMeanDb[b];
+        regRes[r] += p.residualDb[b] * p.residualDb[b];
+        ++regN[r];
+    }
+    p.baselineRmsDb = std::sqrt(sumBase / kErbBands);
+    p.rmsDb = std::sqrt(sumRes / kErbBands);
+    for (int r = 0; r < kErbRegions; ++r) {
+        if (regN[r] == 0) continue;
+        p.regionBaselineRmsDb[r] = std::sqrt(regBase[r] / regN[r]);
+        p.regionRmsDb[r] = std::sqrt(regRes[r] / regN[r]);
+    }
+    return p;
+}
+
+// Puerta S7: la candidata solo se emite si el RMS predicho baja ≥20%
+// respecto a la línea base (10.46 dB → ≤ 8.37 dB).
+bool passesErbGate(double predictedRmsDb, double baselineRmsDb) noexcept {
+    return predictedRmsDb <= (1.0 - kErbGateMinImprovement) * baselineRmsDb;
+}
+
+void printPredict(const char* candidate, const ErbPrediction& p) {
+    std::printf("HARNESS PREDICT %-8s rms predicho %+.2f dB (base %+.2f dB, "
+                "objetivo <= %.2f dB) puerta %s\n",
+                candidate, p.rmsDb, p.baselineRmsDb, kErbTargetRmsDb,
+                passesErbGate(p.rmsDb, p.baselineRmsDb) ? "PASA" : "RECHAZA");
+    for (int r = 0; r < kErbRegions; ++r) {
+        std::printf("HARNESS PREDICT %-8s region %-10s rms %+.2f dB (base %+.2f dB)\n",
+                    candidate, erbRegionName(r), p.regionRmsDb[r], p.regionBaselineRmsDb[r]);
+    }
+    std::fflush(stdout);
+}
 }  // namespace
 
 TEST(AcousticHarness, NeutralIsBitExact) {
@@ -498,6 +784,12 @@ TEST(AcousticHarness, NeutralIsBitExact) {
             EXPECT_LE(m.thdRDb, kThdMaxDbNeutral) << "neutro THD+N R " << m.thdRDb << " dB";
             printRow("N", s, m, inputCrestDb(in));
         }
+        if (s == Stimulus::kSweep) {
+            // S7/510: la firma ERB del neutro es la referencia (bit-exacto:
+            // es el espectro del propio barrido de entrada).
+            const Metrics m = computeMetrics(in, run, s);
+            printErbSignature("N", m);
+        }
     }
 }
 
@@ -513,6 +805,7 @@ TEST(AcousticHarness, FieldOnlyMax) {
             const RunResult run = runChain(c, in);
             const Metrics m = computeMetrics(in, run, s);
             printRow(name, s, m, inputCrestDb(in));
+            if (s == Stimulus::kSweep) printErbSignature(name, m);  // S7/510
             expectCommon(name, s, m, inputCrestDb(in));
             if (s == Stimulus::kTone) {
                 // THD+N se reporta (carácter intencional); el paso/fallo
@@ -533,6 +826,7 @@ TEST(AcousticHarness, LiveMaxFullChain) {
         const RunResult run = runChain(c, in);
         const Metrics m = computeMetrics(in, run, s);
         printRow("L", s, m, inputCrestDb(in));
+        if (s == Stimulus::kSweep) printErbSignature("L", m);  // S7/510
         // expectCommon ya exige overCeiling 0 (techo APEX) en todas las
         // configuraciones de campo; con safety=1.0 el limitador lo respeta.
         expectCommon("L", s, m, inputCrestDb(in));
@@ -550,21 +844,151 @@ TEST(AcousticHarness, CpuPerHopWithinBudget) {
         {"F", fieldOnlyControls(1.0f)},
         {"L", liveMaxControls()},
     };
+    // C11/510 — la métrica se PUBLICA siempre (línea [METRIC] estable para
+    // el log JUnit de C5); la puerta solo muerde con IVANNA_CPU_GATE_HARD=1
+    // (self-hosted) y nunca bajo sanitizador.
+#if defined(__SANITIZE_ADDRESS__) || defined(IVANNA_SANITIZER_ACTIVE)
+    const bool hardGate = false;  // sanitizador: el CPU se infla 2-3x por diseño
+#else
+    const bool hardGate = CpuGateHard();
+#endif
     for (const auto& [name, c] : cfgs) {
         const RunResult run = runChain(c, in);
         const Metrics m = computeMetrics(in, run, Stimulus::kMusic);
         std::printf("HARNESS %-4s cpu musica media %.0f us p95 %.0f us max %.0f us (%zu chunks)\n",
                     name, m.cpuMeanUs, m.cpuP95Us, m.cpuMaxUs, run.cpuUs.size());
+        std::printf("[METRIC] cpu_per_hop %s mean_us=%.1f p95_us=%.1f max_us=%.1f budget_us=2667 gate=%s\n",
+                    name, m.cpuMeanUs, m.cpuP95Us, m.cpuMaxUs,
+                    hardGate ? "hard" : "metric-only");
         std::fflush(stdout);
         // Bajo ASan/TSan el CPU se infla 2-3x por diseño: el presupuesto
         // por hop NO se impone (el sanitizador mide seguridad de memoria,
         // no rendimiento). La medición sigue (se reporta arriba) y el
         // presupuesto sigue vigente en builds sin sanitizador.
 #if !defined(__SANITIZE_ADDRESS__) && !defined(IVANNA_SANITIZER_ACTIVE)
-        EXPECT_LE(m.cpuMeanUs, kCpuMeanMaxUs)
-            << name << " CPU media por hop " << m.cpuMeanUs << " us (presupuesto 2667 us)";
-        EXPECT_LE(m.cpuP95Us, kCpuP95MaxUs)
-            << name << " CPU p95 por hop " << m.cpuP95Us << " us (presupuesto 2667 us)";
+        if (hardGate) {
+            EXPECT_LE(m.cpuMeanUs, kCpuMeanMaxUs)
+                << name << " CPU media por hop " << m.cpuMeanUs << " us (presupuesto 2667 us)";
+            EXPECT_LE(m.cpuP95Us, kCpuP95MaxUs)
+                << name << " CPU p95 por hop " << m.cpuP95Us << " us (presupuesto 2667 us)";
+        }
 #endif
+    }
+}
+
+TEST(AcousticHarness, ErbSignaturePredictsRms) {
+    // S7/510 — el predictor es la pre-pantalla del laboratorio: una
+    // candidata que ni en teoría puede mejorar el RMS ERB un 20% no se
+    // envía al teléfono. El predictor es LINEAL (la cadena real no lo
+    // es): pre-pantalla, no sustituto del A/B.
+    ListenerRoomControls roomNeutral;
+    TonalControls tonalNeutral;  // curve 1 (Harman), todo 0, trim 0
+
+    // (1) Centros ERB: la banda 3 (índice 2) es 209 Hz — el único centro
+    // medido/documentado (ERB-3 209 Hz, perfil v1.1). Si esto falla, la
+    // réplica de SessionAggregator.erbCenterHz está rota.
+    EXPECT_NEAR(erbCenterHz(2), 209.0, 1.0) << "ERB-3 debe ser 209 Hz";
+    EXPECT_NEAR(erbCenterHz(0), 82.0, 5.0) << "ERB-1 ~82 Hz (60 Hz–16 kHz)";
+    EXPECT_NEAR(erbCenterHz(23), 14700.0, 1500.0) << "ERB-24 ~14.7 kHz";
+
+    // (2) Identidad: candidato neutro no mueve el RMS (respuesta 0 en
+    // las 24 bandas) para cualquier vector de error.
+    {
+        double err[kErbBands];
+        for (int b = 0; b < kErbBands; ++b) err[b] = 5.0 + 0.5 * b;
+        const ErbPrediction p = predictErbRms(err, roomNeutral, tonalNeutral);
+        for (int b = 0; b < kErbBands; ++b)
+            EXPECT_NEAR(p.eqResponseDb[b], 0.0, 1e-9) << "banda " << b + 1;
+        EXPECT_NEAR(p.rmsDb, p.baselineRmsDb, 1e-9) << "neutro: RMS intacto";
+        EXPECT_FALSE(passesErbGate(p.rmsDb, p.baselineRmsDb))
+            << "neutro no pasa la puerta del 20%";
+    }
+
+    // (3) SINTÉTICO (etiquetado: NO es dato medido): error plano +10 dB
+    // en las 24 bandas + candidato plano −10 dB (slots tonales −10, trim
+    // 0) → el RMS predicho debe colapsar de 10 dB a ~3 dB. NO a 0: la
+    // cascada RBJ de 10 peakings a una octava (Q 1.41) no suma plana —
+    // la respuesta real oscila entre −6.5 y −15.1 dB según el centro ERB
+    // (rizado medido; el mismo motivo por el que RoomProbe::
+//       designCorrection itera con relajación). El valor 3.15 dB se
+    //       verificó con una implementación independiente en Python de la
+    //       misma fórmula RBJ; la tolerancia ±0.5 dB es el cruce.
+    {
+        double err[kErbBands];
+        for (int b = 0; b < kErbBands; ++b) err[b] = 10.0;
+        TonalControls flat;
+        flat.lowDb = -10.0f;
+        flat.midDb = -10.0f;
+        flat.highDb = -10.0f;
+        const ErbPrediction p = predictErbRms(err, roomNeutral, flat);
+        EXPECT_NEAR(p.baselineRmsDb, 10.0, 1e-9);
+        EXPECT_NEAR(p.rmsDb, 3.15, 0.5) << "RMS predicho del fixture plano";
+        EXPECT_LE(p.rmsDb, 5.0) << "EQ plano −10 dB debe recortar el error plano +10 dB";
+        EXPECT_TRUE(passesErbGate(p.rmsDb, p.baselineRmsDb))
+            << "cancelación parcial pasa la puerta";
+        printPredict("SINT-PLANO", p);
+    }
+
+    // (4) Aritmética de la puerta sobre la línea base MEDIDA (10.46 dB):
+    // objetivo ≤ 8.37 dB; 9.0 dB RECHAZA, 8.0 dB PASA, 10.46 dB RECHAZA.
+    EXPECT_FALSE(passesErbGate(10.46, kErbBaselineRmsDb));
+    EXPECT_FALSE(passesErbGate(9.0, kErbBaselineRmsDb));
+    EXPECT_TRUE(passesErbGate(8.0, kErbBaselineRmsDb));
+    EXPECT_TRUE(passesErbGate(kErbTargetRmsDb, kErbBaselineRmsDb));
+    EXPECT_NEAR(kErbTargetRmsDb, 0.8 * kErbBaselineRmsDb, 1e-9);
+
+    // (5) Candidata v1.1 REAL con el único dato MEDIDO disponible (ERB-3
+    // +9.86 dB @ 209 Hz): slots formato v1.0 (clamp ±2 dB) low −2, mid +2,
+    // high +2, presence +2, trim −4.0. Se evalúa SOLO esa banda: la
+    // respuesta del candidato a 209 Hz y su residual. La puerta COMPLETA
+    // es INDECIDIBLE: las otras 23 bandas del error viven en el servidor
+    // sin exportar (S7 «dato que falta») — el RMS 10.46 dB es el escalar
+    // medido, no el vector. NO se reconstruye el vector ni se emite
+    // veredicto de puerta para v1.1.
+    {
+        TonalControls v11;
+        v11.lowDb = -2.0f;       // low_60_120 (propuesto −3, residual −1.0)
+        v11.midDb = 2.0f;        // mid_500_1k (propuesto +4, residual +2.0)
+        v11.highDb = 2.0f;       // high_2k_4k / brillo (propuesto +9, residual +7.0)
+        v11.presenceDb = 2.0f;   // presence_4k_8k (propuesto +9, residual +7.0)
+        v11.trimDb = -4.0f;      // compensa el neto +4.0 dB de los slots
+        const double resp209 = candidateEqResponseDb(roomNeutral, v11, 209.0);
+        const double resid209 = 9.86 + resp209;
+        std::printf("HARNESS PREDICT v1.1     ERB-3 209 Hz err +9.86 dB eq %+.2f dB resid %+.2f dB\n",
+                    resp209, resid209);
+        std::printf("HARNESS PREDICT v1.1     GATE UNDECIDIBLE (23/24 bandas ERB sin exportar del servidor; RMS base medido 10.46 dB, objetivo <= 8.37 dB)\n");
+        std::fflush(stdout);
+        EXPECT_TRUE(std::isfinite(resp209)) << "respuesta v1.1 a 209 Hz finita";
+        EXPECT_TRUE(std::isfinite(resid209)) << "residual v1.1 a 209 Hz finito";
+        EXPECT_NEAR(resid209, 9.86 + resp209, 1e-9) << "residual = error + respuesta";
+        // Cruce independiente (Python, misma fórmula RBJ): la respuesta
+        // del candidato a 209 Hz es −2.86 dB (el −2 dB de graves tira
+        // hacia abajo, los +2 dB de medios tiran hacia arriba, el trim
+        // −4.0 dB es plano) y el residual queda en +7.00 dB.
+        EXPECT_NEAR(resp209, -2.86, 0.25) << "respuesta v1.1 a 209 Hz";
+        EXPECT_NEAR(resid209, 7.00, 0.25) << "residual v1.1 a 209 Hz";
+        // El clamp del formato v1.0 (±2 dB) ya está aplicado en los slots
+        // de arriba; el clamp del motor (±12 dB) lo aplica el predictor.
+        // El residual a 209 Hz sigue siendo positivo: el −2 dB de graves
+        // no cancela el +9.86 dB de ERB-3 (el resto del trabajo lo hace
+        // roomCorrDb cut-only tras S3, o el A/B).
+        EXPECT_GT(resid209, 0.0) << "ERB-3 sigue en exceso tras v1.1 (esperado: +9.86 con solo −2 dB cerca)";
+    }
+
+    // (6) Cut-only: roomCorrDb por debajo de −12 dB se clampea a −12 y por
+    // encima de 0 dB a 0 (ListenerRoomControls::clamp, vía el predictor).
+    {
+        ListenerRoomControls room;
+        room.roomCorrDb[5] = -30.0f;  // 1 kHz: fuera de rango por abajo
+        room.roomCorrDb[6] = 5.0f;    // 2 kHz: realce prohibido en cut-only
+        const double r1k = candidateEqResponseDb(room, tonalNeutral, 1000.0);
+        const double r2k = candidateEqResponseDb(room, tonalNeutral, 2000.0);
+        // A 1 kHz la respuesta es exactamente −12 dB (el propio centro de
+        // la banda clampea a −12). A 2 kHz no es 0: la banda de 1 kHz
+        // derrama −2.50 dB a una octava de distancia (peaking RBJ Q 1.41);
+        // lo que se verifica es que NO hay realce (+5 clampea a 0) y que
+        // el derrame es el de un −12 dB, no el de un −30 dB.
+        EXPECT_NEAR(r1k, -12.0, 0.1) << "cut-only clampea −30 a −12 dB";
+        EXPECT_NEAR(r2k, -2.50, 0.5) << "cut-only: +5 a 0 dB, derrame de −12 dB a 1 octava";
     }
 }

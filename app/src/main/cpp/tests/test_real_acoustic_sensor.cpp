@@ -218,6 +218,8 @@ TEST(RealAcousticSensor, CoherenceSameSignalIsOne) {
     feed(sen, x, &x);  // referencia = la misma señal
     const SensorFrame fr = sen.latestFrame();
     ASSERT_TRUE(fr.valid);
+    // S1/510: con referencia alimentada el frame es fresco.
+    EXPECT_TRUE(fr.reference_fresh);
     EXPECT_GT(fr.coherence[bandNear(sen, 1002.0f)], 0.9f);
 }
 
@@ -242,7 +244,59 @@ TEST(RealAcousticSensor, CoherenceWithoutReferenceIsZero) {
     feed(sen, x);  // sin referencia
     const SensorFrame fr = sen.latestFrame();
     ASSERT_TRUE(fr.valid);
+    // S1/510: sin referencia el frame no es fresco y la coherencia es 0
+    // (no se finge coherencia).
+    EXPECT_FALSE(fr.reference_fresh);
     for (int b = 0; b < 24; ++b) EXPECT_EQ(fr.coherence[b], 0.0f) << "banda " << b;
+}
+
+TEST(RealAcousticSensor, ReferenceFreshFlagTracksReference) {
+    // S1/510: reference_fresh sigue al refFresh real de cada análisis.
+    RealAcousticSensor sen;
+    sen.prepare(kSr);
+    auto x = sineBin(171, 0.5f, 12 * kN);
+    // Referencia = la misma señal, en lockstep: fresca, coherencia ~1.
+    feed(sen, x, &x);
+    const SensorFrame fr = sen.latestFrame();
+    ASSERT_TRUE(fr.valid);
+    EXPECT_TRUE(fr.reference_fresh);
+    EXPECT_GT(fr.coherence[bandNear(sen, 1002.0f)], 0.9f);
+    // Sin referencia: no fresca, coherencia 0 en las 24 bandas.
+    RealAcousticSensor sen2;
+    sen2.prepare(kSr);
+    feed(sen2, x);
+    const SensorFrame fr2 = sen2.latestFrame();
+    ASSERT_TRUE(fr2.valid);
+    EXPECT_FALSE(fr2.reference_fresh);
+    for (int b = 0; b < 24; ++b) EXPECT_EQ(fr2.coherence[b], 0.0f) << "banda " << b;
+}
+
+TEST(RealAcousticSensor, ReferenceFreshInSilenceReflectsRealRefFresh) {
+    // S1/510: en el camino de silencio reference_fresh refleja el
+    // refFresh real, no false por defecto.
+    RealAcousticSensor sen;
+    sen.prepare(kSr);
+    auto tone = sineBin(171, 0.5f, 12 * kN);
+    feed(sen, tone, &tone);
+    const SensorFrame loud = sen.latestFrame();
+    ASSERT_TRUE(loud.valid);
+    ASSERT_TRUE(loud.reference_fresh);
+    // Mic en silencio pero referencia SÍ alimentada en lockstep: el
+    // frame de silencio es inválido pero reference_fresh sigue siendo
+    // true (la referencia estaba fresca en ese análisis).
+    std::vector<float> silence(8192, 0.0f);
+    feed(sen, silence, &tone);
+    const SensorFrame quiet = sen.latestFrame();
+    EXPECT_FALSE(quiet.valid);
+    EXPECT_TRUE(quiet.reference_fresh);
+    // Y sin referencia alimentada, el frame de silencio no es fresco.
+    RealAcousticSensor sen2;
+    sen2.prepare(kSr);
+    feed(sen2, tone);
+    feed(sen2, silence);
+    const SensorFrame quiet2 = sen2.latestFrame();
+    EXPECT_FALSE(quiet2.valid);
+    EXPECT_FALSE(quiet2.reference_fresh);
 }
 
 TEST(RealAcousticSensor, InvalidFrameDoesNotCorruptState) {

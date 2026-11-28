@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.ivanna.omega.core.IVANNAApplication
 import com.ivanna.omega.core.NativeLibraryLoader
+import com.ivanna.omega.core.ParameterStore
 import com.ivanna.omega.magisk.OmegaEngineBridge
 import com.ivanna.omega.magisk.PerceptualStatePayload
 
@@ -208,11 +209,15 @@ data class ListenerRoomControls(
     // operador oyente+sala. Con 0 la sala firma no actúa.
     val signatureRoom: Int = 0,
     // Corrección de sala, cut-only (-12..0 dB), 10 bandas.
-    // CAVEAT: el JNI fusionado (nativeSetFusedControls) NO tiene slot para
-    // estas 10 bandas — el espejo las conserva (clamp + setNeutral las
-    // cubren, como el C++), pero la integración nativa debe decidir su vía
-    // (extender la firma o mantener la ruta existente) antes de exponerlas
-    // en la UI. Esta pantalla no muestra controles para ellas.
+    // S3/510: nativeSetFusedControls SÍ tiene slot (roomCorrDb0..9) y el
+    // push fusionado las empuja a la Ruta A. OJO — el espejo NO es dueño
+    // de la medida: la corrección MEDIDA vive en ParameterStore
+    // (KEY_ROOM_GAINS) y solo llega al nativo por nativeSetRoomCorrection;
+    // ningún escritor la pone en fused_room_corr_db_*. Por eso el puente
+    // fusiona en el borde (effectiveRoomCorrDb): si el espejo trae algún
+    // valor manda él; si es todo ceros, manda la medida guardada si está
+    // habilitada. Sin esa fusión, cada push fusionado borraría la medida.
+    // Esta pantalla no muestra controles para ellas.
     val roomCorrDb: List<Float> = List(10) { 0.0f },
 ) {
     fun clamp(): ListenerRoomControls = copy(
@@ -477,7 +482,8 @@ object FusedControlsBridge {
      *  - brainMode: 0 = AUTO, 1 = MANUAL.
      *
      * La corrección de sala de 10 bandas (cut-only, ListenerRoomControls)
-     * NO viaja en esta llamada: la firma no tiene slot para ella (ver
+     * SÍ viaja en esta llamada (S3/510: roomCorrDb0..9 al final de la
+     * firma), con la fusión en el borde de [effectiveRoomCorrDb] (ver
      * caveat en [ListenerRoomControls.roomCorrDb]).
      */
     @JvmStatic external fun nativeSetFusedControls(
@@ -530,10 +536,100 @@ object FusedControlsBridge {
         consvPhaseCoherence: Float,
         consvInertia: Float,
         // Unificación 2.5.509 (paso 5): OmniField y diffuse tienen slot
-        // propio (50 parámetros; antes OmniField seguía el amount de
-        // HOLOS y diffuse era fijo 0.85 en el C++).
+        // propio (antes OmniField seguía el amount de HOLOS y diffuse
+        // era fijo 0.85 en el C++).
         fieldOmniAmount: Float,
         fieldDiffuse: Float,
+        // S3/510: presencia 4-8 kHz + corrección de sala cut-only
+        // (61 parámetros en total; al final para no mover los 50
+        // existentes — el orden debe ser idéntico al del C++).
+        tonalPresenceDb: Float,
+        roomCorrDb0: Float,
+        roomCorrDb1: Float,
+        roomCorrDb2: Float,
+        roomCorrDb3: Float,
+        roomCorrDb4: Float,
+        roomCorrDb5: Float,
+        roomCorrDb6: Float,
+        roomCorrDb7: Float,
+        roomCorrDb8: Float,
+        roomCorrDb9: Float,
+    )
+
+    /**
+     * Entrada con fundido por hop (S12/510): mismos 61 parámetros que
+     * [nativeSetFusedControls] en el mismo orden + [rampHops].
+     * rampHops = -1 (auto) = rampa según el salto de los valores.
+     * DECLARACIÓN que faltaba: el C++ (ivanna_omega_jni.cpp:3521) la
+     * define desde Fase 3 y check_jni_wiring (Fase 0) exige que cada
+     * símbolo `Java_*` tenga su `external fun`. Sin llamador aún: el
+     * cableado al camino de aplicación de perfiles queda pendiente
+     * (ver comentario en el C++); sin llamador es código muerto y no
+     * cambia el comportamiento.
+     */
+    @JvmStatic external fun nativeSetFusedControlsRamped(
+        spatialAmount: Float,
+        spatialAzimuthDeg: Float,
+        spatialDistanceM: Float,
+        spatialWidth: Float,
+        spatialMode: Int,
+        spatialWfsSpread: Float,
+        spatialHrtfWet: Float,
+        spatialHeadTracking: Boolean,
+        spatialXtc: Boolean,
+        spatialUpmix: Boolean,
+        spatialImmersivity: Float,
+        fieldAmount: Float,
+        fieldPhiAmount: Float,
+        fieldPhiPreset: Int,
+        fieldPumping: Float,
+        fieldCoherence: Float,
+        fieldHarmonics: Float,
+        fieldGamma: Float,
+        fieldWarmth: Float,
+        fieldDynamics: Float,
+        fieldRt60: Float,
+        roomRt60: Float,
+        roomSizeM: Float,
+        roomWet: Float,
+        roomHearingProfile: Int,
+        transCorrection: Float,
+        transTemporal: Float,
+        transEmf: Boolean,
+        tonalCurve: Int,
+        tonalTrimDb: Float,
+        tonalLowDb: Float,
+        tonalMidDb: Float,
+        tonalHighDb: Float,
+        tonalLoudness: Boolean,
+        dynPunch: Float,
+        dynWidth: Float,
+        dynSafety: Float,
+        dynThrDb: Float,
+        dynRatio: Float,
+        dynExciter: Float,
+        dynVoice: Float,
+        dynUpmix: Float,
+        brainMode: Int,
+        brainAdaptation: Float,
+        consvAmount: Float,
+        consvEnergyCap: Float,
+        consvPhaseCoherence: Float,
+        consvInertia: Float,
+        fieldOmniAmount: Float,
+        fieldDiffuse: Float,
+        tonalPresenceDb: Float,
+        roomCorrDb0: Float,
+        roomCorrDb1: Float,
+        roomCorrDb2: Float,
+        roomCorrDb3: Float,
+        roomCorrDb4: Float,
+        roomCorrDb5: Float,
+        roomCorrDb6: Float,
+        roomCorrDb7: Float,
+        roomCorrDb8: Float,
+        roomCorrDb9: Float,
+        rampHops: Int,
     )
 
     /** Bypass total de la cadena (equivale a FusedControls::setNeutral()). */
@@ -573,6 +669,36 @@ object FusedControlsBridge {
     private fun appContextOrNull(): Context? =
         runCatching { IVANNAApplication.instance.applicationContext }.getOrNull()
 
+    /**
+     * Corrección de sala EFECTIVA para el push fusionado (S3/510).
+     *
+     * El espejo fused_room_corr_db_* NO es dueño de la medida: la
+     * corrección MEDIDA vive en ParameterStore (KEY_ROOM_GAINS) y solo
+     * llega al nativo por IvannaNativeLib.nativeSetRoomCorrection
+     * (RoomMeasureLauncher tras medir; PersistedStateRestorer al
+     * arrancar). Ningún escritor pone la medida en el espejo, así que
+     * el espejo es casi siempre todo ceros. Empujar el espejo tal cual
+     * borraría la corrección medida en el primer push fusionado
+     * (aplicar perfil, mover un slider). Regla de fusión en el borde:
+     * si el espejo trae algún valor distinto de cero, manda el espejo;
+     * si es todo ceros, manda la medida guardada si está habilitada;
+     * si no, ceros. Sin contexto (tests unitarios) no hay medida que
+     * leer: manda el espejo. El arreglo correcto a futuro es
+     * sincronizar la medida al espejo al medir (ParameterStore /
+     * RoomMeasureLauncher); hasta entonces, esta fusión es la guarda.
+     */
+    private fun effectiveRoomCorrDb(c: FusedControls): List<Float> {
+        val mirror = c.listenerRoom.roomCorrDb
+        if (mirror.any { it != 0.0f }) return mirror
+        val ctx = appContextOrNull() ?: return mirror
+        return runCatching {
+            val store = ParameterStore(ctx)
+            if (!store.isRoomCorrectionEnabled()) return@runCatching mirror
+            val gains = store.getRoomCorrectionGains() ?: return@runCatching mirror
+            gains.map { clampf(it, -12.0f, 0.0f) }
+        }.getOrDefault(mirror)
+    }
+
     /** Empuja [controls] (previamente clampados) al nativo. No-op si la lib no cargó. */
     fun safeSetFusedControls(controls: FusedControls) {
         if (!isLoaded) {
@@ -583,6 +709,8 @@ object FusedControlsBridge {
         // Unificación 2.5.509 (paso 4): el tope EqStack se aplica en el
         // borde JNI (Ruta A). Sin contexto (tests) no hay cap.
         val c = c0.copy(tonal = EqStack.cap(c0.tonal, EqStack.inputs(appContextOrNull())))
+        // S3/510: corrección de sala efectiva (ver effectiveRoomCorrDb).
+        val roomCorr = effectiveRoomCorrDb(c)
         try {
             nativeSetFusedControls(
                 spatialAmount = c.spatial.amount,
@@ -637,6 +765,19 @@ object FusedControlsBridge {
                 // 5. OmniField/diffuse (unificación 2.5.509, paso 5).
                 fieldOmniAmount = c.field.omniAmount,
                 fieldDiffuse = c.field.diffuse,
+                // S3/510: presencia + corrección de sala (con la fusión
+                // en el borde: no borrar la medida guardada).
+                tonalPresenceDb = c.tonal.presenceDb,
+                roomCorrDb0 = roomCorr[0],
+                roomCorrDb1 = roomCorr[1],
+                roomCorrDb2 = roomCorr[2],
+                roomCorrDb3 = roomCorr[3],
+                roomCorrDb4 = roomCorr[4],
+                roomCorrDb5 = roomCorr[5],
+                roomCorrDb6 = roomCorr[6],
+                roomCorrDb7 = roomCorr[7],
+                roomCorrDb8 = roomCorr[8],
+                roomCorrDb9 = roomCorr[9],
             )
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to call nativeSetFusedControls", t)
@@ -676,7 +817,9 @@ object FusedControlsBridge {
      *  - spatial.azimuthDeg (no hay campo de azimut en el snapshot).
      *  - field.pumping, field.coherence (sin campo HOLOS en el snapshot).
      *  - listenerRoom.roomSizeM, hearingProfile (sin campo en el snapshot).
-     *  - listenerRoom.roomCorrDb[10] (sin slot en la firma JNI).
+     *  - listenerRoom.roomCorrDb[10] (sin equivalente en
+     *    SET_PERCEPTUAL_STATE: a Ruta A va por la firma JNI fusionada
+     *    (S3/510) y a Ruta B por SET_ROOM_CORRECTION, no por aquí).
      *  - transducer.emfEnabled (sin campo Back-EMF en el snapshot).
      *  - transducer.correction: solo on/off via volterraEnabled (el monto
      *    0..1 no viaja; no hay campo de corrección en el snapshot).

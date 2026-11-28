@@ -64,7 +64,10 @@ object RealAcousticSensor {
     const val SAMPLE_RATE = 48_000
     private const val READ_CHUNK = 2048
 
-    /** [0..23] mag, [24..47] err, [48..71] coh, [72] level, [73] valid. */
+    /** [0..23] mag, [24..47] err, [48..71] coh, [72] level, [73] valid,
+     *  [74] referenceFresh (1/0), [75] referenceLevelDb (dBFS, media del
+     *  mic en 250 Hz–2 kHz — NO es el nivel de la señal de referencia;
+     *  S1/510: la coherencia solo es dato de sala si [74] es 1). */
 
     @Volatile
     var isRunning: Boolean = false
@@ -89,8 +92,9 @@ object RealAcousticSensor {
     private var micPort: MicRouteAnchor.MicDevicePort? = null
 
     /** Listener de frames nuevos (gancho para el Hiper-Operador Φ).
-     *  El array es FloatArray[74]: [0..23] mag, [24..47] err, [48..71]
-     *  coh, [72] level, [73] valid (1/0). */
+     *  El array es FloatArray[76]: [0..23] mag, [24..47] err, [48..71]
+     *  coh, [72] level, [73] valid (1/0), [74] referenceFresh (1/0),
+     *  [75] referenceLevelDb (dBFS). */
     @Volatile
     var onFrame: ((FloatArray) -> Unit)? = null
 
@@ -159,6 +163,12 @@ object RealAcousticSensor {
         audioSourceUsed = source
         stopRequested = false
         this.recorder = rcd
+        // C23/510: el contador de re-anclas es monótono en el proceso.
+        // Un reinicio del sensor (ciclo de vida, barrido Genezi o
+        // watchdog) NO lo pone a 0: si no, el indicador del organismo
+        // bajaría tras cada reinicio y un re-ancla del watchdog se
+        // perdería. Solo se resetea al morir el proceso (es memoria).
+        val prevReanchors = _micRouteStatus.value.reanchorCount
         // Mic con DAC (v2.5.506): anclar el mic interno ANTES de grabar.
         // Si no hay AudioManager o el ancla falla, se registra y se sigue:
         // la captura no depende del ancla.
@@ -177,17 +187,20 @@ object RealAcousticSensor {
                         routedTypeName = MicRouteAnchor.deviceTypeName(
                             routed?.type ?: android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC
                         ),
+                        reanchorCount = prevReanchors,
                         lastCheckMs = System.currentTimeMillis()
                     )
                 }
                 is MicRouteAnchor.AnchorOutcome.AnchorFailed ->
                     _micRouteStatus.value = MicRouteAnchor.RouteStatus(
-                        anchored = false, lastCheckMs = System.currentTimeMillis(),
+                        anchored = false, reanchorCount = prevReanchors,
+                        lastCheckMs = System.currentTimeMillis(),
                         lastError = outcome.reason
                     )
                 MicRouteAnchor.AnchorOutcome.NoBuiltinMic ->
                     _micRouteStatus.value = MicRouteAnchor.RouteStatus(
-                        anchored = false, lastCheckMs = System.currentTimeMillis(),
+                        anchored = false, reanchorCount = prevReanchors,
+                        lastCheckMs = System.currentTimeMillis(),
                         lastError = "sin mic interno"
                     )
             }
@@ -252,7 +265,7 @@ object RealAcousticSensor {
                             val frame = IvannaNativeLib.guardedNative(FloatArray(0)) {
                                 IvannaNativeLib.nativeSensorLatestFrame()
                             }
-                            if (frame.size == 74) listener(frame)
+                            if (frame.size == 76) listener(frame)
                         }
                     }
                 }
@@ -283,6 +296,47 @@ object RealAcousticSensor {
         captureThread?.join(1000)
     }
 
+    /**
+     * C23/510 — reinicio del anclaje del mic tras un stall del sensor
+     * (lo llama el watchdog de SensorSnapshotConsumer vía
+     * OrganismController; el barrido Genezi y el ciclo de vida NO usan
+     * esta vía).
+     *
+     * Por qué reiniciar y no solo re-anclar la ruta: el hilo de captura
+     * YA verifica la ruta ~1 s y re-ancla solo ante deriva, así que un
+     * frameIndex() parado con música sonando no es deriva de ruta: es
+     * el hilo de captura muerto (error de AudioRecord) o el sensor
+     * nativo atascado. La única recuperación es recrear la cadena:
+     * stop() + start() recrea el AudioRecord, re-ejecuta
+     * MicRouteAnchor.anchor() y re-inicializa el nativo (prepare()
+     * conserva el target elegido — ver RealAcousticSensor.hpp —, no se
+     * pierde la curva). El SessionAggregator/sessionId del organismo NO
+     * se toca: la sesión sigue, solo ve un hueco de frames.
+     *
+     * Devuelve true solo si la captura volvió a arrancar. Si el hilo
+     * no muere en 1 s (stop hace join(1000)), devuelve false y el
+     * próximo stall lo reintenta (un intento cada 10 s como mucho).
+     * El reinicio con éxito cuenta como UN re-ancla en micReanchors
+     * (el ancla se re-ejecutó en start(); el contador se conserva
+     * entre reinicios, ver start()).
+     */
+    fun restartMic(context: Context): Boolean {
+        if (isRunning) {
+            stop()
+            if (isRunning) {
+                Log.w(TAG, "C23 restartMic: el hilo de captura no murió en 1 s; no se reinicia")
+                return false
+            }
+        }
+        val ok = start(context)
+        if (ok && _micRouteStatus.value.anchored) {
+            _micRouteStatus.value = _micRouteStatus.value.copy(
+                reanchorCount = _micRouteStatus.value.reanchorCount + 1
+            )
+        }
+        return ok
+    }
+
     /** Objetivo por banda (forma deseada, dB, plano = 0). FloatArray[24]. */
     fun setTarget(targetDb: FloatArray): Boolean {
         if (targetDb.size != 24) return false
@@ -311,7 +365,8 @@ object RealAcousticSensor {
     }
 
     /** Último frame: [0..23] mag, [24..47] err, [48..71] coh, [72] level,
-     *  [73] valid (1/0). Vacío si el nativo no está cargado. */
+     *  [73] valid (1/0), [74] referenceFresh (1/0),
+     *  [75] referenceLevelDb (dBFS). Vacío si el nativo no está cargado. */
     fun latestFrame(): FloatArray = IvannaNativeLib.guardedNative(FloatArray(0)) {
         IvannaNativeLib.nativeSensorLatestFrame()
     }

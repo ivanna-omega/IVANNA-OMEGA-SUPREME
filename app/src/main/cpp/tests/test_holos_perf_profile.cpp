@@ -36,6 +36,12 @@
 
 #include "../spatial/HolosOperator.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace ivanna;
 
 namespace {
@@ -120,7 +126,7 @@ TEST(HolosPerfProfile, CostByComponent) {
     // para dar ILD sin romper la coherencia). Con ruido independiente
     // por canal la puerta de coherencia cierra HOLOS y el perfil mide
     // passthrough (~0 µs), falseando la comparación.
-    const std::vector<float> base = makeInput(totalFrames, 12345);
+    const std::vector<float> base = makeInput(totalFrames, ivanna::test::IvannaTestSeed32(1));
     std::vector<float> inL = base;
     std::vector<float> inR(totalFrames);
     for (int i = 0; i < totalFrames; ++i) inR[i] = 0.9f * base[i];

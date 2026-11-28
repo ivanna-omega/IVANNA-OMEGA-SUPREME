@@ -244,6 +244,10 @@ void IvannaFusionEngine::syncFusedControlsFromAtomics() noexcept {
     c.tonal.lowDb = g_holos_eq_low.load(std::memory_order_relaxed);
     c.tonal.midDb = g_holos_eq_mid.load(std::memory_order_relaxed);
     c.tonal.highDb = g_holos_eq_high.load(std::memory_order_relaxed);
+    // S3/510: presencia 4-8 kHz — sin esta línea la Ruta B fusionada
+    // perdía presenceDb (el atomic g_holos_eq_presence solo lo leía el
+    // HolosOperator legacy). Mismo patrón que low/mid/high.
+    c.tonal.presenceDb = g_holos_eq_presence.load(std::memory_order_relaxed);
     // PARCHE v2.6 (punto 10): sincronizar los flags vivos que antes no
     // llegaban a la cadena fusionada. Cada uno es una puerta de una sola
     // vía: si el flag está en "off", el campo fusionado se apaga; si está

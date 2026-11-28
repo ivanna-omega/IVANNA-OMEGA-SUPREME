@@ -24,6 +24,12 @@
 #include "fused/perceptual_mpc/twin_bridge.hpp"
 #include "fused/acoustic_twin/acoustic_twin.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 namespace {
 
 using namespace ivanna::perceptual_mpc;
@@ -73,7 +79,7 @@ TEST(MpcShadow, BitExactPassthrough) {
   MpcController mpc;
   constexpr std::size_t kFrames = 4096;
   std::vector<float> in(kFrames), out(kFrames, 12345.0f);
-  std::uint64_t s = 0x123456789ABCDEF0ULL;
+  std::uint64_t s = ivanna::test::IvannaTestSeedFor(1);
   for (std::size_t i = 0; i < kFrames; ++i) {
     const std::uint64_t r = splitmixNext(s);
     // Valores variados: ruido determinista en [-1, 1].
@@ -406,7 +412,7 @@ TEST(MpcTelemetry, ShadowStillBitExact) {
   MpcController mpc;
   constexpr std::size_t kFrames = 512;
   std::vector<float> in(kFrames), out(kFrames);
-  std::uint64_t s = 0x123456789ABCDEF0ULL;
+  std::uint64_t s = ivanna::test::IvannaTestSeedFor(1);
   for (std::size_t i = 0; i < kFrames; ++i) {
     in[i] = static_cast<float>((static_cast<double>(splitmixNext(s) >> 11) /
                                 9007199254740992.0) * 2.0 - 1.0);

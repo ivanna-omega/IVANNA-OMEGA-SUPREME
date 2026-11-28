@@ -1,0 +1,131 @@
+name: Tests en cuarentena (carril semanal)
+
+# C11/510 — carril semanal de los tests flaky de wall-clock en cuarentena
+# (etiqueta CTest QUARANTINED, ver app/src/main/cpp/tests/CMakeLists.txt).
+# Mismo patrón que el carril TSan (tests-host.yml, job ctest-tsan): lunes
+# 04:23 UTC, 90 min, sin bloquear pushes ni PRs. Una noche roja mantiene el
+# test en cuarentena con el log publicado (C5); N noches verdes seguidas lo
+# devuelven a la puerta por push (se proponen 4, a confirmar por Esse —
+# propuesta, no dato medido; la salida se ejecuta quitando la etiqueta
+# LABELS en CMakeLists.txt, no hay promoción automática por estado).
+#
+# CUARENTENA INICIAL (verificada contra el código vivo, 2026-11-28):
+#   - test_perf_auditor (LABELS QUARANTINED): WithinBudgetCompliance mide
+#     1 s de CPU de pared (cpu_pct_p99 ≤ 12 %) bajo ctest -j4; tests-host.yml
+#     documenta que «pasa en solitario» y falla por carga del runner.
+#   - AcousticHarness.CpuPerHopWithinBudget (SIN etiqueta: etiquetar el
+#     binario sacaría de la puerta 4 tests deterministas; su cuarentena es
+#     el split métrica-vs-puerta del .cpp): en hosted es MÉTRICA REGISTRADA
+#     (se publica, no falla) y PUERTA DURA solo en self-hosted
+#     (IVANNA_CPU_GATE_HARD=1), donde la carga es conocida.
+# NO se usa `|| true` en ningún paso: una noche roja debe verse roja.
+#
+# La exclusión -LE QUARANTINED de la puerta por push vive en
+# scripts/run_ctest.sh (línea pendiente, la aplica el coordinador tras
+# commitear C5 — NO aquí). Hasta que esa línea aterrice, la puerta por
+# push sigue corriendo test_perf_auditor como antes (la etiqueta por sí
+# sola no cambia lo que corre sin filtro).
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'   # lunes 04:23 UTC — mismo patrón/hora que el carril TSan
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-quarantined-weekly
+  cancel-in-progress: true
+
+jobs:
+  # ── CARRIL SEMANAL (hosted): solo tests en cuarentena ─────────────────────
+  ctest-quarantined:
+    name: Cuarentena (hosted, semanal)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # FIX v2.5.411 — mismo motivo que el job ctest en tests-host.yml:
+    # clang-18 no compila el <format> de libstdc++-15 del runner.
+    env:
+      CC: gcc-14
+      CXX: g++-14
+      CMAKE_BUILD_PARALLEL_LEVEL: '4'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Instalar g++-14 (compilador CTest; ver fix v2.5.411 en tests-host.yml)
+        run: |
+          if ! command -v g++-14 >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq g++-14
+          fi
+          g++-14 --version | head -1
+
+      - name: Instalar cmake
+        run: |
+          cmake --version || { sudo apt-get update -qq && sudo apt-get install -y -qq cmake; }
+          cmake --version | head -1
+
+      # Build completo SIN correr la suite: este carril solo corre los
+      # tests en cuarentena (no se invoca scripts/run_ctest.sh, que corre
+      # la puerta entera). Mismas flags que run_ctest.sh en plano.
+      - name: Configurar y compilar (Release, sin sanitizador)
+        run: |
+          cmake -S app/src/main/cpp/tests -B build/tests-host -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DIVANNA_TEST_ENABLE_ASAN=OFF -DIVANNA_TEST_ENABLE_TSAN=OFF
+          cmake --build build/tests-host -j"${CMAKE_BUILD_PARALLEL_LEVEL:-2}"
+
+      - name: Carril semanal — solo tests en cuarentena
+        run: ctest --test-dir build/tests-host -L QUARANTINED --output-on-failure
+
+      # La puerta CPU del harness en hosted es solo registro: corre por
+      # nombre para dejar la muestra semanal de la métrica en el log.
+      - name: "Métrica CPU por hop del harness (hosted: solo registro, no falla)"
+        run: ctest --test-dir build/tests-host -R 'AcousticHarness.CpuPerHopWithinBudget' --output-on-failure
+
+      - name: Resumen
+        if: always()
+        run: echo "Carril semanal de cuarentena ejecutado. Una noche roja = el test sigue en cuarentena (no bloquea pushes); 4 noches verdes seguidas (N=4, propuesta a confirmar) = candidato a salir de cuarentena quitando su etiqueta LABELS."
+
+  # ── CARRIL SEMANAL (self-hosted): cuarentena + puerta CPU dura ────────────
+  # Aquí la carga es conocida (runner ivanna-vm) y la CPU por hop del
+  # harness SÍ es puerta dura (IVANNA_CPU_GATE_HARD=1). Un fallo aquí es
+  # señal real de regresión de rendimiento o de carga del runner.
+  ctest-quarantined-selfhosted:
+    name: Cuarentena + puerta CPU dura (self-hosted ivanna-vm, semanal)
+    runs-on: [self-hosted, ivanna-vm]
+    timeout-minutes: 90
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      CMAKE: /home/runner/cmake-3.30.3-linux-x86_64/bin/cmake
+    steps:
+      # Sin actions/checkout: mismo motivo que tests-selfhosted.yml (el
+      # runner falla en el checkout por el scrub de hatch-git). El repo es
+      # público: clon anónimo + checkout del SHA que disparó el run.
+      - name: Clone anónimo del repo público
+        run: |
+          if [ -d .git ]; then
+            git fetch --quiet origin
+          else
+            git clone --quiet https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME.git .
+          fi
+          git checkout --quiet ${{ github.sha }}
+
+      - name: Configurar (Release)
+        run: $CMAKE -B build-tests-quarantined -S app/src/main/cpp/tests -DCMAKE_BUILD_TYPE=Release
+
+      # Dir de build propio (build-tests-quarantined) para no colisionar
+      # con el build-tests de tests-selfhosted.yml en el mismo workspace.
+      - name: Compilar
+        run: $CMAKE --build build-tests-quarantined -j2
+
+      - name: Carril semanal en cuarentena (self-hosted, carga conocida)
+        run: ctest --test-dir build-tests-quarantined -L QUARANTINED --output-on-failure
+
+      - name: Puerta CPU dura del harness (self-hosted, IVANNA_CPU_GATE_HARD=1)
+        run: IVANNA_CPU_GATE_HARD=1 ctest --test-dir build-tests-quarantined -R 'AcousticHarness.CpuPerHopWithinBudget' --output-on-failure
+
+      - name: Resumen
+        if: always()
+        run: echo "Carril semanal self-hosted ejecutado. Aquí la CPU por hop SÍ es puerta dura (carga conocida); un fallo aquí es señal real de regresión de rendimiento o de carga del runner."

@@ -22,6 +22,12 @@
 #include "../spatial/OrbeBinaural.hpp"
 #include "ivanna_measure.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace ivanna;
 using namespace ivanna::measure;
 
@@ -262,7 +268,7 @@ TEST(HolosChain, ThroughputRt) {
     // Señal COHERENTE (mono en ambos canales): con ruido incorrelado
     // el fail-closed apaga el operador y el throughput mediría el
     // passthrough (ese error dio 318908× RT en la primera versión).
-    auto nz = noiseBp(0.3, 20.0, 51);
+    auto nz = noiseBp(0.3, 20.0, ivanna::test::IvannaTestSeed32(1));
     std::vector<float> l = nz, r = nz;
     // Calentamiento (el primer segundo incluye warm-up de colas).
     std::vector<float> w1(l.begin(), l.begin() + 480000), w2(r.begin(), r.begin() + 480000);
@@ -332,7 +338,7 @@ TEST(HolosChain, GreenMatchesOrbe) {
     // cubre 0.8–1.5 con las dos patas (argmax + envolvente).
     // NO relajar la tolerancia: el test está cazando un defecto real.
     auto mkInput = []() {
-        auto base = noiseBp(0.4, 3.0, 61);
+        auto base = noiseBp(0.4, 3.0, ivanna::test::IvannaTestSeed32(2));
         std::vector<float> l(144000), r(144000);
         const int delay = 14;  // 0.29 ms @48 kHz, L antes que R
         for (int i = 0; i < 144000; ++i) {
@@ -382,7 +388,7 @@ TEST(HolosChain, GreenMatchesOrbeSpreadSweep) {
     // lineal). Sin el fix del render, la fila 1.3 daba HOLOS −333 µs
     // contra ORBE +312 µs (dif 645 µs) y la ILD de HOLOS caía a −0.0 dB.
     auto mkInput = []() {
-        auto base = noiseBp(0.4, 3.0, 61);
+        auto base = noiseBp(0.4, 3.0, ivanna::test::IvannaTestSeed32(2));
         std::vector<float> l(144000), r(144000);
         const int delay = 14;  // 0.29 ms @48 kHz, L antes que R
         for (int i = 0; i < 144000; ++i) {
@@ -462,7 +468,7 @@ TEST(OmniField, SeparationPreservesMix) {
     StemSeparator sep;
     sep.prepare(48000.0f);
     // Σ stems = mid por construcción, con ruido de banda ancha.
-    auto in = noiseBp(0.4, 1.0, 7);
+    auto in = noiseBp(0.4, 1.0, ivanna::test::IvannaTestSeed32(3));
     std::vector<float> s0(in.size()), s1(in.size()), s2(in.size()), s3(in.size());
     for (int off = 0; off < (int)in.size(); off += 128) {
         const int m = std::min(128, (int)in.size() - off);
@@ -1001,7 +1007,7 @@ TEST(OmniField, ThroughputRt) {
     omni.setParams(p);
     // Señal COHERENTE (mono en ambos canales) para que la escena sea
     // direccional y la convergencia esté activa durante la medición.
-    auto nz = noiseBp(0.3, 10.0, 51);
+    auto nz = noiseBp(0.3, 10.0, ivanna::test::IvannaTestSeed32(1));
     std::vector<float> l = nz, r = nz;
     std::vector<float> w1(l.begin(), l.begin() + 96000), w2(r.begin(), r.begin() + 96000);
     runOmni(omni, w1, w2);  // calentamiento 2 s

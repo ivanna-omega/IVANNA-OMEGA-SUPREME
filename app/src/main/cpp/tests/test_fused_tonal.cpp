@@ -37,6 +37,15 @@ double rmsOf(const std::vector<double>& x) {
     return std::sqrt(p / static_cast<double>(x.size()));
 }
 
+// RMS sobre una ventana [from, to): evita el transitorio de arranque
+// (el RoomCorrectionEq desliza las ganancias a 0.25 dB por trozo de 128
+// y los biquads se asientan) midiendo solo el régimen estable.
+double rmsWindow(const std::vector<double>& x, int from, int to) {
+    double p = 0.0;
+    for (int i = from; i < to; ++i) p += x[i] * x[i];
+    return std::sqrt(p / static_cast<double>(to - from));
+}
+
 bool allFiniteBounded(const std::vector<double>& x, double bound) {
     for (double v : x) {
         if (!std::isfinite(v) || std::fabs(v) > bound) return false;
@@ -47,6 +56,15 @@ bool allFiniteBounded(const std::vector<double>& x, double bound) {
 std::vector<double> tone1k(double amp = 0.707) {
     std::vector<double> x(kFrames);
     fillToneDouble(x.data(), x.size(), kSr, 1000.0, amp);
+    return x;
+}
+
+// Tono a frecuencia arbitraria (S3/510: barrido por banda). Amplitud
+// 0.2: con +8 dB de EQ el pico (~0.5) queda lejos del techo de
+// seguridad del RoomCorrectionEq (0.98), que si no recortaría la medida.
+std::vector<double> toneAt(double freqHz, double amp = 0.2) {
+    std::vector<double> x(kFrames);
+    fillToneDouble(x.data(), x.size(), kSr, freqHz, amp);
     return x;
 }
 
@@ -68,6 +86,17 @@ void prepareNeutral(FusedTonal& t) {
     t.prepare(kSr);
     t.setControls(fc.tonal);
     EXPECT_TRUE(t.isNeutral());
+}
+
+// Controles de solo-EQ (S3/510): sin EvoEQ (curve 0) ni psicoacústica,
+// trim 0 — la cadena es solo el RoomCorrectionEq de 10 bandas, así que
+// la ganancia medida es la del mapeo low/mid/high/presence.
+TonalControls eqOnlyControls() {
+    TonalControls c;
+    c.curve = 0;
+    c.trimDb = 0.0f;
+    c.loudnessComp = false;
+    return c;
 }
 
 }  // namespace
@@ -314,4 +343,118 @@ TEST(FusedTonal, Hal192FrameChunksMatchOneShot) {
     }
     EXPECT_LT(maxDiff, 1e-12) << "la salida en trozos de 192 diverge de "
                                   "la referencia: ceros en el estado DSP";
+}
+
+// 10. S3/510 — presenceDb se clampa a ±12 dB y solo ella saca del neutro.
+TEST(FusedTonal, PresenceDbClamps) {
+    TonalControls c;
+    c.presenceDb = 99.0f;
+    FusedTonal t;
+    t.prepare(kSr);
+    t.setControls(c);
+    EXPECT_FLOAT_EQ(t.controls().presenceDb, 12.0f);
+    c.presenceDb = -99.0f;
+    t.setControls(c);
+    EXPECT_FLOAT_EQ(t.controls().presenceDb, -12.0f);
+    // Solo presencia saca del neutro; con 0 vuelve a neutro.
+    c.curve = 0;
+    c.presenceDb = 2.0f;
+    t.setControls(c);
+    EXPECT_FALSE(t.isNeutral());
+    c.presenceDb = 0.0f;
+    t.setControls(c);
+    EXPECT_TRUE(t.isNeutral());
+}
+
+// 11. S3/510 — presenceDb = 0 es bit-exacto: con highDb activo en las
+// bandas 7-9, la salida es bit-idéntica se deje el campo en su default
+// (+0.0f), se fije explícito a +0.0f o a -0.0f (la guarda != 0.0f de
+// applyControls). Si el reparto fuera sustitutivo en vez de aditivo,
+// este test seguiría pasando — lo que lo caza es el barrido del test 12
+// (la banda 9 debe seguir sonando con highDb) más la comparación
+// antes/después de la suite completa.
+TEST(FusedTonal, PresenceDbZeroIsBitExact) {
+    auto run = [](float presenceDb) {
+        TonalControls c = eqOnlyControls();
+        c.lowDb = 1.0f;
+        c.midDb = 2.0f;
+        c.highDb = 3.0f;
+        c.presenceDb = presenceDb;
+        FusedTonal t;
+        t.prepare(kSr);
+        t.setControls(c);
+        auto l = whiteNoise(0.5), r = whiteNoise(0.5);
+        t.process(l.data(), r.data(), kFrames);
+        return std::make_pair(l, r);
+    };
+    const auto base = run(0.0f);    // default (+0.0f)
+    const auto plus = run(0.0f);    // explícito +0.0f
+    const auto minus = run(-0.0f);  // explícito -0.0f
+    const NullResult n1 = nullTest(base.first.data(), plus.first.data(), kFrames);
+    const NullResult n2 = nullTest(base.second.data(), plus.second.data(), kFrames);
+    const NullResult n3 = nullTest(base.first.data(), minus.first.data(), kFrames);
+    const NullResult n4 = nullTest(base.second.data(), minus.second.data(), kFrames);
+    ASSERT_TRUE(n1.valid && n2.valid && n3.valid && n4.valid);
+    EXPECT_TRUE(n1.bitExact) << "residualDb L (+0) = " << n1.residualDb;
+    EXPECT_TRUE(n2.bitExact) << "residualDb R (+0) = " << n2.residualDb;
+    EXPECT_TRUE(n3.bitExact) << "residualDb L (-0) = " << n3.residualDb;
+    EXPECT_TRUE(n4.bitExact) << "residualDb R (-0) = " << n4.residualDb;
+}
+
+// 12. S3/510 — barrido por banda: con highDb = +2 fijo, presenceDb
+// 0 -> +6 debe mover la firma espectral según el mapeo documentado
+// (low 0-2 / mid 3-6 / high 6-9 + presence aditivo en 7-8). La
+// referencia es la respuesta teórica de la cascada (cascadeMagDb,
+// misma fórmula RBJ que AutoEqFilter): medida y teoría coinciden a
+// <0.01 dB en las 4 frecuencias. En banda (4/8 kHz) el delta es
+// ~+7.0 dB (6.0 de la banda + ~1.0 de la falda de la vecina, que
+// también sube); fuera de banda es pequeño (1 kHz +0.28 dB por la
+// falda de 4 kHz; 16 kHz +0.55 dB por la falda de 8 kHz).
+TEST(FusedTonal, PresenceDbMovesPresenceBands) {
+    // Ganancia medida en régimen estable [12000, 48000): 0.75 s con
+    // ciclos exactos a las 4 frecuencias (750/3000/6000/12000).
+    auto gainDbAt = [](double freqHz, float presenceDb) {
+        TonalControls c = eqOnlyControls();
+        c.highDb = 2.0f;
+        c.presenceDb = presenceDb;
+        FusedTonal t;
+        t.prepare(kSr);
+        t.setControls(c);
+        auto in = toneAt(freqHz);
+        auto l = in, r = in;
+        t.process(l.data(), r.data(), kFrames);
+        const double rmsIn = rmsWindow(in, 12000, kFrames);
+        const double rmsOut = rmsWindow(l, 12000, kFrames);
+        return 20.0 * std::log10(rmsOut / rmsIn);
+    };
+    // Ganancias teóricas de 10 bandas para los dos casos (el mapeo
+    // documentado, no el del código: si el código repartiera distinto,
+    // medida y teoría divergirían).
+    float g0[ivanna::room::kBands] = {};
+    float g1[ivanna::room::kBands] = {};
+    for (int b = 0; b < ivanna::room::kBands; ++b) {
+        g0[b] = (b >= 6) ? 2.0f : 0.0f;  // highDb +2 en 6-9
+        g1[b] = g0[b] + ((b == 7 || b == 8) ? 6.0f : 0.0f);
+    }
+    for (double freqHz : {1000.0, 4000.0, 8000.0, 16000.0}) {
+        const float f = static_cast<float>(freqHz);
+        const double pred =
+            static_cast<double>(ivanna::room::cascadeMagDb(g1, f, 48000.0f) -
+                                ivanna::room::cascadeMagDb(g0, f, 48000.0f));
+        const double meas = gainDbAt(freqHz, 6.0f) - gainDbAt(freqHz, 0.0f);
+        std::cout << "[PresenceDbMovesPresenceBands] f=" << freqHz
+                  << " pred=" << pred << " dB meas=" << meas << " dB\n";
+        EXPECT_NEAR(meas, pred, 0.25)
+            << "el mapeo de presenceDb no es el documentado a " << freqHz << " Hz";
+    }
+    // En banda mueve de verdad; fuera de banda, casi nada.
+    const double d4k = gainDbAt(4000.0, 6.0f) - gainDbAt(4000.0, 0.0f);
+    const double d8k = gainDbAt(8000.0, 6.0f) - gainDbAt(8000.0, 0.0f);
+    const double d1k = gainDbAt(1000.0, 6.0f) - gainDbAt(1000.0, 0.0f);
+    const double d16k = gainDbAt(16000.0, 6.0f) - gainDbAt(16000.0, 0.0f);
+    EXPECT_GT(d4k, 5.0) << "presenceDb no mueve 4 kHz";
+    EXPECT_GT(d8k, 5.0) << "presenceDb no mueve 8 kHz";
+    EXPECT_LT(std::fabs(d1k), 1.0) << "presenceDb no debe tocar 1 kHz";
+    EXPECT_LT(std::fabs(d16k), 1.0)
+        << "presenceDb no debe mover 16 kHz como en banda";
 }

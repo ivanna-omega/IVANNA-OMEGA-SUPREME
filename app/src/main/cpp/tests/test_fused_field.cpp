@@ -15,6 +15,12 @@
 #include "../fused/fused_field.hpp"
 #include "../fused/fused_measure.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace ivanna::fused;
 using namespace ivanna::fused::measure;
 
@@ -145,7 +151,7 @@ TEST(FusedField, NoNaNOrInf) {
     // sobre una entrada de pico 0.9 → 1.8, más margen de cresta).
     {
         field.reset();
-        std::mt19937 rng(12345u);
+        std::mt19937 rng(ivanna::test::IvannaTestSeed32(1));
         std::uniform_real_distribution<double> dist(-0.9, 0.9);
         std::vector<double> l(kFrames), r(kFrames);
         for (int i = 0; i < kFrames; ++i) {

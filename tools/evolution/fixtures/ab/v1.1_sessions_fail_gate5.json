@@ -1,0 +1,230 @@
+{
+  "format": "ivanna-muselink-ab-fixture",
+  "version": 1,
+  "synthetic": true,
+  "seed": 1795857152818,
+  "profile_version": "v1.1",
+  "provenance": "SINTETICO. Candidato construido a partir de la tabla base: error por banda reducido ~25% (efecto del EQ v1.1 aplicado) y ERB-3 cortada de +9.86 a ~+4.9 dB; resto de bandas escaladas para el RMS objetivo. NO son sesiones medidas: la exportacion ERB real esta pendiente del servidor. Caso negativo puerta 5 (S8a): RMS global ~7.92 dB pero ERB-21..24 (aire) a -19 dB: la region aire empeora ~+3.1 dB RMS frente a la base (limite +1 dB).",
+  "expected_verdict": "ROLLED_BACK",
+  "expected_failing_doors": [
+    5
+  ],
+  "sessions": [
+    {
+      "session_id": "v1.1-g5-s1",
+      "profile_version": "v1.1",
+      "spectral_error_rms_db": 7.85,
+      "error_mean_db": [
+        0.33,
+        0.22,
+        4.93,
+        0.22,
+        0.22,
+        0.22,
+        -0.44,
+        -0.44,
+        -0.44,
+        -0.77,
+        -0.77,
+        -0.77,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -1.0,
+        -19.0,
+        -19.0,
+        -19.0,
+        -19.0
+      ],
+      "mean_coherence": 0.0,
+      "level_max_dbfs": -6.2,
+      "level_mean_dbfs": -18.2,
+      "chunks": [
+        {
+          "level_max_dbfs": -6.2
+        },
+        {
+          "level_max_dbfs": -7.7
+        },
+        {
+          "level_max_dbfs": -8.3
+        },
+        {
+          "level_max_dbfs": -9.0
+        },
+        {
+          "level_max_dbfs": -9.5
+        },
+        {
+          "level_max_dbfs": -10.2
+        },
+        {
+          "level_max_dbfs": -10.8
+        },
+        {
+          "level_max_dbfs": -11.4
+        },
+        {
+          "level_max_dbfs": -12.1
+        },
+        {
+          "level_max_dbfs": -12.7
+        },
+        {
+          "level_max_dbfs": -13.4
+        },
+        {
+          "level_max_dbfs": -14.2
+        }
+      ]
+    },
+    {
+      "session_id": "v1.1-g5-s2",
+      "profile_version": "v1.1",
+      "spectral_error_rms_db": 7.92,
+      "error_mean_db": [
+        0.62,
+        0.41,
+        4.93,
+        0.41,
+        0.41,
+        0.41,
+        -0.83,
+        -0.83,
+        -0.83,
+        -1.45,
+        -1.45,
+        -1.45,
+        -1.86,
+        -1.86,
+        -1.86,
+        -1.86,
+        -1.86,
+        -1.86,
+        -1.86,
+        -1.86,
+        -19.0,
+        -19.0,
+        -19.0,
+        -19.0
+      ],
+      "mean_coherence": 0.0,
+      "level_max_dbfs": -5.8,
+      "level_mean_dbfs": -18.2,
+      "chunks": [
+        {
+          "level_max_dbfs": -5.8
+        },
+        {
+          "level_max_dbfs": -7.3
+        },
+        {
+          "level_max_dbfs": -7.9
+        },
+        {
+          "level_max_dbfs": -8.6
+        },
+        {
+          "level_max_dbfs": -9.1
+        },
+        {
+          "level_max_dbfs": -9.8
+        },
+        {
+          "level_max_dbfs": -10.4
+        },
+        {
+          "level_max_dbfs": -11.0
+        },
+        {
+          "level_max_dbfs": -11.7
+        },
+        {
+          "level_max_dbfs": -12.3
+        },
+        {
+          "level_max_dbfs": -13.0
+        },
+        {
+          "level_max_dbfs": -13.8
+        }
+      ]
+    },
+    {
+      "session_id": "v1.1-g5-s3",
+      "profile_version": "v1.1",
+      "spectral_error_rms_db": 7.98,
+      "error_mean_db": [
+        0.79,
+        0.53,
+        4.93,
+        0.53,
+        0.53,
+        0.53,
+        -1.05,
+        -1.05,
+        -1.05,
+        -1.84,
+        -1.84,
+        -1.84,
+        -2.37,
+        -2.37,
+        -2.37,
+        -2.37,
+        -2.37,
+        -2.37,
+        -2.37,
+        -2.37,
+        -19.0,
+        -19.0,
+        -19.0,
+        -19.0
+      ],
+      "mean_coherence": 0.0,
+      "level_max_dbfs": -6.0,
+      "level_mean_dbfs": -18.2,
+      "chunks": [
+        {
+          "level_max_dbfs": -6.0
+        },
+        {
+          "level_max_dbfs": -7.5
+        },
+        {
+          "level_max_dbfs": -8.1
+        },
+        {
+          "level_max_dbfs": -8.8
+        },
+        {
+          "level_max_dbfs": -9.3
+        },
+        {
+          "level_max_dbfs": -10.0
+        },
+        {
+          "level_max_dbfs": -10.6
+        },
+        {
+          "level_max_dbfs": -11.2
+        },
+        {
+          "level_max_dbfs": -11.9
+        },
+        {
+          "level_max_dbfs": -12.5
+        },
+        {
+          "level_max_dbfs": -13.2
+        },
+        {
+          "level_max_dbfs": -14.0
+        }
+      ]
+    }
+  ]
+}

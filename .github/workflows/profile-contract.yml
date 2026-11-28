@@ -1,0 +1,72 @@
+# profile-contract — S4 (release 510): contrato de los perfiles .ivanna.json.
+# Valida TODOS los .ivanna.json del repo en su modo correspondiente:
+#   * FLAC (por defecto): perfil medido de un archivo de audio.
+#   * --live-session: perfil de sesión en vivo (micrófono ERB, sin FLAC).
+# El modo se decide por contenido: si el fingerprint trae
+# `erb_bands_measured` es sesión en vivo; si no, es FLAC. El job falla
+# si algún perfil no pasa su contrato (o si su JSON no parsea).
+# Corre en el runner self-hosted ivanna-vm porque los runners hospedados
+# por GitHub están bloqueados por facturación en golozotns-art
+# (2026-11-23); ver .github/workflows/tests-selfhosted.yml. El checkout
+# es clon anónimo + checkout del SHA exacto (sin actions/checkout, que
+# falla por el scrub de hatch-git), y el fetch del SHA funciona también
+# para el merge commit de un pull_request.
+# Hoy (2026-11-28) el repo aún no contiene ningún .ivanna.json: los
+# perfiles viven fuera del repo (voodoo_child y el candidato v1.1 en
+# ~/workspace/your_files/). Hasta que un perfil entre al repo, el job
+# pasa en vacío y lo dice explícitamente.
+
+name: Profile contract (.ivanna.json)
+
+on:
+  push:
+    paths:
+      - '**.ivanna.json'
+      - 'scripts/validate_ivanna_profile.py'
+      - '.github/workflows/profile-contract.yml'
+  pull_request:
+    paths:
+      - '**.ivanna.json'
+      - 'scripts/validate_ivanna_profile.py'
+      - '.github/workflows/profile-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile-contract:
+    name: Validate .ivanna.json profiles (FLAC + live-session)
+    runs-on: [self-hosted, ivanna-vm]
+    timeout-minutes: 10
+    steps:
+      # Sin actions/checkout: ver tests-selfhosted.yml. El repo es público:
+      # clon anónimo y checkout del SHA exacto que disparó el run.
+      - name: Clone anónimo del repo público
+        run: |
+          if [ -d .git ]; then
+            git fetch --quiet origin ${{ github.sha }} || git fetch --quiet origin
+          else
+            git clone --quiet https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME.git .
+            git fetch --quiet origin ${{ github.sha }}
+          fi
+          git checkout --quiet ${{ github.sha }}
+      - name: Validate every .ivanna.json in its mode
+        run: |
+          set -uo pipefail
+          mapfile -t files < <(find . -path ./.git -prune -o -name '*.ivanna.json' -print | sort)
+          echo "Perfiles .ivanna.json en el repo: ${#files[@]}"
+          rc=0
+          for f in "${files[@]}"; do
+            if python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(0 if "erb_bands_measured" in d.get("fingerprint", {}) else 1)' "$f" 2>/dev/null; then
+              echo "== $f  (sesión en vivo)"
+              python3 scripts/validate_ivanna_profile.py --live-session "$f" || rc=1
+            else
+              echo "== $f  (FLAC)"
+              python3 scripts/validate_ivanna_profile.py "$f" || rc=1
+            fi
+          done
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "Sin perfiles .ivanna.json en el repo: puerta en vacío (OK)."
+          fi
+          exit $rc

@@ -66,7 +66,10 @@ require("app/src/main/cpp/tests/test_perceptual_optimizer_v2.cpp",
         "BoxConstraintProducesConstrainedOptimum",
         "ExponentialContextRegularizationIsPositiveAndMonotonic",
         "RejectsNonFiniteTargetAndInvalidBounds")
-require("app/src/main/cpp/tests/CMakeLists.txt", "ivanna_add_test(test_perceptual_optimizer_v2)")
+# Sin el paréntesis de cierre: C13 (Fase 4, 510) añadió LABELS a los
+# registros (`ivanna_add_test(test_perceptual_optimizer_v2 LABELS fused)`);
+# el contrato exige que el test esté registrado, no la forma exacta.
+require("app/src/main/cpp/tests/CMakeLists.txt", "ivanna_add_test(test_perceptual_optimizer_v2")
 
 require("app/src/main/cpp/spatial/SafmusEvolutionGate.hpp", "mayApplyEvolutionCandidate",
         "std::isfinite(e.fitness)", "e.headroomValid")

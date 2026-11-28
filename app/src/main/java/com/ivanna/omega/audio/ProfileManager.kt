@@ -232,6 +232,27 @@ class ProfileManager(private val context: Context, private val audioEngine: Audi
             
             profiles = container.audioProfiles.associateBy { it.id }
             metadata = container.metadata
+
+            // T1/510 — el override de filesDir (saveOverride) también
+            // alimenta el mapa. DISCREPANCIA CON LA ESPECIFICACIÓN §3.2
+            // paso 3: la VUELTA asume que tras saveOverride() el manager
+            // ve `muselink-live`, pero este método solo leía res/raw, así
+            // que applyToDsp("muselink-live") devolvía false siempre y la
+            // VUELTA no podía aplicar nada (el read-back lo detectaba y
+            // el diario quedaba PENDING en bucle). El override gana por
+            // id; si no hay override (o no parsea), el mapa queda como
+            // antes (res/raw). Los perfiles que ya estaban inicializados
+            // en otro manager no se ven afectados (el mapa es por
+            // instancia); la vía T1 instala con el puente de MainActivity,
+            // cuyo manager se inicializa en el primer apply, tras el
+            // saveOverride.
+            runCatching { ProfilesLoader.load(context) }.getOrNull()?.forEach { ivanna ->
+                runCatching {
+                    profiles = profiles + (ivanna.id to ivanna.toAudioProfile())
+                }.onFailure {
+                    Log.w(TAG, "override: no se pudo convertir ${ivanna.id}: ${it.message}")
+                }
+            }
             
             Log.i(TAG, "✓ Cargados ${profiles.size} perfiles de audio")
             profiles.forEach { (id, profile) ->
@@ -243,6 +264,124 @@ class ProfileManager(private val context: Context, private val audioEngine: Audi
             false
         }
     }
+
+    /**
+     * T1/510 — IvannaAudioProfile (schema de ProfilesLoader) →
+     * AudioProfile (schema legacy de este manager). Mapeo 1:1 por
+     * bloques, sin valores inventados: cada campo viaja con su mismo
+     * nombre y tipo. La usa [loadProfiles] para fusionar el override de
+     * filesDir (la VUELTA instala `muselink-live` ahí).
+     */
+    private fun IvannaAudioProfile.toAudioProfile(): AudioProfile = AudioProfile(
+        id = id,
+        name = name,
+        description = description,
+        category = category,
+        priority = priority,
+        audioEngine = AudioEngineParams(
+            gain = audioEngine.gain,
+            exciterAmount = audioEngine.exciterAmount,
+            eqGain = audioEngine.eqGain,
+            widthAmount = audioEngine.widthAmount,
+            bypass = audioEngine.bypass,
+            eqLowDb = audioEngine.eqLowDb,
+            eqMidDb = audioEngine.eqMidDb,
+            eqHighDb = audioEngine.eqHighDb,
+            eqPresenceDb = audioEngine.eqPresenceDb
+        ),
+        antiDolby = AntiDolbyParams(
+            speechThreshold = antiDolby.speechThreshold,
+            bassThreshold = antiDolby.bassThreshold,
+            eqBoost2k4k = antiDolby.eqBoost2k4k,
+            exciterLowOnly = antiDolby.exciterLowOnly,
+            widenerMultiplier = antiDolby.widenerMultiplier
+        ),
+        neuromorphic = NeuromorphicParams(
+            harmonicGain = neuromorphic.harmonicGain,
+            lateralInhibition = neuromorphic.lateralInhibition,
+            ohcCompression = neuromorphic.ohcCompression,
+            masterGainDb = neuromorphic.masterGainDb,
+            cochlearBandwidth = neuromorphic.cochlearBandwidth
+        ),
+        route = RouteParams(
+            bassBoostDb = route.bassBoostDb,
+            dialogBoostDb = route.dialogBoostDb,
+            widenerMult = route.widenerMult
+        ),
+        tags = tags,
+        recommendedFor = recommendedFor,
+        spatial = SpatialProfileParams(
+            orbeAmount = spatial.orbeAmount,
+            orbeDistanceM = spatial.orbeDistanceM,
+            orbeSpread = spatial.orbeSpread,
+            orbeProximityDb = spatial.orbeProximityDb,
+            orbeDiffuse = spatial.orbeDiffuse,
+            orbeHeadTracking = spatial.orbeHeadTracking,
+            orbeAzimuthDeg = spatial.orbeAzimuthDeg,
+            orbeWidth = spatial.orbeWidth,
+            orbeHeadRadiusM = spatial.orbeHeadRadiusM
+        ),
+        field = FieldProfileParams(
+            holosAmount = field.holosAmount,
+            holosHarmonics = field.holosHarmonics,
+            holosWarmth = field.holosWarmth,
+            holosDynamics = field.holosDynamics,
+            holosGamma = field.holosGamma,
+            holosCoherence = field.holosCoherence,
+            holosRoomRt60 = field.holosRoomRt60,
+            phiAmount = field.phiAmount,
+            phiPreset = field.phiPreset
+        ),
+        volterra = VolterraProfileParams(
+            correction = volterra.correction,
+            temporalAmount = volterra.temporalAmount,
+            emfEnabled = volterra.emfEnabled
+        ),
+        sala = SalaProfileParams(
+            rt60Sec = sala.rt60Sec,
+            roomSizeM = sala.roomSizeM,
+            roomWet = sala.roomWet,
+            hearingProfile = sala.hearingProfile,
+            roomCorrDb = sala.roomCorrDb
+        ),
+        tonal = TonalProfileParams(
+            curve = tonal.curve,
+            trimDb = tonal.trimDb,
+            lowDb = tonal.lowDb,
+            midDb = tonal.midDb,
+            highDb = tonal.highDb,
+            presenceDb = tonal.presenceDb,
+            loudnessComp = tonal.loudnessComp
+        ),
+        dynamics = DynamicsProfileParams(
+            punch = dynamics.punch,
+            width = dynamics.width,
+            safety = dynamics.safety,
+            compThresholdDb = dynamics.compThresholdDb,
+            compRatio = dynamics.compRatio,
+            exciter = dynamics.exciter,
+            voice = dynamics.voice
+        ),
+        brain = BrainProfileParams(
+            mode = brain.mode,
+            adaptation = brain.adaptation
+        ),
+        output = OutputOverrides(
+            headphones = OutputOverrideParams(
+                masterGainDb = output.headphones.masterGainDb,
+                tonalTrimDb = output.headphones.tonalTrimDb,
+                phiPreset = output.headphones.phiPreset
+            ),
+            genezi = OutputOverrideParams(
+                masterGainDb = output.genezi.masterGainDb,
+                tonalTrimDb = output.genezi.tonalTrimDb,
+                phiPreset = output.genezi.phiPreset
+            )
+        ),
+        referenceTrack = referenceTrack,
+        targetLufsDeltaDb = targetLufsDeltaDb,
+        lufsToleranceDb = lufsToleranceDb
+    )
 
     /**
      * Aplica un perfil al AudioEngine (por ID)

@@ -22,6 +22,17 @@
 # Mientras esos 2 fallos vivan, este job es ROJO: eso es lo correcto —
 # un candado en rojo es la señal honesta, no un workflow roto. No se
 # marca como check requerido hasta que la suite llegue a 0 fallos.
+#
+# C12 (release 510, Fase 4): cada propuesta de tools/evolution/ lleva
+# bloque `repro:` obligatorio (sidecar JSON `repro.json`, ver
+# tools/evolution/check_repro.py para el formato real y la desviación
+# documentada). El job `repro-check` — SEPARADO de la suite, para que
+# los 2 fallos preexistentes de arriba no lo arrastren — falla el PR si
+# una propuesta tocada no trae `repro.json`, si un fixture no existe o
+# su sha256 no coincide, o si el comando no produce lo esperado. Las
+# propuestas anteriores a C12 (0001-0033) están exentas (sin repro
+# retroactivo: rellenarlo sería fabricar evidencia). El ejemplo canónico
+# v1.1 (0034-v1.1-ab-candidate) se verifica en cada corrida.
 name: Consejo versionado — suite de evolución
 
 on:
@@ -85,3 +96,40 @@ jobs:
           name: evolution-tests-log
           path: evolution-tests.log
           if-no-files-found: error
+
+  # C12 — bloque `repro:` obligatorio en cada propuesta (ver cabecera).
+  # Job SEPARADO de la suite: los 2 fallos preexistentes de la suite no
+  # deben arrastrar este candado, que es verde por sí mismo.
+  repro-check:
+    name: repro obligatorio (C12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # fetch-depth 0: el diff --changed necesita la base (PR/push).
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Base del diff: PR -> base de la PR; push -> commit anterior;
+      # manual -> HEAD~1. Sin base no hay diff fiable y el paso falla
+      # con mensaje claro (nunca se verifica "nada" en silencio).
+      - name: Base del diff (PR / push / manual)
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            echo "sha=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=$(git rev-parse HEAD~1)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Solo las propuestas tocadas por el PR llevan repro obligatorio
+      # (las anteriores a C12 están exentas; ver check_repro.py).
+      - name: repro en propuestas tocadas por el PR
+        run: python3 tools/evolution/check_repro.py --changed --base "${{ steps.base.outputs.sha }}"
+
+      # El ejemplo canónico v1.1 se re-verifica en cada corrida (C7+S4,
+      # ambos instantáneos y deterministas con semilla fija).
+      - name: repro del ejemplo canónico v1.1 (siempre)
+        run: python3 tools/evolution/check_repro.py --proposal 0034-v1.1-ab-candidate

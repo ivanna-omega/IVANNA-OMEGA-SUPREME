@@ -2,6 +2,7 @@ package com.ivanna.omega.organism
 
 import android.util.Log
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -39,6 +40,54 @@ class NoOpOrganismLogger : OrganismLogger {
 }
 
 /**
+ * MuselinkHosts — lista cerrada de hosts del organismo (C9, v2.5.510).
+ *
+ * ÚNICA fuente de verdad de a dónde puede ir el Bearer: solo estos dos
+ * hosts. Cualquier otro host, aunque el DNS lo resuelva, se rechaza
+ * ANTES de conectar (OrganismSender.sendOne) y nunca recibe el token.
+ * OrganismDns también la usa para decidir qué resuelve por DNS directo.
+ *
+ * REUTILIZAR, NO DUPLICAR: ProfileFetcher (T1, Fase 2 — aún no existe
+ * cuando se escribe esto) DEBE validar contra MuselinkHosts (isAllowedHost
+ * / isAllowedUrl) en vez de definir su propia lista, y reutilizar
+ * OrganismSender.defaultClient() (followRedirects(false), DNS propio).
+ *
+ * PENDIENTE (C9-e, segunda fase): pinning de certificado (SPKI) para
+ * estos dos hosts. NO cablearlo hasta que Esse decida el procedimiento
+ * de rotación de pins: un pin mal rotado deja el teléfono sin VUELTA
+ * hasta la siguiente release.
+ */
+object MuselinkHosts {
+    /** Hostnames permitidos (comparación insensible a mayúsculas). */
+    val HOSTS: Set<String> = setOf(
+        "muselink.ai.studio",
+        "muselink-667333806336.us-west1.run.app"
+    )
+
+    /** URLs base permitidas (las mismas que DEFAULT_HOSTS). */
+    val DEFAULT_URLS: List<String> = listOf(
+        "https://muselink.ai.studio",
+        "https://muselink-667333806336.us-west1.run.app"
+    )
+
+    fun isAllowedHost(host: String): Boolean =
+        host.lowercase() in HOSTS
+
+    /** true solo si la URL es https y su host está en la allowlist. */
+    fun isAllowedUrl(url: String): Boolean {
+        return try {
+            val uri = java.net.URI(url)
+            // Sin https no hay Bearer: en claro, ni siquiera al host bueno.
+            if (uri.scheme?.lowercase() != "https") return false
+            val host = uri.host ?: return false
+            isAllowedHost(host)
+        } catch (e: Exception) {
+            false
+        }
+    }
+}
+
+/**
  * OrganismSender — POST HTTPS al organismo, desde Kotlin (v2.5.506).
  *
  * C++ solo entrega snapshots a una JNI mínima; TODO el transporte vive
@@ -60,24 +109,78 @@ class NoOpOrganismLogger : OrganismLogger {
  *
  * Concurrencia: 1 envío a la vez (el controlador serializa). Timeout
  * 15 s por intento: un organismo caído no debe retener el hilo.
+ *
+ * ALLOWLIST (C9, v2.5.510): el Bearer solo sale hacia MuselinkHosts.
+ * sendOne() salta cualquier host fuera de la lista ANTES de conectar,
+ * sin intentarlo siquiera. enforceAllowlist=true siempre en producción;
+ * solo los tests con dobles locales (http://127.0.0.1) lo pasan a false.
  */
 class OrganismSender(
     private val tokenStore: TokenStore,
     private val queue: OrganismQueue,
     private val client: OkHttpClient = defaultClient(),
     private val hosts: List<String> = DEFAULT_HOSTS,
+    private val enforceAllowlist: Boolean = true,
     private val nowMs: () -> Long = { System.currentTimeMillis() },
     private val jitter: () -> Double = { (Math.random() * 0.5) - 0.25 }, // ±25%
     private val logger: OrganismLogger = AndroidOrganismLogger(TAG)
 ) {
     companion object {
         private const val TAG = "OrganismSender"
-        val DEFAULT_HOSTS = listOf(
-            "https://muselink.ai.studio",
-            "https://muselink-667333806336.us-west1.run.app"
-        )
+        val DEFAULT_HOSTS: List<String> = MuselinkHosts.DEFAULT_URLS
         const val SESSION_PATH = "/api/v1/muse/ivanna/session"
         private val JSON = "application/json; charset=utf-8".toMediaType()
+
+        /**
+         * T9/510 — header en el que el servidor PUEDE anunciar la
+         * versión vigente del perfil en la respuesta del POST de
+         * sesión. Contrato PENDIENTE de confirmación por el lado del
+         * servidor (ver [parsePiggybackVersion]): hasta que lo
+         * confirme, el poll de T1 sigue siendo el respaldo.
+         */
+        const val PROFILE_VERSION_HEADER = "X-Muselink-Profile-Version"
+
+        /**
+         * T9/510 — claves de cuerpo en las que el servidor PUEDE
+         * anunciar la versión vigente del perfil en la respuesta del
+         * POST de sesión (en orden de preferencia). A propósito NO se
+         * lee una clave `version` genérica: en una respuesta de
+         * sesión `version` podría ser la versión del payload o del
+         * API, y disparar un fetch por ella sería un falso positivo.
+         * Contrato PENDIENTE de confirmación por el lado del servidor:
+         * si el campo no viene, el poll de T1 sigue como respaldo (no
+         * se rompe nada). Puro JVM, testeable sin red.
+         */
+        val PROFILE_VERSION_BODY_KEYS: List<String> = listOf(
+            "currentProfileVersion",
+            "profileVersion"
+        )
+
+        /**
+         * T9/510 — extrae la versión vigente del perfil piggybackeada
+         * en la respuesta del POST de sesión (header o cuerpo). null
+         * = la respuesta no anuncia ninguna (el caso hoy: el
+         * servidor no confirma el campo). Solo vale un número entero
+         * > 0; cualquier otra cosa (vacío, no numérico, ≤ 0, JSON
+         * inválido, cuerpo truncado) es null, nunca una versión
+         * inventada. El llamador decide si es mayor que la aplicada.
+         */
+        fun parsePiggybackVersion(headerValue: String?, bodyText: String?): Long? {
+            headerValue?.trim()?.takeIf { it.isNotEmpty() }?.toLongOrNull()
+                ?.takeIf { it > 0L }?.let { return it }
+            val text = bodyText?.takeIf { it.isNotBlank() } ?: return null
+            val root = runCatching { JsonParser.parseString(text) }.getOrNull()
+                ?: return null
+            if (!root.isJsonObject) return null
+            val data = root.asJsonObject
+            for (key in PROFILE_VERSION_BODY_KEYS) {
+                val el = data.get(key) ?: continue
+                if (!el.isJsonPrimitive || !el.asJsonPrimitive.isNumber) continue
+                val v = el.asDouble
+                if (v.isFinite() && v > 0.0) return v.toLong()
+            }
+            return null
+        }
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .dns(OrganismDns()) // DNS propio: no depende de netd/MagicDNS
@@ -85,10 +188,27 @@ class OrganismSender(
             .readTimeout(15, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
             .followRedirects(false) // nunca seguir redirects con el Bearer
+            // PENDIENTE (C9-e, segunda fase): pinning de certificado
+            // (SPKI) para los dos hosts de MuselinkHosts. No cablearlo
+            // hasta que Esse decida el procedimiento de rotación.
             .build()
     }
 
     enum class Outcome { SENT, RETRY, QUARANTINE, TOKEN_INVALID, NO_TOKEN }
+
+    /**
+     * T9/510 — callback de versión piggybackeada: se invoca (en el
+     * hilo del envío, Dispatchers.IO) cuando una respuesta 2xx del
+     * POST de sesión anuncia una versión vigente del perfil
+     * ([parsePiggybackVersion]). Lo cablea `OrganismController` en
+     * `start()` (y en el arranque ligero de `flushAndPollOnce`); null
+     * = nadie escucha (el envío no cambia). El callback NO decide si
+     * la versión es mayor que la aplicada: eso lo hace el controlador
+     * (que es quien conoce la aplicada) y solo entonces fuerza un
+     * sondeo T1. Invocar nunca tumba el envío: va con runCatching.
+     */
+    @Volatile
+    var onServerProfileVersion: ((Long) -> Unit)? = null
 
     /** Resultado de un intento de vaciado (para el indicador de estado). */
     data class FlushResult(
@@ -151,6 +271,14 @@ class OrganismSender(
         val json = item.body.toString()
         var lastOutcome: Outcome = Outcome.RETRY
         for (host in hosts) {
+            // C9-c: host fuera de la allowlist → ni se intenta la
+            // conexión (el Bearer no sale de los dos hosts permitidos).
+            // No es QUARANTINE: es error de configuración, el chunk se
+            // conserva para reintentarlo cuando se corrija la lista.
+            if (enforceAllowlist && !MuselinkHosts.isAllowedUrl(host)) {
+                logger.w("Host fuera de la allowlist, no se conecta: $host (chunk ${item.key})")
+                continue
+            }
             val request = Request.Builder()
                 .url(host + SESSION_PATH)
                 .header("Authorization", "Bearer $token")
@@ -162,7 +290,26 @@ class OrganismSender(
                     val code = resp.code
                     logger.i("POST $host$SESSION_PATH → HTTP $code (chunk ${item.key})")
                     return when {
-                        code in 200..299 -> Outcome.SENT
+                        code in 200..299 -> {
+                            // T9/510 — piggyback de versión: la respuesta
+                            // PUEDE anunciar la versión vigente del perfil
+                            // (header o cuerpo). Si no la trae, no pasa
+                            // nada: el poll de T1 sigue como respaldo. El
+                            // cuerpo se lee entero aquí (una vez) y se
+                            // recorta a 16 KB antes de parsear: una
+                            // respuesta hostil no debe llenar la memoria
+                            // y un JSON truncado parsea a null (fail-
+                            // closed). El callback nunca tumba el envío.
+                            val piggyback = parsePiggybackVersion(
+                                resp.header(PROFILE_VERSION_HEADER),
+                                runCatching { resp.body?.string() }.getOrNull()?.take(16_384)
+                            )
+                            if (piggyback != null) {
+                                runCatching { onServerProfileVersion?.invoke(piggyback) }
+                                    .onFailure { logger.w("T9: onServerProfileVersion falló: ${it.javaClass.simpleName}") }
+                            }
+                            Outcome.SENT
+                        }
                         code == 401 -> Outcome.TOKEN_INVALID
                         code == 429 || code in 500..599 -> Outcome.RETRY
                         else -> Outcome.QUARANTINE
@@ -191,6 +338,13 @@ class OrganismSender(
 //
 // El Dns es inyectable (constructor) para que los tests verifiquen el
 // enrutado y el fallback sin tocar la red real.
+//
+// ENDURECIMIENTO (C9, v2.5.510): el bypass de netd/MagicDNS es una
+// superficie de suplantación si la respuesta no se valida. parseResponse
+// exige ID de transacción == ID de la query y QDCOUNT == 1, y rechaza
+// TTL > MAX_TTL_SECONDS o ANCOUNT > MAX_ANSWER_RECORDS; el sender solo
+// conecta a los hosts de MuselinkHosts (allowlist cerrada) y nunca
+// sigue redirects con el Bearer (followRedirects(false)).
 /**
  * Resuelve los hosts de MuseLink por DNS directo (UDP a 8.8.8.8/1.1.1.1)
  * sin pasar por netd/MagicDNS; resto de hosts y fallback usan el DNS del
@@ -206,10 +360,7 @@ class OrganismDns(
 
     companion object {
         /** Hosts que se resuelven por DNS directo (no por el sistema). */
-        val MUSELINK_HOSTS: Set<String> = setOf(
-            "muselink.ai.studio",
-            "muselink-667333806336.us-west1.run.app"
-        )
+        val MUSELINK_HOSTS: Set<String> = MuselinkHosts.HOSTS
 
         /** Servidores DNS directos (IP literal, sin resolver). */
         val DEFAULT_DNS_SERVERS: List<InetAddress> = listOf(
@@ -224,6 +375,10 @@ class OrganismDns(
         for (server in directServers) {
             try {
                 val addrs = directQuery(hostname, server)
+                // C9-b (defensa en profundidad: directQuery es inyectable):
+                // demasiadas direcciones = respuesta fabricada; se trata
+                // como fallo y se prueba el siguiente servidor.
+                if (addrs.size > OrganismDnsWire.MAX_ANSWER_RECORDS) continue
                 if (addrs.isNotEmpty()) return addrs
             } catch (e: Exception) {
                 // Probar el siguiente servidor directo.
@@ -236,6 +391,24 @@ class OrganismDns(
 
 /** Protocolo DNS mínimo (RFC 1035) para el Dns propio. Sin dependencias. */
 internal object OrganismDnsWire {
+
+    /**
+     * TTL máximo aceptado, en segundos (C9-b). Justificación: Google
+     * Public DNS (8.8.8.8, uno de nuestros servidores directos) recorta
+     * los TTL a 86400 s (1 día) y los frontends de Cloud Run sirven
+     * 300 s; un TTL mayor no puede venir de una respuesta honesta en
+     * este camino. Un TTL absurdo es la marca clásica de envenenamiento
+     * (persistir la entrada falsa en caché). TTL=0 es válido (sin caché).
+     */
+    const val MAX_TTL_SECONDS: Long = 86_400
+
+    /**
+     * Nº máximo de registros de respuesta aceptados (C9-b). Las
+     * respuestas reales de MuseLink traen un puñado de A/AAAA por
+     * round-robin (típicamente ≤ 4); 16 deja margen de sobra. Por
+     * encima, la respuesta es fabricada o abusiva.
+     */
+    const val MAX_ANSWER_RECORDS: Int = 16
 
     /** Construye un query DNS estándar (RD=1) para A (1) o AAAA (28). */
     fun buildQuery(hostname: String, qtype: Int, id: Int): ByteArray {
@@ -269,13 +442,25 @@ internal object OrganismDnsWire {
      * respuesta DNS. Tolera CNAME (el resolver recursivo ya trae los
      * A/AAAA del destino en la misma respuesta) y punteros de compresión
      * (0xC0xx). RCODE != 0 o paquete corto → lista vacía.
+     *
+     * Endurecimiento (C9-a/b, v2.5.510): la respuesta se RECHAZA entera
+     * (lista vacía) si el ID de transacción no coincide con el de la
+     * query (sin esto, un atacante en la misma red puede envenenar la
+     * respuesta), si QDCOUNT != 1, si ANCOUNT supera
+     * MAX_ANSWER_RECORDS, o si cualquier registro trae un TTL mayor que
+     * MAX_TTL_SECONDS. Fail-closed: ante la duda, no se usa la respuesta
+     * y el llamador prueba el siguiente servidor / el DNS del sistema.
      */
-    fun parseResponse(data: ByteArray, wantType: Int): List<InetAddress> {
+    fun parseResponse(data: ByteArray, wantType: Int, expectedId: Int): List<InetAddress> {
         if (data.size < 12) return emptyList()
+        val id = ((data[0].toInt() and 0xFF) shl 8) or (data[1].toInt() and 0xFF)
+        if (id != expectedId) return emptyList()
         val rcode = data[3].toInt() and 0x0F
         if (rcode != 0) return emptyList()
         val qd = ((data[4].toInt() and 0xFF) shl 8) or (data[5].toInt() and 0xFF)
+        if (qd != 1) return emptyList()
         val an = ((data[6].toInt() and 0xFF) shl 8) or (data[7].toInt() and 0xFF)
+        if (an > MAX_ANSWER_RECORDS) return emptyList()
         var off = 12
         repeat(qd) {
             off = skipName(data, off)
@@ -288,6 +473,12 @@ internal object OrganismDnsWire {
             if (off + 10 > data.size) return out
             val type = ((data[off].toInt() and 0xFF) shl 8) or
                 (data[off + 1].toInt() and 0xFF)
+            // TTL: 32 bits sin signo (RFC 1035 §4.1.3).
+            val ttl = ((data[off + 4].toLong() and 0xFF) shl 24) or
+                ((data[off + 5].toLong() and 0xFF) shl 16) or
+                ((data[off + 6].toLong() and 0xFF) shl 8) or
+                (data[off + 7].toLong() and 0xFF)
+            if (ttl > MAX_TTL_SECONDS) return emptyList()
             val rdlen = ((data[off + 8].toInt() and 0xFF) shl 8) or
                 (data[off + 9].toInt() and 0xFF)
             val rdataOff = off + 10
@@ -334,7 +525,8 @@ private fun queryDirectDns(
                 val buf = ByteArray(2048)
                 val pkt = DatagramPacket(buf, buf.size)
                 sock.receive(pkt)
-                out += OrganismDnsWire.parseResponse(pkt.data.copyOf(pkt.length), qtype)
+                // C9-a: la respuesta se valida contra el ID de ESTA query.
+                out += OrganismDnsWire.parseResponse(pkt.data.copyOf(pkt.length), qtype, id)
             }
         } catch (e: Exception) {
             // Un tipo falló (timeout): el otro aún puede responder.

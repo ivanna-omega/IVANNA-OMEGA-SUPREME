@@ -113,16 +113,17 @@ object NeuroSensorGateway {
 
     /**
      * Reenvía UN frame del MICRÓFONO DEL TELÉFONO (v2.5.449) al motor
-     * nativo. [erbFrame]: FloatArray[74] con el layout de
+     * nativo. [erbFrame]: FloatArray[76] con el layout de
      * nativeSensorLatestFrame — mag[0..23], err[24..47], coh[48..71],
-     * level[72], valid[73] (1/0). El mapeo 24 ERB -> 8 Greenwood y la
+     * level[72], valid[73] (1/0), referenceFresh[74] (1/0),
+     * referenceLevelDb[75] (v2.5.510, S1). El mapeo 24 ERB -> 8 Greenwood y la
      * validación viven en C++ (micErbToNeuroFrame); el nativo vuelve a
      * validar. Devuelve true solo si el frame se aceptó y se aprendió.
      * Solo lo llama NeuroMicDriver, con frames reales del micrófono.
      */
     fun submitMicFrame(erbFrame: FloatArray, timestampUs: Long): Boolean {
         if (!isEnabled) return false
-        if (erbFrame.size != 74) return false
+        if (erbFrame.size != 76) return false
         if (timestampUs <= 0L) return false
         if (erbFrame[73] < 0.5f) return false  // valid=0: no aprender
         if (erbFrame.any { !it.isFinite() }) return false

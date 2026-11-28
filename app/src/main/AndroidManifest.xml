@@ -31,6 +31,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <!-- v2.5.510 (fix del «nada» de la 509): el Organismo captura el mic
+         en segundo plano; Android 14+ exige este permiso + el tipo
+         microphone del servicio para un foreground service de micrófono. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
@@ -146,6 +150,36 @@
             android:name=".audio.BridgePlaybackService"
             android:exported="false"
             android:foregroundServiceType="mediaPlayback"/>
+
+        <!-- Organismo (v2.5.510, fix del «nada» de la 509): mantiene el
+             proceso en primer plano mientras el organismo está enabled,
+             para que Android no congele el proceso ni silencie el mic
+             al salir de la app. No captura ni envía nada por sí mismo;
+             lo hacen OrganismController + RealAcousticSensor. -->
+        <service
+            android:name=".organism.OrganismForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone"/>
+
+        <!-- T8/510 — WorkManager del Organismo: el Initializer
+             (OrganismWorkSchedulerInitializer) programa en cada arranque
+             el trabajo periódico `organism-flush` (15 min, con red) que
+             vacía la cola y comprueba la versión del perfil con la app
+             cerrada. La entrada es el <meta-data> con valor
+             "androidx.startup" bajo el InitializationProvider (merge con
+             el que ya declara la librería WorkManager); sin ella el
+             Initializer existe pero nunca se ejecuta. El Initializer no
+             arranca el controlador ni envía nada: solo encola el trabajo
+             (KEEP, idempotente). -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="com.ivanna.omega.organism.OrganismWorkSchedulerInitializer"
+                android:value="androidx.startup" />
+        </provider>
 
         <!-- FIX: Receptor de sesiones de audio globales (Global Effect Manager) -->
         <!-- Permite capturar el broadcast de Android cuando cualquier app abre audio -->

@@ -15,7 +15,9 @@ on:
       - 'app/src/main/cpp/**'
       - 'tests/**'
       - 'scripts/run_ctest.sh'
+      - 'scripts/ci_triage.py'
       - 'scripts/check_*.py'
+      - 'scripts/ctest_ledger.py'
       - 'README.md'
       - 'LÉAME.md'
       - 'telemetry/**'
@@ -28,7 +30,9 @@ on:
       - 'app/src/main/cpp/**'
       - 'tests/**'
       - 'scripts/run_ctest.sh'
+      - 'scripts/ci_triage.py'
       - 'scripts/check_*.py'
+      - 'scripts/ctest_ledger.py'
       - 'README.md'
       - 'LÉAME.md'
       - 'telemetry/**'
@@ -59,23 +63,61 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── PUERTA por push/PR: normal + ASan+UBSan (verificadas ~1 min cada una) ──
+  # ── PUERTA por push/PR: 4 shards por etiqueta de área (C13/510) ────────
+  # C4/510 — en la 509 el job ASan+UBSan murió por timeout a los 30 min
+  # (1515/1835 tests, 0 fallos): un solo job hacía configurar + compilar
+  # (enlace ASan de test_acoustic_harness >20 min) + ejecutar 1835 tests
+  # en 2 núcleos. La pata ASan completa se movió a tests-selfhosted.yml
+  # (job ctest-selfhosted-asan, timeout 120 min, sin minutos de GitHub,
+  # también en PR); aquí queda solo la pata plana.
+  # C13/510 — la ejecución se parte en shards por etiqueta CTest (LABELS en
+  # app/src/main/cpp/tests/CMakeLists.txt: dsp, acoustic, daemon, spatial,
+  # fused, más slow-a/slow-b para los 5 binarios 'fused' que concentran el
+  # 65% del tiempo — un test, un shard, sin solapes ni huecos). Ledger
+  # medido con scripts/ctest_ledger.py (ver job ctest-ledger, que publica
+  # el top-20). Tiempos medidos 2026-11-28 en VM local (flat, -j4):
+    #   - shard-1-light: 701 tests, 133.9 s de ejecucion
+    #   - shard-2-spatial-fused: 1099 tests, 365.8 s de ejecucion
+    #   - shard-3-slow-a: 21 tests, 516.6 s de ejecucion
+    #   - shard-4-slow-b: 27 tests, 481.8 s de ejecucion
+  # Cada shard es un job separado con su propio timeout y su propio
+  # artefacto C5 (ctest-plain-<shard>); todos excluyen QUARANTINED (-LE)
+  # igual que la puerta por push, y la cuarentena sigue en su carril
+  # semanal. Las etiquetas slow-a/slow-b son DISJUNTAS de 'fused' (un solo
+  # LABEL por binario: gtest_discover_tests serializa LABELS multivalor sin
+  # comillas y CTest tira el resto en silencio — ver comentario C13 en
+  # CMakeLists.txt), así que el shard de área '-L fused' ya no las incluye.
+  # COSTE: cada shard configura+compila el árbol entero (el build no se
+  # puede partir por etiqueta sin lista de targets por shard); lo que se
+  # parte es la EJECUCIÓN. Los shards corren en paralelo: el wall-clock de
+  # la puerta es el del shard más lento, no la suma. Con el ledger medido,
+  # la ejecución pasa de ~380 s (monolito, -j4) a ~130 s (shard-3, el más
+  # lento, 517 s·proc / 4).
   ctest:
-    name: ${{ matrix.san == 'asan' && 'CTest (ASan+UBSan)' || 'CTest' }}
+    name: CTest (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    # 30 min (era 20): el enlace ASan+UBSan de test_acoustic_harness
-    # supera los 20 min y el job se cancelaba a mitad del enlace (509),
-    # sin fallo de test. El CTest plano tarda ~1 min.
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
-        san: ['', 'asan']
+        include:
+          - shard: shard-1-light
+            labels: 'dsp|acoustic|daemon'
+            timeout: 30
+          - shard: shard-2-spatial-fused
+            labels: 'spatial|fused'
+            timeout: 30
+          - shard: shard-3-slow-a
+            labels: 'slow-a'
+            timeout: 30
+          - shard: shard-4-slow-b
+            labels: 'slow-b'
+            timeout: 30
     env:
       CC: gcc-14
       CXX: g++-14
       CMAKE_BUILD_PARALLEL_LEVEL: '4'
-      IVANNA_SAN: ${{ matrix.san }}
+      IVANNA_SAN: ''
     steps:
       - uses: actions/checkout@v7
 
@@ -114,14 +156,113 @@ jobs:
           fi
           bash -n scripts/run_ctest.sh
 
-      - name: Configurar, compilar y correr CTest (33→60 targets, GTest vendoreado, offline)
+      # Espejo de run_ctest.sh (configurar + compilar) + solo su shard.
+      # -L '<etiquetas>' selecciona el shard; -LE QUARANTINED es la misma
+      # selección que la puerta por push tenía vía run_ctest.sh. El JUnit
+      # por shard lo fusiona el job ctest-ledger.
+      - name: Configurar, compilar y correr el shard (${{ matrix.shard }})
         run: |
           set -o pipefail
-          bash scripts/run_ctest.sh | tee /tmp/ctest_run.log
-          python3 scripts/check_docs_claims.py --generate-from-log /tmp/ctest_run.log
+          cmake -S app/src/main/cpp/tests -B build/tests-host -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release -DIVANNA_TEST_ENABLE_ASAN=OFF -DIVANNA_TEST_ENABLE_TSAN=OFF
+          cmake --build build/tests-host -j"$CMAKE_BUILD_PARALLEL_LEVEL"
+          # OJO: --output-junit con ruta RELATIVA la resuelve ctest contra
+          # el test-dir (cae en build/tests-host/build/... y el artefacto
+          # C5 no la encuentra); por eso ruta ABSOLUTA aquí y en el tee.
+          ctest --test-dir build/tests-host --output-on-failure \
+            --output-junit "$GITHUB_WORKSPACE/build/tests-host/ctest_junit.xml" \
+            -L "${{ matrix.labels }}" -LE QUARANTINED -j"${CTEST_JOBS:-4}" --timeout 300 \
+            2>&1 | tee "$GITHUB_WORKSPACE/build/tests-host/ctest_last.log"
+
+      # C5 (510) — publicar artefactos JUnit + log en CADA run, también al
+      # cancelar por timeout. Causa raíz: en la 509 el job ASan+UBSan murió
+      # por timeout a los 30 min (1515/1835 tests, 0 fallos) y el log murió
+      # con el runner — para saber qué 320 tests no corrieron había que
+      # re-correr. Diagnóstico sin re-correr: descargar el artefacto y
+      # grep -E "Failed|Timeout" ctest_last.log. `if-no-files-found: warn`
+      # porque si ctest muere por timeout del job, el JUnit (que ctest
+      # escribe al final) puede no existir; el log sí sobrevive (tee).
+      # Nombre POR SHARD (C13): con el mismo nombre, los 4 shards
+      # colisionarían en un solo artefacto y el triaje C6 y el ledger
+      # perderían 3 de 4 logs.
+      # C6 (510) — LastTestsFailed.log es lo que hace posible el
+      # `--rerun-failed` del reintento discriminado: sin el, el job
+      # ci-triage no sabria que tests fallaron. Si el job muere a mitad
+      # de corrida, el archivo puede no existir (ctest lo escribe al
+      # final); el triaje deriva entonces los no corridos del log.
+      - name: Publicar artefactos CTest (log + JUnit)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-plain-${{ matrix.shard }}
+          path: |
+            build/tests-host/ctest_last.log
+            build/tests-host/ctest_junit.xml
+            build/tests-host/Testing/Temporary/LastTestsFailed.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Resumen
+        if: always()
+        run: echo "Shard ${{ matrix.shard }} ejecutado, etiquetas ${{ matrix.labels }}. Cualquier fallo aquí es una regresión DSP real o un test roto — no se ignora."
+
+  # ── C13 (510) — Ledger de tiempos + Fase 0 sobre el total fusionado ────
+  # Los 4 shards publican cada uno su log + JUnit (C5 por shard). Este job
+  # los fusiona con scripts/ctest_ledger.py (top-20 de tests más lentos,
+  # reparto por etiqueta y balance de shards) y escribe UNA línea resumen
+  # con los totales reales — un log por shard trae su propia línea resumen
+  # y check_docs_claims.py --generate-from-log toma la primera, así que sin
+  # fusionar el telemetry/ctest_summary.json quedaría con el total de un
+  # solo shard. La Fase 0 se movió aquí verbatim desde el job ctest (mismos
+  # chequeos, incluido test_determinism): es estática salvo docs_claims, que
+  # necesita el summary fusionado, así que no puede correr dentro de un
+  # shard. `if: always()` + filtro por resultado: el ledger es más valioso
+  # justo cuando un shard falla; si ctest se saltó (paths) o se canceló, no
+  # hay artefactos que fusionar y el job no corre.
+  ctest-ledger:
+    name: Ledger CTest (C13)
+    if: always() && (needs.ctest.result == 'success' || needs.ctest.result == 'failure')
+    needs: ctest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Instalar g++-14 (compilador CTest; ver fix v2.5.411 arriba)
+        run: |
+          if ! command -v g++-14 >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq g++-14
+          fi
+          g++-14 --version | head -1
+
+      - name: Instalar cmake
+        run: |
+          cmake --version || { sudo apt-get update -qq && sudo apt-get install -y -qq cmake; }
+          cmake --version | head -1
+
+      - name: Descargar artefactos CTest por shard (C5)
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ctest-plain-*
+          path: ledger-artifacts
+
+      - name: Ledger (top-20 + reparto + resumen fusionado)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          JUNITS=(ledger-artifacts/*/ctest_junit.xml)
+          if [ "${#JUNITS[@]}" -eq 0 ]; then
+            echo "::warning::Sin JUnit por shard (los shards murieron antes de CTest): sin ledger ni resumen fusionado; la Fase 0 sigue con el telemetry commiteado."
+            echo "Sin JUnit por shard: ledger no disponible." > ctest_ledger.txt
+          else
+            python3 scripts/ctest_ledger.py \
+              --junit "${JUNITS[@]}" \
+              --merged-summary build/ctest_merged.log | tee ctest_ledger.txt
+            python3 scripts/check_docs_claims.py --generate-from-log build/ctest_merged.log
+            cat ctest_ledger.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Fase 0 — Herramientas de verdad (0.1–0.5 + cppcheck + header_wiring)
-        if: matrix.san == ''
         run: |
           set -euo pipefail
           # Cada chequeo emite una anotación ::error:: con su nombre y las últimas
@@ -140,6 +281,7 @@ jobs:
           run_check jni_wiring            python3 scripts/check_jni_wiring.py
           run_check kotlin_wrapper_wiring python3 scripts/check_kotlin_wrapper_wiring.py
           run_check header_wiring         python3 scripts/check_header_wiring.py
+          run_check test_determinism      python3 scripts/check_test_determinism.py
           run_check rt_safety             python3 scripts/check_rt_safety.py
           run_check "Fase 0 — verdad de los 10 ejes (10D)" python3 scripts/check_10d_axis_truth.py
           run_check build_flags           python3 scripts/check_build_flags.py
@@ -157,9 +299,307 @@ jobs:
           fi
           exit $rc
 
+
+      - name: Publicar ledger CTest
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-ledger
+          path: |
+            ctest_ledger.txt
+            build/ctest_merged.log
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Resumen
         if: always()
-        run: echo "Puerta de tests host ejecutada (san=${IVANNA_SAN:-none}). Cualquier fallo aquí es una regresión DSP real o un test roto — no se ignora."
+        run: echo "Ledger C13 publicado (top-20 + balance de shards)."
+
+  # ── C6 (510) — Auto-reintento discriminado + triaje automático ──────────
+  # Fin de las re-corridas manuales del boton «Re-run»: este job distingue
+  # «fallo un test» de «murio el runner» leyendo el artefacto de C5
+  # (ctest_last.log + ctest_junit.xml + LastTestsFailed.log) con
+  # scripts/ci_triage.py (solo stdlib, reglas conservadoras documentadas
+  # en su docstring). Veredicto `retry` SOLO ante timeout del job o
+  # infra de la lista explicita; un fallo de asercion (incluido ASan
+  # `ERROR: AddressSanitizer` / UBSan `runtime error`) NUNCA se reintenta:
+  # se publica un comentario en la PR con los nombres y el comando exacto
+  # de reproduccion. Un test individual con `(Timeout)` se marca
+  # sospechoso de deadlock y tampoco se reintenta sin revision.
+  # Maximo 1 reintento por run, estructural: este job corre una sola vez
+  # por workflow run y no se re-dispara a si mismo.
+  ci-triage:
+    name: Triaje CI (C6)
+    # `if: failure()` NO basta: cuando el job ctest muere por timeout del
+    # job, su resultado es 'cancelled', no 'failure', y `failure()` no se
+    # dispara — el triaje no correria justo en su caso principal (el
+    # timeout 1515/1835 de la 509). Por eso `always()` + filtro explicito
+    # por needs.ctest.result.
+    if: always() && (needs.ctest.result == 'failure' || needs.ctest.result == 'cancelled')
+    needs: ctest
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    env:
+      # C6 — PR en borrador ci-autofix: DESACTIVADO por defecto.
+      # La propuesta exige confirmar con Esse que un PR en borrador
+      # abierto por la CI es aceptable; esa confirmacion NO existe
+      # todavia (2026-11-28). No poner 'true' sin su si explicito.
+      # Activarlo exige ademas subir este job a `contents: write`
+      # (hoy `read`: la CI no puede pushear ninguna rama).
+      CI_TRIAGE_AUTOFIX_DRAFT_PR: 'false'
+    steps:
+      - uses: actions/checkout@v7
+
+      # Si el artefacto no existe (el job ctest murio antes del paso C5),
+      # el clasificador emite `no-retry-unknown` con ese motivo: nunca
+      # se reintenta a ciegas. Por eso `continue-on-error: true`.
+      # C13 — los artefactos C5 ahora son uno por shard (ctest-plain-*):
+      # sin merge-multiple cada uno cae en su subdirectorio y el paso
+      # siguiente los fusiona a las rutas únicas que classify/render y el
+      # reintento esperan (triage-artifact/ctest_last.log, ctest_junit.xml,
+      # LastTestsFailed.log). Si un shard murió antes de publicar, su
+      # artefacto falta y la fusión sigue con los demás; si no hay ninguno,
+      # el clasificador emite no-retry-unknown como antes.
+      - name: Descargar artefactos CTest por shard (C5)
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ctest-plain-*
+          path: triage-artifact
+
+      - name: Fusionar artefactos por shard (C13)
+        if: always()
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          LOGS=(triage-artifact/*/ctest_last.log)
+          if [ "${#LOGS[@]}" -eq 0 ]; then
+            echo "Sin artefactos CTest por shard: nada que fusionar (el clasificador emitirá no-retry-unknown)."
+            exit 0
+          fi
+          # Los logs por shard se fusionan RENUMERADOS y con UNA línea
+          # resumen con los totales reales: el clasificador (parse_log)
+          # toma la PRIMERA línea resumen y empareja "Start N:" con
+          # "Test #N:" por número — con un cat pelado, los números se
+          # repiten en los 4 shards (un test sin terminar quedaría
+          # enmascarado como terminado por el test #N de otro shard) y los
+          # totales serían los del primer shard (701) en vez de la suite
+          # (1848). Las líneas resumen por shard se descartan y se añade
+          # una sola sintética con los totales sumados.
+          python3 - <<'PYEOF'
+          import glob, re
+          start_re = re.compile(r"^(\s*)Start\s+(\d+):(.*)$")
+          result_re = re.compile(r"^(\s*)(\d+)/(\d+)\s+(Test\s+#)(\d+):(.*)$")
+          summary_re = re.compile(r"(\d+)% tests passed, (\d+) tests failed out of (\d+)")
+          logs = sorted(glob.glob("triage-artifact/*/ctest_last.log"))
+          # Totales por shard (de su linea resumen; si un shard murio sin
+          # resumen, del mayor numero de test visto en su log).
+          totals, grand_total, grand_failed = [], 0, 0
+          for log in logs:
+              text = open(log, encoding="utf-8", errors="replace").read()
+              sm = summary_re.search(text)
+              if sm:
+                  totals.append(int(sm.group(3))); grand_total += int(sm.group(3)); grand_failed += int(sm.group(2))
+              else:
+                  nums = [int(n) for _, n in start_re.findall(text)] + [int(n) for _, _, _, _, n, _ in result_re.findall(text)]
+                  totals.append(max(nums) if nums else 0); grand_total += totals[-1]
+          out, offset = [], 0
+          for log, shard_total in zip(logs, totals):
+              for line in open(log, encoding="utf-8", errors="replace").read().splitlines():
+                  if summary_re.search(line):
+                      continue
+                  m = start_re.match(line)
+                  if m:
+                      out.append(f"{m.group(1)}Start {int(m.group(2)) + offset}:{m.group(3)}")
+                      continue
+                  m = result_re.match(line)
+                  if m:
+                      t = grand_total if grand_total else int(m.group(3))
+                      out.append(f"{m.group(1)}{int(m.group(2)) + offset}/{t} {m.group(4)}{int(m.group(5)) + offset}:{m.group(6)}")
+                      continue
+                  out.append(line)
+              offset += shard_total
+          pct = 100 * (grand_total - grand_failed) // grand_total if grand_total else 0
+          out.append(f"{pct}% tests passed, {grand_failed} tests failed out of {grand_total}")
+          open("triage-artifact/ctest_last.log", "w", encoding="utf-8").write("\n".join(out) + "\n")
+          print(f"Log fusionado: {grand_total} tests, {grand_failed} fallados (renumerados).")
+          PYEOF
+          python3 - <<'PYEOF'
+          import glob, xml.etree.ElementTree as ET
+          junits = sorted(glob.glob("triage-artifact/*/ctest_junit.xml"))
+          root = ET.Element("testsuites")
+          for j in junits:
+              try:
+                  tree = ET.parse(j)
+              except ET.ParseError:
+                  continue
+              for ts in tree.getroot().iter("testsuite"):
+                  root.append(ts)
+          ET.ElementTree(root).write("triage-artifact/ctest_junit.xml",
+                                     encoding="utf-8", xml_declaration=True)
+          PYEOF
+          FAILED=(triage-artifact/*/LastTestsFailed.log)
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            cat "${FAILED[@]}" > triage-artifact/LastTestsFailed.log
+          fi
+          echo "Fusionados ${#LOGS[@]} artefactos de shard."
+
+      - name: Clasificar (scripts/ci_triage.py)
+        id: triage
+        if: always()
+        run: |
+          set -euo pipefail
+          ARGS=(--ctest-result "${{ needs.ctest.result }}" --out triage-verdict.json)
+          ARGS+=(--github-output "$GITHUB_OUTPUT")
+          [ -f triage-artifact/ctest_last.log ] && ARGS+=(--log triage-artifact/ctest_last.log)
+          [ -f triage-artifact/ctest_junit.xml ] && ARGS+=(--junit triage-artifact/ctest_junit.xml)
+          [ -f triage-artifact/LastTestsFailed.log ] && ARGS+=(--last-tests-failed triage-artifact/LastTestsFailed.log)
+          python3 scripts/ci_triage.py classify "${ARGS[@]}"
+          python3 scripts/ci_triage.py render --verdict triage-verdict.json \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --sha "${{ github.sha }}" > triage-comment.md
+          cat triage-verdict.json
+
+      - name: Resumen de triaje
+        if: always()
+        run: |
+          if [ -f triage-comment.md ]; then
+            cat triage-comment.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Triaje C6: no se pudo clasificar (ni siquiera hay veredicto)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Solo en PR y solo cuando NO hay reintento: el comentario es el
+      # canal para el fallo real (asercion, deadlock sospechoso, o sin
+      # clasificar). `continue-on-error`: en PRs desde fork el token es
+      # de solo lectura y el comentario fallaria — eso no debe poner el
+      # triaje en rojo (el resumen del job sigue publicado).
+      - name: Comentar en la PR (fallo real — sin reintento)
+        if: github.event_name == 'pull_request' && steps.triage.outputs.verdict != 'retry'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file triage-comment.md
+
+      # Reintento discriminado: reconstruye el arbol (configurar +
+      # compilar, SIN correr CTest entero — eso es lo que se evita) y
+      # re-ejecuta SOLO lo no corrido/fallado, segun el modo del veredicto:
+      #   rerun-failed: el comando de la propuesta (LastTestsFailed.log
+      #     restaurado desde el artefacto C5);
+      #   by-name: el job murio a mitad de corrida sin LastTestsFailed.log;
+      #     los nombres salen del log (tests empezados sin resultado);
+      #   full: ctest nunca llego a arrancar (timeout en configurar o
+      #     compilar): todo esta "no corrido";
+      #   none: CTest termino entero (el timeout cayo fuera de CTest):
+      #     no hay nada que reintentar.
+      - name: Reintento discriminado (solo timeout/infra — max. 1 por run)
+        if: steps.triage.outputs.verdict == 'retry'
+        env:
+          CC: gcc-14
+          CXX: g++-14
+          CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        run: |
+          set -euo pipefail
+          if ! command -v g++-14 >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq g++-14
+          fi
+          cmake --version || { sudo apt-get update -qq && sudo apt-get install -y -qq cmake; }
+          # Espejo de run_ctest.sh (configurar + compilar) sin su ctest.
+          cmake -S app/src/main/cpp/tests -B build/tests-host -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release -DIVANNA_TEST_ENABLE_ASAN=OFF -DIVANNA_TEST_ENABLE_TSAN=OFF
+          cmake --build build/tests-host -j"$CMAKE_BUILD_PARALLEL_LEVEL"
+          MODE="$(python3 -c 'import json; print(json.load(open("triage-verdict.json"))["retry_mode"])')"
+          mkdir -p build/tests-host/Testing/Temporary
+          if [ -f triage-artifact/LastTestsFailed.log ]; then
+            cp triage-artifact/LastTestsFailed.log build/tests-host/Testing/Temporary/LastTestsFailed.log
+          fi
+          case "$MODE" in
+            rerun-failed)
+              ctest --test-dir build/tests-host --rerun-failed --output-on-failure 2>&1 | tee build/tests-host/ctest_retry.log
+              ;;
+            by-name)
+              NAMES="$(python3 -c 'import json; print("|".join(json.load(open("triage-verdict.json"))["retry_tests"]))')"
+              ctest --test-dir build/tests-host -R "^(${NAMES})$" --output-on-failure 2>&1 | tee build/tests-host/ctest_retry.log
+              ;;
+            full)
+              ctest --test-dir build/tests-host --output-on-failure 2>&1 | tee build/tests-host/ctest_retry.log
+              ;;
+            none)
+              echo "Triaje C6: veredicto retry con modo none (CTest ya termino entero) — nada que reintentar." | tee build/tests-host/ctest_retry.log
+              ;;
+            *)
+              echo "::error::Triaje C6: modo de reintento desconocido: $MODE"; exit 1
+              ;;
+          esac
+
+      # El log del reintento tambien se publica: si el reintento falla,
+      # el diagnostico no vuelve a morir con el runner.
+      - name: Publicar artefacto del reintento
+        if: always() && steps.triage.outputs.verdict == 'retry'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-triage-retry
+          path: build/tests-host/ctest_retry.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Si el reintento mismo fallo con asercion, es un fallo real nuevo
+      # (no otro timeout): se avisa en la PR y NO se reintenta mas.
+      - name: Re-clasificar tras el reintento (si fallo con asercion, avisar)
+        if: always() && steps.triage.outputs.verdict == 'retry' && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ ! -f build/tests-host/ctest_retry.log ]; then
+            echo "Sin log de reintento: nada que re-clasificar."
+            exit 0
+          fi
+          python3 scripts/ci_triage.py classify --log build/tests-host/ctest_retry.log \
+            --ctest-result failure --out triage-retry-verdict.json
+          REVERDICT="$(python3 -c 'import json; print(json.load(open("triage-retry-verdict.json"))["verdict"])')"
+          if [ "$REVERDICT" != "retry" ] && [ "$REVERDICT" != "no-retry-unknown" ]; then
+            python3 scripts/ci_triage.py render --verdict triage-retry-verdict.json \
+              --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --sha "${{ github.sha }}" --retry-of > triage-retry-comment.md
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file triage-retry-comment.md
+          elif [ "$REVERDICT" = "no-retry-unknown" ]; then
+            echo "Reintento sin evidencia clasificable (puede haber pasado o fallado fuera de CTest); ver artefacto ctest-triage-retry."
+          else
+            echo "El reintento tambien murio por timeout/infra; no se reintenta una segunda vez (max. 1 por run)."
+          fi
+
+      # ── CAMINO DISENADO, DESACTIVADO ──────────────────────────────────
+      # Lo maximo autonomo permitido por la propuesta: abrir una rama
+      # `ci-autofix/<job>-<fecha>` con un PR en borrador y el diagnostico
+      # (SIN cambios de codigo, SIN auto-merge; la fusion seguiria
+      # exigiendo a Esse). Gated por CI_TRIAGE_AUTOFIX_DRAFT_PR, que hoy
+      # es 'false' porque FALTA la confirmacion de Esse. No activar sin
+      # su si explicito, y al activarlo subir el job a `contents: write`.
+      - name: PR en borrador ci-autofix — DESACTIVADO (falta confirmacion de Esse)
+        if: env.CI_TRIAGE_AUTOFIX_DRAFT_PR == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="ci-autofix/ctest-$(date -u +%Y-%m-%d)"
+          git config user.name "ivanna-ci-triage"
+          git config user.email "ci-triage@ivanna.local"
+          git checkout -b "$BRANCH"
+          mkdir -p triage
+          cp triage-verdict.json "triage/ctest-${{ github.run_id }}.json"
+          cp triage-comment.md "triage/ctest-${{ github.run_id }}.md"
+          git add "triage/ctest-${{ github.run_id }}.json" "triage/ctest-${{ github.run_id }}.md"
+          git commit -m "C6 triaje: diagnostico ctest run ${{ github.run_id }} (sin cambios de codigo)"
+          git push origin "$BRANCH"
+          gh pr create --draft --title "C6 triaje: diagnostico ctest run ${{ github.run_id }}" \
+            --body-file triage-comment.md --base main --head "$BRANCH"
 
   # ── BANCO ADVERSARIAL: carril propio, no bloquea la puerta principal ─────
   # Proyecto CTest independiente (tests/adversarial): generador de 21 casos
@@ -231,6 +671,20 @@ jobs:
 
       - name: CTest completo con ThreadSanitizer
         run: bash scripts/run_ctest.sh
+
+      # C5 (510) — mismo artefacto que en el job `ctest`: el carril TSan
+      # también genera ctest_last.log + ctest_junit.xml vía run_ctest.sh
+      # y también puede morir por timeout (90 min).
+      - name: Publicar artefactos CTest (log + JUnit)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-tsan
+          path: |
+            build/tests-host/ctest_last.log
+            build/tests-host/ctest_junit.xml
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Resumen
         if: always()

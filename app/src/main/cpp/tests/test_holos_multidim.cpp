@@ -56,6 +56,12 @@
 
 #include "../spatial/HolosOperator.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 namespace {
 constexpr double kFs = 48000.0;
 constexpr int kDur = 96000;       // 2 s @48 kHz
@@ -276,7 +282,7 @@ TEST(HolosMultidim, ToneBandEnergy) {
 
 // --- Ruido dual-mono: perfil por banda (Welch) ---------------------------
 TEST(HolosMultidim, NoiseMonoBandProfile) {
-    const Sig in = noiseMono(61);
+    const Sig in = noiseMono(ivanna::test::IvannaTestSeed32(1));
     std::vector<float> l = in.l, r = in.r;
     runHolos(holosParams(1.0f), l, r);
     const BandSpectrum sIn = bandSpectrum(in.l, in.r);
@@ -307,7 +313,7 @@ TEST(HolosMultidim, NoiseMonoBandProfile) {
 
 // --- Ruido L/R independiente: la puerta se cierra (fail-closed) ----------
 TEST(HolosMultidim, IndependentNoiseGateCloses) {
-    const Sig in = noiseIndep(11, 12);
+    const Sig in = noiseIndep(ivanna::test::IvannaTestSeed32(2), ivanna::test::IvannaTestSeed32(3));
     std::vector<float> l = in.l, r = in.r;
     runHolos(holosParams(1.0f), l, r);
     double maxDiff = 0.0;
@@ -321,7 +327,7 @@ TEST(HolosMultidim, IndependentNoiseGateCloses) {
 
 // --- Estéreo asimétrico: el lado no se espeja -----------------------------
 TEST(HolosMultidim, AsymmetricStereoKeepsSide) {
-    const Sig in = noiseAsym(61);
+    const Sig in = noiseAsym(ivanna::test::IvannaTestSeed32(1));
     std::vector<float> l = in.l, r = in.r;
     runHolos(holosParams(1.0f), l, r);
     const BandSpectrum sIn = bandSpectrum(in.l, in.r);
@@ -372,7 +378,7 @@ TEST(HolosMultidim, TransientsNoBlowUp) {
 
 // --- Amount 0.5: conserva como amount 1.0 --------------------------------
 TEST(HolosMultidim, AmountHalfConserves) {
-    const Sig in = noiseMono(61);
+    const Sig in = noiseMono(ivanna::test::IvannaTestSeed32(1));
     std::vector<float> l = in.l, r = in.r;
     runHolos(holosParams(0.5f), l, r);
     const double pIn = power(in.l, kMeasFrom, kMeasTo) + power(in.r, kMeasFrom, kMeasTo);
@@ -384,7 +390,7 @@ TEST(HolosMultidim, AmountHalfConserves) {
 
 // --- Amount 0: bypass bit-exacto ------------------------------------------
 TEST(HolosMultidim, AmountZeroIsBitExact) {
-    const Sig in = noiseMono(61);
+    const Sig in = noiseMono(ivanna::test::IvannaTestSeed32(1));
     std::vector<float> l = in.l, r = in.r;
     runHolos(holosParams(0.0f), l, r);
     EXPECT_EQ(l, in.l);

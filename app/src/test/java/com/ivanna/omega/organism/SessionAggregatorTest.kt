@@ -8,7 +8,8 @@ import org.junit.Test
 
 /**
  * Tests del agregador de sesión (ventanas 1–5 s, v2.5.506).
- * Puro JVM: frames sintéticos con el layout ERB[74] del sensor.
+ * Puro JVM: frames sintéticos con el layout ERB[76] del sensor
+ * (S1/510: [74] referenceFresh, [75] referenceLevelDb).
  */
 class SessionAggregatorTest {
 
@@ -17,9 +18,11 @@ class SessionAggregatorTest {
         err: Float = 2f,
         coh: Float = 0.9f,
         level: Float = -30f,
-        valid: Float = 1f
+        valid: Float = 1f,
+        referenceFresh: Float = 1f,
+        referenceLevelDb: Float = -35f
     ): FloatArray {
-        val f = FloatArray(74)
+        val f = FloatArray(76)
         for (b in 0 until 24) {
             f[b] = mag
             f[24 + b] = err
@@ -27,6 +30,8 @@ class SessionAggregatorTest {
         }
         f[72] = level
         f[73] = valid
+        f[74] = referenceFresh
+        f[75] = referenceLevelDb
         return f
     }
 
@@ -91,6 +96,35 @@ class SessionAggregatorTest {
         assertNotNull(emitted)
         assertEquals(0f, emitted!!.errorMeanDb[0], 0.001f)
         assertEquals(2f, emitted.erbStdDb[0], 0.01f)
+    }
+
+    @Test
+    fun `referencia fresca se agrega por ventana (S1 510)`() {
+        val agg = SessionAggregator(windowSeconds = 5f)
+        var emitted: SessionAggregator.SessionChunk? = null
+        // 60 frames: 45 con referencia fresca (nivel ref −35) y 15 sin
+        // ella (nivel ref −40). La ventana de 5 s cierra en el frame 60.
+        for (i in 0 until 60) {
+            val f = if (i < 45) frame() else frame(referenceFresh = 0f, referenceLevelDb = -40f)
+            agg.addFrame(f, 1_000_000L + i * 85_000L, i.toLong())?.let { emitted = it }
+        }
+        assertNotNull("la ventana debe cerrar", emitted)
+        val chunk = emitted!!
+        assertEquals(45, chunk.framesReferenceFresh)
+        assertEquals(0.75f, chunk.referenceFreshFrac, 0.001f)
+        // Media ponderada: (45·−35 + 15·−40) / 60 = −36.25.
+        assertEquals(-36.25f, chunk.referenceLevelMeanDbfs, 0.001f)
+    }
+
+    @Test
+    fun `frame de 74 floats se rechaza con el layout nuevo (S1 510)`() {
+        val agg = SessionAggregator(windowSeconds = 5f)
+        val old = FloatArray(74) { 1f }
+        old[72] = -30f
+        old[73] = 1f
+        assertNull(agg.addFrame(old, 1_000_000L, 0L))
+        assertEquals(1, agg.framesSeen)
+        assertEquals(0, agg.framesValidSeen)
     }
 
     @Test

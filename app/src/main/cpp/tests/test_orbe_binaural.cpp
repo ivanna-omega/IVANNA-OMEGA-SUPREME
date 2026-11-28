@@ -8,6 +8,12 @@
 #include <vector>
 #include "../spatial/OrbeBinaural.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 namespace {
 constexpr double kPi = 3.14159265358979323846;
 
@@ -39,7 +45,7 @@ TEST(OrbeBinaural, AmountZeroIsBitExactBypass) {
     ivanna::OrbeBinaural o;
     o.prepare(48000.0f);
     o.setAmount(0.0f);
-    std::mt19937 g(1);
+    std::mt19937 g(ivanna::test::IvannaTestSeed32(1));
     std::uniform_real_distribution<float> u(-1, 1);
     std::vector<float> l(48000), r(48000);
     for (auto& v : l) v = u(g);
@@ -59,7 +65,7 @@ TEST(OrbeBinaural, MonoIsPreservedWithinFftRoundoff) {
     ivanna::OrbeParams p;
     p.amount = 1.0f;
     o.setParams(p);
-    std::mt19937 g(2);
+    std::mt19937 g(ivanna::test::IvannaTestSeed32(2));
     std::uniform_real_distribution<float> u(-0.9f, 0.9f);
     std::vector<float> l(96000);
     for (auto& v : l) v = u(g);
@@ -188,7 +194,7 @@ TEST(OrbeBinaural, StableAndBoundedAtAllSampleRates) {
         p.amount = 1.0f;
         o.setParams(p);
         const int n = (int)sr;  // 1 s
-        std::mt19937 g(3);
+        std::mt19937 g(ivanna::test::IvannaTestSeed32(3));
         std::uniform_real_distribution<float> u(-1, 1);
         std::vector<float> l(n), r(n);
         for (auto& v : l) v = u(g);

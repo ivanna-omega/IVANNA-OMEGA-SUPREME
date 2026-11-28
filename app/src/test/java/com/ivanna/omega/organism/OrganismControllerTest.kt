@@ -1,6 +1,9 @@
 package com.ivanna.omega.organism
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -111,5 +114,609 @@ class OrganismControllerTest {
                 lastFlush = null, lastErrorAtMs = 0L, nowMs = now
             )
         )
+    }
+
+    // T2/510 — estado del perfil aplicado (atribución A/B).
+
+    @Test
+    fun `State por defecto lleva perfil aplicado neutro de fabrica`() {
+        val state = OrganismController.State()
+        assertEquals("factory", state.appliedProfileId)
+        assertEquals(0L, state.appliedProfileVersion)
+        assertEquals("none", state.abState)
+        assertEquals("", state.appliedProfileHash)
+    }
+
+    @Test
+    fun `recordAppliedProfile actualiza el estado y el siguiente chunk lo refleja`() {
+        try {
+            val applied = OrganismController.recordAppliedProfile(
+                profileId = "omega-1795857152818-9lec",
+                version = 3L,
+                abState = "ab_running",
+                profileHash = "sha256:abc123"
+            )
+            assertEquals("omega-1795857152818-9lec", applied.id)
+            assertEquals(3L, applied.version)
+            val state = OrganismController.state.value
+            assertEquals("omega-1795857152818-9lec", state.appliedProfileId)
+            assertEquals(3L, state.appliedProfileVersion)
+            assertEquals("ab_running", state.abState)
+            assertEquals("sha256:abc123", state.appliedProfileHash)
+            // El snapshot que lee enqueueChunk es el mismo estado.
+            assertEquals(applied, OrganismController.appliedProfile())
+        } finally {
+            // Restaura los neutros: el controlador es un singleton.
+            OrganismController.recordAppliedProfile("factory", 0L, "none", "")
+        }
+    }
+
+    // C8 — decisión pura del intento de rollback por arranque (máximo 1 vez).
+
+    @Test
+    fun `rollback se intenta una sola vez por arranque`() {
+        val ready = ProfileApplier.RollbackCheck.Ready(2L, "{}")
+        assertEquals(true, OrganismController.shouldAttemptRollback(false, ready))
+        assertEquals(false, OrganismController.shouldAttemptRollback(true, ready))
+    }
+
+    @Test
+    fun `sin diario pendiente no se intenta nada`() {
+        assertEquals(false, OrganismController.shouldAttemptRollback(false, ProfileApplier.RollbackCheck.None))
+        assertEquals(false, OrganismController.shouldAttemptRollback(true, ProfileApplier.RollbackCheck.None))
+    }
+
+    @Test
+    fun `hash distinto tambien consume el unico intento del arranque`() {
+        val mismatch = ProfileApplier.RollbackCheck.StableHashMismatch(2L, "aaa", "bbb")
+        assertEquals(true, OrganismController.shouldAttemptRollback(false, mismatch))
+        assertEquals(false, OrganismController.shouldAttemptRollback(true, mismatch))
+    }
+
+    @Test
+    fun `estable ausente tambien consume el unico intento del arranque`() {
+        val missing = ProfileApplier.RollbackCheck.StableMissing(2L)
+        assertEquals(true, OrganismController.shouldAttemptRollback(false, missing))
+        assertEquals(false, OrganismController.shouldAttemptRollback(true, missing))
+    }
+
+    // T1/510 — decisiones puras del sondeo de perfil (la VUELTA).
+
+    @Test
+    fun `State por defecto lleva appliedProfileStatus none`() {
+        assertEquals("none", OrganismController.State().appliedProfileStatus)
+    }
+
+    @Test
+    fun `recordAppliedProfile con profileStatus actualiza appliedProfileStatus`() {
+        try {
+            OrganismController.recordAppliedProfile(
+                profileId = "omega-1795857152818-9lec",
+                version = 3L,
+                abState = "ab_running",
+                profileHash = "sha256:abc123",
+                profileStatus = "ab_running"
+            )
+            assertEquals("ab_running", OrganismController.state.value.appliedProfileStatus)
+            assertEquals(3L, OrganismController.state.value.appliedProfileVersion)
+        } finally {
+            OrganismController.recordAppliedProfile("factory", 0L, "none", "", "none")
+        }
+    }
+
+    @Test
+    fun `interruptor maestro en OFF apaga tambien el sondeo`() {
+        assertEquals(
+            false,
+            OrganismController.shouldPollProfile(
+                enabled = false, hasToken = true,
+                nowMs = now, lastCheckMs = 0L
+            )
+        )
+    }
+
+    @Test
+    fun `sin token no se sondea aunque toque`() {
+        assertEquals(
+            false,
+            OrganismController.shouldPollProfile(
+                enabled = true, hasToken = false,
+                nowMs = now, lastCheckMs = 0L
+            )
+        )
+    }
+
+    @Test
+    fun `sondeo toca a los 30 min y no antes`() {
+        val interval = OrganismController.PROFILE_POLL_INTERVAL_MS
+        assertEquals(
+            true,
+            OrganismController.shouldPollProfile(
+                enabled = true, hasToken = true,
+                nowMs = now, lastCheckMs = now - interval
+            )
+        )
+        assertEquals(
+            false,
+            OrganismController.shouldPollProfile(
+                enabled = true, hasToken = true,
+                nowMs = now, lastCheckMs = now - interval + 1000L
+            )
+        )
+    }
+
+    @Test
+    fun `stable mas nuevo se aplica`() {
+        assertEquals(true, OrganismController.shouldApplyServerVersion("stable", "none", 3L, 2L))
+        assertEquals(true, OrganismController.shouldApplyServerVersion("promoted", "promoted", 3L, 2L))
+    }
+
+    @Test
+    fun `version igual o mas vieja no se aplica`() {
+        assertEquals(false, OrganismController.shouldApplyServerVersion("stable", "none", 2L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("stable", "none", 1L, 2L))
+    }
+
+    @Test
+    fun `candidate solo se aplica con abState que permite probar`() {
+        assertEquals(true, OrganismController.shouldApplyServerVersion("candidate", "candidate", 3L, 2L))
+        assertEquals(true, OrganismController.shouldApplyServerVersion("ab_running", "ab_running", 3L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("candidate", "none", 3L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("candidate", "promoted", 3L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("candidate", "rolled_back", 3L, 2L))
+    }
+
+    @Test
+    fun `rolled_back no se aplica por la via normal (lo gestiona el rollback)`() {
+        assertEquals(false, OrganismController.shouldApplyServerVersion("rolled_back", "rolled_back", 3L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("rolled_back", "rolled_back", 1L, 2L))
+    }
+
+    @Test
+    fun `status desconocido no se aplica (fail-closed)`() {
+        assertEquals(false, OrganismController.shouldApplyServerVersion("experimental", "none", 3L, 2L))
+    }
+
+    @Test
+    fun `rollback solo restaura un estable estrictamente anterior`() {
+        assertEquals(true, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = 3L))
+        assertEquals(false, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = 4L))
+        assertEquals(false, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = 5L))
+        assertEquals(false, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = null))
+    }
+
+    // C21/510 — veredicto puro de la re-validación del token recién pegado.
+
+    @Test
+    fun `State por defecto no lleva ultimo 401 ni diagnostico`() {
+        val state = OrganismController.State()
+        assertEquals(0L, state.last401AtMs)
+        assertEquals(null, state.lastTokenDiagnosis)
+        assertEquals(false, state.tokenDiagnosing)
+    }
+
+    @Test
+    fun `Current y NotModified validan el token pegado (el servidor lo acepto)`() {
+        val current = ProfileFetcher.Result.Current("omega-1", 3L, "stable", "promoted", "{}")
+        assertEquals(
+            OrganismController.TokenValidation.VALID,
+            OrganismController.classifyTokenValidation(current)
+        )
+        assertEquals(
+            OrganismController.TokenValidation.VALID,
+            // C24/510: NotModified es data class (lleva la señal
+            // minSupportedPayloadVersion); el default es null.
+            OrganismController.classifyTokenValidation(ProfileFetcher.Result.NotModified())
+        )
+    }
+
+    @Test
+    fun `Quarantine tambien valida el token (404 = auth paso, aun no hay perfil)`() {
+        val quarantine = ProfileFetcher.Result.Quarantine("GET current → HTTP 404 (aún no hay perfil compilado)")
+        assertEquals(
+            OrganismController.TokenValidation.VALID,
+            OrganismController.classifyTokenValidation(quarantine)
+        )
+    }
+
+    @Test
+    fun `TokenInvalid es el unico veredicto invalido`() {
+        assertEquals(
+            OrganismController.TokenValidation.INVALID,
+            OrganismController.classifyTokenValidation(ProfileFetcher.Result.TokenInvalid)
+        )
+    }
+
+    @Test
+    fun `Retry NoToken y excepcion son desconocido, no invalido`() {
+        assertEquals(
+            OrganismController.TokenValidation.UNKNOWN,
+            OrganismController.classifyTokenValidation(ProfileFetcher.Result.Retry)
+        )
+        assertEquals(
+            OrganismController.TokenValidation.UNKNOWN,
+            OrganismController.classifyTokenValidation(ProfileFetcher.Result.NoToken)
+        )
+        assertEquals(
+            OrganismController.TokenValidation.UNKNOWN,
+            OrganismController.classifyTokenValidation(null)
+        )
+    }
+
+    // C24/510 — cuarentena versionada.
+
+    @Test
+    fun `State por defecto no lleva cuarentena ni payload obsoleto`() {
+        val state = OrganismController.State()
+        assertEquals(0, state.quarantined)
+        assertNull(state.lastQuarantineError)
+        assertNull(state.minSupportedPayloadVersion)
+        assertFalse(state.payloadObsolete)
+        assertEquals(0, state.obsoleteChunksDiscarded)
+        assertEquals(0L, state.lastPayloadDiscardAtMs)
+    }
+
+    @Test
+    fun `payload obsoleto solo si el servidor exige mas que PAYLOAD_VERSION`() {
+        assertFalse(OrganismController.isPayloadObsolete(null))
+        assertFalse(OrganismController.isPayloadObsolete(1L))
+        assertFalse(
+            OrganismController.isPayloadObsolete(OrganismPayload.PAYLOAD_VERSION.toLong())
+        )
+        assertTrue(
+            OrganismController.isPayloadObsolete(OrganismPayload.PAYLOAD_VERSION.toLong() + 1)
+        )
+    }
+
+    @Test
+    fun `NotModified con senal tambien valida el token pegado`() {
+        assertEquals(
+            OrganismController.TokenValidation.VALID,
+            OrganismController.classifyTokenValidation(
+                ProfileFetcher.Result.NotModified(minSupportedPayloadVersion = 2L)
+            )
+        )
+    }
+
+    // C16/510 — salud del LLM del cerebro.
+
+    @Test
+    fun `State por defecto no lleva salud LLM (desconocida)`() {
+        val state = OrganismController.State()
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, state.llmStatus)
+        assertNull(state.llmModel)
+        assertNull(state.llmDrafted)
+        assertEquals(0L, state.lastLlmStatusAtMs)
+    }
+
+    @Test
+    fun `parseLlmStatus normaliza nulo vacio y fuera de vocabulario a unknown`() {
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, OrganismController.parseLlmStatus(null))
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, OrganismController.parseLlmStatus(""))
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, OrganismController.parseLlmStatus("muerto"))
+        assertEquals(OrganismController.LLM_STATUS_OK, OrganismController.parseLlmStatus("ok"))
+        assertEquals(OrganismController.LLM_STATUS_DEGRADED, OrganismController.parseLlmStatus("degraded"))
+        assertEquals(OrganismController.LLM_STATUS_UNAVAILABLE, OrganismController.parseLlmStatus("unavailable"))
+    }
+
+    @Test
+    fun `applyLlmSignal registra la senal fresca en el State`() {
+        val state = OrganismController.applyLlmSignal(
+            OrganismController.State(),
+            status = "degraded",
+            model = "duckduckgo-web/claude-haiku-4-5",
+            drafted = true,
+            atMs = 1_000L
+        )
+        assertEquals(OrganismController.LLM_STATUS_DEGRADED, state.llmStatus)
+        assertEquals("duckduckgo-web/claude-haiku-4-5", state.llmModel)
+        assertEquals(true, state.llmDrafted)
+        assertEquals(1_000L, state.lastLlmStatusAtMs)
+    }
+
+    @Test
+    fun `applyLlmSignal sin senal deja unknown sin fecha`() {
+        val state = OrganismController.applyLlmSignal(
+            OrganismController.State(),
+            status = null,
+            model = null,
+            drafted = null,
+            atMs = 1_000L
+        )
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, state.llmStatus)
+        assertNull(state.llmModel)
+        assertNull(state.llmDrafted)
+        assertEquals(0L, state.lastLlmStatusAtMs)
+    }
+
+    @Test
+    fun `applyLlmSignal sin senal limpia una senal anterior (salud fresca o desconocida)`() {
+        val withSignal = OrganismController.applyLlmSignal(
+            OrganismController.State(),
+            status = "ok",
+            model = "gemini/gemini-3-flash-preview",
+            drafted = true,
+            atMs = 1_000L
+        )
+        val cleared = OrganismController.applyLlmSignal(
+            withSignal,
+            status = null,
+            model = null,
+            drafted = null,
+            atMs = 2_000L
+        )
+        assertEquals(OrganismController.LLM_STATUS_UNKNOWN, cleared.llmStatus)
+        assertNull(cleared.llmModel)
+        assertNull(cleared.llmDrafted)
+        assertEquals(0L, cleared.lastLlmStatusAtMs)
+    }
+
+    @Test
+    fun `applyLlmSignal con drafted false marca sin redaccion LLM`() {
+        val state = OrganismController.applyLlmSignal(
+            OrganismController.State(),
+            status = "unavailable",
+            model = null,
+            drafted = false,
+            atMs = 1_000L
+        )
+        assertEquals(OrganismController.LLM_STATUS_UNAVAILABLE, state.llmStatus)
+        assertEquals(false, state.llmDrafted)
+        assertEquals(1_000L, state.lastLlmStatusAtMs)
+    }
+
+    // T6/510 — tope de excursión acumulada + antichurn.
+
+    @Test
+    fun `State por defecto no lleva dwell tope veto ni temporizador A-B`() {
+        val state = OrganismController.State()
+        assertNull(state.dwellVersion)
+        assertEquals(0, state.dwellSightings)
+        assertEquals(0, state.autoAppliesToday)
+        assertFalse(state.autoApplyCapHit)
+        assertEquals(0L, state.lastApplyCapHitAtMs)
+        assertNull(state.vetoedVersion)
+        assertEquals(0L, state.vetoedUntilMs)
+        assertEquals(0L, state.abStartedAtMs)
+        assertEquals(0, state.abSessionsCompleted)
+        assertEquals(0L, state.lastAbTimeoutAtMs)
+    }
+
+    @Test
+    fun `dwell primera vista no aplica segunda si`() {
+        val first = OrganismController.dwellAdvance(null, 0, 5L)
+        assertEquals(5L, first.version)
+        assertEquals(1, first.sightings)
+        assertFalse(first.ready)
+        val second = OrganismController.dwellAdvance(first.version, first.sightings, 5L)
+        assertEquals(5L, second.version)
+        assertEquals(2, second.sightings)
+        assertTrue(second.ready)
+        // Una tercera vista seguida sigue lista (el dwell queda latido
+        // hasta aplicar; el tope diario es el que frena entonces).
+        val third = OrganismController.dwellAdvance(second.version, second.sightings, 5L)
+        assertTrue(third.ready)
+        assertEquals(3, third.sightings)
+    }
+
+    @Test
+    fun `dwell otra version reinicia el conteo a 1`() {
+        val dwelled = OrganismController.dwellAdvance(5L, 2, 5L)
+        assertTrue(dwelled.ready)
+        val other = OrganismController.dwellAdvance(dwelled.version, dwelled.sightings, 6L)
+        assertEquals(6L, other.version)
+        assertEquals(1, other.sightings)
+        assertFalse(other.ready)
+    }
+
+    @Test
+    fun `dayKey agrupa el mismo dia y separa dias distintos`() {
+        // 1970-01-01 00:16 y 00:33 UTC: mismo día en cualquier zona
+        // (±14 h no cruza la medianoche entre ambas).
+        assertEquals(
+            OrganismController.dayKey(1_000_000L),
+            OrganismController.dayKey(2_000_000L)
+        )
+        // 1970-01-02 03:46 UTC: día distinto en cualquier zona.
+        assertFalse(
+            OrganismController.dayKey(1_000_000L) ==
+                OrganismController.dayKey(100_000_000L)
+        )
+    }
+
+    @Test
+    fun `tope diario dos aplicaciones y la tercera espera a manana`() {
+        val today = "2026-11-28"
+        assertTrue(OrganismController.autoApplyAllowed(today, 0, today))
+        assertTrue(OrganismController.autoApplyAllowed(today, 1, today))
+        assertFalse(OrganismController.autoApplyAllowed(today, 2, today))
+        // Día nuevo: el contador se reinicia aunque ayer se llegara al tope.
+        assertTrue(OrganismController.autoApplyAllowed("2026-11-27", 2, today))
+        assertTrue(OrganismController.autoApplyAllowed("", 0, today))
+    }
+
+    @Test
+    fun `nextAutoApplyCount suma en el mismo dia y reinicia en dia nuevo`() {
+        val today = "2026-11-28"
+        assertEquals(1, OrganismController.nextAutoApplyCount(today, 0, today))
+        assertEquals(2, OrganismController.nextAutoApplyCount(today, 1, today))
+        assertEquals(1, OrganismController.nextAutoApplyCount("2026-11-27", 2, today))
+        assertEquals(1, OrganismController.nextAutoApplyCount("", 0, today))
+    }
+
+    @Test
+    fun `veto bloquea hasta su caducidad exacta y no despues`() {
+        val until = 5_000L
+        assertTrue(OrganismController.isVersionVetoed(until, 4_999L))
+        assertFalse(OrganismController.isVersionVetoed(until, 5_000L))
+        assertFalse(OrganismController.isVersionVetoed(until, 5_001L))
+        assertFalse(OrganismController.isVersionVetoed(0L, 1_000L))
+    }
+
+    @Test
+    fun `timeout A-B sin 3 sesiones en 4 h`() {
+        val timeout = OrganismController.AB_TIMEOUT_MS
+        val start = 10_000_000L
+        // Sin A/B en curso no hay timeout.
+        assertFalse(OrganismController.abTimedOut(0L, 0, start + timeout))
+        // Antes de las 4 h no caduca aunque no haya sesiones.
+        assertFalse(OrganismController.abTimedOut(start, 0, start + timeout - 1L))
+        // A las 4 h exactas, sin sesiones, caduca.
+        assertTrue(OrganismController.abTimedOut(start, 0, start + timeout))
+        // Con 2 sesiones sigue caducando; con 3 ya no.
+        assertTrue(OrganismController.abTimedOut(start, 2, start + timeout + 1L))
+        assertFalse(OrganismController.abTimedOut(start, 3, start + timeout + 1L))
+    }
+
+    @Test
+    fun `abSessionsCompleted es el delta desde el arranque del A-B`() {
+        assertEquals(0, OrganismController.abSessionsCompleted(0L, 10L, 12L))
+        assertEquals(2, OrganismController.abSessionsCompleted(1_000L, 10L, 12L))
+        assertEquals(0, OrganismController.abSessionsCompleted(1_000L, 10L, 10L))
+        // Un contador que retrocede no resta sesiones.
+        assertEquals(0, OrganismController.abSessionsCompleted(1_000L, 12L, 10L))
+    }
+
+    // T10/510 — auditoría de la IDA (emitidos vs enviados).
+
+    @Test
+    fun `State por defecto no lleva auditoria IDA`() {
+        val state = OrganismController.State()
+        assertEquals(0L, state.chunksEmitted)
+        assertEquals(0, state.chunksPruned)
+        assertEquals(0, state.chunksUserCleared)
+        assertEquals(0, state.chunksDroppedWhilePaused)
+        assertEquals(0L, state.chunksUnaccounted)
+        assertEquals(0L, state.chunksLost)
+        assertEquals(0L, state.enqueueFailures)
+        assertFalse(state.auditDiverged)
+        assertFalse(state.auditPaused)
+        assertEquals(0, state.auditDivergentChecks)
+        assertEquals(0L, state.lastAuditAtMs)
+        assertEquals(0L, state.lastAuditPauseAtMs)
+    }
+
+    @Test
+    fun `auditoria cuadra cuando todo esta contabilizado`() {
+        // 10 emitidos: 6 enviados + 2 en cola + 1 podado + 1 borrado.
+        val audit = OrganismController.evaluateChunkAudit(
+            emitted = 10L, sent = 6L, queued = 2, quarantined = 1,
+            pruned = 1, obsoleteDiscarded = 0, userCleared = 1,
+            droppedWhilePaused = 0, enqueueFailures = 0L
+        )
+        assertEquals(0L, audit.unaccounted)
+        assertEquals(0L, audit.lost)
+    }
+
+    @Test
+    fun `cuarentena esta dentro de en cola no se suma dos veces`() {
+        // 5 emitidos: 3 enviados + 2 en cola (los 2 en cuarentena).
+        val audit = OrganismController.evaluateChunkAudit(
+            emitted = 5L, sent = 3L, queued = 2, quarantined = 2,
+            pruned = 0, obsoleteDiscarded = 0, userCleared = 0,
+            droppedWhilePaused = 0, enqueueFailures = 0L
+        )
+        assertEquals(0L, audit.unaccounted)
+        assertEquals(0L, audit.lost)
+    }
+
+    @Test
+    fun `perdida es emitidos menos contabilizados`() {
+        val audit = OrganismController.evaluateChunkAudit(
+            emitted = 10L, sent = 2L, queued = 1, quarantined = 0,
+            pruned = 0, obsoleteDiscarded = 0, userCleared = 0,
+            droppedWhilePaused = 0, enqueueFailures = 1L
+        )
+        assertEquals(7L, audit.unaccounted)
+        assertEquals(7L, audit.lost)
+        assertEquals(1L, audit.enqueueFailures)
+    }
+
+    @Test
+    fun `excedente de un proceso anterior no es perdida`() {
+        // Tras un reinicio: 0 emitidos en este proceso, 4 en cola de
+        // antes (la cola durable no se reinicia; sentTotal sí).
+        val audit = OrganismController.evaluateChunkAudit(
+            emitted = 0L, sent = 0L, queued = 4, quarantined = 0,
+            pruned = 0, obsoleteDiscarded = 0, userCleared = 0,
+            droppedWhilePaused = 0, enqueueFailures = 0L
+        )
+        assertEquals(-4L, audit.unaccounted)
+        assertEquals(0L, audit.lost)
+    }
+
+    @Test
+    fun `ventana mide solo la perdida nueva entre checks`() {
+        val prev = OrganismController.ChunkAuditSnapshot(
+            emitted = 10L, sent = 6L, queued = 2, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 0
+        )
+        // Ventana limpia: 5 emitidos nuevos, 3 enviados, 2 en cola.
+        val clean = OrganismController.ChunkAuditSnapshot(
+            emitted = 15L, sent = 9L, queued = 4, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 0
+        )
+        assertEquals(0L, OrganismController.auditWindowLost(prev, clean))
+        // Ventana con 2 perdidos: 5 emitidos, solo 3 contabilizados.
+        val leaky = OrganismController.ChunkAuditSnapshot(
+            emitted = 15L, sent = 8L, queued = 3, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 0
+        )
+        assertEquals(2L, OrganismController.auditWindowLost(prev, leaky))
+        // Drenar la cola no es pérdida: 2 enviados, 2 menos en cola.
+        val drained = OrganismController.ChunkAuditSnapshot(
+            emitted = 10L, sent = 8L, queued = 0, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 0
+        )
+        assertEquals(0L, OrganismController.auditWindowLost(prev, drained))
+        // En pausa la ventana vale 0: 3 emitidos nuevos, los 3
+        // rechazados contabilizados, y 1 enviado drena la cola.
+        val paused = OrganismController.ChunkAuditSnapshot(
+            emitted = 13L, sent = 7L, queued = 1, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 3
+        )
+        assertEquals(0L, OrganismController.auditWindowLost(prev, paused))
+        // Primer check (sin previo): la ventana es el acumulado.
+        val first = OrganismController.ChunkAuditSnapshot(
+            emitted = 10L, sent = 6L, queued = 2, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 1, droppedWhilePaused = 0
+        )
+        assertEquals(0L, OrganismController.auditWindowLost(OrganismController.ChunkAuditSnapshot(), first))
+    }
+
+    @Test
+    fun `divergencia por ventana grande o por fuga lenta con acumulado`() {
+        // Ventana > tope: diverge aunque el acumulado sea igual.
+        assertTrue(OrganismController.isAuditDivergent(6L, 6L))
+        // Fuga lenta: 2 por ventana, pero el acumulado ya pasa el tope.
+        assertTrue(OrganismController.isAuditDivergent(2L, 7L))
+        // Pérdida histórica con ventana limpia: no diverge (el pasado
+        // no condena al presente; así la pausa puede reanudar).
+        assertFalse(OrganismController.isAuditDivergent(0L, 7L))
+        // Por debajo del tope en ambos: no diverge.
+        assertFalse(OrganismController.isAuditDivergent(2L, 2L))
+        // El tope es estricto (> 5, no >= 5).
+        assertFalse(OrganismController.isAuditDivergent(5L, 5L))
+        assertFalse(OrganismController.isAuditDivergent(0L, 0L))
+    }
+
+    @Test
+    fun `check de auditoria con throttle de 5 min`() {
+        val interval = OrganismController.AUDIT_INTERVAL_MS
+        assertTrue(OrganismController.shouldRunAuditCheck(interval, 0L))
+        assertFalse(OrganismController.shouldRunAuditCheck(interval - 1L, 0L))
+        assertTrue(OrganismController.shouldRunAuditCheck(2 * interval, interval))
+        assertFalse(OrganismController.shouldRunAuditCheck(2 * interval - 1L, interval))
+    }
+
+    @Test
+    fun `pausa a las 3 ventanas divergentes y reanudacion a las 2 limpias`() {
+        assertFalse(OrganismController.shouldPauseAudit(0))
+        assertFalse(OrganismController.shouldPauseAudit(2))
+        assertTrue(OrganismController.shouldPauseAudit(3))
+        assertTrue(OrganismController.shouldPauseAudit(4))
+        assertFalse(OrganismController.shouldResumeAudit(false, 2))
+        assertFalse(OrganismController.shouldResumeAudit(true, 1))
+        assertTrue(OrganismController.shouldResumeAudit(true, 2))
     }
 }

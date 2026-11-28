@@ -346,6 +346,36 @@ fun OmegaApp() {
             runCatching { DSPStatePrefs.save(appContext, state) }
         }
     }
+    // T1/510 (H5) — cableado de la VUELTA que la especificación omitió:
+    // OrganismController no tiene DSPState, así que MainActivity registra
+    // aquí cómo aplicar un IvannaAudioProfile al motor. La vía es la
+    // misma que usa la UI (ProfileManagerBridge.applyProfile → applyToDsp:
+    // DSPState + pushToNative + FusedControls + daemon). Se registra en
+    // OmegaApp porque es el dueño de `dsp` (el controlador arranca en
+    // PersistedStateRestorer, antes de componer; si un sondeo llega antes
+    // de este registro, el install falla cerrado y se reintenta en el
+    // próximo ciclo). El puente y el `dsp` capturados son estables en
+    // toda la vida de la app; el registro sobrevive a stop()/start().
+    // DISCREPANCIA (código vivo manda): ProfileManagerBridge.applyProfile
+    // devuelve Unit, no Boolean; el Boolean se deriva del read-back
+    // getCurrentProfileId() == profile.id (applyToDsp solo fija el id
+    // vigente si aplicó de verdad). Y ProfileManager solo leía res/raw:
+    // loadProfiles() ahora fusiona también el override de filesDir
+    // (saveOverride), sin lo cual applyToDsp("muselink-live") devolvería
+    // false siempre.
+    val profileBridge = remember { ProfileManagerBridge(appContext) }
+    DisposableEffect(profileBridge) {
+        com.ivanna.omega.organism.OrganismController.onApplyProfile = { profile ->
+            profileBridge.applyProfile(profile.id, dsp.value) { dsp.value = it }
+            profileBridge.getCurrentProfileId() == profile.id
+        }
+        com.ivanna.omega.organism.OrganismController.onReadAppliedProfileId =
+            { profileBridge.getCurrentProfileId() }
+        onDispose {
+            com.ivanna.omega.organism.OrganismController.onApplyProfile = null
+            com.ivanna.omega.organism.OrganismController.onReadAppliedProfileId = null
+        }
+    }
     // v2.5.448: IvannaTheme (Aurora Obsidiana) envuelve TODA la app. Antes
     // un MaterialTheme genérico con darkColorScheme(background=Carbon,
     // surface=Surface1) pisaba el tema central: su `primary` era el morado

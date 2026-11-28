@@ -56,7 +56,9 @@ void FusedTonal::setControls(const TonalControls& c) noexcept {
 void FusedTonal::applyControls() noexcept {
     trimGain_ = std::pow(10.0, static_cast<double>(controls_.trimDb) / 20.0);
     // EQ de usuario, 10 bandas RoomProbe (31.5 Hz … 16 kHz):
-    //   bandas 0-2 = lowDb, 3-6 = midDb, 7-9 = highDb.
+    //   bandas 0-2 = lowDb, 3-6 = midDb, 7-9 = highDb, y S3/510:
+    //   presencia 4-8 kHz (bandas 7-8: 4 kHz y 8 kHz) ADITIVA sobre
+    //   highDb. La banda 9 (16 kHz) queda solo con highDb.
     // curve 2 (élite-lean): el EvoEQ sigue apuntando a Harman ×0.5, así
     // que el delta (élite − Harman) ×0.5 se suma aquí; el total queda
     // élite-lean ×0.5, a la misma escala que Harman ×0.5 en curve 1.
@@ -65,6 +67,13 @@ void FusedTonal::applyControls() noexcept {
     for (int b = 0; b < ivanna::room::kBands; ++b) {
         float g = (b <= 2) ? controls_.lowDb
                            : (b <= 6) ? controls_.midDb : controls_.highDb;
+        // S3/510 — presenceDb ADITIVO (no sustitutivo): las bandas
+        // 7-8 (4 kHz y 8 kHz) suman presenceDb ENCIMA de highDb. Con
+        // presenceDb = 0 las ganancias son idénticas a antes
+        // (bit-exacto para perfiles existentes); la guarda != 0.0f lo
+        // hace exacto incluso ante -0.0f.
+        if (controls_.presenceDb != 0.0f && (b == 7 || b == 8))
+            g += controls_.presenceDb;
         if (controls_.curve == 2) {
             const float f = ivanna::room::kBandHz[b];
             const float harman =

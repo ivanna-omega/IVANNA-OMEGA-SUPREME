@@ -221,6 +221,16 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.11.0")
 
+    // T8/510 — WorkManager: flush + sondeo de perfil en fondo cuando la
+    // app está cerrada (OrganismFlushWorker). Versión 2.9.0: estable
+    // conocida, compatible con el stack fijado del proyecto (AGP 8.5.2,
+    // compileSdk 35, Kotlin 2.4.21). El proyecto NO tiene catálogo de
+    // versiones (no hay gradle/libs.versions.toml); la línea actual de
+    // WorkManager es 2.12.0 (sep 2026) — subir a ella es decisión aparte,
+    // no parte de T8. Solo se usa work-runtime-ktx (CoroutineWorker);
+    // sin work-testing (no hay tests de worker en este frente).
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
+
     // OmniRoute (2026-11-14, v2.5.443): cliente HTTP del gateway LLM gratis
     // (endpoint OpenAI-compatible). OkHttp por su streaming SSE limpio.
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

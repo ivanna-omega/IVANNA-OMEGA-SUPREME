@@ -356,6 +356,14 @@ fun ControlTabScreen(
         onOrganismClearQueue = {
             com.ivanna.omega.organism.OrganismController.clearQueue()
         },
+        // C21/510: diagnóstico de un toque del token (sin enviar el token).
+        onOrganismDiagnoseToken = {
+            com.ivanna.omega.organism.OrganismController.runTokenDiagnosis()
+        },
+        // C22/510: borrado explícito del perfil estable (maestro en OFF).
+        onOrganismDeleteStableProfile = {
+            com.ivanna.omega.organism.OrganismController.deleteStableProfile()
+        },
         onAuxFieldChange = { en, xo, co ->
             paramStore.setAuxField(en, xo, co)
             if (IvannaNativeLib.isLoaded)

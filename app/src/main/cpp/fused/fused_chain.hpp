@@ -164,6 +164,60 @@ public:
     void prepare(double sampleRate) noexcept;
     void setControls(const FusedControls& c) noexcept;
     FusedControls controls() const noexcept { return userControls_; }
+
+    // ── S12/510 — FUNDIDO DE APLICACIÓN POR HOP (SLEW) ───────────────────
+    // El perfil descargado NO entra en escalón: setControlsRamped()
+    // interpola cada parámetro continuo (EQ por banda, trim, amounts de
+    // los operadores, compresor…) desde el valor vigente hasta el objetivo
+    // en N hops de 128 muestras, ejecutada por el hilo de audio como parte
+    // de su trabajo por hop existente (process() parte los chunks en
+    // fronteras de hop mientras la rampa está activa; en régimen el coste
+    // es cero y el comportamiento es bit-idéntico al anterior).
+    //   · hops <= 0 → comportamiento anterior exacto (setControls
+    //     inmediato, sin fundido). Es el camino de sliders / re-push.
+    //   · hops > 0 → ese número de hops (acotado a kParamRampMaxHops).
+    //   · La rampa es MONÓTONA por campo (lerp lineal entre extremos
+    //     clampados) y ACOTADA: como mucho kParamRampMaxHops hops; al
+    //     completarse, userControls_ ES el objetivo bit-exacto (snap
+    //     final, sin deriva float). Los campos discretos (modo, curva,
+    //     presets, bools) NO se interpolan: cambian con el snap final.
+    //   · Un setControls() nuevo, setNeutral() o reset() CANCELAN la
+    //     rampa y aplican de inmediato (gana el último: el motor termina
+    //     en el objetivo más reciente, nunca queda a medias). Una rampa
+    //     re-programada re-basa `from` en el valor interpolado vigente.
+    //   · Un cambio de modo o de enganche de TΩ NO se rampea: delega en
+    //     setControls() y lo cubre el fundido de modo existente (OUT 256
+    //     / IN 512 muestras). Tampoco se programa rampa con un fundido
+    //     de modo en curso.
+    //   · HILO: igual que setControls — la programa el hilo de control
+    //     (JNI) y la ejecuta el hilo de audio; miembros planos, sin lock
+    //     nuevo (misma convención que userControls_).
+    //   · Telemetría S13: paramRampActive()/paramRampRemainingHops() son
+    //     el punto de enganche para la puerta A/B «sin clip durante la
+    //     ventana de aplicación» — el Organismo debe muestrear
+    //     levelMaxDbfs mientras la rampa está activa, no solo después.
+    //     PENDIENTE DE MEDICIÓN FÍSICA: levelMaxDbfs + escucha de Esse
+    //     en la primera aplicación real de la v1.1 (no medida aquí).
+    // Reutiliza el patrón de slew de la casa (fundido de modo en muestras,
+    // kModeFadeOutSamples/kModeFadeInSamples; precedente Volterra ~18 ms).
+    static constexpr int kParamRampHopSamples = 128;  // hop del motor
+    static constexpr float kParamRampMaxDbPerHop = 0.5f;  // tope conservador (§S12)
+    static constexpr int kParamRampMaxHops = 32;   // ~85 ms @ 48 kHz
+    static constexpr int kParamRampDefaultHops = 7;  // ~18 ms @ 48 kHz
+    void setControlsRamped(const FusedControls& target, int hops) noexcept;
+    // Hops que pide la regla conservadora §S12 para ir de `from` a `to`:
+    // ceil(máx |Δ| en dB / 0.5) sobre trim/EQ por banda/umbral del
+    // compresor/corrección de sala; 0 si no hay cambio; kParamRampDefaultHops
+    // (~18 ms) si solo cambian parámetros sin unidad dB (amounts…); tope
+    // kParamRampMaxHops. La v1.1 (+2/−2 dB por banda, trim −4 dB, umbral del
+    // compresor −12 → −24 dB) pide 24: el umbral domina el cálculo.
+    static int rampHopsFor(const FusedControls& from,
+                           const FusedControls& to) noexcept;
+    // Telemetría S13 (solo lectura, sin locks).
+    bool paramRampActive() const noexcept { return paramRampTotalHops_ > 0; }
+    int paramRampRemainingHops() const noexcept {
+        return paramRampTotalHops_ > 0 ? (paramRampTotalHops_ - paramRampHopsDone_) : 0;
+    }
     void setNeutral() noexcept;
     bool isNeutral() const noexcept { return userControls_.isNeutral(); }
     void reset() noexcept;
@@ -393,6 +447,13 @@ private:
     // operadores, fuerza un frame TΩ en la siguiente muestra si TΩ se
     // engancha) y pasa el fundido a IN. Se llama al llegar la ganancia a 0.
     void applyModeFadePending() noexcept;
+    // ── S12/510 — fundido de aplicación por hop (slew) ───────────────────
+    // Cancela la rampa (sin tocar userControls_: el motor se queda en el
+    // valor interpolado vigente hasta que el llamador fije el nuevo).
+    void cancelParamRamp() noexcept;
+    // Avanza UN hop de la rampa: userControls_ = lerp(from, to, done/total);
+    // al llegar al total, snap exacto a `to` y desactiva la rampa.
+    void advanceParamRampHop() noexcept;
     // Reparte userControls_ a los 7 operadores (cuerpo de setControls sin
     // la detección de cambio de modo; lo usan setControls y el pendiente).
     void distributeControls() noexcept;
@@ -492,6 +553,15 @@ private:
     double modeFadeGain_ = 1.0;              // ganancia de salida del fundido de modo
     FusedControls modeFadePending_;          // controles nuevos en espera (cambio de modo)
     bool modeFadePendingValid_ = false;      // true = hay un pendiente por aplicar
+    // ── S12/510 — fundido de aplicación por hop (slew) ───────────────────
+    // Estado de la rampa (solo hilo de audio lo avanza; lo programa el hilo
+    // de control con setControlsRamped — misma convención que userControls_).
+    // totalHops_ == 0 significa SIN rampa (régimen: coste cero en process()).
+    FusedControls paramRampFrom_;  // valor vigente al programar (o al re-basar)
+    FusedControls paramRampTo_;    // objetivo (ya clampado)
+    int paramRampTotalHops_ = 0;
+    int paramRampHopsDone_ = 0;
+    int paramRampHopPos_ = 0;  // muestras consumidas del hop vigente (0..127)
     // 6.4 (refinamiento 2026-11-26) — fundido al apagar el D10 en caliente.
     // d10EnabledSeen_ recuerda el último valor visto de D10 (process() lo
     // compara para detectar el apagado; default true = default de D10Config).

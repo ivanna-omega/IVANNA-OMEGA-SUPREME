@@ -169,4 +169,108 @@ class OrganismQueueTest {
         assertEquals(listOf(2, 3), items.map { it.chunkId })
         assertTrue(items.all { it.state == OrganismQueue.State.PENDING })
     }
+
+    // T10/510 — el prune deja de ser silencioso: la auditoría IDA
+    // cuenta los podados como disposición, no como pérdida.
+
+    @Test
+    fun `prunedTotal cuenta los podados por tope de cola`() {
+        val tinyDir = Files.createTempDirectory("organism-queue-prune-test").toFile()
+        try {
+            val tiny = OrganismQueue(tinyDir, maxItems = 2)
+            assertEquals(0, tiny.prunedTotal)
+            tiny.enqueue("s1", 0, body(0))
+            tiny.enqueue("s1", 1, body(1))
+            assertEquals(0, tiny.prunedTotal)
+            tiny.enqueue("s1", 2, body(2)) // 3 con tope 2: cae el más viejo.
+            assertEquals(1, tiny.prunedTotal)
+            tiny.enqueue("s1", 3, body(3))
+            assertEquals(2, tiny.prunedTotal)
+            assertEquals(2, tiny.listAll().size)
+        } finally {
+            tinyDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `prunedTotal cuenta el podado por retencion al reabrir`() {
+        // Chunk viejo escrito a mano (createdAtMs de hace 8 días).
+        val oldDir = Files.createTempDirectory("organism-queue-retention-test").toFile()
+        try {
+            val oldJson = """{"sessionId":"s1","chunkId":0,"state":"PENDING","attempts":0,"nextAttemptAtMs":0,"bodyJson":"{\"song\":\"x\"}","lastError":null,"createdAtMs":${System.currentTimeMillis() - 8L * 24 * 60 * 60 * 1000}}"""
+            File(oldDir, "s1_0.json").writeText(oldJson)
+            val reopened = OrganismQueue(oldDir)
+            assertTrue("el chunk de 8 días debe descartarse", reopened.listAll().isEmpty())
+            assertEquals(1, reopened.prunedTotal)
+        } finally {
+            oldDir.deleteRecursively()
+        }
+    }
+
+    // C24/510 — cuarentena versionada.
+
+    private fun versionedBody(version: Int): JsonObject =
+        JsonObject().apply {
+            add("telemetry", JsonObject().apply { addProperty("payloadVersion", version) })
+        }
+
+    @Test
+    fun `markQuarantined estampa la fecha y lastQuarantinedError devuelve el mas reciente`() {
+        queue.enqueue("s1", 0, body(0))
+        queue.enqueue("s1", 1, body(1))
+        val first = queue.listAll().first { it.chunkId == 0 }
+        queue.markQuarantined(first, "400 viejo", nowMs = 1000L)
+        val second = queue.listAll().first { it.chunkId == 1 }
+        queue.markQuarantined(second, "422 nuevo", nowMs = 2000L)
+        assertEquals(2, queue.counts().getValue(OrganismQueue.State.QUARANTINED))
+        assertEquals("422 nuevo", queue.lastQuarantinedError())
+        // La estampa sobrevive a reabrir la cola (disco, no memoria).
+        val reopened = OrganismQueue(dir)
+        assertEquals("422 nuevo", reopened.lastQuarantinedError())
+    }
+
+    @Test
+    fun `lastQuarantinedError es null sin cuarentena`() {
+        queue.enqueue("s1", 0, body(0))
+        assertNull(queue.lastQuarantinedError())
+    }
+
+    @Test
+    fun `discardPayloadOlderThan borra solo los de version vieja o sin versionar`() {
+        queue.enqueue("s1", 0, versionedBody(1)) // vigente
+        queue.enqueue("s1", 1, versionedBody(0)) // versionado a 0
+        queue.enqueue("s1", 2, body(2)) // sin telemetry (pre-C24)
+        queue.enqueue("s1", 3, versionedBody(2)) // nuevo
+        assertEquals(2, queue.discardPayloadOlderThan(2L))
+        assertEquals(listOf(0, 3), queue.listAll().map { it.chunkId })
+        // Idempotente: el segundo pase no borra nada.
+        assertEquals(0, queue.discardPayloadOlderThan(2L))
+        // Un mínimo igual a la versión no descarta nada.
+        assertEquals(0, queue.discardPayloadOlderThan(1L))
+    }
+
+    @Test
+    fun `discardPayloadOlderThan no toca un chunk en SENDING`() {
+        queue.enqueue("s1", 0, versionedBody(0))
+        val item = queue.nextReady(1000L)!!
+        queue.markSending(item)
+        assertEquals(0, queue.discardPayloadOlderThan(2L))
+        assertEquals(1, queue.listAll().size)
+        // Al resolverse el envío (aquí, cuarentena por 4xx), el próximo
+        // descarte sí lo alcanza: no queda huérfano obsoleto.
+        queue.markQuarantined(item, "400 esquema viejo", nowMs = 5000L)
+        assertEquals(1, queue.discardPayloadOlderThan(2L))
+        assertTrue(queue.listAll().isEmpty())
+    }
+
+    @Test
+    fun `el prune de retencion no borra cuarentena joven (solo la edad manda)`() {
+        queue.enqueue("s1", 0, body(0))
+        val item = queue.nextReady(1000L)!!
+        queue.markQuarantined(item, "400", nowMs = System.currentTimeMillis())
+        // Prune inmediato: la cuarentena joven sobrevive (la edad, no el
+        // estado, decide; el descarte por esquema es discardPayloadOlderThan).
+        assertEquals(0, queue.pruneIfOverCap())
+        assertEquals(1, queue.listAll().size)
+    }
 }

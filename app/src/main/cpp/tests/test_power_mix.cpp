@@ -55,6 +55,12 @@
 #include "../spatial/OrbeBinaural.hpp"
 #include "../spatial/PowerMix.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 namespace {
 constexpr double kFs = 48000.0;
 constexpr int kSec = 48000;
@@ -192,7 +198,7 @@ TEST(PowerMixer, UncorrelatedNoiseIsZeroDb) {
     // picos-vs-potencia.
     PowerMixer m;
     m.prepare(48000.0);
-    std::mt19937 gD(7), gW(8);
+    std::mt19937 gD(ivanna::test::IvannaTestSeed32(2)), gW(ivanna::test::IvannaTestSeed32(3));
     std::normal_distribution<double> u(0.0, 0.25);
     std::vector<double> d(kSec), w(kSec);
     for (int i = 0; i < kSec; ++i) { d[i] = u(gD); w[i] = u(gW); }
@@ -207,7 +213,7 @@ TEST(PowerMixer, UniformNoiseLossIsBounded) {
     // de pico): la pérdida está acotada y no hay blow-up. Medido −0.65 dB.
     PowerMixer m;
     m.prepare(48000.0);
-    std::mt19937 gD(7), gW(8);
+    std::mt19937 gD(ivanna::test::IvannaTestSeed32(2)), gW(ivanna::test::IvannaTestSeed32(3));
     std::uniform_real_distribution<double> u(-0.5, 0.5);
     std::vector<double> d(kSec), w(kSec);
     for (int i = 0; i < kSec; ++i) { d[i] = u(gD); w[i] = u(gW); }
@@ -394,7 +400,7 @@ TEST(PowerMixSteady, HolosNoiseAmountHalfIsZeroDb) {
     ivanna::HolosParams p;
     p.amount = 0.5f;
     op.setParams(p);
-    auto nz = noiseMono(61);
+    auto nz = noiseMono(ivanna::test::IvannaTestSeed32(1));
     std::vector<float> l = nz.l, r = nz.r;
     runHolos(op, l, r);
     const double pIn = powerLR(nz.l, nz.r, 2 * kSec, 3 * kSec);
@@ -410,7 +416,7 @@ TEST(PowerMixSteady, OrbeNoiseAmountHalfIsZeroDb) {
     ivanna::OrbeParams p;
     p.amount = 0.5f;
     op.setParams(p);
-    auto nz = noiseMono(61);
+    auto nz = noiseMono(ivanna::test::IvannaTestSeed32(1));
     std::vector<float> l = nz.l, r = nz.r;
     runOrbe(op, l, r);
     const double pIn = powerLR(nz.l, nz.r, 2 * kSec, 3 * kSec);

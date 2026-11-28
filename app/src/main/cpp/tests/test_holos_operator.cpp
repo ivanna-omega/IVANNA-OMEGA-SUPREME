@@ -15,6 +15,12 @@
 #include "../spatial/HolosOperator.hpp"
 #include "ivanna_measure.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace ivanna;
 using namespace ivanna::measure;
 
@@ -78,7 +84,7 @@ TEST(HolosOperator, BypassIsBitExact) {
     HolosParams p;  // amount = 0 por defecto
     op.setParams(p);
     auto t = tone(1000.0, 0.5, 2.0);
-    auto nz = noise(0.3, 2.0, 7);
+    auto nz = noise(0.3, 2.0, ivanna::test::IvannaTestSeed32(1));
     for (int i = 0; i < (int)t.size(); ++i) t[i] += nz[i];
     std::vector<float> l = t, r = t;
     // R distinto de L en la segunda mitad (estéreo real).
@@ -142,7 +148,7 @@ TEST(HolosOperator, StableAtAllSampleRates) {
         op.prepare((float)sr);
         op.setParams(onParams());
         auto t = tone(1000.0, 0.5, 1.0, sr);
-        auto nz = noise(0.1, 1.0, 11, sr);
+        auto nz = noise(0.1, 1.0, ivanna::test::IvannaTestSeed32(2), sr);
         for (int i = 0; i < (int)t.size(); ++i) t[i] += nz[i] + 0.1f;  // + DC
         std::vector<float> l = t, r = t;
         for (int i = 0; i < (int)r.size(); ++i) r[i] = -t[i];
@@ -228,8 +234,8 @@ TEST(HolosOperator, FailClosedOnIncoherentContent) {
     HolosOperator op;
     op.prepare(48000.0f);
     op.setParams(onParams());
-    auto l = noise(0.4, 2.0, 41);
-    auto r = noise(0.4, 2.0, 42);
+    auto l = noise(0.4, 2.0, ivanna::test::IvannaTestSeed32(3));
+    auto r = noise(0.4, 2.0, ivanna::test::IvannaTestSeed32(4));
     const std::vector<float> inL = l, inR = r;
     run(op, l, r);
     std::printf("[holos-op] fail-closed: coh media %.2f, activo %d\n",
@@ -259,15 +265,15 @@ TEST(HolosOperator, CoherenceGateReopensAfterProbe415) {
             op.process(l.data() + b * kBlock, r.data() + b * kBlock, kBlock);
     };
     // 1) Ruido incorrelado: la puerta se cierra.
-    auto l = noise(0.4, 4.0, 41);
-    auto r = noise(0.4, 4.0, 42);
+    auto l = noise(0.4, 4.0, ivanna::test::IvannaTestSeed32(3));
+    auto r = noise(0.4, 4.0, ivanna::test::IvannaTestSeed32(4));
     runBlocks(l, r, (int)l.size() / kBlock);
     EXPECT_LT(op.meanCoherence(), 0.3f);
     EXPECT_FALSE(op.isActive());
     // 2) Más ruido incorrelado: la puerta sigue cerrada (el sondeo no la
     // reabre sin señal coherente) y la salida sigue en passthrough.
-    auto l2 = noise(0.4, 4.0, 43);
-    auto r2 = noise(0.4, 4.0, 44);
+    auto l2 = noise(0.4, 4.0, ivanna::test::IvannaTestSeed32(5));
+    auto r2 = noise(0.4, 4.0, ivanna::test::IvannaTestSeed32(6));
     const std::vector<float> inL2 = l2, inR2 = r2;
     runBlocks(l2, r2, (int)l2.size() / kBlock);
     EXPECT_FALSE(op.isActive());
@@ -298,8 +304,8 @@ TEST(HolosOperator, NoNanInfOnSilenceDcAndNoise) {
             std::fill(l.begin(), l.end(), 0.5f);
             std::fill(r.begin(), r.end(), 0.5f);
         } else if (std::string(name) == "noise") {
-            l = noise(1.0, 2.0, 31);
-            r = noise(1.0, 2.0, 32);
+            l = noise(1.0, 2.0, ivanna::test::IvannaTestSeed32(7));
+            r = noise(1.0, 2.0, ivanna::test::IvannaTestSeed32(8));
         } else if (std::string(name) == "hot") {
             l = tone(1000.0, 1.5, 2.0);
             r = tone(1000.0, 1.5, 2.0);

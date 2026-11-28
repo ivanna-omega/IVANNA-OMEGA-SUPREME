@@ -6,6 +6,12 @@
 #include <vector>
 #include "spatial/RoomProbe.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 using namespace ivanna::room;
 static constexpr float kSr = 48000.f;
 static constexpr float kPi = 3.14159265358979f;
@@ -13,7 +19,7 @@ static constexpr float kPi = 3.14159265358979f;
 TEST(RoomProbe, LockInRecoversAmplitudeUnderNoise) {
     for (float f : {40.f, 125.f, 1000.f, 5000.f}) {
         std::vector<float> x(24000);
-        std::srand(7);
+        std::srand(ivanna::test::IvannaTestSeed32(1));
         for (size_t i = 0; i < x.size(); ++i) {
             const float noise = 0.05f * (float(std::rand()) / RAND_MAX - 0.5f) * 2.f;       // ruido blanco ±0.05
             x[i] = 0.3f * std::sin(2 * kPi * f * i / kSr + 0.7f) + noise;

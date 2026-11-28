@@ -40,6 +40,12 @@
 #include <vector>
 #include <algorithm>
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 static constexpr int   kSR     = 48000;
 static constexpr int   kFrames = 512;
 static constexpr float kTarget = 0.97723722f;  // -0.2 dBTP
@@ -237,7 +243,7 @@ TEST(MasterOutputStage, MixAndDither_ShapedOutputOnDownstreamGrid) {
 // amplitud de dither, redondeo a la misma rejilla, sin realimentación).
 namespace {
 struct TestTpdfRef {
-    uint64_t sL = 0x123456789ABCDEF0ULL, sR = 0x0FEDCBA987654321ULL;
+    uint64_t sL = ivanna::test::IvannaTestSeedFor(1), sR = ivanna::test::IvannaTestSeedFor(2);
     static double uni(uint64_t& s) {
         uint64_t x = s;
         x ^= x >> 12; x ^= x << 25; x ^= x >> 27; s = x;

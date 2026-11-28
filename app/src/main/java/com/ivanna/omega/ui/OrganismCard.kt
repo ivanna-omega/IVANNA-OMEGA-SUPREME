@@ -25,6 +25,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.ivanna.omega.organism.OrganismController
+import com.ivanna.omega.organism.OrganismPayload
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 /**
  * OrganismCard — la UI MÍNIMA indispensable del organismo (v2.5.506).
@@ -48,6 +52,10 @@ fun OrganismCard(
     onToggle: (Boolean) -> Unit,
     onSaveToken: (String) -> Boolean,
     onClearQueue: () -> Unit = {},
+    onDiagnoseToken: () -> Unit = {},
+    // C22/510: borrado explícito del perfil estable. Solo se muestra con
+    // el interruptor maestro en OFF; el controlador lo rechaza si está ON.
+    onDeleteStableProfile: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var tokenDraft by remember { mutableStateOf("") }
@@ -92,6 +100,76 @@ fun OrganismCard(
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.SemiBold
             )
+            // C16/510 — versión del perfil aplicado + salud del LLM del
+            // cerebro, juntas (la propuesta pide el estado del LLM junto
+            // a la versión del perfil). La versión solo se muestra cuando
+            // hay un perfil aplicado (v > 0); la línea LLM solo cuando el
+            // servidor anuncia algo (estado conocido o drafted conocido).
+            // Sin señal del servidor no hay nada que mostrar: no se
+            // inventa un estado. Si el perfil se compiló solo con el
+            // analizador determinista, la línea dice «sin redacción LLM».
+            if (state.appliedProfileVersion > 0) {
+                Text(
+                    "Perfil: v${state.appliedProfileVersion} (${state.appliedProfileStatus})",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            if (state.llmStatus != OrganismController.LLM_STATUS_UNKNOWN || state.llmDrafted != null) {
+                Text(
+                    llmLine(state),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            // T6/510 — antichurn: dwell, tope diario, veto de versión
+            // y timeout del A/B. Solo se muestra cuando hay algo que
+            // ver; con todo a cero no añade ruido. El tope y el veto
+            // son estado visible, no silencio: si el ciclo se detiene,
+            // la tarjeta dice por qué y hasta cuándo.
+            if (state.dwellVersion != null && state.dwellSightings in 1 until OrganismController.DWELL_REQUIRED_POLLS) {
+                Text(
+                    "Versión v${state.dwellVersion} vista ${state.dwellSightings}/${OrganismController.DWELL_REQUIRED_POLLS} sondeos: se aplica cuando el servidor la repita (antichurn).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            if (state.autoAppliesToday > 0) {
+                Text(
+                    "Aplicaciones automáticas hoy: ${state.autoAppliesToday}/${OrganismController.MAX_AUTO_APPLIES_PER_DAY}.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            if (state.autoApplyCapHit) {
+                Text(
+                    "Tope diario alcanzado: la próxima aplicación automática espera a mañana.",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                if (state.lastApplyCapHitAtMs > 0L) {
+                    Text(
+                        "Último tope: ${format401Date(state.lastApplyCapHitAtMs)}.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            if (state.vetoedVersion != null && state.vetoedUntilMs > System.currentTimeMillis()) {
+                Text(
+                    "Versión v${state.vetoedVersion} vetada hasta ${format401Date(state.vetoedUntilMs)} (hizo rollback): no se aplica aunque el servidor la vuelva a publicar.",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            if (state.abStartedAtMs > 0L) {
+                Text(
+                    "A/B en curso desde ${format401Date(state.abStartedAtMs)}: ${state.abSessionsCompleted}/${OrganismController.AB_SESSIONS_REQUIRED} sesiones; sin 3 sesiones en 4 h vuelve solo al estable.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            if (state.lastAbTimeoutAtMs > 0L) {
+                Text(
+                    "Último timeout de A/B: ${format401Date(state.lastAbTimeoutAtMs)} (sin 3 sesiones en 4 h; vuelta al estable).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
             if (state.queued > 0) {
                 Text(
                     "En cola: ${state.queued} chunk(s) · Enviados: ${state.sentTotal}",
@@ -100,11 +178,151 @@ fun OrganismCard(
                 Spacer(modifier = Modifier.height(4.dp))
                 Button(onClick = onClearQueue) { Text("Borrar cola local") }
             }
+            // C22/510: el estable (último perfil bueno) solo se borra con
+            // borrado explícito y el organismo apagado; borrar la cola no
+            // lo toca. Sin este botón no habría forma de borrarlo.
+            if (!state.enabled) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "Borrar la cola conserva el último perfil bueno. Para borrarlo también:",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Button(onClick = onDeleteStableProfile) { Text("Borrar perfil estable") }
+            }
             if (state.micReanchors > 0) {
                 Text(
                     "Mic re-anclado al interno ${state.micReanchors} vez/veces (DAC conectado).",
                     style = MaterialTheme.typography.bodySmall
                 )
+            }
+            // C23/510 — salud del consumidor: solo se muestra cuando hay
+            // algo que ver (rechazos o stalls); con todo a cero no añade
+            // ruido. Un stall con música sonando es «el sensor se paró y
+            // nadie lo notaba»: el estado diría «Capturando» o «En
+            // espera» mientras la sesión no se genera.
+            if (state.snapshotsRejected > 0 || state.sensorStalls > 0) {
+                Text(
+                    "Sensor: ${state.snapshotsAccepted} aceptados · ${state.snapshotsRejected} rechazados · ${state.sensorStalls} stall(s).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (state.lastSensorStallAtMs > 0L) {
+                    Text(
+                        "Último stall: ${format401Date(state.lastSensorStallAtMs)} (frameIndex parado con música; mic re-anclado).",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            // C24/510 — cuarentena versionada: el conteo y el último
+            // error ya no son solo un número en el estado. Solo se
+            // muestra cuando hay algo que ver; el error dice por qué
+            // murió el chunk (sin el cuerpo). La cuarentena se borra a
+            // los 7 días por retención, no por este texto.
+            if (state.quarantined > 0) {
+                Text(
+                    "En cuarentena: ${state.quarantined} chunk(s) (4xx no reintentable o max-intentos).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                state.lastQuarantineError?.let { err ->
+                    Text(
+                        "Último error de cuarentena: $err",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            // C24/510 — payload obsoleto: el servidor cambió el esquema
+            // y la cola vieja se descartó explícitamente (no se dejó
+            // pudrir 7 días). Sin actualización de la app el teléfono
+            // seguirá enviando la versión vieja: los chunks nuevos
+            // caerán igual en el próximo sondeo.
+            if (state.payloadObsolete) {
+                Text(
+                    "Payload obsoleto: el servidor exige v${state.minSupportedPayloadVersion} y este teléfono envía v${OrganismPayload.PAYLOAD_VERSION}; ${state.obsoleteChunksDiscarded} chunk(s) descartados explícitamente.",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                if (state.lastPayloadDiscardAtMs > 0L) {
+                    Text(
+                        "Último descarte por obsolescencia: ${format401Date(state.lastPayloadDiscardAtMs)}.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            // T10/510 — auditoría de la IDA: emitidos vs enviados.
+            // Solo se muestra cuando hay algo que auditar (chunks
+            // emitidos) o algo que ver (divergencia o pausa). Con
+            // todo a cero no añade ruido. La divergencia y la pausa
+            // son estado visible, no silencio: si el ciclo se detiene,
+            // la tarjeta dice por qué y cuántos chunks faltan.
+            if (state.chunksEmitted > 0L || state.auditDiverged || state.auditPaused) {
+                Text(
+                    "IDA: emitidos ${state.chunksEmitted} · enviados ${state.sentTotal} · en cola ${state.queued} · podados ${state.chunksPruned} · sin contabilizar ${state.chunksUnaccounted}.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (state.auditDiverged) {
+                    Text(
+                        "Auditoría IDA: ${state.chunksLost} chunk(s) sin contabilizar (${state.auditDivergentChecks}/${OrganismController.AUDIT_DIVERGENT_CHECKS_TO_PAUSE} ventanas divergentes).",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                if (state.auditPaused) {
+                    Text(
+                        "Entrada en pausa por la auditoría (pérdida persistente): los chunks nuevos se rechazan hasta que la cola drene y la auditoría vuelva a cuadrar; el audio no se toca.",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    if (state.lastAuditPauseAtMs > 0L) {
+                        Text(
+                            "Última pausa: ${format401Date(state.lastAuditPauseAtMs)}.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+                if (state.lastAuditAtMs > 0L) {
+                    Text(
+                        "Última auditoría: ${format401Date(state.lastAuditAtMs)}.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            // C21/510 — diagnóstico de un toque del token: cuando el
+            // estado huele a token o a red (Sin token / Token inválido /
+            // Sin conexión / Error), un toque dice si los hosts
+            // responden y si el DNS directo resuelve, para que el
+            // re-pegado sea de un minuto y no una investigación. No
+            // envía el token (el GET va sin Authorization).
+            if (state.status == OrganismController.Status.NO_TOKEN ||
+                state.status == OrganismController.Status.TOKEN_INVALID ||
+                state.status == OrganismController.Status.OFFLINE ||
+                state.status == OrganismController.Status.ERROR
+            ) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = onDiagnoseToken,
+                    enabled = !state.tokenDiagnosing
+                ) {
+                    Text(if (state.tokenDiagnosing) "Diagnosticando…" else "Diagnosticar conexión")
+                }
+            }
+            if (state.last401AtMs > 0L) {
+                Text(
+                    "Último 401: ${format401Date(state.last401AtMs)} (el token de entonces murió; si la red vive, pega uno nuevo).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            state.lastTokenDiagnosis?.let { diagnosis ->
+                Text(
+                    diagnosis.summary(),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (!diagnosis.anyReachable) {
+                    Text(
+                        "Ningún host responde: es la red, no el token. Revisa la conexión antes de re-pegar.",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
             if (state.status == OrganismController.Status.NO_TOKEN ||
                 state.status == OrganismController.Status.TOKEN_INVALID
@@ -157,6 +375,22 @@ fun OrganismCard(
     }
 }
 
+/** C16: línea de salud del LLM del cerebro para la tarjeta. */
+fun llmLine(state: OrganismController.State): String {
+    val status = when (state.llmStatus) {
+        OrganismController.LLM_STATUS_OK -> "OK"
+        OrganismController.LLM_STATUS_DEGRADED -> "degradado (fallback)"
+        OrganismController.LLM_STATUS_UNAVAILABLE -> "no disponible"
+        else -> "desconocido"
+    }
+    val model = state.llmModel?.let { " · $it" } ?: ""
+    // Solo el caso que marca la propuesta: perfil compilado solo con el
+    // analizador determinista («sin redacción LLM»). Con drafted true el
+    // modelo ya lo dice; con null el servidor no lo dice.
+    val drafted = if (state.llmDrafted == false) " · sin redacción LLM" else ""
+    return "LLM del cerebro: $status$model$drafted"
+}
+
 fun statusText(status: OrganismController.Status): String = when (status) {
     OrganismController.Status.OFF -> "Apagado"
     OrganismController.Status.CAPTURING -> "Capturando"
@@ -166,3 +400,10 @@ fun statusText(status: OrganismController.Status): String = when (status) {
     OrganismController.Status.NO_TOKEN -> "Sin token"
     OrganismController.Status.TOKEN_INVALID -> "Token inválido"
 }
+
+/** C21: fecha del último 401 en hora local (día + hora, sin segundos). */
+private val formatter401: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault())
+
+fun format401Date(epochMs: Long): String =
+    Instant.ofEpochMilli(epochMs).atZone(ZoneId.systemDefault()).format(formatter401)

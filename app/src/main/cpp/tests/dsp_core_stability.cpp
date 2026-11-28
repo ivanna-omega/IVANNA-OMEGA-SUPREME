@@ -14,6 +14,12 @@
 #include "../supreme/SupremeAcousticStabilityGuard.hpp"
 #include "../dsp/dsp_load_shed_governor.hpp"
 
+#include "ivanna_test_seed.hpp"
+
+// C10: semilla global — imprime `seed=…` al inicio del log.
+namespace { [[maybe_unused]] const bool kIvannaSeedLogged =
+    [] { ivanna::test::PrintIvannaTestSeed(); return true; }(); }  // namespace
+
 namespace {
 bool allFinite(const std::vector<float>& v) {
     return std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); });
@@ -139,7 +145,7 @@ TEST(VolterraH2Stability, BypassIsIdentity) {
     v.setEnabled(false);
 
     std::vector<float> in(256), out(256);
-    std::mt19937 rng(1234);
+    std::mt19937 rng(ivanna::test::IvannaTestSeed32(1));
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     for (auto& x : in) x = dist(rng);
 
@@ -152,7 +158,7 @@ TEST(VolterraH2Stability, EnabledStaysFiniteAndSoftClipped) {
     v.setEnabled(true);
 
     std::vector<float> in(2048), out(2048);
-    std::mt19937 rng(42);
+    std::mt19937 rng(ivanna::test::IvannaTestSeed32(2));
     std::uniform_real_distribution<float> dist(-2.0f, 2.0f);  // provocamos saturación
     for (auto& x : in) x = dist(rng);
 
