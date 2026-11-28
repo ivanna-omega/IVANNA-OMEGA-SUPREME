@@ -125,6 +125,23 @@ fun OrganismCard(
                     style = MaterialTheme.typography.bodySmall
                 )
             }
+            // C23/510 — salud del consumidor: solo se muestra cuando hay
+            // algo que ver (rechazos o stalls); con todo a cero no añade
+            // ruido. Un stall con música sonando es «el sensor se paró y
+            // nadie lo notaba»: el estado diría «Capturando» o «En
+            // espera» mientras la sesión no se genera.
+            if (state.snapshotsRejected > 0 || state.sensorStalls > 0) {
+                Text(
+                    "Sensor: ${state.snapshotsAccepted} aceptados · ${state.snapshotsRejected} rechazados · ${state.sensorStalls} stall(s).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (state.lastSensorStallAtMs > 0L) {
+                    Text(
+                        "Último stall: ${format401Date(state.lastSensorStallAtMs)} (frameIndex parado con música; mic re-anclado).",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
             // C21/510 — diagnóstico de un toque del token: cuando el
             // estado huele a token o a red (Sin token / Token inválido /
             // Sin conexión / Error), un toque dice si los hosts

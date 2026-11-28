@@ -72,6 +72,16 @@ import java.io.File
  *      re-valida con un GET barato de versión antes de reanudar el
  *      sondeo. La fecha del último 401 se registra (sin el valor del
  *      token, jamás) para distinguir «token muerto» de «red caída».
+ *   8. WATCHDOG DE STALL DEL SENSOR (C23/510): el consumidor cuenta
+ *      snapshotsAccepted/Rejected y detecta si frameIndex() deja de
+ *      avanzar 10 s con música sonando (umbral PROVISIONAL, pendiente
+ *      de medir la cadencia real en vivo — ver
+ *      SensorSnapshotConsumer.STALL_THRESHOLD_MS): reintenta el anclaje
+ *      del mic (restartMic: stop + start, mismo SessionAggregator/
+ *      sessionId — la sesión NO se parte) y registra el stall. La salud
+ *      del consumidor vive en el State (snapshotsAccepted/Rejected,
+ *      sensorStalls, lastSensorStallAtMs) y la tarjeta la muestra
+ *      cuando hay algo que ver (rechazos o stalls).
  *
  * ESTADO (el indicador de la UI):
  *   Capturando / En cola / Sin conexión / Error recuperable, más los
@@ -399,7 +409,29 @@ object OrganismController {
         /** Resultado del último diagnóstico de un toque (null = aún no se pidió). */
         val lastTokenDiagnosis: OrganismTokenDiagnostics.Diagnosis? = null,
         /** true mientras corre el diagnóstico de un toque. */
-        val tokenDiagnosing: Boolean = false
+        val tokenDiagnosing: Boolean = false,
+        // ── C23/510 — salud del consumidor de snapshots (watchdog de stall) ──
+        /**
+         * Snapshots aceptados por la JNI (canal latest-wins) desde el
+         * arranque del consumidor. Crece ~1 por frame (~85 ms con
+         * música); es el contador de «el sensor vive».
+         */
+        val snapshotsAccepted: Long = 0L,
+        /**
+         * Snapshots rechazados por la JNI (no tocan el estado ni el
+         * agregador). > 0 con música = el canal lateral tiene un
+         * problema que mirar.
+         */
+        val snapshotsRejected: Long = 0L,
+        /**
+         * Stalls detectados por el watchdog: frameIndex() sin avanzar
+         * >= 10 s con música sonando. Cada stall reintenta el anclaje
+         * del mic (ver [RealAcousticSensor.restartMic]) y queda
+         * contado aquí; sin música no hay stall.
+         */
+        val sensorStalls: Long = 0L,
+        /** Fecha (epoch ms) del último stall; 0 = ninguno. */
+        val lastSensorStallAtMs: Long = 0L
     )
 
     private val _state = MutableStateFlow(State())
@@ -572,7 +604,11 @@ object OrganismController {
                 runCatching {
                     (ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)?.isMusicActive
                 }.getOrDefault(false) == true
-            }
+            },
+            // C23/510 — watchdog de stall: el consumidor dispara
+            // handleSensorStall() en su hilo; la recuperación corre en
+            // Dispatchers.IO (no bloquea el hilo del consumidor).
+            onStall = { handleSensorStall() }
         )
         consumer = cons
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -793,6 +829,40 @@ object OrganismController {
                 Log.w(TAG, "C21 diagnóstico: falló sin resultado")
             }
             tokenDiagnosing = false
+            refreshState()
+        }
+    }
+
+    /**
+     * C23/510 — recuperación ante un stall del sensor (la dispara el
+     * watchdog del consumidor en el hilo IvannaSensorSnapshot).
+     * Reinicia el anclaje del mic ([RealAcousticSensor.restartMic]:
+     * stop + start) en Dispatchers.IO, sin bloquear el hilo del
+     * consumidor. El mismo SessionAggregator/sessionId sigue vivo: la
+     * sesión NO se parte (el agregador solo ve un hueco de frames) y
+     * el reinicio con éxito cuenta como UN re-ancla en
+     * `State.micReanchors`. Sin scope o sin consumidor (controlador
+     * deteniéndose) no se hace nada: el stall ya quedó contado en el
+     * consumidor y el sensor lo gestiona su ciclo de vida.
+     *
+     * Anti-solapamiento sin flag: el consumidor no vuelve a disparar
+     * hasta pasados otros 10 s (su cooldown) y un reinicio tarda ~1 s
+     * como mucho, así que dos recuperaciones no se pisan; si el mic no
+     * vuelve, hay un intento cada 10 s, no una tormenta. No hay flag
+     * que pueda quedarse atascado si stop() cae en medio.
+     */
+    private fun handleSensorStall() {
+        val s = scope ?: return
+        if (consumer == null) return
+        s.launch(Dispatchers.IO) {
+            val ctx = appContext
+            val ok = ctx != null &&
+                runCatching { RealAcousticSensor.restartMic(ctx) }.getOrDefault(false)
+            if (ok) {
+                Log.i(TAG, "C23: stall del sensor: mic re-anclado (misma sesión ${aggregator?.sessionId ?: "?"}); contadores en State")
+            } else {
+                Log.w(TAG, "C23: stall del sensor: no se pudo reiniciar el mic; el próximo stall lo reintentará")
+            }
             refreshState()
         }
     }
@@ -1119,7 +1189,14 @@ object OrganismController {
             // lo cambian record401/clear401/runTokenDiagnosis).
             last401AtMs = last401AtMs,
             lastTokenDiagnosis = lastTokenDiagnosis,
-            tokenDiagnosing = tokenDiagnosing
+            tokenDiagnosing = tokenDiagnosing,
+            // C23/510: la salud del consumidor se lee del consumidor
+            // vivo; sin consumidor (controlador detenido) se conserva
+            // el último valor conocido, como el perfil aplicado.
+            snapshotsAccepted = consumer?.snapshotsAccepted ?: _state.value.snapshotsAccepted,
+            snapshotsRejected = consumer?.snapshotsRejected ?: _state.value.snapshotsRejected,
+            sensorStalls = consumer?.stalls ?: _state.value.sensorStalls,
+            lastSensorStallAtMs = consumer?.lastStallAtMs ?: _state.value.lastSensorStallAtMs
         )
     }
 
