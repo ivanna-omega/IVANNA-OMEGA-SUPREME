@@ -170,6 +170,43 @@ class OrganismQueueTest {
         assertTrue(items.all { it.state == OrganismQueue.State.PENDING })
     }
 
+    // T10/510 — el prune deja de ser silencioso: la auditoría IDA
+    // cuenta los podados como disposición, no como pérdida.
+
+    @Test
+    fun `prunedTotal cuenta los podados por tope de cola`() {
+        val tinyDir = Files.createTempDirectory("organism-queue-prune-test").toFile()
+        try {
+            val tiny = OrganismQueue(tinyDir, maxItems = 2)
+            assertEquals(0, tiny.prunedTotal)
+            tiny.enqueue("s1", 0, body(0))
+            tiny.enqueue("s1", 1, body(1))
+            assertEquals(0, tiny.prunedTotal)
+            tiny.enqueue("s1", 2, body(2)) // 3 con tope 2: cae el más viejo.
+            assertEquals(1, tiny.prunedTotal)
+            tiny.enqueue("s1", 3, body(3))
+            assertEquals(2, tiny.prunedTotal)
+            assertEquals(2, tiny.listAll().size)
+        } finally {
+            tinyDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `prunedTotal cuenta el podado por retencion al reabrir`() {
+        // Chunk viejo escrito a mano (createdAtMs de hace 8 días).
+        val oldDir = Files.createTempDirectory("organism-queue-retention-test").toFile()
+        try {
+            val oldJson = """{"sessionId":"s1","chunkId":0,"state":"PENDING","attempts":0,"nextAttemptAtMs":0,"bodyJson":"{\"song\":\"x\"}","lastError":null,"createdAtMs":${System.currentTimeMillis() - 8L * 24 * 60 * 60 * 1000}}"""
+            File(oldDir, "s1_0.json").writeText(oldJson)
+            val reopened = OrganismQueue(oldDir)
+            assertTrue("el chunk de 8 días debe descartarse", reopened.listAll().isEmpty())
+            assertEquals(1, reopened.prunedTotal)
+        } finally {
+            oldDir.deleteRecursively()
+        }
+    }
+
     // C24/510 — cuarentena versionada.
 
     private fun versionedBody(version: Int): JsonObject =

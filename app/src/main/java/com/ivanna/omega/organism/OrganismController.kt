@@ -146,6 +146,38 @@ import java.io.File
  *      cambia. Todo el estado T6 vive en el State y la tarjeta lo
  *      muestra cuando hay algo que ver (dwell pendiente, tope
  *      alcanzado, veto vigente, A/B en curso, último timeout).
+ *  12. AUDITORÍA DE LA IDA (T10/510): «177/177» es auto-reporte del
+ *      servidor; nada en el teléfono probaba que lo enviado fuera lo
+ *      que el mic oyó (caídas silenciosas a QUARANTINED, prune por
+ *      retención de 7 días). El State expone `chunksEmitted` (cada
+ *      chunk que el SessionAggregator emite en este proceso, contado
+ *      en [enqueueChunk] — la única vía de encolado — incluido el
+ *      chunk final de close() y los rechazados en pausa) y la
+ *      identidad emitidos = enviados + en cola + podados +
+ *      descartados por obsolescencia + borrados por el usuario +
+ *      rechazados en pausa + sin contabilizar se comprueba en un log
+ *      periódico (cada 5 min, en el tick del flush) con las sesiones
+ *      completadas del teléfono. La divergencia se decide POR
+ *      VENTANA (pérdida nueva entre dos checks, no acumulada: la
+ *      cola durable trae chunks de procesos anteriores y el
+ *      acumulado nunca cuadra tras un reinicio); 3 ventanas
+ *      divergentes seguidas (15 min de pérdida persistente) pausan
+ *      la ENTRADA — los chunks nuevos se rechazan contabilizados,
+ *      el vaciado sigue drenando la cola y 2 ventanas limpias
+ *      seguidas reanudan sola. El audio nunca se toca: la pausa es
+ *      solo de entrada al ciclo de envío, y el interruptor maestro
+ *      (stop()) la limpia. La pata «sesiones del servidor» NO se
+ *      puede comparar hoy: ningún endpoint anuncia un conteo de
+ *      sesiones — ni el GET de perfil (ver [ProfileFetcher]) ni la
+ *      respuesta del POST (ver [OrganismSender.sendOne], que solo
+ *      mira el código HTTP) lo traen — así que el log dice
+ *      «desconocido» en vez de inventar un número; cuando el
+ *      servidor anuncie `sessionsReceived` en el sobre del GET
+ *      (mismo patrón de señal que C16/C24), la comparación es
+ *      sesiones completadas del teléfono ([sessionsCompletedTotal])
+ *      vs ese conteo. El prune dejó de ser silencioso: la cola
+ *      cuenta los podados ([OrganismQueue.prunedTotal]) y el
+ *      borrado del usuario también se contabiliza ([clearQueue]).
  *
  * ESTADO (el indicador de la UI):
  *   Capturando / En cola / Sin conexión / Error recuperable, más los
@@ -325,6 +357,29 @@ object OrganismController {
     const val AB_TIMEOUT_MS = 4L * 60L * 60L * 1000L
     /** Sesiones que debe completar el A/B antes de que caduque el timeout. */
     const val AB_SESSIONS_REQUIRED = 3
+
+    // ── T10/510 — auditoría de la IDA (chunks emitidos vs enviados) ──
+    /**
+     * Cada cuánto se comprueba la auditoría (el flushJob tickea cada
+     * 30 s; la auditoría no necesita esa cadencia: un chunk son 5 s
+     * de audio, así que 5 min son ~60 chunks por ventana).
+     */
+    const val AUDIT_INTERVAL_MS = 5L * 60L * 1000L
+    /**
+     * Pérdida sin contabilizar por encima de este nº de chunks =
+     * divergencia en la ventana. El encolado es síncrono (en vuelo
+     * ≈ 0) y un duplicado o un fallo de disco aislado explican
+     * ≤ 1–2 chunks; > 5 chunks (≈ 25 s de audio) sin disposición es
+     * un agujero real, no ruido.
+     */
+    const val MAX_UNACCOUNTED_CHUNKS = 5L
+    /**
+     * Ventanas divergentes consecutivas antes de pausar la entrada
+     * (3 × 5 min = 15 min de pérdida persistente).
+     */
+    const val AUDIT_DIVERGENT_CHECKS_TO_PAUSE = 3
+    /** Ventanas limpias consecutivas en pausa antes de reanudar la entrada. */
+    const val AUDIT_CLEAN_CHECKS_TO_RESUME = 2
 
     /**
      * S13 — veredicto puro de la guarda de aplicación (testeable en JVM).
@@ -642,7 +697,39 @@ object OrganismController {
         /** Sesiones completadas desde que arrancó el A/B vigente (0 = ninguna). */
         val abSessionsCompleted: Int = 0,
         /** Fecha (epoch ms) del último rollback por timeout del A/B; 0 = ninguno. */
-        val lastAbTimeoutAtMs: Long = 0L
+        val lastAbTimeoutAtMs: Long = 0L,
+        // ── T10/510 — auditoría de la IDA (emitidos vs enviados) ──
+        /**
+         * Chunks emitidos por el SessionAggregator en este proceso
+         * (acumulado de todas las sesiones; el contador por sesión
+         * vive en `SessionAggregator.chunksEmitted` y se reinicia en
+         * cada start()). Es el numerador de la auditoría: cada chunk
+         * emitido debe acabar enviado, en cola, podado, descartado,
+         * borrado o rechazado en pausa — o es pérdida.
+         */
+        val chunksEmitted: Long = 0L,
+        /** Chunks podados por retención (7 días) o tope de cola en este proceso (acumulado entre arranques). */
+        val chunksPruned: Int = 0,
+        /** Chunks borrados por el usuario con «Borrar cola local» en este proceso (borrado deliberado, no pérdida). */
+        val chunksUserCleared: Int = 0,
+        /** Chunks que el agregador emitió mientras la auditoría tenía la entrada en pausa (rechazados deliberadamente, no pérdida). */
+        val chunksDroppedWhilePaused: Int = 0,
+        /** Emitidos − contabilizados (puede ser negativo: excedente de la cola durable de un proceso anterior; no es pérdida). */
+        val chunksUnaccounted: Long = 0L,
+        /** max(0, chunksUnaccounted): chunks sin disposición. */
+        val chunksLost: Long = 0L,
+        /** Fallos de escritura al encolar (disco) en este proceso: parte explicada de [chunksLost]. */
+        val enqueueFailures: Long = 0L,
+        /** true si la última ventana de auditoría divergió (pérdida nueva > tope, o fuga lenta con acumulado > tope). */
+        val auditDiverged: Boolean = false,
+        /** true si la auditoría pausó la entrada (pérdida persistente). */
+        val auditPaused: Boolean = false,
+        /** Ventanas divergentes consecutivas (3 = pausa). */
+        val auditDivergentChecks: Int = 0,
+        /** Fecha (epoch ms) del último check de auditoría; 0 = ninguno. */
+        val lastAuditAtMs: Long = 0L,
+        /** Fecha (epoch ms) de la última pausa por auditoría; 0 = ninguna. */
+        val lastAuditPauseAtMs: Long = 0L
     )
 
     private val _state = MutableStateFlow(State())
@@ -904,6 +991,16 @@ object OrganismController {
         abSessionsAtStart = 0L
         lastChunkSessionId = null
         autoApplyCapHit = false
+        // T10/510: la pausa y las rachas son de este arranque (el
+        // interruptor maestro es la recuperación manual: al detener
+        // el controlador se limpian y el próximo arranque audita de
+        // nuevo). Los contadores acumulados (emitidos, borrados,
+        // rechazados) NO se resetean: son por proceso, como sentTotal.
+        auditPaused = false
+        auditDivergentChecks = 0
+        auditCleanChecks = 0
+        lastAuditDivergent = false
+        lastAuditSnapshot = null
         // CIERRE DIFERIDO (defecto #5): el scope se cancela ANTES de
         // cerrar el agregador, para que el enqueueChunk del chunk final
         // no pueda lanzar un flush que se cancelaría a medias. El chunk
@@ -916,6 +1013,11 @@ object OrganismController {
             }
         }
         aggregator = null
+        // T10/510: la cola se recrea en cada start() (su prunedTotal
+        // se reinicia con ella); el acumulado entre arranques vive
+        // aquí. Se suma ANTES de soltar la cola (con queue ya null el
+        // segundo stop() sumaría 0: no hay doble conteo).
+        prunedTotalAccumulated += queue?.prunedTotal ?: 0
         queue = null
         sender = null
         tokenStore = null
@@ -942,6 +1044,12 @@ object OrganismController {
      */
     fun clearQueue(): Int {
         val deleted = queue?.clearAll() ?: 0
+        // T10/510: el borrado del usuario es una disposición
+        // contabilizada, no pérdida: sin esto la auditoría marcaría
+        // divergencia tras cada «Borrar cola local». (También cubre
+        // chunks de procesos anteriores: inflan lo contabilizado,
+        // nunca la pérdida.)
+        if (deleted > 0) chunksUserCleared += deleted
         val candidatesDeleted = profileApplier?.deleteCandidates()
             ?: appContext?.let { ProfileApplier(it.filesDir).deleteCandidates() }
             ?: 0
@@ -1296,6 +1404,65 @@ object OrganismController {
     @Volatile
     private var lastAbTimeoutAtMs: Long = 0L
 
+    // ── T10/510 — auditoría de la IDA ───────────────────────────────
+    /**
+     * Chunks emitidos por el agregador en este proceso (acumulado;
+     * ver State.chunksEmitted). Por proceso, como sentTotal: un
+     * reinicio no lo reinicia (solo lo hace la muerte del proceso).
+     */
+    @Volatile
+    private var chunksEmitted: Long = 0L
+
+    /**
+     * Chunks podados acumulados de instancias de cola YA detenidas
+     * (la viva se suma al leer; ver [chunksPrunedTotal]). La cola se
+     * recrea en cada start() y su prunedTotal se reinicia con ella:
+     * sin este acumulado, un prune de un arranque anterior se
+     * perdería y la auditoría lo marcaría como pérdida.
+     */
+    @Volatile
+    private var prunedTotalAccumulated: Int = 0
+
+    /** Chunks borrados por el usuario con clearQueue en este proceso. */
+    @Volatile
+    private var chunksUserCleared: Int = 0
+
+    /** Chunks rechazados mientras la auditoría tenía la entrada en pausa. */
+    @Volatile
+    private var chunksDroppedWhilePaused: Int = 0
+
+    /** Fallos de escritura al encolar (disco) en este proceso. */
+    @Volatile
+    private var enqueueFailures: Long = 0L
+
+    /** true si la auditoría pausó la entrada (pérdida persistente). */
+    @Volatile
+    private var auditPaused: Boolean = false
+
+    /** Ventanas divergentes consecutivas (3 = pausa). */
+    @Volatile
+    private var auditDivergentChecks: Int = 0
+
+    /** Ventanas limpias consecutivas EN PAUSA (2 = reanudar). */
+    @Volatile
+    private var auditCleanChecks: Int = 0
+
+    /** Fecha (epoch ms) del último check de auditoría; 0 = ninguno. */
+    @Volatile
+    private var lastAuditAtMs: Long = 0L
+
+    /** Fecha (epoch ms) de la última pausa por auditoría; 0 = ninguna. */
+    @Volatile
+    private var lastAuditPauseAtMs: Long = 0L
+
+    /** true si la última ventana de auditoría divergió. */
+    @Volatile
+    private var lastAuditDivergent: Boolean = false
+
+    /** Foto de contadores del check anterior (null = aún no hubo check; la primera ventana usa ceros). */
+    @Volatile
+    private var lastAuditSnapshot: ChunkAuditSnapshot? = null
+
     /**
      * C21 — veredicto puro de la re-validación de un token recién
      * pegado (testeable en JVM). El GET barato de versión es el mismo
@@ -1424,9 +1591,34 @@ object OrganismController {
             sessionsCompletedTotal++
         }
         lastChunkSessionId = chunk.sessionId
+        // T10/510 — la auditoría cuenta CADA chunk emitido por el
+        // agregador (también el final de close() y también los que la
+        // pausa rechaza abajo): es el numerador «lo que el mic oyó».
+        // El conteo va ANTES de la pausa para que un rechazo en pausa
+        // cuente en ambos lados de la identidad (emitido + rechazado).
+        chunksEmitted++
+        if (auditPaused) {
+            // Pausa de la auditoría: no se alimenta una tubería con
+            // pérdida persistente. El rechazo es una disposición
+            // contabilizada, no pérdida: mientras la entrada está en
+            // pausa el vaciado drena la cola y la auditoría puede
+            // volver a cuadrar y reanudar sola. El audio no se toca.
+            chunksDroppedWhilePaused++
+            refreshState()
+            return
+        }
         // T2/510: el chunk lleva el perfil aplicado actual en telemetry.
         val body = OrganismPayload.sessionBody(chunk, applied = appliedProfile())
-        val enqueued = q.enqueue(chunk.sessionId, chunk.chunkId, body)
+        // T10/510: un fallo de escritura al encolar (disco) antes
+        // propagaba la excepción al consumidor; ahora se cuenta como
+        // pérdida explicada en la auditoría y el consumidor sigue
+        // vivo. Un `false` es un duplicado (clave ya en cola): ese
+        // chunk YA está contabilizado en `queued`, no es pérdida.
+        val enqueued = runCatching { q.enqueue(chunk.sessionId, chunk.chunkId, body) }.getOrElse {
+            enqueueFailures++
+            Log.w(TAG, "T10: no se pudo encolar el chunk ${chunk.sessionId}/${chunk.chunkId} (${it.javaClass.simpleName}); cuenta como pérdida en la auditoría")
+            false
+        }
         if (enqueued) {
             scope?.launch(Dispatchers.IO) { flushOnce() }
         }
@@ -1454,6 +1646,78 @@ object OrganismController {
         // sondear (cada 30 min); un GET cada 30 s serían ~2.900
         // peticiones/día contra un endpoint gratuito, eso no es barato.
         maybePollProfile()
+        // T10/510 — check periódico de la auditoría IDA (throttle
+        // interno: como mucho una vez cada 5 min).
+        maybeRunChunkAudit()
+        refreshState()
+    }
+
+    /** T10/510 — podados totales en este proceso: cola viva + arranques anteriores (ver [prunedTotalAccumulated]). */
+    private fun chunksPrunedTotal(): Int = prunedTotalAccumulated + (queue?.prunedTotal ?: 0)
+
+    /**
+     * T10/510 — check periódico de la auditoría IDA (lo llama
+     * [flushOnce], que tickea cada 30 s; el check en sí corre como
+     * mucho cada [AUDIT_INTERVAL_MS]). Compara emitidos vs enviados
+     * vs en cola vs disposiciones y deja constancia en el Log con las
+     * sesiones completadas del teléfono; la pata «sesiones del
+     * servidor» es hoy desconocida (ningún endpoint anuncia un conteo
+     * de sesiones: el log lo dice en vez de inventar un número).
+     * Divergencia persistente (3 ventanas seguidas) → pausa la
+     * entrada ([enqueueChunk] rechaza chunks nuevos, contabilizados
+     * como rechazados, no como pérdida); en pausa, 2 ventanas
+     * limpias seguidas → se reanuda sola (el vaciado drena la cola
+     * mientras tanto; la ventana en pausa vale 0 por construcción,
+     * ver [auditWindowLost]). El audio nunca se toca: la pausa es
+     * solo de entrada al ciclo de envío, y stop() la limpia.
+     */
+    private fun maybeRunChunkAudit(nowMs: Long = System.currentTimeMillis()) {
+        if (!shouldRunAuditCheck(nowMs, lastAuditAtMs)) return
+        lastAuditAtMs = nowMs
+        val counts = queue?.counts()
+        val queued = counts?.values?.sum() ?: 0
+        val quarantined = counts?.getValue(OrganismQueue.State.QUARANTINED) ?: 0
+        val nowSnapshot = ChunkAuditSnapshot(
+            emitted = chunksEmitted,
+            sent = sentTotal,
+            queued = queued,
+            pruned = chunksPrunedTotal(),
+            obsoleteDiscarded = obsoleteChunksDiscarded,
+            userCleared = chunksUserCleared,
+            droppedWhilePaused = chunksDroppedWhilePaused
+        )
+        val prevSnapshot = lastAuditSnapshot ?: ChunkAuditSnapshot()
+        val audit = evaluateChunkAudit(
+            emitted = nowSnapshot.emitted,
+            sent = nowSnapshot.sent,
+            queued = nowSnapshot.queued,
+            quarantined = quarantined,
+            pruned = nowSnapshot.pruned,
+            obsoleteDiscarded = nowSnapshot.obsoleteDiscarded,
+            userCleared = nowSnapshot.userCleared,
+            droppedWhilePaused = nowSnapshot.droppedWhilePaused,
+            enqueueFailures = enqueueFailures
+        )
+        val windowLost = auditWindowLost(prevSnapshot, nowSnapshot)
+        val divergent = isAuditDivergent(windowLost, audit.lost)
+        lastAuditSnapshot = nowSnapshot
+        lastAuditDivergent = divergent
+        if (divergent) {
+            auditDivergentChecks++
+            auditCleanChecks = 0
+        } else {
+            auditDivergentChecks = 0
+            if (auditPaused) auditCleanChecks++ else auditCleanChecks = 0
+        }
+        Log.i(TAG, "T10 auditoría IDA: emitidos=${audit.emitted} enviados=${audit.sent} enCola=${audit.queued} (cuarentena=${audit.quarantined}) podados=${audit.pruned} obsoletos=${audit.obsoleteDiscarded} borradosUsuario=${audit.userCleared} rechazadosEnPausa=${audit.droppedWhilePaused} fallosEncolado=${audit.enqueueFailures} sinContabilizar=${audit.unaccounted} perdidos=${audit.lost} perdidosEnVentana=$windowLost sesionesTeléfono=$sessionsCompletedTotal sesionesServidor=desconocido (el servidor aún no anuncia sessionsReceived)")
+        if (divergent && !auditPaused && shouldPauseAudit(auditDivergentChecks)) {
+            auditPaused = true
+            lastAuditPauseAtMs = nowMs
+            Log.w(TAG, "T10: pérdida persistente (${audit.lost} chunks sin contabilizar, $auditDivergentChecks ventanas divergentes seguidas); entrada en PAUSA — los chunks nuevos se rechazan (contabilizados) hasta que la auditoría vuelva a cuadrar; el audio no se toca")
+        } else if (!divergent && shouldResumeAudit(auditPaused, auditCleanChecks)) {
+            auditPaused = false
+            Log.i(TAG, "T10: auditoría limpia $AUDIT_CLEAN_CHECKS_TO_RESUME ventanas seguidas; se reanuda la entrada")
+        }
         refreshState()
     }
 
@@ -1464,6 +1728,7 @@ object OrganismController {
         // el total para `queued` y el de cuarentena para el State.
         val counts = queue?.counts()
         val queued = counts?.values?.sum() ?: 0
+        val quarantined = counts?.getValue(OrganismQueue.State.QUARANTINED) ?: _state.value.quarantined
         val music = consumer?.isMusicActive() ?: false
         val status = deriveStatus(
             enabled = enabled,
@@ -1484,6 +1749,23 @@ object OrganismController {
             Status.OFFLINE -> "Sin conexión: la sesión se guarda local y se reintenta sola."
             Status.ERROR -> "Error recuperable: se reintenta solo; el audio no se toca."
         }
+        // T10/510: la contabilidad ACUMULADA se recomputa en cada
+        // refresh con los contadores vivos (aritmética pura, sin red):
+        // el State siempre muestra la foto actual de emitidos vs
+        // contabilizados. La DIVERGENCIA y la pausa NO se recomputan
+        // aquí: son por ventana y las decide el check periódico
+        // ([maybeRunChunkAudit]); aquí solo se reflejan.
+        val auditLive = evaluateChunkAudit(
+            emitted = chunksEmitted,
+            sent = sentTotal,
+            queued = queued,
+            quarantined = quarantined,
+            pruned = chunksPrunedTotal(),
+            obsoleteDiscarded = obsoleteChunksDiscarded,
+            userCleared = chunksUserCleared,
+            droppedWhilePaused = chunksDroppedWhilePaused,
+            enqueueFailures = enqueueFailures
+        )
         _state.value = State(
             status = status,
             enabled = enabled,
@@ -1530,7 +1812,7 @@ object OrganismController {
             // conocido. El error es el del chunk en cuarentena más
             // reciente; con la cola vacía de cuarentena vuelve a null
             // (no se conserva un error de chunks ya borrados).
-            quarantined = counts?.getValue(OrganismQueue.State.QUARANTINED) ?: _state.value.quarantined,
+            quarantined = quarantined,
             lastQuarantineError = queue?.lastQuarantinedError()
                 ?: if (queue == null) _state.value.lastQuarantineError else null,
             // C24/510: la señal del servidor solo la cambia el sondeo
@@ -1561,7 +1843,25 @@ object OrganismController {
             vetoedUntilMs = vetoedUntilMs,
             abStartedAtMs = abStartedAtMs,
             abSessionsCompleted = abSessionsCompleted(abStartedAtMs, abSessionsAtStart, sessionsCompletedTotal),
-            lastAbTimeoutAtMs = lastAbTimeoutAtMs
+            lastAbTimeoutAtMs = lastAbTimeoutAtMs,
+            // T10/510: los acumulados son la foto viva (ver auditLive
+            // arriba); la divergencia, la pausa y las rachas solo las
+            // cambia el check periódico ([maybeRunChunkAudit]); aquí
+            // se reflejan. Los podados suman la cola viva + el
+            // acumulado de arranques anteriores (ver
+            // [chunksPrunedTotal]).
+            chunksEmitted = chunksEmitted,
+            chunksPruned = chunksPrunedTotal(),
+            chunksUserCleared = chunksUserCleared,
+            chunksDroppedWhilePaused = chunksDroppedWhilePaused,
+            chunksUnaccounted = auditLive.unaccounted,
+            chunksLost = auditLive.lost,
+            enqueueFailures = enqueueFailures,
+            auditDiverged = lastAuditDivergent,
+            auditPaused = auditPaused,
+            auditDivergentChecks = auditDivergentChecks,
+            lastAuditAtMs = lastAuditAtMs,
+            lastAuditPauseAtMs = lastAuditPauseAtMs
         )
     }
 
@@ -1817,6 +2117,117 @@ object OrganismController {
     fun abSessionsCompleted(abStartedAtMs: Long, sessionsAtStart: Long, sessionsTotal: Long): Int =
         if (abStartedAtMs <= 0L) 0
         else (sessionsTotal - sessionsAtStart).toInt().coerceAtLeast(0)
+
+    // ── T10/510 — auditoría de la IDA (decisiones puras) ─────────────
+
+    /**
+     * T10 — contabilidad ACUMULADA de la IDA (testeable en JVM).
+     * La identidad es: emitidos = enviados + en cola + podados +
+     * descartados por obsolescencia + borrados por el usuario +
+     * rechazados en pausa + sin contabilizar. `queued` YA incluye
+     * los en cuarentena (counts().values.sum()): `quarantined` es
+     * solo informativo y NO se suma otra vez. `unaccounted` puede
+     * ser negativo (excedente: la cola durable trae chunks de un
+     * proceso anterior, mientras `sentTotal` y `chunksEmitted` se
+     * reinician por proceso); `lost` es la pérdida real (≥ 0).
+     * `divergent` NO se decide aquí: el acumulado nunca cuadra tras
+     * un reinicio, así que la divergencia es por ventana (ver
+     * [isAuditDivergent]).
+     */
+    data class ChunkAudit(
+        val emitted: Long,
+        val sent: Long,
+        val queued: Int,
+        val quarantined: Int,
+        val pruned: Int,
+        val obsoleteDiscarded: Int,
+        val userCleared: Int,
+        val droppedWhilePaused: Int,
+        val enqueueFailures: Long,
+        val unaccounted: Long,
+        val lost: Long
+    )
+
+    /** T10 — foto de contadores para una ventana de auditoría (ceros = primer check). */
+    data class ChunkAuditSnapshot(
+        val emitted: Long = 0L,
+        val sent: Long = 0L,
+        val queued: Int = 0,
+        val pruned: Int = 0,
+        val obsoleteDiscarded: Int = 0,
+        val userCleared: Int = 0,
+        val droppedWhilePaused: Int = 0
+    )
+
+    /** T10 — contabilidad acumulada (testeable en JVM). */
+    fun evaluateChunkAudit(
+        emitted: Long,
+        sent: Long,
+        queued: Int,
+        quarantined: Int,
+        pruned: Int,
+        obsoleteDiscarded: Int,
+        userCleared: Int,
+        droppedWhilePaused: Int,
+        enqueueFailures: Long
+    ): ChunkAudit {
+        val accounted = sent + queued + pruned + obsoleteDiscarded + userCleared + droppedWhilePaused
+        val unaccounted = emitted - accounted
+        return ChunkAudit(
+            emitted = emitted,
+            sent = sent,
+            queued = queued,
+            quarantined = quarantined,
+            pruned = pruned,
+            obsoleteDiscarded = obsoleteDiscarded,
+            userCleared = userCleared,
+            droppedWhilePaused = droppedWhilePaused,
+            enqueueFailures = enqueueFailures,
+            unaccounted = unaccounted,
+            lost = unaccounted.coerceAtLeast(0L)
+        )
+    }
+
+    /**
+     * T10 — pérdida NUEVA en la ventana entre dos checks (testeable
+     * en JVM). Puede ser negativa (excedente: drenar la cola o un
+     * borrado del usuario mueven `queued` sin emitir nada). En pausa
+     * vale 0 por construcción: cada chunk nuevo se rechaza
+     * contabilizado (emitted y dropped crecen a la par) y cada envío
+     * drena la cola (sent +1, queued −1), así que la pausa puede
+     * limpiarse sola y reanudar.
+     */
+    fun auditWindowLost(prev: ChunkAuditSnapshot, now: ChunkAuditSnapshot): Long =
+        (now.emitted - prev.emitted) -
+            ((now.sent - prev.sent) + (now.queued - prev.queued) +
+                (now.pruned - prev.pruned) +
+                (now.obsoleteDiscarded - prev.obsoleteDiscarded) +
+                (now.userCleared - prev.userCleared) +
+                (now.droppedWhilePaused - prev.droppedWhilePaused))
+
+    /**
+     * T10 — ¿diverge esta ventana? (testeable en JVM). Dos vías: (a)
+     * la ventana perdió más que el tope; (b) fuga lenta — la ventana
+     * perdió algo (> 0) y el acumulado ya supera el tope (un goteo
+     * de 2 chunks por ventana no debe esconderse detrás del tope).
+     * Una pérdida histórica con ventana limpia (0) NO diverge: el
+     * pasado no condena al presente.
+     */
+    fun isAuditDivergent(windowLost: Long, cumulativeLost: Long): Boolean =
+        windowLost > MAX_UNACCOUNTED_CHUNKS ||
+            (cumulativeLost > MAX_UNACCOUNTED_CHUNKS && windowLost > 0)
+
+    /** T10 — ¿toca comprobar la auditoría? Throttle: como mucho una vez por [AUDIT_INTERVAL_MS]. */
+    fun shouldRunAuditCheck(nowMs: Long, lastAuditAtMs: Long): Boolean =
+        nowMs - lastAuditAtMs >= AUDIT_INTERVAL_MS
+
+    /** T10 — ¿toca pausar la entrada? Solo con pérdida persistente: N ventanas divergentes seguidas. */
+    fun shouldPauseAudit(divergentStreak: Int): Boolean =
+        divergentStreak >= AUDIT_DIVERGENT_CHECKS_TO_PAUSE
+
+    /** T10 — ¿toca reanudar la entrada? Solo en pausa y con N ventanas limpias seguidas (histéresis: no flapear). */
+    fun shouldResumeAudit(paused: Boolean, cleanStreak: Int): Boolean =
+        paused && cleanStreak >= AUDIT_CLEAN_CHECKS_TO_RESUME
 
     /**
      * Decisión pura del sondeo (testeable en JVM): ¿toca pedir el perfil

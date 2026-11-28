@@ -576,4 +576,147 @@ class OrganismControllerTest {
         // Un contador que retrocede no resta sesiones.
         assertEquals(0, OrganismController.abSessionsCompleted(1_000L, 12L, 10L))
     }
+
+    // T10/510 — auditoría de la IDA (emitidos vs enviados).
+
+    @Test
+    fun `State por defecto no lleva auditoria IDA`() {
+        val state = OrganismController.State()
+        assertEquals(0L, state.chunksEmitted)
+        assertEquals(0, state.chunksPruned)
+        assertEquals(0, state.chunksUserCleared)
+        assertEquals(0, state.chunksDroppedWhilePaused)
+        assertEquals(0L, state.chunksUnaccounted)
+        assertEquals(0L, state.chunksLost)
+        assertEquals(0L, state.enqueueFailures)
+        assertFalse(state.auditDiverged)
+        assertFalse(state.auditPaused)
+        assertEquals(0, state.auditDivergentChecks)
+        assertEquals(0L, state.lastAuditAtMs)
+        assertEquals(0L, state.lastAuditPauseAtMs)
+    }
+
+    @Test
+    fun `auditoria cuadra cuando todo esta contabilizado`() {
+        // 10 emitidos: 6 enviados + 2 en cola + 1 podado + 1 borrado.
+        val audit = OrganismController.evaluateChunkAudit(
+            emitted = 10L, sent = 6L, queued = 2, quarantined = 1,
+            pruned = 1, obsoleteDiscarded = 0, userCleared = 1,
+            droppedWhilePaused = 0, enqueueFailures = 0L
+        )
+        assertEquals(0L, audit.unaccounted)
+        assertEquals(0L, audit.lost)
+    }
+
+    @Test
+    fun `cuarentena esta dentro de en cola no se suma dos veces`() {
+        // 5 emitidos: 3 enviados + 2 en cola (los 2 en cuarentena).
+        val audit = OrganismController.evaluateChunkAudit(
+            emitted = 5L, sent = 3L, queued = 2, quarantined = 2,
+            pruned = 0, obsoleteDiscarded = 0, userCleared = 0,
+            droppedWhilePaused = 0, enqueueFailures = 0L
+        )
+        assertEquals(0L, audit.unaccounted)
+        assertEquals(0L, audit.lost)
+    }
+
+    @Test
+    fun `perdida es emitidos menos contabilizados`() {
+        val audit = OrganismController.evaluateChunkAudit(
+            emitted = 10L, sent = 2L, queued = 1, quarantined = 0,
+            pruned = 0, obsoleteDiscarded = 0, userCleared = 0,
+            droppedWhilePaused = 0, enqueueFailures = 1L
+        )
+        assertEquals(7L, audit.unaccounted)
+        assertEquals(7L, audit.lost)
+        assertEquals(1L, audit.enqueueFailures)
+    }
+
+    @Test
+    fun `excedente de un proceso anterior no es perdida`() {
+        // Tras un reinicio: 0 emitidos en este proceso, 4 en cola de
+        // antes (la cola durable no se reinicia; sentTotal sí).
+        val audit = OrganismController.evaluateChunkAudit(
+            emitted = 0L, sent = 0L, queued = 4, quarantined = 0,
+            pruned = 0, obsoleteDiscarded = 0, userCleared = 0,
+            droppedWhilePaused = 0, enqueueFailures = 0L
+        )
+        assertEquals(-4L, audit.unaccounted)
+        assertEquals(0L, audit.lost)
+    }
+
+    @Test
+    fun `ventana mide solo la perdida nueva entre checks`() {
+        val prev = OrganismController.ChunkAuditSnapshot(
+            emitted = 10L, sent = 6L, queued = 2, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 0
+        )
+        // Ventana limpia: 5 emitidos nuevos, 3 enviados, 2 en cola.
+        val clean = OrganismController.ChunkAuditSnapshot(
+            emitted = 15L, sent = 9L, queued = 4, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 0
+        )
+        assertEquals(0L, OrganismController.auditWindowLost(prev, clean))
+        // Ventana con 2 perdidos: 5 emitidos, solo 3 contabilizados.
+        val leaky = OrganismController.ChunkAuditSnapshot(
+            emitted = 15L, sent = 8L, queued = 3, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 0
+        )
+        assertEquals(2L, OrganismController.auditWindowLost(prev, leaky))
+        // Drenar la cola no es pérdida: 2 enviados, 2 menos en cola.
+        val drained = OrganismController.ChunkAuditSnapshot(
+            emitted = 10L, sent = 8L, queued = 0, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 0
+        )
+        assertEquals(0L, OrganismController.auditWindowLost(prev, drained))
+        // En pausa la ventana vale 0: 3 emitidos nuevos, los 3
+        // rechazados contabilizados, y 1 enviado drena la cola.
+        val paused = OrganismController.ChunkAuditSnapshot(
+            emitted = 13L, sent = 7L, queued = 1, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 0, droppedWhilePaused = 3
+        )
+        assertEquals(0L, OrganismController.auditWindowLost(prev, paused))
+        // Primer check (sin previo): la ventana es el acumulado.
+        val first = OrganismController.ChunkAuditSnapshot(
+            emitted = 10L, sent = 6L, queued = 2, pruned = 1,
+            obsoleteDiscarded = 0, userCleared = 1, droppedWhilePaused = 0
+        )
+        assertEquals(0L, OrganismController.auditWindowLost(OrganismController.ChunkAuditSnapshot(), first))
+    }
+
+    @Test
+    fun `divergencia por ventana grande o por fuga lenta con acumulado`() {
+        // Ventana > tope: diverge aunque el acumulado sea igual.
+        assertTrue(OrganismController.isAuditDivergent(6L, 6L))
+        // Fuga lenta: 2 por ventana, pero el acumulado ya pasa el tope.
+        assertTrue(OrganismController.isAuditDivergent(2L, 7L))
+        // Pérdida histórica con ventana limpia: no diverge (el pasado
+        // no condena al presente; así la pausa puede reanudar).
+        assertFalse(OrganismController.isAuditDivergent(0L, 7L))
+        // Por debajo del tope en ambos: no diverge.
+        assertFalse(OrganismController.isAuditDivergent(2L, 2L))
+        // El tope es estricto (> 5, no >= 5).
+        assertFalse(OrganismController.isAuditDivergent(5L, 5L))
+        assertFalse(OrganismController.isAuditDivergent(0L, 0L))
+    }
+
+    @Test
+    fun `check de auditoria con throttle de 5 min`() {
+        val interval = OrganismController.AUDIT_INTERVAL_MS
+        assertTrue(OrganismController.shouldRunAuditCheck(interval, 0L))
+        assertFalse(OrganismController.shouldRunAuditCheck(interval - 1L, 0L))
+        assertTrue(OrganismController.shouldRunAuditCheck(2 * interval, interval))
+        assertFalse(OrganismController.shouldRunAuditCheck(2 * interval - 1L, interval))
+    }
+
+    @Test
+    fun `pausa a las 3 ventanas divergentes y reanudacion a las 2 limpias`() {
+        assertFalse(OrganismController.shouldPauseAudit(0))
+        assertFalse(OrganismController.shouldPauseAudit(2))
+        assertTrue(OrganismController.shouldPauseAudit(3))
+        assertTrue(OrganismController.shouldPauseAudit(4))
+        assertFalse(OrganismController.shouldResumeAudit(false, 2))
+        assertFalse(OrganismController.shouldResumeAudit(true, 1))
+        assertTrue(OrganismController.shouldResumeAudit(true, 2))
+    }
 }

@@ -70,6 +70,21 @@ class OrganismQueue(
 
     enum class State { PENDING, SENDING, RETRY, QUARANTINED }
 
+    /**
+     * T10/510 — chunks descartados por prune en la vida de ESTA
+     * instancia (retención 7 días o tope de cola; ver
+     * [pruneIfOverCap]). Antes el prune era una caída silenciosa:
+     * `enqueue()` lo llamaba y tiraba el conteo, así que un chunk
+     * podado por viejo no aparecía en ningún contador y la auditoría
+     * IDA lo habría marcado como «sin contabilizar». La instancia se
+     * recrea en cada start() del controlador, así que el acumulado
+     * entre arranques vive en el controlador (lo suma al detenerlo);
+     * aquí solo cuenta lo de esta instancia.
+     */
+    @Volatile
+    var prunedTotal: Int = 0
+        private set
+
     /** Un chunk encolado. `body` es el JSON del POST (sin token, nunca). */
     data class Item(
         val sessionId: String,
@@ -291,6 +306,10 @@ class OrganismQueue(
             items = items - victim
             bytes = items.sumOf { fileSize(it) }
         }
+        // T10/510: el prune deja de ser silencioso — el conteo lo lee
+        // la auditoría IDA (un chunk podado es una disposición
+        // contabilizada, no pérdida).
+        prunedTotal += degraded
         return degraded
     }
 

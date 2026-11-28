@@ -248,6 +248,44 @@ fun OrganismCard(
                     )
                 }
             }
+            // T10/510 — auditoría de la IDA: emitidos vs enviados.
+            // Solo se muestra cuando hay algo que auditar (chunks
+            // emitidos) o algo que ver (divergencia o pausa). Con
+            // todo a cero no añade ruido. La divergencia y la pausa
+            // son estado visible, no silencio: si el ciclo se detiene,
+            // la tarjeta dice por qué y cuántos chunks faltan.
+            if (state.chunksEmitted > 0L || state.auditDiverged || state.auditPaused) {
+                Text(
+                    "IDA: emitidos ${state.chunksEmitted} · enviados ${state.sentTotal} · en cola ${state.queued} · podados ${state.chunksPruned} · sin contabilizar ${state.chunksUnaccounted}.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if (state.auditDiverged) {
+                    Text(
+                        "Auditoría IDA: ${state.chunksLost} chunk(s) sin contabilizar (${state.auditDivergentChecks}/${OrganismController.AUDIT_DIVERGENT_CHECKS_TO_PAUSE} ventanas divergentes).",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                if (state.auditPaused) {
+                    Text(
+                        "Entrada en pausa por la auditoría (pérdida persistente): los chunks nuevos se rechazan hasta que la cola drene y la auditoría vuelva a cuadrar; el audio no se toca.",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    if (state.lastAuditPauseAtMs > 0L) {
+                        Text(
+                            "Última pausa: ${format401Date(state.lastAuditPauseAtMs)}.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+                if (state.lastAuditAtMs > 0L) {
+                    Text(
+                        "Última auditoría: ${format401Date(state.lastAuditAtMs)}.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
             // C21/510 — diagnóstico de un toque del token: cuando el
             // estado huele a token o a red (Sin token / Token inválido /
             // Sin conexión / Error), un toque dice si los hosts
