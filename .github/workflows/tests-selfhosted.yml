@@ -197,17 +197,12 @@ jobs:
             git fetch --quiet origin "pull/${{ github.event.pull_request.number }}/merge"
           fi
           git checkout --quiet ${{ github.sha }}
-      # La caché es un acelerador, no una puerta (mismo patrón que el job
-      # plano). Clave propia (ctest-build-asan-*) para no colisionar con
-      # la caché del build plano.
-      - name: Cache dir de build CTest (ASan)
-        uses: actions/cache@v4
-        continue-on-error: true
-        with:
-          path: build-tests-asan
-          key: ctest-build-asan-${{ runner.os }}-${{ hashFiles('app/src/main/cpp/tests/**', '.github/workflows/tests-selfhosted.yml') }}
-          restore-keys: |
-            ctest-build-asan-${{ runner.os }}-
+      # SIN actions/cache aquí (CodeQL actions/cache-poisoning, alta,
+      # PR #14): el job corre en pull_request (código no confiable) Y en
+      # push/workflow_dispatch (rama por defecto); cachear build-tests-asan
+      # compartiría la caché entre ambos y CodeQL lo marca como alerta
+      # nueva que falla el check. Build limpio cada vez (más lento, pero
+      # el job tiene timeout 120 min y el runner es propio, sin minutos).
       - name: Configure (Release, ASan+UBSan)
         run: $CMAKE -B build-tests-asan -S app/src/main/cpp/tests -DCMAKE_BUILD_TYPE=Release -DIVANNA_TEST_ENABLE_ASAN=ON
       - name: Build
