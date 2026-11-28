@@ -556,6 +556,82 @@ object FusedControlsBridge {
         roomCorrDb9: Float,
     )
 
+    /**
+     * Entrada con fundido por hop (S12/510): mismos 61 parámetros que
+     * [nativeSetFusedControls] en el mismo orden + [rampHops].
+     * rampHops = -1 (auto) = rampa según el salto de los valores.
+     * DECLARACIÓN que faltaba: el C++ (ivanna_omega_jni.cpp:3521) la
+     * define desde Fase 3 y check_jni_wiring (Fase 0) exige que cada
+     * símbolo `Java_*` tenga su `external fun`. Sin llamador aún: el
+     * cableado al camino de aplicación de perfiles queda pendiente
+     * (ver comentario en el C++); sin llamador es código muerto y no
+     * cambia el comportamiento.
+     */
+    @JvmStatic external fun nativeSetFusedControlsRamped(
+        spatialAmount: Float,
+        spatialAzimuthDeg: Float,
+        spatialDistanceM: Float,
+        spatialWidth: Float,
+        spatialMode: Int,
+        spatialWfsSpread: Float,
+        spatialHrtfWet: Float,
+        spatialHeadTracking: Boolean,
+        spatialXtc: Boolean,
+        spatialUpmix: Boolean,
+        spatialImmersivity: Float,
+        fieldAmount: Float,
+        fieldPhiAmount: Float,
+        fieldPhiPreset: Int,
+        fieldPumping: Float,
+        fieldCoherence: Float,
+        fieldHarmonics: Float,
+        fieldGamma: Float,
+        fieldWarmth: Float,
+        fieldDynamics: Float,
+        fieldRt60: Float,
+        roomRt60: Float,
+        roomSizeM: Float,
+        roomWet: Float,
+        roomHearingProfile: Int,
+        transCorrection: Float,
+        transTemporal: Float,
+        transEmf: Boolean,
+        tonalCurve: Int,
+        tonalTrimDb: Float,
+        tonalLowDb: Float,
+        tonalMidDb: Float,
+        tonalHighDb: Float,
+        tonalLoudness: Boolean,
+        dynPunch: Float,
+        dynWidth: Float,
+        dynSafety: Float,
+        dynThrDb: Float,
+        dynRatio: Float,
+        dynExciter: Float,
+        dynVoice: Float,
+        dynUpmix: Float,
+        brainMode: Int,
+        brainAdaptation: Float,
+        consvAmount: Float,
+        consvEnergyCap: Float,
+        consvPhaseCoherence: Float,
+        consvInertia: Float,
+        fieldOmniAmount: Float,
+        fieldDiffuse: Float,
+        tonalPresenceDb: Float,
+        roomCorrDb0: Float,
+        roomCorrDb1: Float,
+        roomCorrDb2: Float,
+        roomCorrDb3: Float,
+        roomCorrDb4: Float,
+        roomCorrDb5: Float,
+        roomCorrDb6: Float,
+        roomCorrDb7: Float,
+        roomCorrDb8: Float,
+        roomCorrDb9: Float,
+        rampHops: Int,
+    )
+
     /** Bypass total de la cadena (equivale a FusedControls::setNeutral()). */
     @JvmStatic external fun nativeSetFusedNeutral()
 
