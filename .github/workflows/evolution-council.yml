@@ -80,7 +80,7 @@ jobs:
 
       - name: Publicar log de la suite
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: evolution-tests-log
           path: evolution-tests.log

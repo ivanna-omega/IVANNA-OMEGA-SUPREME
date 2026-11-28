@@ -85,7 +85,7 @@ jobs:
 
       - name: Publicar reporte JSON
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: perfection-gate-report
           path: perfection_gate_report.json
