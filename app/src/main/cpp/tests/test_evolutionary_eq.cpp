@@ -345,3 +345,226 @@ TEST(EvolutionaryEQ, ResetHistoryClearsFilterState) {
         EXPECT_FLOAT_EQ(zero.right[i], 0.0f) << "i=" << i;
     }
 }
+
+// ── S14 — Auto-calibración re-objetivada (Fase 6, 510) ────────────────────
+// El objetivo es Harman 2018 ×0.5 − error regional ERB, cut-only: el
+// error solo recorta, nunca eleva por encima de Harman; los refuerzos
+// solo tras A/B. El punto de entrada está APAGADO por defecto (sin
+// llamador en producción). Valores medidos de referencia (sonda S14,
+// host -O2, 2026-11-28): error cero ⇒ FIR bit-idéntico a calibrate()
+// (fitness −3.637); exceso +6 dB en 2–4 kHz ⇒ −6.01 dB a 3.15 kHz,
+// −4.09 dB a 2 kHz, −3.13 dB a 4 kHz, ±0.04 dB fuera de la región.
+namespace {
+// Frecuencia de la banda 512 nº b (misma fórmula que el módulo).
+float bandFreqHz(size_t b) {
+    return (static_cast<float>(b) + 0.5f) * 24000.0f / 512.0f;
+}
+float respDb(const float* fir, float freqHz) {
+    const float wn = 6.2831853f * freqHz / 48000.0f;
+    return 20.0f * std::log10(std::fmax(magnitudeOf(fir, wn), 1e-6f));
+}
+float maxMagDense(const float* fir) {
+    float m = 0.0f;
+    for (int i = 0; i <= 64; ++i) {
+        m = std::fmax(m, magnitudeOf(fir, 3.14159265f * i / 64.0f));
+    }
+    return m;
+}
+// Error ERB con `db` en las bandas cuyo centro cae en [fLo, fHi] Hz.
+void erbErrorInRange(float* err24, float fLo, float fHi, float db) {
+    float centers[24];
+    ivanna::spatial::eliteErbCenters24(48000.0f, centers);
+    for (int b = 0; b < 24; ++b) err24[b] = 0.0f;
+    for (int b = 0; b < 24; ++b) {
+        if (centers[b] >= fLo && centers[b] <= fHi) err24[b] = db;
+    }
+}
+float respAt(const EvolutionaryEQ& eq, float fHz) {
+    return respDb(eq.firLeft(), fHz);
+}
+} // namespace
+
+// 15. Error cero ⇒ objetivo Harman ×0.5 exacto y FIR bit-idéntico a
+//     calibrate(): la re-objetivación degenera en la calibración plana
+//     (misma base, mismo genoma inicial neutro, misma semilla, misma
+//     tabla de fitness). Ancla de 1 kHz unidad y topes heredados.
+TEST(EvolutionaryEQ, S14ZeroErrorIsIdenticalToPlainCalibration) {
+    EvolutionaryEQ base;
+    base.calibrate(48000.0f);
+    ASSERT_TRUE(base.isReady());
+
+    float zero[24] = {};
+    EvolutionaryEQ eq;
+    eq.calibrateToTarget(zero);
+    ASSERT_TRUE(eq.isReady());
+    EXPECT_TRUE(eq.hasCustomTarget());
+    EXPECT_FLOAT_EQ(eq.currentFitness(), base.currentFitness());
+    for (size_t t = 0; t < FIR_TAPS; ++t) {
+        EXPECT_FLOAT_EQ(eq.firLeft()[t], base.firLeft()[t]) << "tap " << t;
+    }
+    // El objetivo 512 bandas ES Harman ×0.5 (con piso −2.0 dB), exacto.
+    for (size_t b = 0; b < Ivanna::BANDS_512; ++b) {
+        EXPECT_FLOAT_EQ(eq.targetGenome()[b], harmanTargetDb(bandFreqHz(b)))
+            << "banda " << b;
+    }
+    // Ancla de 1 kHz y topes (mismos que calibrate()).
+    EXPECT_NEAR(respAt(eq, 1000.0f), 0.0f, 0.1f);
+    EXPECT_LE(peakAbs(eq.firLeft(), FIR_TAPS), 1.5f + 1e-4f);
+    EXPECT_LE(maxMagDense(eq.firLeft()), 2.0f + 1e-4f);
+    EXPECT_TRUE(allFinite(eq.firLeft(), FIR_TAPS));
+}
+
+// 16. Cut-only a nivel de objetivo (EXACTO) y a nivel de FIR (medido):
+//     exceso +6 dB en 2–4 kHz. El objetivo nunca supera Harman ×0.5 y
+//     es idéntico a Harman fuera de la región; el FIR recorta en la
+//     región y no realza en ningún anclaje.
+TEST(EvolutionaryEQ, S14CutOnlyExcessCutsOnlyWhereMeasured) {
+    float exc[24];
+    erbErrorInRange(exc, 2000.0f, 4000.0f, 6.0f);
+    EvolutionaryEQ eq;
+    eq.calibrateToTarget(exc);
+    ASSERT_TRUE(eq.isReady());
+
+    // Objetivo: nunca por encima de Harman ×0.5, exacto fuera de región.
+    for (size_t b = 0; b < Ivanna::BANDS_512; ++b) {
+        const float f = bandFreqHz(b);
+        EXPECT_LE(eq.targetGenome()[b], harmanTargetDb(f)) << "banda " << b;
+        if (f <= 1000.0f) {
+            EXPECT_FLOAT_EQ(eq.targetGenome()[b], harmanTargetDb(f))
+                << "banda " << b;
+        }
+    }
+    // FIR: recorte real en la región (medido −6.01 / −4.09 / −3.13 dB
+    // frente a calibrate(); márgenes con ≥1 dB de holgura).
+    EvolutionaryEQ base;
+    base.calibrate(48000.0f);
+    ASSERT_TRUE(base.isReady());
+    EXPECT_LE(respAt(eq, 3150.0f), respAt(base, 3150.0f) - 4.0f);
+    EXPECT_LE(respAt(eq, 2000.0f), respAt(base, 2000.0f) - 3.0f);
+    EXPECT_LE(respAt(eq, 4000.0f), respAt(base, 4000.0f) - 2.0f);
+    // Y ningún anclaje se realza por encima de la calibración plana.
+    for (int k = 0; k < 13; ++k) {
+        EXPECT_LE(respAt(eq, kHarmanAnchorHz[k]),
+                  respAt(base, kHarmanAnchorHz[k]) + 0.1f)
+            << "f=" << kHarmanAnchorHz[k] << " Hz";
+    }
+    EXPECT_NEAR(respAt(eq, 1000.0f), 0.0f, 0.1f);
+    EXPECT_LE(maxMagDense(eq.firLeft()), 2.0f + 1e-4f);
+    EXPECT_LE(peakAbs(eq.firLeft(), FIR_TAPS), 1.5f + 1e-4f);
+}
+
+// 17. Un hueco medido (error negativo) NO se refuerza: con error −6 dB
+//     en 2–4 kHz el objetivo es EXACTAMENTE Harman ×0.5 en las 512
+//     bandas y el FIR es bit-idéntico a calibrate(). Los refuerzos solo
+//     tras A/B — en la primera pasada el hueco queda sin corregir.
+TEST(EvolutionaryEQ, S14NegativeErrorNeverBoosts) {
+    float dip[24];
+    erbErrorInRange(dip, 2000.0f, 4000.0f, -6.0f);
+    EvolutionaryEQ eq;
+    eq.calibrateToTarget(dip);
+    ASSERT_TRUE(eq.isReady());
+    for (size_t b = 0; b < Ivanna::BANDS_512; ++b) {
+        EXPECT_FLOAT_EQ(eq.targetGenome()[b], harmanTargetDb(bandFreqHz(b)))
+            << "banda " << b;
+    }
+    EvolutionaryEQ base;
+    base.calibrate(48000.0f);
+    ASSERT_TRUE(base.isReady());
+    EXPECT_FLOAT_EQ(eq.currentFitness(), base.currentFitness());
+    for (size_t t = 0; t < FIR_TAPS; ++t) {
+        EXPECT_FLOAT_EQ(eq.firLeft()[t], base.firLeft()[t]) << "tap " << t;
+    }
+}
+
+// 18. Determinismo e idempotencia de la vía S14: dos instancias frescas
+//     con el mismo error dan el MISMO FIR, y recalibrar la misma
+//     instancia también.
+TEST(EvolutionaryEQ, S14TargetCalibrationIsDeterministicAndIdempotent) {
+    float exc[24];
+    erbErrorInRange(exc, 2000.0f, 4000.0f, 6.0f);
+    EvolutionaryEQ a, b;
+    a.calibrateToTarget(exc);
+    b.calibrateToTarget(exc);
+    ASSERT_TRUE(a.isReady());
+    ASSERT_TRUE(b.isReady());
+    EXPECT_FLOAT_EQ(a.currentFitness(), b.currentFitness());
+    for (size_t t = 0; t < FIR_TAPS; ++t) {
+        EXPECT_FLOAT_EQ(a.firLeft()[t], b.firLeft()[t]) << "tap " << t;
+    }
+    a.calibrateToTarget(exc);
+    ASSERT_TRUE(a.isReady());
+    for (size_t t = 0; t < FIR_TAPS; ++t) {
+        EXPECT_FLOAT_EQ(a.firLeft()[t], b.firLeft()[t]) << "tap " << t;
+    }
+}
+
+// 19. Gating: sin llamar a calibrateToTarget() el módulo es identidad
+//     bit-exacta (la vía S14 está APAGADA por defecto; su activación es
+//     decisión de Esse). Un puntero nulo es fail-closed: no cambia nada.
+TEST(EvolutionaryEQ, S14EntryPointIsGatedOffByDefault) {
+    EvolutionaryEQ eq;
+    EXPECT_FALSE(eq.isReady());
+    EXPECT_FALSE(eq.hasCustomTarget());
+    EXPECT_TRUE(isExactDelta(eq.firLeft()));
+
+    std::vector<float> l(77), r(77);
+    for (size_t i = 0; i < l.size(); ++i) { l[i] = std::sin(0.3f * i); r[i] = std::cos(0.2f * i); }
+    auto l0 = l, r0 = r;
+    eq.processPlanar(l.data(), r.data(), l.size());
+    EXPECT_EQ(l, l0); EXPECT_EQ(r, r0);
+
+    eq.calibrateToTarget(nullptr);
+    EXPECT_FALSE(eq.isReady());
+    EXPECT_FALSE(eq.hasCustomTarget());
+    EXPECT_TRUE(isExactDelta(eq.firLeft()));
+}
+
+// 20. Topes bajo error fuerte (+12 dB en 100 Hz–8 kHz): FIR finito,
+//     pico de tap ≤ 1.5, maxMag ≤ 2.0 en rejilla densa y ancla de 1 kHz
+//     intacta (el tope NO se dispara: |H(1 kHz)| = 0 dB es el detector).
+//     NOTA: a 10 kHz la respuesta queda por encima de la calibración
+//     plana (+1.7 dB medido): el FIR de 256 taps no puede realizar el
+//     corte profundo que el objetivo exige en la octava superior —
+//     limitación MEDIDA y preexistente del diseño (ver piso −2.0 dB en
+//     EvolutionaryEQ.cpp), no un refuerzo: el OBJETIVO nunca supera
+//     Harman (test 16). Por eso aquí no se exige ≤ baseline en 10 kHz.
+TEST(EvolutionaryEQ, S14CapsHoldUnderStrongError) {
+    float strong[24];
+    erbErrorInRange(strong, 100.0f, 8000.0f, 12.0f);
+    EvolutionaryEQ eq;
+    eq.calibrateToTarget(strong);
+    ASSERT_TRUE(eq.isReady());
+    EXPECT_TRUE(allFinite(eq.firLeft(), FIR_TAPS));
+    EXPECT_LE(peakAbs(eq.firLeft(), FIR_TAPS), 1.5f + 1e-4f);
+    EXPECT_LE(maxMagDense(eq.firLeft()), 2.0f + 1e-4f);
+    EXPECT_NEAR(respAt(eq, 1000.0f), 0.0f, 0.1f);
+    EXPECT_TRUE(std::isfinite(eq.currentFitness()));
+    // El corte fuerte SÍ se realiza donde el FIR llega (3.15 kHz).
+    EvolutionaryEQ base;
+    base.calibrate(48000.0f);
+    ASSERT_TRUE(base.isReady());
+    EXPECT_LE(respAt(eq, 3150.0f), respAt(base, 3150.0f) - 3.0f);
+}
+
+// 21. calibrate() borra el objetivo personalizado: tras
+//     calibrateToTarget() + calibrate(), el módulo vuelve a Harman ×0.5
+//     (mismo FIR bit-exacto que una calibración plana fresca).
+TEST(EvolutionaryEQ, S14PlainCalibrationClearsCustomTarget) {
+    float exc[24];
+    erbErrorInRange(exc, 2000.0f, 4000.0f, 6.0f);
+    EvolutionaryEQ eq;
+    eq.calibrateToTarget(exc);
+    ASSERT_TRUE(eq.isReady());
+    ASSERT_TRUE(eq.hasCustomTarget());
+    eq.calibrate(48000.0f);
+    ASSERT_TRUE(eq.isReady());
+    EXPECT_FALSE(eq.hasCustomTarget());
+    EvolutionaryEQ base;
+    base.calibrate(48000.0f);
+    ASSERT_TRUE(base.isReady());
+    EXPECT_FLOAT_EQ(eq.currentFitness(), base.currentFitness());
+    for (size_t t = 0; t < FIR_TAPS; ++t) {
+        EXPECT_FLOAT_EQ(eq.firLeft()[t], base.firLeft()[t]) << "tap " << t;
+    }
+}
+

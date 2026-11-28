@@ -170,6 +170,68 @@ const FitnessTables& fitnessTables() {
     return t;
 }
 
+// ── S14 — objetivo re-objetivado por error regional ERB ──────────────────
+//
+// erbError[24]: error medido en dB por banda ERB (respuesta − Harman).
+// Solo CORTES en la primera pasada: el error se recorta a ≥ 0 ANTES de
+// interpolar, así que el objetivo nunca supera Harman ×0.5 en ninguna
+// banda. La interpolación es lineal en log-frecuencia entre los centros
+// ERB (eliteErbCenters24, 60 Hz–16 kHz, misma fórmula que el operador y
+// el sensor); fuera de rango se clampa al valor del borde (nunca se
+// extrapola). El piso −2.0 dB es el existente del módulo y se aplica
+// igual al objetivo 512 bandas y a los 13 anclajes de fitness, así que
+// con error cero la tabla resultante es BIT-IDÉNTICA a fitnessTables().
+// Frecuencia de la banda 512 nº b: f_b = (b+0.5)/512 · 24 kHz (Nyquist
+// a 48 kHz, la referencia del módulo).
+constexpr int kNumErbBands = 24;
+
+inline float cutAtFreq(const float* cut24, const float* centers24,
+                       float freqHz) noexcept {
+    if (freqHz <= centers24[0]) return cut24[0];
+    if (freqHz >= centers24[kNumErbBands - 1])
+        return cut24[kNumErbBands - 1];
+    const float lf = std::log(freqHz);
+    for (int i = 1; i < kNumErbBands; ++i) {
+        if (freqHz <= centers24[i]) {
+            const float l0 = std::log(centers24[i - 1]);
+            const float l1 = std::log(centers24[i]);
+            const float t = (lf - l0) / (l1 - l0);
+            return cut24[i - 1] + t * (cut24[i] - cut24[i - 1]);
+        }
+    }
+    return cut24[kNumErbBands - 1];
+}
+
+// Construye el objetivo S14: target512[b] (dB por banda 512) y los 13
+// anclajes de fitness anchorDb[k]. Entradas no finitas ⇒ 0 dB.
+inline void buildTarget512(const float* erbError, float* target512,
+                           float* anchorDb) noexcept {
+    float cut24[kNumErbBands];
+    for (int b = 0; b < kNumErbBands; ++b) {
+        const float e = (erbError != nullptr && std::isfinite(erbError[b]))
+                            ? erbError[b] : 0.0f;
+        cut24[b] = std::fmax(e, 0.0f); // CUT-ONLY: el hueco no se refuerza
+    }
+    float centers24[kNumErbBands];
+    ivanna::spatial::eliteErbCenters24(kRefSampleRateHz, centers24);
+    for (size_t b = 0; b < BANDS_512; ++b) {
+        const float f = (static_cast<float>(b) + 0.5f)
+                      * (kRefSampleRateHz * 0.5f)
+                      / static_cast<float>(BANDS_512);
+        const float harman = ivanna::spatial::eliteTargetDbAt(
+            ivanna::spatial::EliteTargetKind::Harman2018, f) * kHarmanScale;
+        target512[b] = std::fmax(harman - cutAtFreq(cut24, centers24, f),
+                                 kTargetDbFloor);
+    }
+    for (int k = 0; k < kNumTargets; ++k) {
+        const float f = kTargetFreqHz[k];
+        const float harman = ivanna::spatial::eliteTargetDbAt(
+            ivanna::spatial::EliteTargetKind::Harman2018, f) * kHarmanScale;
+        anchorDb[k] = std::fmax(harman - cutAtFreq(cut24, centers24, f),
+                                kTargetDbFloor);
+    }
+}
+
 // Adaptación de paso POR ÉXITO (regla 1/5). Si el fitness del genoma medio
 // mejoró respecto a la generación anterior, el paso crece (×1.05, hasta
 // 1.0 dB); si no, se encoge (×0.95, hasta 0.05 dB) para afinar. Es robusta
@@ -206,7 +268,9 @@ EvolutionaryEQ::EvolutionaryEQ() {
     for (size_t i = 0; i < BANDS_512; ++i) {
         // Arranque NEUTRO: genoma en 0 dB ⇒ filtro identidad exacto.
         m_meanGenome[i] = 0.0f;
+        m_targetGenome[i] = 0.0f; // S14: sin objetivo hasta calibrateToTarget()
     }
+    for (int k = 0; k < kTargetAnchorCount; ++k) m_targetDb[k] = 0.0f;
 
     rebuildFilterFromGenome(); // deja el FIR en identidad (genoma 0 dB)
     m_ready = false;           // …pero NO habilitado: espera calibración real
@@ -238,6 +302,10 @@ float EvolutionaryEQ::magnitudeAt(const float* coeffs, float wn) const {
 // así el fitness puede explorar forma espectral real.
 float EvolutionaryEQ::calculateFitness(const float* genome) {
     const FitnessTables& T = fitnessTables();
+    // S14: con objetivo personalizado, los 13 anclajes son los del
+    // objetivo construido (misma matriz M, mismo delta); sin él, la tabla
+    // Harman ×0.5 estática — comportamiento de calibrate(), sin cambios.
+    const float* targetDb = m_hasCustomTarget ? m_targetDb : T.targetDb;
 
     float dev[BANDS_512];
     for (size_t b = 0; b < BANDS_512; ++b) dev[b] = db2lin(genome[b]) - 1.0f;
@@ -252,7 +320,7 @@ float EvolutionaryEQ::calculateFitness(const float* genome) {
         }
         const float mag = std::sqrt(re * re + im * im);
         const float db  = 20.0f * std::log10(std::fmax(mag, 1e-6f));
-        const float d   = db - T.targetDb[k];
+        const float d   = db - targetDb[k];
         err += d * d;
     }
 
@@ -415,6 +483,9 @@ void EvolutionaryEQ::calibrate(float /*sampleRateHz*/) {
     // instancias y cada calibración daba un FIR distinto (defecto #1).
     // El objetivo está en frecuencia normalizada (referencia 48 kHz), así
     // que sampleRateHz no cambia el resultado (se ignora, como antes).
+    // S14: una calibración plana BORRA el objetivo personalizado — el
+    // módulo vuelve a Harman ×0.5 y calculateFitness() a la tabla estática.
+    m_hasCustomTarget = false;
     for (size_t i = 0; i < BANDS_512; ++i) {
         m_meanGenome[i] = 0.0f;
     }
@@ -426,7 +497,46 @@ void EvolutionaryEQ::calibrate(float /*sampleRateHz*/) {
         updateLM_CMA_ES();
     }
     rebuildFilterFromGenome();
+    armIfVerified();
+}
 
+// S14 — auto-calibración re-objetivada (ver header). Misma optimización
+// (kCalibrationGenerations × updateLM_CMA_ES), mismo rebuild y mismo
+// gate que calibrate(); solo cambia el OBJETIVO: Harman ×0.5 − error
+// regional ERB, cut-only, con el piso existente.
+//
+// El genoma inicial es NEUTRO, como en calibrate() — NO el objetivo
+// construido. Medido en host (sonda S14, 2026-11-28): iniciar en el
+// objetivo deja el FIR con maxMag 2.75 en la rejilla densa y el tope de
+// rebuildFilterFromGenome escala todo ×0.73 (−2.8 dB global, ancla de
+// 1 kHz rota: |H(1 kHz)| = −2.81 dB), porque el fitness optimiza la
+// respuesta SIN normalizar ni topar y no ve el escalado que el rebuild
+// aplica después. Desde neutro el optimizador converge a la misma
+// cuenca que calibrate() (fitness ≈ −3.6, sin tope activo, ancla
+// intacta) y el error solo recorta desde ahí. El objetivo 512 bandas
+// define los 13 anclajes de fitness y queda expuesto en targetGenome().
+void EvolutionaryEQ::calibrateToTarget(const float erbError[24]) {
+    // Fail-closed: sin medición no hay calibración; el estado queda
+    // intacto (sin calibrar ⇒ identidad bit-exacta, como antes).
+    if (erbError == nullptr) return;
+
+    buildTarget512(erbError, m_targetGenome, m_targetDb);
+    m_hasCustomTarget = true;
+    for (size_t i = 0; i < BANDS_512; ++i) {
+        m_meanGenome[i] = 0.0f;
+    }
+    m_stepSize = 0.5f;
+    m_prevMeanFitness = -1e30f;
+    m_rng.seed(1337);
+
+    for (int g = 0; g < kCalibrationGenerations; ++g) {
+        updateLM_CMA_ES();
+    }
+    rebuildFilterFromGenome();
+    armIfVerified();
+}
+
+void EvolutionaryEQ::armIfVerified() {
     // Auto-verificación: el FIR aplicado debe ser finito y de pico <= 1.5
     // (el tope de rebuildFilterFromGenome; el FIR Harman natural tiene pico
     // ~1.05, así que 1.0 era demasiado estricto y hundía el nivel).
