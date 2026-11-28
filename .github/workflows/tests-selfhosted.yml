@@ -25,10 +25,35 @@ name: Tests host (self-hosted ivanna-vm)
 on:
   push:
     branches: ["main"]
+  # C4/510 — la pata ASan+UBSan vive aquí (job ctest-selfhosted-asan) y la
+  # puerta hosted (tests-host.yml) ya no la corre: el self-hosted tiene que
+  # dispararse también en PR, con las mismas rutas que tests-host.yml, para
+  # que el PR no fusione sin ASan. Sin minutos de GitHub (runner propio).
+  pull_request:
+    paths:
+      - 'app/src/main/cpp/**'
+      - 'tests/**'
+      - 'scripts/run_ctest.sh'
+      - 'scripts/check_*.py'
+      - 'README.md'
+      - 'LÉAME.md'
+      - 'telemetry/**'
+      - 'magisk_module/module.prop'
+      - 'magisk_module/customize.sh'
+      - 'research/deh6_optics/**'
+      - '.github/workflows/tests-selfhosted.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Un push nuevo cancela la corrida del push anterior que aún esté corriendo:
+# la única corrida que importa es la del HEAD (mismo patrón que
+# tests-host.yml). En este runner único (ivanna-vm) evita además que los
+# jobs ASan de 120 min se encolen detrás de corridas ya obsoletas.
+concurrency:
+  group: tests-selfhosted-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ctest-selfhosted:
@@ -39,6 +64,14 @@ jobs:
       CC: clang-18
       CXX: clang++-18
       CMAKE: /home/runner/cmake-3.30.3-linux-x86_64/bin/cmake
+      # C11/510 (línea pendiente) — la CPU por hop del harness es PUERTA
+      # DURA aquí (self-hosted, carga conocida), no solo en el carril
+      # semanal. El job corre ctest en línea (equivalente a run_ctest.sh)
+      # y el test lee esta variable en runtime
+      # (test_acoustic_harness.cpp: CpuGateHard); al ser env de job
+      # aplica a todos los pasos, incluido el ctest. En hosted sigue
+      # siendo solo métrica registrada.
+      IVANNA_CPU_GATE_HARD: '1'
     steps:
       # Sin actions/checkout: el runner self-hosted falla en el checkout
       # por el scrub de hatch-git. El repo es público: clon anónimo y
@@ -51,6 +84,11 @@ jobs:
             git fetch --quiet origin
           else
             git clone --quiet https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME.git .
+          fi
+          # En pull_request, github.sha es el commit de merge
+          # (refs/pull/N/merge), que un fetch normal de ramas no trae.
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --quiet origin "pull/${{ github.event.pull_request.number }}/merge"
           fi
           git checkout --quiet ${{ github.sha }}
       # La caché es un acelerador, no una puerta: si el servicio de
@@ -114,5 +152,80 @@ jobs:
             fails=$(grep -E "^\s*[0-9]+ - .*\(Failed|Timeout|SEGFAULT|Subprocess aborted|Exception" ctest_last.log | sed 's/^ *//' | tr '\n' ';' | cut -c1-600)
             detail=$(grep -E "Failure|Expected|Actual|which is|SUMMARY:|medido:" ctest_last.log | head -8 | tr '\n' ' ' | cut -c1-700)
             echo "::error title=DSP CTest fallido::${fails} | ${detail}"
+          fi
+          exit $rc
+
+  # ── C4/510 — pata ASan+UBSan, movida desde hosted ─────────────────────────
+  # En la 509 el job hosted ASan murió por timeout a los 30 min (1515/1835
+  # tests, 0 fallos): un solo job hacía configurar + compilar (enlace ASan
+  # de test_acoustic_harness >20 min) + ejecutar 1835 tests en 2 núcleos.
+  # Subir el timeout solo movía el muro. La pata completa vive aquí:
+  # timeout 120 min, sin minutos de GitHub, y en hosted queda solo la pata
+  # plana como puerta rápida (tests-host.yml). Sin los pasos Python del job
+  # plano (no dependen del sanitizador). Dir de build propio
+  # (build-tests-asan) para no colisionar con build-tests del job plano en
+  # el mismo workspace (mismo patrón que build-tests-quarantined en
+  # tests-quarantined-weekly.yml). Log propio (ctest_last_asan.log) por el
+  # mismo motivo. Sin `needs:`: corre independiente del job plano; un
+  # fallo en uno no esconde el resultado del otro (el runner único los
+  # ejecuta en serie de todos modos).
+  ctest-selfhosted-asan:
+    name: DSP Native Tests (ASan+UBSan, CTest, self-hosted)
+    runs-on: [self-hosted, ivanna-vm]
+    timeout-minutes: 120
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      CMAKE: /home/runner/cmake-3.30.3-linux-x86_64/bin/cmake
+      # Inocua bajo sanitizador por diseño: test_acoustic_harness.cpp
+      # pone hardGate=false con IVANNA_SANITIZER_ACTIVE (el sanitizador
+      # infla el CPU 2-3x; mide seguridad de memoria, no rendimiento).
+      # Se pone igual por uniformidad con el job plano.
+      IVANNA_CPU_GATE_HARD: '1'
+    steps:
+      # Sin actions/checkout: mismo motivo que el job plano (scrub de
+      # hatch-git). Mismo clon anónimo + checkout del SHA del run, con el
+      # fetch de la ref de merge en pull_request (ver job plano).
+      - name: Clone anónimo del repo público
+        run: |
+          if [ -d .git ]; then
+            git fetch --quiet origin
+          else
+            git clone --quiet https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME.git .
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --quiet origin "pull/${{ github.event.pull_request.number }}/merge"
+          fi
+          git checkout --quiet ${{ github.sha }}
+      # La caché es un acelerador, no una puerta (mismo patrón que el job
+      # plano). Clave propia (ctest-build-asan-*) para no colisionar con
+      # la caché del build plano.
+      - name: Cache dir de build CTest (ASan)
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: build-tests-asan
+          key: ctest-build-asan-${{ runner.os }}-${{ hashFiles('app/src/main/cpp/tests/**', '.github/workflows/tests-selfhosted.yml') }}
+          restore-keys: |
+            ctest-build-asan-${{ runner.os }}-
+      - name: Configure (Release, ASan+UBSan)
+        run: $CMAKE -B build-tests-asan -S app/src/main/cpp/tests -DCMAKE_BUILD_TYPE=Release -DIVANNA_TEST_ENABLE_ASAN=ON
+      - name: Build
+        run: $CMAKE --build build-tests-asan -j2
+      - name: Run tests (ASan+UBSan)
+        run: |
+          set -o pipefail
+          rc=0
+          # -LE QUARANTINED: misma selección que la pata ASan tenía en
+          # hosted vía run_ctest.sh. Los tests en cuarentena son de
+          # wall-clock y bajo ASan el CPU se infla 2-3x por diseño: sin
+          # la exclusión, test_perf_auditor fallaría por carga del
+          # sanitizador, no por defecto real. Siguen cubiertos por el
+          # job plano self-hosted y el carril semanal.
+          ctest --test-dir build-tests-asan --output-on-failure -LE QUARANTINED 2>&1 | tee ctest_last_asan.log || rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            fails=$(grep -E "^\s*[0-9]+ - .*\(Failed|Timeout|SEGFAULT|Subprocess aborted|Exception" ctest_last_asan.log | sed 's/^ *//' | tr '\n' ';' | cut -c1-600)
+            detail=$(grep -E "Failure|Expected|Actual|which is|ERROR: AddressSanitizer|runtime error|SUMMARY:|medido:" ctest_last_asan.log | head -8 | tr '\n' ' ' | cut -c1-700)
+            echo "::error title=DSP CTest (ASan+UBSan) fallido::${fails} | ${detail}"
           fi
           exit $rc

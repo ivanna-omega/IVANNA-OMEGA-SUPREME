@@ -59,18 +59,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── PUERTA por push/PR: normal + ASan+UBSan (verificadas ~1 min cada una) ──
+  # ── PUERTA por push/PR: pata plana (la ASan+UBSan vive en self-hosted) ───
+  # C4/510 — en la 509 el job ASan+UBSan murió por timeout a los 30 min
+  # (1515/1835 tests, 0 fallos): un solo job hacía configurar + compilar
+  # (enlace ASan de test_acoustic_harness >20 min) + ejecutar 1835 tests
+  # en 2 núcleos. La pata ASan completa se movió a tests-selfhosted.yml
+  # (job ctest-selfhosted-asan, timeout 120 min, sin minutos de GitHub,
+  # también en PR); aquí queda solo la pata plana como puerta rápida
+  # (el CTest plano tarda ~1 min). La matriz queda con un solo valor para
+  # no tocar las referencias a matrix.san (nombre, artefacto C5, Fase 0).
   ctest:
     name: ${{ matrix.san == 'asan' && 'CTest (ASan+UBSan)' || 'CTest' }}
     runs-on: ubuntu-latest
-    # 30 min (era 20): el enlace ASan+UBSan de test_acoustic_harness
-    # supera los 20 min y el job se cancelaba a mitad del enlace (509),
-    # sin fallo de test. El CTest plano tarda ~1 min.
+    # 30 min: holgura amplia para la pata plana (~1 min); el enlace ASan
+    # que lo reventaba en la 509 ya no corre en este job.
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        san: ['', 'asan']
+        san: ['']
     env:
       CC: gcc-14
       CXX: g++-14
