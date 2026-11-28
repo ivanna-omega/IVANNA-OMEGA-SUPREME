@@ -67,6 +67,35 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 
+// FIX (crash 506 - ConcurrentModificationException en Compose, 3x el 2026-11-27
+// 02:11): instantaneas inmutables para cruzar del hilo de fondo
+// (Dispatchers.Default, JNI) al hilo principal, donde vive TODA escritura de
+// estado de Compose. Sin ellas, los bucles de telemetria publicaban estado
+// desde Default mientras el layout lo leia y tiraba CME.
+private data class UnityTelemetrySnap(
+    val loaded: Boolean,
+    val unityTelemetry: FloatArray,
+    val punchTelemetry: FloatArray,
+    val evoEqActive: Boolean,
+    val volterraKernelLoaded: Boolean,
+    val hyperMeanCoherence: Float,
+    val hyperMode: Int,
+    val volterraKernelId: String,
+    val sensorRunning: Boolean,
+    val sensorFrameIndex: Long,
+    val sensorSource: String,
+)
+
+private data class NpeHudSnap(
+    val genre: String,
+    val rmsDb: Float,
+    val agcDb: Float,
+    val confidence: Float,
+    val thd: Float,
+    val inferenceUs: Long,
+)
+
+
 // ── Fichas magistrales · Control (prototipo aprobado, Pantalla III · Motor) ─
 // Texto exacto del prototipo; nada inventado. SpecInfo / ScreenSpecCard /
 // SpecInfoButton viven en SpecSheet.kt, mismo paquete. Los controles del
@@ -570,40 +599,64 @@ fun IvannaControlPanel(
     var hyperBassTrimDb by remember { mutableFloatStateOf(initialHyperBassTrimDb) }
     var punchTelemetry by remember { mutableStateOf(FloatArray(0)) }
     LaunchedEffect(Unit) {
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+        // FIX (crash 506 - ConcurrentModificationException en Compose, 3x el
+        // 2026-11-27 02:11): este bucle corria ENTERO en Dispatchers.Default
+        // y escribia estado de Compose desde un hilo de fondo mientras el
+        // hilo principal lo leia en layout. Ahora lo pesado (JNI) corre en
+        // Default y TODA escritura de estado corre en Main, el hilo de este
+        // LaunchedEffect.
         if (IvannaNativeLib.isLoaded) {
-            runCatching { IvannaNativeLib.nativeSetUnityEnabled(unityEnabled) }
+            val unityFallback = unityEnabled
+            withContext(Dispatchers.Default) {
+                runCatching { IvannaNativeLib.nativeSetUnityEnabled(unityFallback) }
+            }
             // La UI muestra el estado REAL del motor nativo, no el supuesto.
-            unityEnabled = runCatching { IvannaNativeLib.nativeIsUnityEnabled() }.getOrDefault(unityEnabled)
+            unityEnabled = withContext(Dispatchers.Default) {
+                runCatching { IvannaNativeLib.nativeIsUnityEnabled() }.getOrDefault(unityFallback)
+            }
         }
         while (isActive) {
-            if (IvannaNativeLib.isLoaded) {
-                unityTelemetry = runCatching { IvannaNativeLib.nativeGetUnityTelemetry() }.getOrDefault(FloatArray(0))
-                punchTelemetry = runCatching { IvannaNativeLib.nativeGetPunchTelemetry() }.getOrDefault(FloatArray(0))
-                evoEqActive = runCatching { IvannaNativeLib.nativeIsEvolutionaryEqActive() }.getOrDefault(false)
-                volterraKernelLoaded = runCatching { IvannaNativeLib.nativeHasVolterraKernel() }.getOrDefault(false)
-                // Coherencia media de Φ (v2.5.450): sin .so o sin lectura, 0.
-                hyperMeanCoherence = runCatching { IvannaNativeLib.nativeHyperStatus().getOrNull(6) ?: 0f }.getOrDefault(0f)
-                // Modo de Φ (v2.5.451): 3 = CALIBRADO (perfil guardado, DAC).
-                hyperMode = runCatching { (IvannaNativeLib.nativeHyperStatus().getOrNull(1) ?: 0f).toInt() }.getOrDefault(0)
-                if (!volterraSwitching) {
-                    volterraKernelId = runCatching { IvannaNativeLib.activeVolterraKernelId(context) }.getOrDefault("")
-                }
-            } else {
-                evoEqActive = false
-                volterraKernelLoaded = false
-                hyperMeanCoherence = 0f
-                hyperMode = 0
-                if (!volterraSwitching) volterraKernelId = ""
+            val switching = volterraSwitching
+            val snap = withContext(Dispatchers.Default) {
+                val loaded = IvannaNativeLib.isLoaded
+                val unityTel = if (loaded) runCatching { IvannaNativeLib.nativeGetUnityTelemetry() }.getOrDefault(FloatArray(0)) else FloatArray(0)
+                val punchTel = if (loaded) runCatching { IvannaNativeLib.nativeGetPunchTelemetry() }.getOrDefault(FloatArray(0)) else FloatArray(0)
+                val evoActive = if (loaded) runCatching { IvannaNativeLib.nativeIsEvolutionaryEqActive() }.getOrDefault(false) else false
+                val kernelLoaded = if (loaded) runCatching { IvannaNativeLib.nativeHasVolterraKernel() }.getOrDefault(false) else false
+                // Coherencia media de Phi (v2.5.450): sin .so o sin lectura, 0.
+                val meanCoherence = if (loaded) runCatching { IvannaNativeLib.nativeHyperStatus().getOrNull(6) ?: 0f }.getOrDefault(0f) else 0f
+                // Modo de Phi (v2.5.451): 3 = CALIBRADO (perfil guardado, DAC).
+                val mode = if (loaded) runCatching { (IvannaNativeLib.nativeHyperStatus().getOrNull(1) ?: 0f).toInt() }.getOrDefault(0) else 0
+                val kernelId = if (loaded && !switching) runCatching { IvannaNativeLib.activeVolterraKernelId(context) }.getOrDefault("") else ""
+                // Sensor acustico: se lee del objeto real, independiente de la
+                // biblioteca nativa (frameIndex() devuelve -1 sin .so).
+                UnityTelemetrySnap(
+                    loaded = loaded,
+                    unityTelemetry = unityTel,
+                    punchTelemetry = punchTel,
+                    evoEqActive = evoActive,
+                    volterraKernelLoaded = kernelLoaded,
+                    hyperMeanCoherence = meanCoherence,
+                    hyperMode = mode,
+                    volterraKernelId = kernelId,
+                    sensorRunning = RealAcousticSensor.isRunning,
+                    sensorFrameIndex = RealAcousticSensor.frameIndex(),
+                    sensorSource = RealAcousticSensor.audioSourceUsed,
+                )
             }
-            // Sensor acústico: se lee del objeto real, independiente de la
-            // biblioteca nativa (frameIndex() devuelve -1 sin .so).
-            sensorRunning = RealAcousticSensor.isRunning
-            sensorFrameIndex = RealAcousticSensor.frameIndex()
-            sensorSource = RealAcousticSensor.audioSourceUsed
+            if (snap.loaded) {
+                unityTelemetry = snap.unityTelemetry
+                punchTelemetry = snap.punchTelemetry
+            }
+            evoEqActive = snap.evoEqActive
+            volterraKernelLoaded = snap.volterraKernelLoaded
+            hyperMeanCoherence = snap.hyperMeanCoherence
+            hyperMode = snap.hyperMode
+            if (!switching) volterraKernelId = snap.volterraKernelId
+            sensorRunning = snap.sensorRunning
+            sensorFrameIndex = snap.sensorFrameIndex
+            sensorSource = snap.sensorSource
             delay(500)
-        }
-    
         }
     }
     // v2.5.369 (selector PZ1D/Genezi): ejecuta el cambio de kernel pedido
@@ -787,53 +840,63 @@ fun IvannaControlPanel(
     val rmsHistory = remember { mutableStateListOf<Float>().apply { repeat(32) { add(-60f) } } }
 
     LaunchedEffect(Unit) {
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
-        kotlinx.coroutines.delay(800)
+        // FIX (crash 506 - ConcurrentModificationException en Compose, 3x el
+        // 2026-11-27 02:11): este bucle corria ENTERO en Dispatchers.Default
+        // y mutaba rmsHistory (removeAt/add) y el resto del HUD desde un hilo
+        // de fondo mientras LiveTelemetryHud iteraba la lista en layout. Ahora
+        // lo pesado (JNI + lectura del bus) corre en Default y TODA escritura
+        // de estado corre en Main.
+        delay(800)
         while (true) {
-            // FIX (HUD "en vivo" mostraba datos congelados de la última
-            // sesión de captura, para siempre, incluso con MediaProjection
+            // FIX (HUD "en vivo" mostraba datos congelados de la ultima
+            // sesion de captura, para siempre, incluso con MediaProjection
             // ya terminado): sin este guard, npeGenre/npeRmsDb/etc. nunca se
-            // reseteaban al morir la captura — el título dice "tiempo real"
-            // pero el estado era "último valor conocido, sin caducidad".
-            // FIX (HUD muerto fuera de captura): la telemetría sólo se daba por viva con
-            // MediaProjection activo; con el motor NPE/nativo procesando por otra vía
-            // (módulo Magisk, bridge) quedaba clavada en -60 dB / "—". Ahora se considera
+            // reseteaban al morir la captura - el titulo dice "tiempo real"
+            // pero el estado era "ultimo valor conocido, sin caducidad".
+            // FIX (HUD muerto fuera de captura): la telemetria solo se daba por viva con
+            // MediaProjection activo; con el motor NPE/nativo procesando por otra via
+            // (modulo Magisk, bridge) quedaba clavada en -60 dB / "-". Ahora se considera
             // viva si hay captura, inferencia NPE reciente o nivel en el bus compartido.
-            val sharedRmsLin = com.ivanna.omega.audio.OmegaMetrics.shared.value.rmsLevel
-            val npeLive = IvannaNpeEngine.isReady && IvannaNpeEngine.lastInferenceUs >= 0L
-            if (!com.ivanna.omega.audio.PlaybackCaptureService.isCapturing.value &&
-                !npeLive && sharedRmsLin <= 1e-6f) {
-                npeGenre = "\u2014"
-                npeRmsDb = -60f
-                npeAgcGainDb = 0f
-                npeClassifyConfidence = 0f
-                npeClassifyThd = 0f
-                npeInferenceUs = -1L
-                rmsHistory.removeAt(0)
-                rmsHistory.add(-60f)
-                kotlinx.coroutines.delay(750)
-                continue
+            val snap = withContext(Dispatchers.Default) {
+                val sharedRmsLin = com.ivanna.omega.audio.OmegaMetrics.shared.value.rmsLevel
+                val npeLive = IvannaNpeEngine.isReady && IvannaNpeEngine.lastInferenceUs >= 0L
+                if (!com.ivanna.omega.audio.PlaybackCaptureService.isCapturing.value &&
+                    !npeLive && sharedRmsLin <= 1e-6f) {
+                    NpeHudSnap(genre = "\u2014", rmsDb = -60f, agcDb = 0f, confidence = 0f, thd = 0f, inferenceUs = -1L)
+                } else {
+                    val genre = if (IvannaNpeEngine.isReady) IvannaNpeEngine.getDetectedGenre() else "\u2014"
+                    val m = if (IvannaNpeEngine.isReady) IvannaNpeEngine.getMetrics() else FloatArray(0)
+                    val rmsLin = m.getOrElse(1) { 0f }.takeIf { it > 1e-6f } ?: sharedRmsLin
+                    val rmsDb = if (rmsLin > 1e-6f) (20f * log10(rmsLin)) else -60f
+                    val agcLin = m.getOrElse(2) { 1f }
+                    val agcDb = if (agcLin > 1e-6f) (20f * log10(agcLin)) else 0f
+                    val c = if (IvannaNpeEngine.isReady) IvannaNpeEngine.getSynthClassify() else FloatArray(0)
+                    NpeHudSnap(
+                        genre = genre,
+                        rmsDb = rmsDb,
+                        agcDb = agcDb,
+                        confidence = c.getOrElse(1) { 0f },
+                        thd = c.getOrElse(2) { 0f },
+                        inferenceUs = IvannaNpeEngine.lastInferenceUs,
+                    )
+                }
             }
-            npeGenre = if (IvannaNpeEngine.isReady) IvannaNpeEngine.getDetectedGenre() else "\u2014"
-            val m = if (IvannaNpeEngine.isReady) IvannaNpeEngine.getMetrics() else FloatArray(0)
-            val rmsLin = m.getOrElse(1) { 0f }.takeIf { it > 1e-6f } ?: sharedRmsLin
-            npeRmsDb = if (rmsLin > 1e-6f) (20f * log10(rmsLin)) else -60f
-            val agcLin = m.getOrElse(2) { 1f }
-            npeAgcGainDb = if (agcLin > 1e-6f) (20f * log10(agcLin)) else 0f
-            val c = if (IvannaNpeEngine.isReady) IvannaNpeEngine.getSynthClassify() else FloatArray(0)
-            npeClassifyConfidence = c.getOrElse(1) { 0f }
-            npeClassifyThd = c.getOrElse(2) { 0f }
-            npeInferenceUs = IvannaNpeEngine.lastInferenceUs
+            npeGenre = snap.genre
+            npeRmsDb = snap.rmsDb
+            npeAgcGainDb = snap.agcDb
+            npeClassifyConfidence = snap.confidence
+            npeClassifyThd = snap.thd
+            npeInferenceUs = snap.inferenceUs
             rmsHistory.removeAt(0)
-            rmsHistory.add(npeRmsDb)
+            rmsHistory.add(snap.rmsDb)
 
-            // FIX ("presets automáticos" nunca existía pese a que autoMode ya
-            // prometía "Auto IA seleccionando" en el subtítulo — solo subía
+            // FIX ("presets automaticos" nunca existia pese a que autoMode ya
+            // prometia "Auto IA seleccionando" en el subtitulo - solo subia
             // un multiplicador visual (omniLevel) y bloqueaba los controles
-            // manuales; ningún código seleccionaba realmente un preset).
-            // Mapeo honesto a los 8 géneros reales que autonomous_brain.hpp
+            // manuales; ningun codigo seleccionaba realmente un preset).
+            // Mapeo honesto a los 8 generos reales que autonomous_brain.hpp
             // puede devolver (ratios espectrales medidos, no adivinados),
-            // sobre el catálogo de 14 presets ya construido — con debounce
+            // sobre el catalogo de 14 presets ya construido - con debounce
             // para no recargar el mismo preset en cada bloque de 750ms.
             if (autoMode && npeGenre != lastAutoAppliedGenre && npeGenre != "\u2014") {
                 val profile = when (npeGenre) {
@@ -846,41 +909,45 @@ fun IvannaControlPanel(
                     "Electr\u00f3nica" -> com.ivanna.omega.audio.IvannaEffectProfile.SPATIAL
                     else               -> com.ivanna.omega.audio.IvannaEffectProfile.WARM  // "Mixto"
                 }
-                runCatching {
-                    com.ivanna.omega.dsp.DSPState.globalEffectManager?.applyProfile(profile)
+                withContext(Dispatchers.Default) {
+                    runCatching {
+                        com.ivanna.omega.dsp.DSPState.globalEffectManager?.applyProfile(profile)
+                    }
                 }
                 lastAutoAppliedGenre = npeGenre
             }
 
-            kotlinx.coroutines.delay(750)
-        }
-    
+            delay(750)
         }
     }
 
     LaunchedEffect(Unit) {
-        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
-        kotlinx.coroutines.delay(1200)
+        // FIX (crash 506 - ConcurrentModificationException en Compose, 3x el
+        // 2026-11-27 02:11): este bucle escribia evoFitness/evoGeneration
+        // desde Dispatchers.Default. Ahora el JNI corre en Default y la
+        // escritura de estado corre en Main.
+        delay(1200)
         while (true) {
             try {
                 // FIX (kernel evolutivo "no jalaba"): nativeGetBestFitness()
-                // solo tenía implementación nativa en evolutionary_kernel.cpp
-                // (v1) — archivo excluido del CMakeLists activo desde hace
-                // tiempo. El símbolo JNI no existe en el .so real: esta
+                // solo tenia implementacion nativa en evolutionary_kernel.cpp
+                // (v1) - archivo excluido del CMakeLists activo desde hace
+                // tiempo. El simbolo JNI no existe en el .so real: esta
                 // llamada lanzaba UnsatisfiedLinkError en CADA tick, atrapado
-                // aquí y logueado como "no disponible todavía" para siempre.
-                // El kernel v2 (evolutionary_kernel_v2.cpp, el que SÍ compila
-                // y SÍ evoluciona en background via pd_engine.hpp) expone su
-                // fitness real por nativeGetEvoBestFitness() — ya usado
-                // correctamente más abajo en este mismo archivo (línea ~820).
-                evoFitness = IvannaNativeLib.nativeGetEvoBestFitness()
-                evoGeneration = IvannaNativeLib.nativeGetGeneration()
+                // aqui y logueado como "no disponible todavia" para siempre.
+                // El kernel v2 (evolutionary_kernel_v2.cpp, el que SI compila
+                // y SI evoluciona en background via pd_engine.hpp) expone su
+                // fitness real por nativeGetEvoBestFitness() - ya usado
+                // correctamente mas abajo en este mismo archivo (linea ~820).
+                val (fitness, generation) = withContext(Dispatchers.Default) {
+                    IvannaNativeLib.nativeGetEvoBestFitness() to IvannaNativeLib.nativeGetGeneration()
+                }
+                evoFitness = fitness
+                evoGeneration = generation
             } catch (e: Throwable) {
                 Log.w("IvannaControlPanel", "Kernel evolutivo no disponible todavía", e)
             }
-            kotlinx.coroutines.delay(2000)
-        }
-    
+            delay(2000)
         }
     }
 
