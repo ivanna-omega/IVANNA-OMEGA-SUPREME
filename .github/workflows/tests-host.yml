@@ -15,6 +15,7 @@ on:
       - 'app/src/main/cpp/**'
       - 'tests/**'
       - 'scripts/run_ctest.sh'
+      - 'scripts/ci_triage.py'
       - 'scripts/check_*.py'
       - 'README.md'
       - 'LÉAME.md'
@@ -28,6 +29,7 @@ on:
       - 'app/src/main/cpp/**'
       - 'tests/**'
       - 'scripts/run_ctest.sh'
+      - 'scripts/ci_triage.py'
       - 'scripts/check_*.py'
       - 'README.md'
       - 'LÉAME.md'
@@ -137,6 +139,11 @@ jobs:
       # escribe al final) puede no existir; el log sí sobrevive (tee).
       # Nombre por pata de la matriz: sin él, plain y ASan colisionarían
       # en el mismo artefacto.
+      # C6 (510) — LastTestsFailed.log es lo que hace posible el
+      # `--rerun-failed` del reintento discriminado: sin el, el job
+      # ci-triage no sabria que tests fallaron. Si el job muere a mitad
+      # de corrida, el archivo puede no existir (ctest lo escribe al
+      # final); el triaje deriva entonces los no corridos del log.
       - name: Publicar artefactos CTest (log + JUnit)
         if: always()
         uses: actions/upload-artifact@v7
@@ -145,6 +152,7 @@ jobs:
           path: |
             build/tests-host/ctest_last.log
             build/tests-host/ctest_junit.xml
+            build/tests-host/Testing/Temporary/LastTestsFailed.log
           if-no-files-found: warn
           retention-days: 14
 
@@ -189,6 +197,208 @@ jobs:
       - name: Resumen
         if: always()
         run: echo "Puerta de tests host ejecutada (san=${IVANNA_SAN:-none}). Cualquier fallo aquí es una regresión DSP real o un test roto — no se ignora."
+
+  # ── C6 (510) — Auto-reintento discriminado + triaje automático ──────────
+  # Fin de las re-corridas manuales del boton «Re-run»: este job distingue
+  # «fallo un test» de «murio el runner» leyendo el artefacto de C5
+  # (ctest_last.log + ctest_junit.xml + LastTestsFailed.log) con
+  # scripts/ci_triage.py (solo stdlib, reglas conservadoras documentadas
+  # en su docstring). Veredicto `retry` SOLO ante timeout del job o
+  # infra de la lista explicita; un fallo de asercion (incluido ASan
+  # `ERROR: AddressSanitizer` / UBSan `runtime error`) NUNCA se reintenta:
+  # se publica un comentario en la PR con los nombres y el comando exacto
+  # de reproduccion. Un test individual con `(Timeout)` se marca
+  # sospechoso de deadlock y tampoco se reintenta sin revision.
+  # Maximo 1 reintento por run, estructural: este job corre una sola vez
+  # por workflow run y no se re-dispara a si mismo.
+  ci-triage:
+    name: Triaje CI (C6)
+    # `if: failure()` NO basta: cuando el job ctest muere por timeout del
+    # job, su resultado es 'cancelled', no 'failure', y `failure()` no se
+    # dispara — el triaje no correria justo en su caso principal (el
+    # timeout 1515/1835 de la 509). Por eso `always()` + filtro explicito
+    # por needs.ctest.result.
+    if: always() && (needs.ctest.result == 'failure' || needs.ctest.result == 'cancelled')
+    needs: ctest
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    env:
+      # C6 — PR en borrador ci-autofix: DESACTIVADO por defecto.
+      # La propuesta exige confirmar con Esse que un PR en borrador
+      # abierto por la CI es aceptable; esa confirmacion NO existe
+      # todavia (2026-11-28). No poner 'true' sin su si explicito.
+      # Activarlo exige ademas subir este job a `contents: write`
+      # (hoy `read`: la CI no puede pushear ninguna rama).
+      CI_TRIAGE_AUTOFIX_DRAFT_PR: 'false'
+    steps:
+      - uses: actions/checkout@v7
+
+      # Si el artefacto no existe (el job ctest murio antes del paso C5),
+      # el clasificador emite `no-retry-unknown` con ese motivo: nunca
+      # se reintenta a ciegas. Por eso `continue-on-error: true`.
+      - name: Descargar artefacto CTest (C5)
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: ctest-plain
+          path: triage-artifact
+
+      - name: Clasificar (scripts/ci_triage.py)
+        id: triage
+        if: always()
+        run: |
+          set -euo pipefail
+          ARGS=(--ctest-result "${{ needs.ctest.result }}" --out triage-verdict.json)
+          ARGS+=(--github-output "$GITHUB_OUTPUT")
+          [ -f triage-artifact/ctest_last.log ] && ARGS+=(--log triage-artifact/ctest_last.log)
+          [ -f triage-artifact/ctest_junit.xml ] && ARGS+=(--junit triage-artifact/ctest_junit.xml)
+          [ -f triage-artifact/LastTestsFailed.log ] && ARGS+=(--last-tests-failed triage-artifact/LastTestsFailed.log)
+          python3 scripts/ci_triage.py classify "${ARGS[@]}"
+          python3 scripts/ci_triage.py render --verdict triage-verdict.json \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --sha "${{ github.sha }}" > triage-comment.md
+          cat triage-verdict.json
+
+      - name: Resumen de triaje
+        if: always()
+        run: |
+          if [ -f triage-comment.md ]; then
+            cat triage-comment.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Triaje C6: no se pudo clasificar (ni siquiera hay veredicto)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Solo en PR y solo cuando NO hay reintento: el comentario es el
+      # canal para el fallo real (asercion, deadlock sospechoso, o sin
+      # clasificar). `continue-on-error`: en PRs desde fork el token es
+      # de solo lectura y el comentario fallaria — eso no debe poner el
+      # triaje en rojo (el resumen del job sigue publicado).
+      - name: Comentar en la PR (fallo real — sin reintento)
+        if: github.event_name == 'pull_request' && steps.triage.outputs.verdict != 'retry'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file triage-comment.md
+
+      # Reintento discriminado: reconstruye el arbol (configurar +
+      # compilar, SIN correr CTest entero — eso es lo que se evita) y
+      # re-ejecuta SOLO lo no corrido/fallado, segun el modo del veredicto:
+      #   rerun-failed: el comando de la propuesta (LastTestsFailed.log
+      #     restaurado desde el artefacto C5);
+      #   by-name: el job murio a mitad de corrida sin LastTestsFailed.log;
+      #     los nombres salen del log (tests empezados sin resultado);
+      #   full: ctest nunca llego a arrancar (timeout en configurar o
+      #     compilar): todo esta "no corrido";
+      #   none: CTest termino entero (el timeout cayo fuera de CTest):
+      #     no hay nada que reintentar.
+      - name: Reintento discriminado (solo timeout/infra — max. 1 por run)
+        if: steps.triage.outputs.verdict == 'retry'
+        env:
+          CC: gcc-14
+          CXX: g++-14
+          CMAKE_BUILD_PARALLEL_LEVEL: '4'
+        run: |
+          set -euo pipefail
+          if ! command -v g++-14 >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq g++-14
+          fi
+          cmake --version || { sudo apt-get update -qq && sudo apt-get install -y -qq cmake; }
+          # Espejo de run_ctest.sh (configurar + compilar) sin su ctest.
+          cmake -S app/src/main/cpp/tests -B build/tests-host -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release -DIVANNA_TEST_ENABLE_ASAN=OFF -DIVANNA_TEST_ENABLE_TSAN=OFF
+          cmake --build build/tests-host -j"$CMAKE_BUILD_PARALLEL_LEVEL"
+          MODE="$(python3 -c 'import json; print(json.load(open("triage-verdict.json"))["retry_mode"])')"
+          mkdir -p build/tests-host/Testing/Temporary
+          if [ -f triage-artifact/LastTestsFailed.log ]; then
+            cp triage-artifact/LastTestsFailed.log build/tests-host/Testing/Temporary/LastTestsFailed.log
+          fi
+          case "$MODE" in
+            rerun-failed)
+              ctest --test-dir build/tests-host --rerun-failed --output-on-failure 2>&1 | tee build/tests-host/ctest_retry.log
+              ;;
+            by-name)
+              NAMES="$(python3 -c 'import json; print("|".join(json.load(open("triage-verdict.json"))["retry_tests"]))')"
+              ctest --test-dir build/tests-host -R "^(${NAMES})$" --output-on-failure 2>&1 | tee build/tests-host/ctest_retry.log
+              ;;
+            full)
+              ctest --test-dir build/tests-host --output-on-failure 2>&1 | tee build/tests-host/ctest_retry.log
+              ;;
+            none)
+              echo "Triaje C6: veredicto retry con modo none (CTest ya termino entero) — nada que reintentar." | tee build/tests-host/ctest_retry.log
+              ;;
+            *)
+              echo "::error::Triaje C6: modo de reintento desconocido: $MODE"; exit 1
+              ;;
+          esac
+
+      # El log del reintento tambien se publica: si el reintento falla,
+      # el diagnostico no vuelve a morir con el runner.
+      - name: Publicar artefacto del reintento
+        if: always() && steps.triage.outputs.verdict == 'retry'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-triage-retry
+          path: build/tests-host/ctest_retry.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Si el reintento mismo fallo con asercion, es un fallo real nuevo
+      # (no otro timeout): se avisa en la PR y NO se reintenta mas.
+      - name: Re-clasificar tras el reintento (si fallo con asercion, avisar)
+        if: always() && steps.triage.outputs.verdict == 'retry' && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ ! -f build/tests-host/ctest_retry.log ]; then
+            echo "Sin log de reintento: nada que re-clasificar."
+            exit 0
+          fi
+          python3 scripts/ci_triage.py classify --log build/tests-host/ctest_retry.log \
+            --ctest-result failure --out triage-retry-verdict.json
+          REVERDICT="$(python3 -c 'import json; print(json.load(open("triage-retry-verdict.json"))["verdict"])')"
+          if [ "$REVERDICT" != "retry" ] && [ "$REVERDICT" != "no-retry-unknown" ]; then
+            python3 scripts/ci_triage.py render --verdict triage-retry-verdict.json \
+              --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --sha "${{ github.sha }}" --retry-of > triage-retry-comment.md
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file triage-retry-comment.md
+          elif [ "$REVERDICT" = "no-retry-unknown" ]; then
+            echo "Reintento sin evidencia clasificable (puede haber pasado o fallado fuera de CTest); ver artefacto ctest-triage-retry."
+          else
+            echo "El reintento tambien murio por timeout/infra; no se reintenta una segunda vez (max. 1 por run)."
+          fi
+
+      # ── CAMINO DISENADO, DESACTIVADO ──────────────────────────────────
+      # Lo maximo autonomo permitido por la propuesta: abrir una rama
+      # `ci-autofix/<job>-<fecha>` con un PR en borrador y el diagnostico
+      # (SIN cambios de codigo, SIN auto-merge; la fusion seguiria
+      # exigiendo a Esse). Gated por CI_TRIAGE_AUTOFIX_DRAFT_PR, que hoy
+      # es 'false' porque FALTA la confirmacion de Esse. No activar sin
+      # su si explicito, y al activarlo subir el job a `contents: write`.
+      - name: PR en borrador ci-autofix — DESACTIVADO (falta confirmacion de Esse)
+        if: env.CI_TRIAGE_AUTOFIX_DRAFT_PR == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BRANCH="ci-autofix/ctest-$(date -u +%Y-%m-%d)"
+          git config user.name "ivanna-ci-triage"
+          git config user.email "ci-triage@ivanna.local"
+          git checkout -b "$BRANCH"
+          mkdir -p triage
+          cp triage-verdict.json "triage/ctest-${{ github.run_id }}.json"
+          cp triage-comment.md "triage/ctest-${{ github.run_id }}.md"
+          git add "triage/ctest-${{ github.run_id }}.json" "triage/ctest-${{ github.run_id }}.md"
+          git commit -m "C6 triaje: diagnostico ctest run ${{ github.run_id }} (sin cambios de codigo)"
+          git push origin "$BRANCH"
+          gh pr create --draft --title "C6 triaje: diagnostico ctest run ${{ github.run_id }}" \
+            --body-file triage-comment.md --base main --head "$BRANCH"
 
   # ── BANCO ADVERSARIAL: carril propio, no bloquea la puerta principal ─────
   # Proyecto CTest independiente (tests/adversarial): generador de 21 casos
