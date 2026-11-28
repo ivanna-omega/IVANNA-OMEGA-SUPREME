@@ -9,6 +9,16 @@
 # systemd actions.runner.golozotns-art-IVANNA-OMEGA-SUPREME.ivanna-vm).
 # Tras un reemplazo de VM se restaura con
 # ~/workspace/github-runner-recover.sh (ver AGENTS.md).
+#
+# Checkout SIN actions/checkout (2026-11-28): el job fallaba en el
+# checkout por el scrub de hatch-git (plataforma, solo lectura, no
+# arreglable desde adentro). El repo es público, así que se clona
+# anónimo y se fija el SHA exacto que disparó el run. La caché
+# (actions/cache) acelera los reruns: pip y el dir de build. ccache NO
+# está instalado en el runner y NO se instala aquí; el dir de build
+# cacheado cumple la misma función, y si algún día se instala ccache su
+# CCACHE_DIR debe vivir bajo el workspace del runner (o /home/runner),
+# NUNCA en ~/workspace (el usuario runner no lo puede leer).
 
 name: Tests host (self-hosted ivanna-vm)
 
@@ -30,8 +40,35 @@ jobs:
       CXX: clang++-18
       CMAKE: /home/runner/cmake-3.30.3-linux-x86_64/bin/cmake
     steps:
-      - uses: actions/checkout@v7
-        with: { fetch-depth: 0 }
+      # Sin actions/checkout: el runner self-hosted falla en el checkout
+      # por el scrub de hatch-git. El repo es público: clon anónimo y
+      # checkout del SHA exacto que disparó el run (push a main o
+      # workflow_dispatch). Si el workspace ya tiene un clon de un run
+      # anterior, se reutiliza (fetch + checkout) en vez de clonar.
+      - name: Clone anónimo del repo público
+        run: |
+          if [ -d .git ]; then
+            git fetch --quiet origin
+          else
+            git clone --quiet https://github.com/ivanna-omega/IVANNA-OMEGA-SUPREME.git .
+          fi
+          git checkout --quiet ${{ github.sha }}
+      # La caché es un acelerador, no una puerta: si el servicio de
+      # caché falla, el job sigue (continue-on-error) y reconstruye.
+      - name: Cache pip (h5py, numpy)
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('.github/workflows/tests-selfhosted.yml') }}
+      - name: Cache dir de build CTest
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: build-tests
+          key: ctest-build-${{ runner.os }}-${{ hashFiles('app/src/main/cpp/tests/**', '.github/workflows/tests-selfhosted.yml') }}
+          restore-keys: |
+            ctest-build-${{ runner.os }}-
       - name: Install HDF5 validator
         run: python3 -m pip install --disable-pip-version-check --user --break-system-packages h5py numpy
       - name: Validate every SOFA with a real HDF5 reader
