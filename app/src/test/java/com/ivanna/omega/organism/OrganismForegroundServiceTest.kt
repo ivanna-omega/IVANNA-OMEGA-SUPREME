@@ -102,7 +102,7 @@ class OrganismForegroundServiceTest {
         )
         // El canal propio existe (IMPORTANCE_LOW, sin sonido ni vibración).
         val nm = app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        assertNotNull(shadowOf(nm).getNotificationChannel(OrganismForegroundService.CHANNEL_ID))
+        assertNotNull(nm.getNotificationChannel(OrganismForegroundService.CHANNEL_ID))
         // La notificación lleva la acción para detener el organismo.
         val titles = notification.actions?.map { it.title.toString() } ?: emptyList()
         assertTrue(titles.contains("Detener organismo"))

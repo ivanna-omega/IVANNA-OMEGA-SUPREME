@@ -39,9 +39,11 @@ class OrganismTokenDiagnosticsTest {
 
     /** DNS falso: resuelve, o falla si [dnsDown] es true. */
     private var dnsDown: Boolean = false
-    private val fakeDns = Dns { hostname ->
-        if (dnsDown) throw UnknownHostException("DNS simulado caído: $hostname")
-        listOf(InetAddress.getByAddress(byteArrayOf(93.toByte(), 184.toByte(), 216.toByte(), 34.toByte())))
+    private val fakeDns = object : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            if (dnsDown) throw UnknownHostException("DNS simulado caído: $hostname")
+            return listOf(InetAddress.getByAddress(byteArrayOf(93.toByte(), 184.toByte(), 216.toByte(), 34.toByte())))
+        }
     }
 
     private fun fakeClient(): OkHttpClient = OkHttpClient.Builder()
@@ -87,7 +89,7 @@ class OrganismTokenDiagnosticsTest {
     }
 
     @Test
-    fun `DNS caido y hosts caidos: nada resuelve ni responde`() {
+    fun `DNS caido y hosts caidos - nada resuelve ni responde`() {
         dnsDown = true
         downHost = null // el interceptor no se alcanza: el DNS ya falló
         // Sin interceptor alcanzable: simular caída total lanzando en ambos hosts.
@@ -110,7 +112,7 @@ class OrganismTokenDiagnosticsTest {
     }
 
     @Test
-    fun `primario caido y alterno vivo: el diagnostico lo distingue`() {
+    fun `primario caido y alterno vivo - el diagnostico lo distingue`() {
         downHost = "muselink.ai.studio"
         val diag = diagnostics().diagnose(last401AtMs = 0L)
         assertTrue(diag.anyReachable)
