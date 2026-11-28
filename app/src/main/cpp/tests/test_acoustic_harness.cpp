@@ -556,9 +556,15 @@ TEST(AcousticHarness, CpuPerHopWithinBudget) {
         std::printf("HARNESS %-4s cpu musica media %.0f us p95 %.0f us max %.0f us (%zu chunks)\n",
                     name, m.cpuMeanUs, m.cpuP95Us, m.cpuMaxUs, run.cpuUs.size());
         std::fflush(stdout);
+        // Bajo ASan/TSan el CPU se infla 2-3x por diseño: el presupuesto
+        // por hop NO se impone (el sanitizador mide seguridad de memoria,
+        // no rendimiento). La medición sigue (se reporta arriba) y el
+        // presupuesto sigue vigente en builds sin sanitizador.
+#if !defined(__SANITIZE_ADDRESS__) && !defined(IVANNA_SANITIZER_ACTIVE)
         EXPECT_LE(m.cpuMeanUs, kCpuMeanMaxUs)
             << name << " CPU media por hop " << m.cpuMeanUs << " us (presupuesto 2667 us)";
         EXPECT_LE(m.cpuP95Us, kCpuP95MaxUs)
             << name << " CPU p95 por hop " << m.cpuP95Us << " us (presupuesto 2667 us)";
+#endif
     }
 }

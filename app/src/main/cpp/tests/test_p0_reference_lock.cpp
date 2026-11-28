@@ -789,6 +789,11 @@ TEST(P0ReferenceLock, CpuXruns) {
                 cpu.p50Us, cpu.p99Us, cpu.maxUs, cpu.wallP50Us, cpu.wallP99Us,
                 cpu.wallMaxUs, cpu.xruns, p0::kCpuP50MaxUs, p0::kCpuP99MaxUs,
                 p0::kCpuMaxMaxUs, kHopBudgetUs);
+    // Bajo ASan/TSan el CPU se infla 2-3x por diseño: el presupuesto de
+    // CPU por hop NO se impone (el sanitizador mide seguridad de memoria,
+    // no rendimiento). La medición sigue (se reporta en [P0-CPU] arriba)
+    // y el presupuesto sigue vigente en builds sin sanitizador.
+#if !defined(__SANITIZE_ADDRESS__) && !defined(IVANNA_SANITIZER_ACTIVE)
     // Lo que se congela es el coste del motor (tiempo de CPU del hilo).
     // El máx tiene límite 2x el presupuesto (no el presupuesto pelado):
     // es un estadístico extremo y el motor tiene picos de hilo de hasta
@@ -811,6 +816,7 @@ TEST(P0ReferenceLock, CpuXruns) {
            "el motor no cabe en tiempo real";
     EXPECT_LE(cpu.p99Us, 1.5 * kHopBudgetUs)
         << "p99 µs/hop (hilo) sobre 1.5x el presupuesto realtime de hop";
+#endif
     // Los xruns de pared se REPORTAN (ver [P0-CPU] arriba) pero NO se
     // imponen — y esta NO-imposición es una decisión medida, no un hueco:
     // en VM compartida cargada, runCpu midió xruns=37 con p50 de HILO en
