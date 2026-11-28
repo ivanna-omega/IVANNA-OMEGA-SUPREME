@@ -10,6 +10,9 @@ import android.util.Log
 import com.ivanna.omega.safmus.SafmusAdapterPolicy
 import com.ivanna.omega.safmus.SafmusHardwareCoordinator
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * AudioRouteManager — detecta la ruta de salida de audio activa
@@ -24,6 +27,31 @@ import java.util.concurrent.atomic.AtomicLong
  * Android de gama media. Ninguna de las dos rutas se corrige sola.
  */
 enum class OutputRoute { BLUETOOTH, WIRED_AUX, USB, SPEAKER, UNKNOWN }
+
+/**
+ * Estado de Ruta B publicado (unificación espacial 2.5.509, paso 2).
+ *
+ * EL PROBLEMA: la puerta de Ruta B (qué modo de salida — audífonos /
+ * Genezi / bocinas — y por tanto qué montos pasan) se RE-EVALUABA en
+ * cada envío (OmegaEngineBridge.sendCommand, MagiskBridge.sendCommand
+ * y PersistedStateRestorer.resolveRouteBMode leían el AudioManager y
+ * enumeraban dispositivos por su cuenta). Tres evaluaciones por envío,
+ * cada una con la enumeración del momento — y el flap del JieLi (que
+ * enumera como USB_HEADSET o como USB_DEVICE según el momento) hacía
+ * que la puerta cambiara entre envíos.
+ *
+ * LA REGLA: la puerta se evalúa UNA sola vez POR CAMBIO DE DISPOSITIVO
+ * (start / applyRoute / refreshRoute) y se PUBLICA aquí; los envíos solo
+ * LEEN el estado publicado (sin AudioManager dentro). Enumeración vacía
+ * transitoria → se conserva el último modo válido + log; fail-closed a
+ * SPEAKERS solo en arranque sin datos (hasData=false → SPEAKERS).
+ */
+data class RouteBDeviceState(
+    val output: RouteBOutput = RouteBOutput.SPEAKERS,
+    val deviceTypes: List<Int> = emptyList(),
+    val usbDacTarget: UsbDacTarget = UsbDacTarget.SPEAKERS,
+    val hasData: Boolean = false,
+)
 
 data class RouteProfile(
     val bassBoostDb: Float,
@@ -53,6 +81,55 @@ object AudioRouteManager {
     private val hrtfRestoreToken = AtomicLong(0L)
     private var pendingHrtfRestore: Runnable? = null
 
+    // ── Estado de Ruta B publicado (unificación 2.5.509, paso 2) ─────────
+    private val _routeBState = MutableStateFlow(RouteBDeviceState())
+    /** Salida efectiva de Ruta B, evaluada por cambio de dispositivo. */
+    val routeBStateFlow: StateFlow<RouteBDeviceState> = _routeBState.asStateFlow()
+
+    /**
+     * Estado publicado, con evaluación en frío si aún no hay datos.
+     * Los envíos (OmegaEngineBridge/MagiskBridge/PersistedStateRestorer)
+     * usan esto en vez de enumerar: una sola evaluación por arranque.
+     */
+    fun routeBState(context: Context): RouteBDeviceState {
+        if (_routeBState.value.hasData) return _routeBState.value
+        refreshRouteBState(context)
+        return _routeBState.value
+    }
+
+    /**
+     * Re-evalúa la puerta de Ruta B UNA vez y la publica. Se llama solo
+     * por cambio de dispositivo (start / applyRoute / refreshRoute), nunca
+     * por envío. Enumeración vacía transitoria → conserva el último modo
+     * válido + log; sin datos previos → fail-closed SPEAKERS.
+     */
+    fun refreshRouteBState(context: Context? = null) {
+        val ctx = context ?: appContextRef ?: return
+        val am = audioManager
+            ?: (ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)
+            ?: return
+        val types = runCatching { am.getDevices(AudioManager.GET_DEVICES_OUTPUTS) }
+            .getOrNull()?.map { it.type }.orEmpty()
+        if (types.isEmpty()) {
+            if (_routeBState.value.hasData) {
+                Log.w(TAG, "RouteB: enumeración vacía transitoria; se conserva ${_routeBState.value.output}")
+            } else {
+                _routeBState.value = RouteBDeviceState(output = RouteBOutput.SPEAKERS, hasData = true)
+                Log.w(TAG, "RouteB: sin dispositivos en arranque; fail-closed SPEAKERS")
+            }
+            return
+        }
+        val target = runCatching {
+            com.ivanna.omega.ui.SpatialAudioPrefs.load(ctx).usbDacTarget
+        }.getOrDefault(UsbDacTarget.SPEAKERS)
+        val output = RouteBDeviceGate.routeBOutput(types.toIntArray(), target)
+        val next = RouteBDeviceState(output = output, deviceTypes = types, usbDacTarget = target, hasData = true)
+        if (next != _routeBState.value) {
+            Log.i(TAG, "RouteB: salida publicada $output (tipos=${types.joinToString()}, usbDac=$target)")
+        }
+        _routeBState.value = next
+    }
+
     @Synchronized
     fun start(context: Context) {
         appContextRef = context.applicationContext
@@ -63,6 +140,9 @@ object AudioRouteManager {
         deviceCallback = null
         audioManager = am
 
+        // Unificación 2.5.509 (paso 2): la puerta se evalúa y publica al
+        // arrancar (antes del primer applyRoute/pushRouteBState).
+        refreshRouteBState(context)
         applyRoute(detectOutputRoute(am))
 
         val callback = object : AudioDeviceCallback() {
@@ -82,6 +162,9 @@ object AudioRouteManager {
         // Invalidate any outstanding codec lookup before releasing route ownership.
         routeGeneration.incrementAndGet()
         currentRoute = OutputRoute.UNKNOWN
+        // Unificación 2.5.509 (paso 2): al parar, el estado publicado deja
+        // de ser válido; el próximo envío re-evalúa en frío (fail-closed).
+        _routeBState.value = RouteBDeviceState()
         appContextRef?.let { syncTransauralRoute(it, OutputRoute.UNKNOWN) }
         BluetoothAudioProfiler.invalidate()
         // Un restore HRTF diferido no debe dispararse tras detener el manager.
@@ -312,6 +395,10 @@ object AudioRouteManager {
     }
 
     private fun applyRoute(route: OutputRoute) {
+        // Unificación 2.5.509 (paso 2): la puerta se re-evalúa y publica
+        // ANTES del pushRouteBState de abajo (un getDevices() por cambio
+        // de dispositivo, no por envío).
+        refreshRouteBState()
         // 0032 — Re-enviar el estado binaural de Ruta B al cambiar la
         // salida. Va ANTES del early-return de abajo: un cambio
         // DAC USB_DEVICE → audífono USB_HEADSET no cambia la categoría

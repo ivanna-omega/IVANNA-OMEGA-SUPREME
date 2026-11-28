@@ -45,7 +45,7 @@ extern std::atomic<float> g_consv_amount;          // CONSERVACIÓN: 0 = bypass 
 extern std::atomic<float> g_consv_energy_cap;      // CONSERVACIÓN: techo de energía por banda (1 = sin techo)
 extern std::atomic<float> g_consv_phase_coherence; // CONSERVACIÓN: suavidad del cambio de ganancia
 extern std::atomic<float> g_consv_inertia;         // CONSERVACIÓN: continuidad temporal del estado de campo
-extern std::atomic<float> g_omni_amount;           // IVANNA: 0 = bypass bit-exacto (default en Ruta B hasta medir CPU en el G85)
+extern std::atomic<float> g_omni_amount;           // IVANNA (OmniField fusionado): lo escribe el puente JNI fusionado (FieldControls.omniAmount, default 1.0, unificación 2.5.509 paso 5); el 0.0 inicial es solo estado pre-push fail-closed, no el valor vivo.
 extern std::atomic<float> g_omni_scene_pull;
 extern std::atomic<float> g_omni_distance_m;
 extern std::atomic<bool>  g_omni_head_tracking;

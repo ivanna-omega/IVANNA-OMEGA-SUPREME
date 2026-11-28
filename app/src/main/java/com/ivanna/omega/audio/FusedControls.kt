@@ -1,9 +1,11 @@
 package com.ivanna.omega.audio
 
+import android.content.Context
 import android.util.Log
+import com.ivanna.omega.core.IVANNAApplication
 import com.ivanna.omega.core.NativeLibraryLoader
 import com.ivanna.omega.magisk.OmegaEngineBridge
-import org.json.JSONObject
+import com.ivanna.omega.magisk.PerceptualStatePayload
 
 /**
  * FusedControls.kt — ESPEJO KOTLIN DE app/src/main/cpp/fused/fused_controls.hpp
@@ -164,6 +166,16 @@ data class FieldControls(
     val warmth: Float = 0.0f,     // calidez 0..1.
     val dynamics: Float = 1.0f,   // dinámica 0..1 (1 = sin compresión extra).
     val roomRt60: Float = 0.34f,  // RT60 de la sala del campo 0.05..1.5 s.
+    // Unificación espacial 2.5.509 (paso 5): OmniField y la cola difusa
+    // tienen DUEÑO ÚNICO — estos dos campos. Antes OmniField tomaba el
+    // amount de HOLOS y diffuse era un 0.85f fijo en fused_field.cpp.
+    // Defaults = valores vivos (omniAmount 1.0 BOOT COMPLETO 473;
+    // diffuse 0.85 ATREVIDA 502). Espejo exacto del C++
+    // (fused/fused_controls.hpp). NOTA DE COMPORTAMIENTO: al bajar HOLOS
+    // por debajo de 1.0, OmniField ya NO baja con él (antes sí, porque
+    // lo seguía); pendiente de escucha en vivo.
+    val omniAmount: Float = 1.0f, // OmniField amount 0..1 (1 = campo pleno).
+    val diffuse: Float = 0.85f,   // cola difusa HOLOS 0..1 (0.85 ATREVIDA 502).
 ) {
     fun clamp(): FieldControls = copy(
         amount = clampf(amount, 0.0f, 1.0f),
@@ -175,9 +187,11 @@ data class FieldControls(
         warmth = clampf(warmth, 0.0f, 1.0f),
         dynamics = clampf(dynamics, 0.0f, 1.0f),
         roomRt60 = clampf(roomRt60, 0.05f, 1.5f),
+        omniAmount = clampf(omniAmount, 0.0f, 1.0f),
+        diffuse = clampf(diffuse, 0.0f, 1.0f),
     )
 
-    fun isNeutral(): Boolean = amount <= 0.0f && phiAmount <= 0.0f
+    fun isNeutral(): Boolean = amount <= 0.0f && phiAmount <= 0.0f && omniAmount <= 0.0f
 }
 
 // ── 3. SALA VIVA — MODELO OYENTE+SALA ───────────────────────────────────────
@@ -382,7 +396,7 @@ data class FusedControls(
             hrtfWet = 0.0f, xtcEnabled = false, upmixEnabled = false,
             upmixImmersivity = 0.0f,
         ),
-        field = field.copy(amount = 0.0f, phiAmount = 0.0f),
+        field = field.copy(amount = 0.0f, phiAmount = 0.0f, omniAmount = 0.0f),
         listenerRoom = listenerRoom.copy(
             roomWet = 0.0f, hearingProfile = FusedHearingProfile.FLAT,
             signatureRoom = 0, // v2.5.472: sin sala firma en neutro.
@@ -515,6 +529,11 @@ object FusedControlsBridge {
         consvEnergyCap: Float,
         consvPhaseCoherence: Float,
         consvInertia: Float,
+        // Unificación 2.5.509 (paso 5): OmniField y diffuse tienen slot
+        // propio (50 parámetros; antes OmniField seguía el amount de
+        // HOLOS y diffuse era fijo 0.85 en el C++).
+        fieldOmniAmount: Float,
+        fieldDiffuse: Float,
     )
 
     /** Bypass total de la cadena (equivale a FusedControls::setNeutral()). */
@@ -546,13 +565,24 @@ object FusedControlsBridge {
 
     // ── Envoltorios seguros (fail-closed, patrón NativeBridge.safe*) ──────
 
+    /**
+     * Contexto de la app si existe (null en tests unitarios / antes de
+     * onCreate). Unificación 2.5.509 (paso 4): EqStack necesita prefs
+     * para el tope; sin contexto no hay cap (pasa como hoy).
+     */
+    private fun appContextOrNull(): Context? =
+        runCatching { IVANNAApplication.instance.applicationContext }.getOrNull()
+
     /** Empuja [controls] (previamente clampados) al nativo. No-op si la lib no cargó. */
     fun safeSetFusedControls(controls: FusedControls) {
         if (!isLoaded) {
             Log.w(TAG, "Native library not loaded; ignoring setFusedControls")
             return
         }
-        val c = controls.clamp()
+        val c0 = controls.clamp()
+        // Unificación 2.5.509 (paso 4): el tope EqStack se aplica en el
+        // borde JNI (Ruta A). Sin contexto (tests) no hay cap.
+        val c = c0.copy(tonal = EqStack.cap(c0.tonal, EqStack.inputs(appContextOrNull())))
         try {
             nativeSetFusedControls(
                 spatialAmount = c.spatial.amount,
@@ -604,6 +634,9 @@ object FusedControlsBridge {
                 consvEnergyCap = c.conservation.energyCap,
                 consvPhaseCoherence = c.conservation.phaseCoherence,
                 consvInertia = c.conservation.inertia,
+                // 5. OmniField/diffuse (unificación 2.5.509, paso 5).
+                fieldOmniAmount = c.field.omniAmount,
+                fieldDiffuse = c.field.diffuse,
             )
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to call nativeSetFusedControls", t)
@@ -697,9 +730,9 @@ object FusedControlsBridge {
             // v2.5.472: escala del parallax (0..1). El daemon la guarda como
             // deseada y la aplica a la pose de SET_HEAD_POSE (Ruta B).
             "parallaxAmount" to clamped.spatial.parallaxAmount,
-            // Modo de salida: JNI 0 = audífonos, 1 = bocinas; el daemon
-            // usa 1 = audífonos, 2 = bocinas (0 = desconocido).
-            "outputMode" to if (clamped.spatial.mode == FusedSpatialMode.SPEAKERS) 2f else 1f,
+            // Unificación 2.5.509 (paso 3): "outputMode" YA NO se estampa
+            // aquí; lo pone PerceptualStatePayload desde el modo publicado
+            // (AudioRouteManager.routeBStateFlow). El mapa es puro.
             "upmixingEnabled" to if (clamped.spatial.upmixEnabled) 1f else 0f,
             "upmixingImmersivity" to clamped.spatial.upmixImmersivity,
             // HOLOS·Ω (campo).
@@ -753,13 +786,16 @@ object FusedControlsBridge {
      */
     fun pushFusedToDaemon(controls: FusedControls) {
         try {
-            val fields = buildFusedPerceptualFields(controls)
-            val json = JSONObject().apply {
-                put("action", "SET_PERCEPTUAL_STATE")
-                for ((key, value) in fields) {
-                    put(key, value.toDouble())
-                }
-            }
+            // Unificación 2.5.509 (pasos 3+4): el payload lo arma el
+            // constructor único (outputMode desde el modo publicado) y la
+            // EQ va con el tope EqStack antes de salir.
+            val fields = EqStack.capFields(
+                buildFusedPerceptualFields(controls),
+                EqStack.inputs(appContextOrNull())
+            )
+            val json = PerceptualStatePayload.buildSet(
+                fields, AudioRouteManager.routeBStateFlow.value.output
+            )
             val ok = OmegaEngineBridge.sendCommand(json)
             if (!ok) Log.w(TAG, "pushFusedToDaemon: SET_PERCEPTUAL_STATE no llegó al daemon")
         } catch (t: Throwable) {

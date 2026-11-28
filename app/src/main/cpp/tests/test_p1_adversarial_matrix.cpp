@@ -92,6 +92,9 @@ FusedControls engagedControls() {
     c.spatial.distanceM = 1.0f;
     c.spatial.hrtfWet = 0.5f;
     c.field.amount = 0.5f;
+    c.field.omniAmount = 0.5f;  // Unificación 2.5.509 (paso 5): OmniField ya NO sigue a HOLOS —
+    // su amount es propio; el helper fija el valor explícito para
+    // preservar la configuración medida (antes lo ponía field.amount).
     c.field.phiAmount = 0.5f;
     c.listenerRoom.roomWet = 0.22f;
     c.transducer.correction = 1.0f;
@@ -127,6 +130,7 @@ FusedControls operatorOnlyControls(int op) {
             break;
         case 2:  // HOLOS·Ω (field)
             c.field.amount = 0.5f;
+            c.field.omniAmount = 0.5f;  // Unificación 2.5.509 (paso 5): op 2 = campo entero.
             c.field.phiAmount = 0.5f;
             break;
         case 3:  // SALA VIVA (listenerRoom)

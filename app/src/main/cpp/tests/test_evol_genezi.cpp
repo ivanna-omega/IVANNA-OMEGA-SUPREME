@@ -84,7 +84,7 @@ void zero7(FusedControls& c) {
 void setOp(FusedControls& c, std::size_t op, float v) {
     switch (op) {
         case 0: c.spatial.amount = v; break;
-        case 1: c.field.amount = v; break;
+        case 1: c.field.amount = v; c.field.omniAmount = v; break;  // Unif. 2.5.509 paso 5: op 1 = campo entero
         case 2: c.listenerRoom.roomWet = v; break;
         case 3: c.transducer.correction = v; break;
         case 4: c.tonal.amount = v; break;
@@ -115,6 +115,9 @@ FusedControls p0EngagedControls() {
     c.spatial.distanceM = 1.0f;
     c.spatial.hrtfWet = 0.5f;
     c.field.amount = 0.5f;
+    c.field.omniAmount = 0.5f;  // Unificación 2.5.509 (paso 5): OmniField ya NO sigue a HOLOS —
+    // su amount es propio; el helper fija el valor explícito para
+    // preservar la configuración medida (antes lo ponía field.amount).
     c.field.phiAmount = 0.5f;
     c.listenerRoom.roomWet = 0.22f;
     c.transducer.correction = 1.0f;

@@ -77,12 +77,16 @@ class PerceptualViewModel(application: Application) : AndroidViewModel(applicati
                 // v2.5.473 §2.4: puerta AUTO — en modo MANUAL el cerebro
                 // observa (la decisión se calcula y se muestra) pero NO actúa
                 // sobre el DSP. Default AUTO = comportamiento previo.
-                val brainAuto = runCatching {
+                // Unificación 2.5.509 (paso 6): se pasa lo fusionado que ya
+                // se cargó (evita una segunda lectura de prefs por tick).
+                val fused = runCatching {
                     com.ivanna.omega.core.ParameterStore(application.applicationContext)
-                        .loadFusedControls().brain.mode == com.ivanna.omega.audio.FusedBrainMode.AUTO
-                }.getOrDefault(true)
+                        .loadFusedControls()
+                }.getOrNull()
+                val brainAuto = fused?.brain?.mode == com.ivanna.omega.audio.FusedBrainMode.AUTO
+                    || fused == null
                 if (brainAuto && !EffectsOffTransition.isNeutralOffActive()) {
-                    decisionEngine.dispatchDecision(measured)
+                    decisionEngine.dispatchDecision(measured, fused = fused)
                 }
             }
         }

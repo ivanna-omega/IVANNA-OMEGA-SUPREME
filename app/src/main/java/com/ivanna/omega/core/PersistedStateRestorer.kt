@@ -1,7 +1,6 @@
 package com.ivanna.omega.core
 
 import android.content.Context
-import android.media.AudioManager
 import android.util.Log
 import com.ivanna.omega.audio.EffectsOffTransition
 import com.ivanna.omega.audio.FusedControlsBridge
@@ -11,7 +10,6 @@ import com.ivanna.omega.audio.RouteBOutput
 import com.ivanna.omega.audio.TransducerMode
 import com.ivanna.omega.audio.TransducerProfile
 import com.ivanna.omega.audio.TransducerProfileFactory
-import com.ivanna.omega.audio.UsbDacTarget
 import com.ivanna.omega.magisk.OmegaEngineBridge
 import com.ivanna.omega.spatial.IvannaSpatialEngine
 import com.ivanna.omega.spatial.IvannaSpatialManager
@@ -24,25 +22,30 @@ object PersistedStateRestorer {
 
     /**
      * Resolución única del transductor (FASE 2, tercer modo v2.5.483):
-     * selector de DAC USB + tipos de dispositivo → (salida, modo).
-     * Pura salvo la lectura de prefs/AudioManager; fail-closed a
-     * (SPEAKERS, SPEAKERS_GENERIC). GENEZI = DAC USB con selector
-     * SPEAKERS (la cadena JieLi → Genezi): binaural del usuario,
-     * general neutro.
+     * modo de salida publicado + perfil de transductor que le corresponde.
+     * Unificación 2.5.509 (paso 2): el modo sale del estado PUBLICADO
+     * (AudioRouteManager.routeBStateFlow), evaluado una sola vez por
+     * cambio de dispositivo; en frío se evalúa una vez y se publica.
+     * El modo de transductor se deriva del modo publicado (HEADPHONES →
+     * HEADPHONES, GENEZI → SPEAKERS_GENEZI, SPEAKERS → SPEAKERS_GENERIC):
+     * misma función que RouteBDeviceGate.routeBOutput, sin re-enumerar.
+     * Fail-closed a (SPEAKERS, SPEAKERS_GENERIC).
      */
     private fun resolveRouteBMode(context: Context): Pair<RouteBOutput, TransducerMode> {
         val ctx = context.applicationContext
-        val usbDacTarget = runCatching { SpatialAudioPrefs.load(ctx).usbDacTarget }
-            .getOrDefault(UsbDacTarget.SPEAKERS)
-        val types = runCatching {
-            val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
-            am?.getDevices(AudioManager.GET_DEVICES_OUTPUTS)?.map { it.type }?.toIntArray()
-        }.getOrNull() ?: intArrayOf()
-        return RouteBDeviceGate.routeBOutput(types, usbDacTarget) to
-            TransducerProfileFactory.resolveMode(types, usbDacTarget)
+        val output = com.ivanna.omega.audio.AudioRouteManager.routeBState(ctx).output
+        val mode = when (output) {
+            RouteBOutput.HEADPHONES -> TransducerMode.HEADPHONES
+            RouteBOutput.GENEZI -> TransducerMode.SPEAKERS_GENEZI
+            RouteBOutput.SPEAKERS -> TransducerMode.SPEAKERS_GENERIC
+        }
+        return output to mode
     }
 
-    /** Perfil efectivo para un modo, desde los montos del usuario. */
+    /** Perfil efectivo para un modo, desde los montos del usuario.
+     * Unificación 2.5.509 (paso 1): los getters ya delegan en lo
+     * fusionado (getOrbeAmount/getHolosAmount/getHyperAmount/etc.), así
+     * que el perfil nace de FusedControls sin cambiar esta función. */
     private fun profileForMode(mode: TransducerMode, store: ParameterStore): TransducerProfile =
         TransducerProfileFactory.profileFor(
             mode,
@@ -155,7 +158,19 @@ object PersistedStateRestorer {
             // Tronidos 493 (c): el upmix también pasa por el throttle
             // compartido (OmegaEngineBridge.sendCommand: puerta + dedup +
             // throttle), no directo por MagiskBridge.
-            runCatching { OmegaEngineBridge.sendCommand(JSONObject("{\"action\":\"SET_PERCEPTUAL_STATE\",\"upmixingEnabled\":${if (paramStore.isHoaUpmixingEnabled() && hrtfAllowed) 1.0f else 0.0f},\"upmixingImmersivity\":${paramStore.getHoaImmersivity()}}")) }
+            // Unificación 2.5.509 (paso 3): el SET lo arma el constructor
+            // único (outputMode desde el modo publicado).
+            runCatching {
+                OmegaEngineBridge.sendCommand(
+                    com.ivanna.omega.magisk.PerceptualStatePayload.buildSet(
+                        mapOf(
+                            "upmixingEnabled" to if (paramStore.isHoaUpmixingEnabled() && hrtfAllowed) 1.0f else 0.0f,
+                            "upmixingImmersivity" to paramStore.getHoaImmersivity(),
+                        ),
+                        routeBOutput,
+                    )
+                )
+            }
 
             // Wave Field Synthesis (WFS) & SPSC Ring Buffer
             runCatching { IvannaNativeLib.nativeSetWfsEnabled(paramStore.isWfsEnabled() && !externalStereo) }
@@ -230,11 +245,14 @@ object PersistedStateRestorer {
                     paramStore.getHolosRoomRt60(), paramStore.isHolosHeadTrackingEnabled(),
                     paramStore.getHolosBandCount()
                 )
-                IvannaNativeLib.nativeSetHolosEq(
-                    paramStore.getHolosEqLow(), paramStore.getHolosEqMid(),
-                    paramStore.getHolosEqHigh(), paramStore.getHolosEqPresence(),
-                    paramStore.getHolosEqTiltDb(), paramStore.getHolosEqFreq()
-                )
+                // Unificación 2.5.509 (paso 4): la llamada a nativeSetHolosEq
+                // se ELIMINA del restore. Escribía Γ sin tope en los
+                // atomics y el sync lo reinyectaba a la FusedChain,
+                // rompiendo el tope EqStack (±6 dB por banda). La EQ Γ
+                // ahora viaja SOLO por el camino fusionado
+                // (buildFusedPerceptualFields → SET_PERCEPTUAL_STATE, con
+                // tope en pushFusedToDaemon/safeSetFusedControls). La
+                // función JNI queda (sin llamador Kotlin).
             }
             // Ω — Operador Universal (v2.5.444): restaura enabled/equipment/
             // boostMax/ildPrecomp en la Ruta A por JNI. OFF por defecto
@@ -294,7 +312,7 @@ object PersistedStateRestorer {
             // modo (Genezi → genezy_mhc_pz1d.ivk1; audífonos → pz1d).
             // Tronidos 493 (d): orbe+holos+hyper/aux en UN solo comando
             // atómico (sendRouteBStateAtomic), no en 4 envíos separados.
-            sendRouteBStateAtomic(paramStore, routeBProfile)
+            sendRouteBStateAtomic(ctx, paramStore, routeBProfile)
             applyTransducerVolterraKernel(ctx, routeBMode)
             // Sensor acústico real (v2.5.369): arranca la captura del
             // micrófono por defecto para que Φ corra en MEDIDO (el operador
@@ -419,11 +437,9 @@ object PersistedStateRestorer {
         // empuja directo al daemon para que la Ruta B no se quede con
         // los legacy (idempotente: mismos valores).
         runCatching {
-            // v2.5.473 §2.1: migración única legacy→fused ANTES de cargar:
-            // un usuario que viene de la 472 trae sus valores en claves
-            // orbe_*/holos_*/hyper_*; sin esto el restore cargaría defaults.
-            ParameterStore(ctx).migrateLegacyToFused()
-
+            // Unificación 2.5.509 (paso 1): la migración única legacy→fused
+            // ya NO se llama aquí: loadFusedControls() la corre perezosamente
+            // (idempotente) en cada carga.
             val fused = ParameterStore(ctx).loadFusedControls()
             FusedControlsBridge.safeSetFusedControls(fused)
             if (!FusedControlsBridge.isLoaded) {
@@ -444,66 +460,63 @@ object PersistedStateRestorer {
     // loudness, no solo ORBE/HOLOS/widener). La Ruta A NO se toca aquí:
     // los JNI nativeSet* siguen con los montos del usuario siempre.
 
-    // FIX 1 (bofo Genezi, v2.5.465): modo de salida para el snapshot
-    // (OmegaOutputMode en omega_control_bus.h: 0 = desconocido, 1 =
-    // audífonos, 2 = bocinas planas, 3 = Genezi). Lo resuelve
-    // RouteBDeviceGate + usbDacTarget (resolveRouteBMode); el EFECTO lo
-    // hace cumplir en omega_apply_snapshot. TERCER MODO — GENEZI
-    // (evol-holos, 2026-11-26): el Genezi ya NO codifica como bocina
-    // plana (2): con 3 el efecto deja pasar el holograma del usuario y
-    // solo neutraliza lo general. Un daemon viejo decodifica 3 como
-    // UNKNOWN (aplica el snapshot tal cual: compatible).
-    private fun outputModeFor(mode: TransducerMode): Int =
-        when (mode) {
-            TransducerMode.HEADPHONES -> 1
-            TransducerMode.SPEAKERS_GENEZI -> 3
-            TransducerMode.SPEAKERS_GENERIC -> 2
-        }
+    // Unificación 2.5.509 (paso 3): los 4 grupos ya NO son plantillas
+    // JSON con su propio "action"/"outputMode" — son MAPAS de campos.
+    // El único SET lo arma PerceptualStatePayload (constructor único);
+    // el "outputMode" lo estampa él desde el modo publicado.
+    // Los campos sin slot fused (orbe/holos proximity+diffuse-orbe,
+    // distance/spread/width/bandCount/headTracking, holosEqTiltDb/Freq)
+    // siguen viajando aquí, desde sus claves legacy (ver ParameterStore).
+    private fun orbeFields(store: ParameterStore, profile: TransducerProfile): Map<String, Float> =
+        mapOf(
+            "orbeAmount" to profile.orbeAmount,
+            "orbeDistanceM" to store.getOrbeDistanceM(),
+            "orbeSpread" to store.getOrbeSpread(),
+            "orbeProximityDb" to store.getOrbeProximityDb(),
+            "orbeDiffuse" to store.getOrbeDiffuse(),
+            "orbeHeadTracking" to if (store.isOrbeHeadTrackingEnabled()) 1.0f else 0.0f,
+        )
 
-    // Tronidos 493 (d): ORBE y HOLOS viajan en UN SOLO comando atómico.
-    // Antes eran 2 SET_PERCEPTUAL_STATE separados (cada uno con su
-    // runCatching que tragaba el fallo): si el de holos fallaba o el
-    // restore se interrumpía entre ambos, orbe quedaba en 1.0 y holos en
-    // su valor viejo (0 envenenado por el gate de SPEAKERS, que pone
-    // holosAmount a 0), y el merge pegajoso del daemon lo re-sembraba en
-    // cada cambio de sesión (ivanna_daemon.cpp, copyDesiredPerceptual).
-    // Ahora pushRouteBState funde los 4 grupos (orbe/holos/hyper/aux) en
-    // un solo JSONObject y lo envía una vez por OmegaEngineBridge
-    // .sendCommand (puerta + dedup + throttle). O el estado entero llega,
-    // o no llega nada; el restore es idempotente (se re-corre al cambiar
-    // de ruta), así que un fallo se autocorrige en el próximo cambio.
-    private fun orbeJson(store: ParameterStore, profile: TransducerProfile): String =
-        """{"action":"SET_PERCEPTUAL_STATE","outputMode":${outputModeFor(profile.mode)},"orbeAmount":${profile.orbeAmount},"orbeDistanceM":${store.getOrbeDistanceM()},"orbeSpread":${store.getOrbeSpread()},"orbeProximityDb":${store.getOrbeProximityDb()},"orbeDiffuse":${store.getOrbeDiffuse()},"orbeHeadTracking":${if (store.isOrbeHeadTrackingEnabled()) 1.0f else 0.0f}}"""
-
-    private fun holosJson(store: ParameterStore, profile: TransducerProfile): String =
-        """{"action":"SET_PERCEPTUAL_STATE","outputMode":${outputModeFor(profile.mode)},"holosAmount":${profile.holosAmount},"holosDistanceM":${store.getHolosDistanceM()},"holosSpread":${store.getHolosSpread()},"holosProximityDb":${store.getHolosProximityDb()},"holosDiffuse":${store.getHolosDiffuse()},"holosHarmonics":${store.getHolosHarmonics()},"holosWarmth":${store.getHolosWarmth()},"holosDynamics":${store.getHolosDynamics()},"holosWidth":${store.getHolosWidth()},"holosGamma":${store.getHolosGamma()},"holosRoomRt60":${store.getHolosRoomRt60()},"holosHeadTracking":${if (store.isHolosHeadTrackingEnabled()) 1.0f else 0.0f},"holosBandCount":${store.getHolosBandCount()},"holosEqLow":${store.getHolosEqLow()},"holosEqMid":${store.getHolosEqMid()},"holosEqHigh":${store.getHolosEqHigh()},"holosEqPresence":${store.getHolosEqPresence()},"holosEqTiltDb":${store.getHolosEqTiltDb()},"holosEqFreq":${store.getHolosEqFreq()}}"""
-
-    // Funde varios JSONObject parciales en uno (las claves repetidas —
-    // "action" y "outputMode" — llevan el mismo valor en todos los grupos).
-    private fun mergePerceptualJson(vararg parts: JSONObject): JSONObject {
-        val out = JSONObject()
-        for (part in parts) {
-            val keys = part.keys()
-            while (keys.hasNext()) {
-                val key = keys.next()
-                out.put(key, part.opt(key))
-            }
-        }
-        return out
-    }
+    private fun holosFields(store: ParameterStore, profile: TransducerProfile): Map<String, Float> =
+        mapOf(
+            "holosAmount" to profile.holosAmount,
+            "holosDistanceM" to store.getHolosDistanceM(),
+            "holosSpread" to store.getHolosSpread(),
+            "holosProximityDb" to store.getHolosProximityDb(),
+            "holosDiffuse" to store.getHolosDiffuse(),
+            "holosHarmonics" to store.getHolosHarmonics(),
+            "holosWarmth" to store.getHolosWarmth(),
+            "holosDynamics" to store.getHolosDynamics(),
+            "holosWidth" to store.getHolosWidth(),
+            "holosGamma" to store.getHolosGamma(),
+            "holosRoomRt60" to store.getHolosRoomRt60(),
+            "holosHeadTracking" to if (store.isHolosHeadTrackingEnabled()) 1.0f else 0.0f,
+            "holosBandCount" to store.getHolosBandCount().toFloat(),
+            "holosEqLow" to store.getHolosEqLow(),
+            "holosEqMid" to store.getHolosEqMid(),
+            "holosEqHigh" to store.getHolosEqHigh(),
+            "holosEqPresence" to store.getHolosEqPresence(),
+            "holosEqTiltDb" to store.getHolosEqTiltDb(),
+            "holosEqFreq" to store.getHolosEqFreq(),
+        )
 
     // Tronidos 493 (c+d): UN solo SET_PERCEPTUAL_STATE atómico
     // (orbe+holos+hyper/Volterra+aux) por el throttle compartido. Lo usan
     // el restore de arranque y pushRouteBState (cambio de ruta).
-    private fun sendRouteBStateAtomic(store: ParameterStore, profile: TransducerProfile) {
+    private fun sendRouteBStateAtomic(ctx: Context, store: ParameterStore, profile: TransducerProfile) {
         runCatching {
+            val fields = orbeFields(store, profile) + holosFields(store, profile) +
+                hyperVolterraFields(profile) + auxFields(profile)
+            // Unificación 2.5.509 (pasos 3+4): el payload lo arma el
+            // constructor único y la EQ va con el tope EqStack (este envío
+            // también escribe holosEq* al daemon; sin tope, un cambio de
+            // ruta repondría Γ sin capar).
+            val capped = com.ivanna.omega.audio.EqStack.capFields(
+                fields, com.ivanna.omega.audio.EqStack.inputs(ctx)
+            )
+            val output = com.ivanna.omega.audio.AudioRouteManager.routeBStateFlow.value.output
             OmegaEngineBridge.sendCommand(
-                mergePerceptualJson(
-                    JSONObject(orbeJson(store, profile)),
-                    JSONObject(holosJson(store, profile)),
-                    JSONObject(hyperVolterraJson(profile)),
-                    JSONObject(auxFieldJson(profile)),
-                )
+                com.ivanna.omega.magisk.PerceptualStatePayload.buildSet(capped, output)
             )
         }
     }
@@ -514,11 +527,17 @@ object PersistedStateRestorer {
     // FASE 2: los cuatro valores vienen del perfil de transductor (el
     // XTC es del modo, no del toggle global: en audífonos no hay
     // diafonía que cancelar; en Genezi el XTC es el del modo).
-    // FASE A: el JSON vive en hyperVolterraJson() (única fuente de verdad
-    // del payload) para que el envío en caliente del deslizador use
-    // EXACTAMENTE el mismo comando que el restore.
-    private fun hyperVolterraJson(profile: TransducerProfile): String =
-        """{"action":"SET_PERCEPTUAL_STATE","hyperAmount":${profile.hyperAmount},"hyperPreset":${profile.hyperPreset},"hyperXtcEnabled":${if (profile.hyperXtcEnabled) 1.0f else 0.0f},"volterraEnabled":${if (profile.volterraEnabled) 1.0f else 0.0f}}"""
+    // FASE A: el mapa vive en hyperVolterraFields() (única fuente de
+    // verdad del payload) para que el envío en caliente del deslizador use
+    // EXACTAMENTE los mismos campos que el restore. Unificación 2.5.509
+    // (paso 3): el SET lo arma PerceptualStatePayload.
+    private fun hyperVolterraFields(profile: TransducerProfile): Map<String, Float> =
+        mapOf(
+            "hyperAmount" to profile.hyperAmount,
+            "hyperPreset" to profile.hyperPreset.toFloat(),
+            "hyperXtcEnabled" to if (profile.hyperXtcEnabled) 1.0f else 0.0f,
+            "volterraEnabled" to if (profile.volterraEnabled) 1.0f else 0.0f,
+        )
 
     // (sendHyperVolterraToDaemon ya no existe: el grupo hyper/Volterra
     // viaja dentro del comando atómico de pushRouteBState; el envío en
@@ -538,8 +557,13 @@ object PersistedStateRestorer {
     fun hyperVolterraCommand(context: Context): String {
         val ctx = context.applicationContext
         val store = ParameterStore(ctx)
-        val (_, mode) = resolveRouteBMode(ctx)
-        return hyperVolterraJson(profileForMode(mode, store))
+        val (output, mode) = resolveRouteBMode(ctx)
+        // Unificación 2.5.509 (paso 3): el SET lo arma el constructor
+        // único (outputMode desde el modo publicado). La firma se conserva
+        // (String) para pushHyperVolterraToDaemon.
+        return com.ivanna.omega.magisk.PerceptualStatePayload.buildSet(
+            hyperVolterraFields(profileForMode(mode, store)), output
+        ).toString()
     }
 
     /**
@@ -563,8 +587,13 @@ object PersistedStateRestorer {
     // 0–1, encode a snapshot.flags), pero nadie se lo mandaba: solo
     // nativeSetAuxField en Ruta A. En Genezi, graves en fase coherente
     // bajo el cruce; en audífonos/bocina genérica, apagado.
-    private fun auxFieldJson(profile: TransducerProfile): String =
-        """{"action":"SET_PERCEPTUAL_STATE","auxEnabled":${if (profile.auxFieldEnabled) 1.0f else 0.0f},"auxXoverHz":${profile.auxXoverHz},"auxCoherence":${profile.auxCoherence}}"""
+    // Unificación 2.5.509 (paso 3): mapa de campos, no JSON.
+    private fun auxFields(profile: TransducerProfile): Map<String, Float> =
+        mapOf(
+            "auxEnabled" to if (profile.auxFieldEnabled) 1.0f else 0.0f,
+            "auxXoverHz" to profile.auxXoverHz,
+            "auxCoherence" to profile.auxCoherence,
+        )
 
     private fun sendGeneralToDaemon(harmonicGain: Float, antiDolby: Float, output: RouteBOutput) {
         if (!OmegaEngineBridge.isConnected) return
@@ -619,7 +648,7 @@ object PersistedStateRestorer {
         val profile = profileForMode(mode, store)
         // Tronidos 493 (c+d): el estado de Ruta B viaja en UN solo
         // SET_PERCEPTUAL_STATE atómico (ver sendRouteBStateAtomic).
-        sendRouteBStateAtomic(store, profile)
+        sendRouteBStateAtomic(ctx, store, profile)
         applyTransducerVolterraKernel(ctx, mode)
         val hePrefs = ctx.getSharedPreferences("harmonic_exciter_prefs", Context.MODE_PRIVATE)
         val exciterEnabled = hePrefs.getBoolean("exciterEnabled", true)

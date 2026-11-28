@@ -533,27 +533,48 @@ internal fun CoroutineScope.startTelemetryPoller(
         //     hi ≈ −6.1 dB (spread ~17 dB): el stack existe y se ve aquí.
         // El comentario en el JNI (línea ~1168) ya advertía que con boosts
         // grandes el EQ apila >6 dB y el SafetyLimiter arranca en modo pared.
+        // Unificación 2.5.509 (paso 4): EQ_STACK_TAG pasa de LOG a GUARDA.
+        // La suma se calcula con EqStack (la MISMA que capan los bordes de
+        // escritura: safeSetFusedControls/pushFusedToDaemon), así que
+        // stack_* y holos_* son los valores EFECTIVOS (con tope ±6 dB) y
+        // capped/excess_* dicen si el tope enganchó y cuánto se descartó.
         if (appContext != null) {
             runCatching {
                 val ps = ParameterStore(appContext)
                 val ac = AdaptiveControlsPrefs.load(appContext)
                 val legacyDb =
                     (20.0 * kotlin.math.log10(ac.masterGain.coerceIn(0.1f, 2.0f).toDouble())).toFloat()
-                val stackLo = ps.getHolosEqLow() + ac.eqBass + ps.getHyperBassTrimDb() + legacyDb
-                val stackMid = ps.getHolosEqMid() + ac.eqMid + legacyDb
-                val stackHi = ps.getHolosEqHigh() + ps.getHolosEqPresence() + ac.eqTreble + legacyDb
+                val capped = EqStack.inputs(appContext)?.let { inputs ->
+                    EqStack.compute(
+                        ps.getHolosEqLow(), ps.getHolosEqMid(), ps.getHolosEqHigh(),
+                        ps.getHolosEqPresence(), inputs
+                    )
+                }
+                val stackLo = capped?.stackLowDb
+                    ?: (ps.getHolosEqLow() + ac.eqBass + ps.getHyperBassTrimDb() + legacyDb)
+                val stackMid = capped?.stackMidDb
+                    ?: (ps.getHolosEqMid() + ac.eqMid + legacyDb)
+                val stackHi = capped?.stackHighDb
+                    ?: (ps.getHolosEqHigh() + ps.getHolosEqPresence() + ac.eqTreble + legacyDb)
                 Log.i(
                     EQ_STACK_TAG,
                     String.format(
                         Locale.US,
                         "stack_lo=%+.2f stack_mid=%+.2f stack_hi=%+.2f tilt=%+.2f " +
                             "holos_lo=%+.2f holos_mid=%+.2f holos_hi=%+.2f holos_pres=%+.2f " +
-                            "user_lo=%+.2f user_mid=%+.2f user_hi=%+.2f trim=%+.2f legacy=%+.2f",
+                            "user_lo=%+.2f user_mid=%+.2f user_hi=%+.2f trim=%+.2f legacy=%+.2f " +
+                            "capped=%d excess_lo=%+.2f excess_mid=%+.2f excess_hi=%+.2f",
                         stackLo, stackMid, stackHi, ps.getHolosEqTiltDb(),
-                        ps.getHolosEqLow(), ps.getHolosEqMid(), ps.getHolosEqHigh(),
+                        capped?.lowDb ?: ps.getHolosEqLow(),
+                        capped?.midDb ?: ps.getHolosEqMid(),
+                        capped?.highDb ?: ps.getHolosEqHigh(),
                         ps.getHolosEqPresence(),
                         ac.eqBass, ac.eqMid, ac.eqTreble,
-                        ps.getHyperBassTrimDb(), legacyDb
+                        ps.getHyperBassTrimDb(), legacyDb,
+                        if (capped?.capped == true) 1 else 0,
+                        capped?.excessLowDb ?: 0f,
+                        capped?.excessMidDb ?: 0f,
+                        capped?.excessHighDb ?: 0f
                     )
                 )
             }

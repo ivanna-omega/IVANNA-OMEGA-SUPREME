@@ -239,6 +239,11 @@ FusedControls fieldOnlyControls(float phiAmount) {
     FusedControls c;
     c.setNeutral();
     c.field.amount = 1.0f;      // HOLOS al máximo
+    // Unificación 2.5.509 (paso 5): OmniField ya NO sigue a HOLOS —
+    // tiene su propio amount y setNeutral() lo deja en 0. La config
+    // F0/F es "HOLOS+Omni al máximo", así que se re-enciende explícito
+    // (antes lo re-encendía implícitamente field.amount=1.0).
+    c.field.omniAmount = 1.0f;  // OmniField al máximo
     c.field.phiAmount = phiAmount;
     c.field.harmonics = 0.002f; // guarda validada
     c.clamp();

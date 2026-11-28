@@ -79,8 +79,14 @@ data class SpatialProfileParams(
 
 @Serializable
 data class FieldProfileParams(
-    val holosAmount: Float = 0.5f,
-    val holosHarmonics: Float = 0.0f,
+    // Unificación 2.5.509 (paso 1): defaults ATREVIDA (1.0 / 0.002), igual
+    // que IvannaFieldProfileParams (ProfilesLoader). Antes 0.5 / 0.0:
+    // dos dataclasses de perfil con distinto default de holos, y los
+    // perfiles integrados que no especifican holosAmount explícito
+    // tomaban 0.5 aquí y 1.0 allá. CONSECUENCIA: los perfiles integrados
+    // sin holosAmount explícito pasan de HOLOS 0.5 a 1.0.
+    val holosAmount: Float = 1.0f,
+    val holosHarmonics: Float = 0.002f,
     val holosWarmth: Float = 0.0f,
     val holosDynamics: Float = 1.0f,
     val holosGamma: Float = 1.0f,

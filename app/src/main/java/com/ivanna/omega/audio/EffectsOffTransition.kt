@@ -95,12 +95,14 @@ object EffectsOffTransition {
         val ctx = context.applicationContext
         synchronized(lock) {
             val effectsOff = runCatching {
-                val store = ParameterStore(ctx)
-                store.getOrbeAmount() <= 0f &&
-                    store.getHolosAmount() <= 0f &&
-                    store.getOmniAmount() <= 0f &&
-                    store.getHyperAmount() <= 0f &&
-                    !store.isVolterraEnabled() &&
+                // Unificación 2.5.509 (paso 1): la fórmula lee LO FUSIONADO
+                // directamente (una sola carga), no los getters legacy.
+                val fused = ParameterStore(ctx).loadFusedControls()
+                fused.spatial.amount <= 0f &&
+                    fused.field.amount <= 0f &&
+                    fused.field.omniAmount <= 0f &&
+                    fused.field.phiAmount <= 0f &&
+                    fused.transducer.correction <= 0f &&
                     AudioStateManager.getCurrentState().adaptiveMode == AdaptiveMode.OFF
             }.getOrNull() ?: return
             if (lastEffectsOff == effectsOff) return
@@ -144,23 +146,26 @@ object EffectsOffTransition {
         // neutro explícito, para que el snapshot coloreado no sobreviva en
         // el daemon aunque luego se cierre IVANNA. No marca fallo si el
         // daemon no está (los toggles locales ya quedaron en neutro).
+        // Unificación 2.5.509 (paso 3): el neutro lo arma el constructor
+        // único sobre el mapa neutro fusionado + los 6 campos generales
+        // (sin slot fused: compressor/loudnessTarget/exciterRed/
+        // harmonicGain/antiDolby/holosEqTiltDb). Mismos valores que el
+        // JSON a mano que había antes (compressor 0 = bypass, etc.).
         runCatching {
-            val ok = OmegaEngineBridge.sendCommand(org.json.JSONObject().apply {
-                put("action", "SET_PERCEPTUAL_STATE")
-                put("orbeAmount", 0)
-                put("holosAmount", 0)
-                put("spatialWidth", 1.0)
-                put("compressor", 0)
-                put("loudnessTarget", 0)
-                put("exciterRed", 0)
-                put("harmonicGain", 0)
-                put("antiDolby", 0)
-                put("holosEqLow", 0)
-                put("holosEqMid", 0)
-                put("holosEqHigh", 0)
-                put("holosEqPresence", 0)
-                put("holosEqTiltDb", 0)
-            })
+            val fields = FusedControlsBridge.buildFusedPerceptualFields(FusedControls().setNeutral())
+                .toMutableMap().apply {
+                    put("compressor", 0f)
+                    put("loudnessTarget", 0f)
+                    put("exciterRed", 0f)
+                    put("harmonicGain", 0f)
+                    put("antiDolby", 0f)
+                    put("holosEqTiltDb", 0f)
+                }
+            val ok = OmegaEngineBridge.sendCommand(
+                com.ivanna.omega.magisk.PerceptualStatePayload.buildSet(
+                    fields, AudioRouteManager.routeBStateFlow.value.output
+                )
+            )
             if (!ok) Log.w(TAG, "applyOff: SET_PERCEPTUAL_STATE neutro no llegó al daemon")
         }.onFailure { Log.w(TAG, "applyOff: SET_PERCEPTUAL_STATE neutro falló: ${it.message}") }
     }.onFailure { Log.w(TAG, "applyOff falló: ${it.message}") }.isSuccess

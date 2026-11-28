@@ -3330,7 +3330,8 @@ JNIEXPORT void JNICALL Java_com_ivanna_omega_dsp_DSPBridge_nativeSetBypass(
 
 // ── FUSIÓN MAGISTRAL (2026-11-18) — puente JNI de controles fusionados ────
 // Corresponde a FusedControlsBridge (com.ivanna.omega.audio). La firma de
-// nativeSetFusedControls es la del Kotlin (48 parámetros, mismo orden).
+// nativeSetFusedControls es la del Kotlin (50 parámetros, mismo orden;
+// 48 + fieldOmniAmount + fieldDiffuse, unificación 2.5.509 paso 5).
 // TRAMPA DEL MODO: el contrato JNI es 0=HEADPHONES/1=SPEAKERS, pero el enum
 // C++ OmegaOutputMode es UNKNOWN=0/HEADPHONES=1/SPEAKERS=2 — se traduce
 // aquí (pasar el Int tal cual pondría UNKNOWN=fail-closed). Los valores que
@@ -3358,7 +3359,8 @@ Java_com_ivanna_omega_audio_FusedControlsBridge_nativeSetFusedControls(
     jfloat dynRatio, jfloat dynExciter, jfloat dynVoice, jfloat dynUpmix,
     jint brainMode, jfloat brainAdaptation,
     jfloat consvAmount, jfloat consvEnergyCap, jfloat consvPhaseCoherence,
-    jfloat consvInertia) {
+    jfloat consvInertia,
+    jfloat fieldOmniAmount, jfloat fieldDiffuse) {
     using ivanna::fused::FusedControls;
     FusedControls c = g_fusedChainRouteA.controls();
     c.spatial.amount = spatialAmount;
@@ -3383,6 +3385,10 @@ Java_com_ivanna_omega_audio_FusedControlsBridge_nativeSetFusedControls(
     c.field.warmth = fieldWarmth;
     c.field.dynamics = fieldDynamics;
     c.field.roomRt60 = fieldRt60;
+    // Unificación 2.5.509 (paso 5): OmniField y diffuse tienen slot propio
+    // (antes OmniField seguía el amount de HOLOS y diffuse era fijo 0.85).
+    c.field.omniAmount = fieldOmniAmount;
+    c.field.diffuse = fieldDiffuse;
     c.listenerRoom.rt60Sec = roomRt60;
     c.listenerRoom.roomSizeM = roomSizeM;
     c.listenerRoom.roomWet = roomWet;
@@ -3436,6 +3442,10 @@ Java_com_ivanna_omega_audio_FusedControlsBridge_nativeSetFusedControls(
     g_holos_dynamics.store(c.field.dynamics, std::memory_order_relaxed);
     g_holos_gamma.store(c.field.gamma, std::memory_order_relaxed);
     g_holos_room_rt60.store(c.field.roomRt60, std::memory_order_relaxed);
+    // Unificación 2.5.509 (paso 5): espejo de los dos campos nuevos; sin
+    // esto el sync por bloque los reescribiría con los valores viejos.
+    g_omni_amount.store(c.field.omniAmount, std::memory_order_relaxed);
+    g_holos_diffuse.store(c.field.diffuse, std::memory_order_relaxed);
     g_holos_eq_low.store(c.tonal.lowDb, std::memory_order_relaxed);
     g_holos_eq_mid.store(c.tonal.midDb, std::memory_order_relaxed);
     g_holos_eq_high.store(c.tonal.highDb, std::memory_order_relaxed);

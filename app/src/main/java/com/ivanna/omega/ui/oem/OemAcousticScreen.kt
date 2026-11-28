@@ -122,6 +122,9 @@ fun OemAcousticScreen(state: OemState, onBack: () -> Unit) {
                     diffusion = it
                     // v2.5.476 — Difusión cableada: orbe_diffuse [0,1] a
                     // Ruta A (nativo) + Ruta B (daemon, SET_PERCEPTUAL_STATE).
+                    // Unificación 2.5.509 (paso 3): el SET es el payload
+                    // COMPLETO fusionado + orbeDiffuse (sin slot fused),
+                    // armado por el constructor único.
                     runCatching {
                         val ctx = appContext
                         val store = com.ivanna.omega.core.ParameterStore(ctx)
@@ -129,11 +132,15 @@ fun OemAcousticScreen(state: OemState, onBack: () -> Unit) {
                             store.getOrbeAmount(), store.getOrbeDistanceM(),
                             store.getOrbeSpread(), store.getOrbeProximityDb(),
                             it, store.isOrbeHeadTrackingEnabled())
+                        val fields = com.ivanna.omega.audio.FusedControlsBridge
+                            .buildFusedPerceptualFields(store.loadFusedControls())
+                            .toMutableMap().apply { put("orbeDiffuse", it) }
                         com.ivanna.omega.magisk.OmegaEngineBridge.sendCommand(
-                            org.json.JSONObject().apply {
-                                put("action", "SET_PERCEPTUAL_STATE")
-                                put("orbeDiffuse", it.toDouble())
-                            })
+                            com.ivanna.omega.magisk.PerceptualStatePayload.buildSet(
+                                fields,
+                                com.ivanna.omega.audio.AudioRouteManager.routeBStateFlow.value.output
+                            )
+                        )
                     }
                 }
             }

@@ -44,6 +44,8 @@ FusedControls linearEngagedControls() {
     c.spatial.hrtfWet = 0.5f;
     c.spatial.mode = ivanna::OmegaOutputMode::HEADPHONES;
     c.field.amount = 0.0f;
+    c.field.omniAmount = 0.0f;  // Unificación 2.5.509 (paso 5):
+    // campo FUERA = también OmniField en 0 (antes lo apagaba field.amount).
     c.field.phiAmount = 0.0f;
     c.field.harmonics = 0.0f;
     c.listenerRoom.roomWet = 0.22f;

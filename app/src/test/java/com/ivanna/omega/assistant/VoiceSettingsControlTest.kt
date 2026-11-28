@@ -104,7 +104,7 @@ class VoiceSettingsControlTest {
         assertNotNull(cmd)
         val result = VoiceSettingsControl.apply(context, cmd!!)
         assertTrue(result.applied)
-        assertEquals(0.7f, ParameterStore(context).getOrbeAmount(), 0.001f)
+        assertEquals(0.7f, ParameterStore(context).loadFusedControls().spatial.amount, 0.001f)
     }
 
     @Test
@@ -360,7 +360,7 @@ class VoiceSettingsControlTest {
         val result = VoiceSettingsControl.apply(context, cmd)
         assertTrue(result.applied)
         assertTrue(result.confirmation.contains("ORBE"))
-        assertEquals(0.7f, ParameterStore(context).getOrbeAmount(), 0.001f)
+        assertEquals(0.7f, ParameterStore(context).loadFusedControls().spatial.amount, 0.001f)
     }
 
     @Test
@@ -368,14 +368,14 @@ class VoiceSettingsControlTest {
         VoiceSettingsControl.apply(context, VoiceSettingsControl.parse("pon el HOLOS a 0.5")!!)
         val result = VoiceSettingsControl.apply(context, VoiceSettingsControl.parse("sube el HOLOS")!!)
         assertTrue(result.applied)
-        assertEquals(0.6f, ParameterStore(context).getHolosAmount(), 0.001f)
+        assertEquals(0.6f, ParameterStore(context).loadFusedControls().field.amount, 0.001f)
     }
 
     @Test
     fun applyOrbeDisableSetsZero() {
         val result = VoiceSettingsControl.apply(context, VoiceSettingsControl.parse("apaga el ORBE")!!)
         assertTrue(result.applied)
-        assertEquals(0f, ParameterStore(context).getOrbeAmount(), 0.001f)
+        assertEquals(0f, ParameterStore(context).loadFusedControls().spatial.amount, 0.001f)
     }
 
     @Test
@@ -443,7 +443,7 @@ class VoiceSettingsControlTest {
         assertTrue(result.confirmation.contains("guardado"))
         // "(motor)" es la marca del readback en vivo: sin .so no debe aparecer.
         assertFalse(result.confirmation.contains("(motor)"))
-        assertEquals(0.7f, ParameterStore(context).getOrbeAmount(), 0.001f)
+        assertEquals(0.7f, ParameterStore(context).loadFusedControls().spatial.amount, 0.001f)
     }
 
     @Test

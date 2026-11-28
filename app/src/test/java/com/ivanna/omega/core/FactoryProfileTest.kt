@@ -84,8 +84,8 @@ class FactoryProfileTest {
         // v2.5.473 (§3.6.4) — BOOT_PROFILE = PROFILE_COMPLETO (antes ESPACIAL):
         // ORBE 1.0, HOLOS 1.0, OmniField 1.0, Φ 0.5, Volterra ON
         // (ATREVIDA 502, directiva Esse 2026-11-24; antes HOLOS 0.5).
-        assertEquals(1.0f, store.getOrbeAmount(), 0f)
-        assertEquals(1.0f, store.getHolosAmount(), 0f)
+        assertEquals(1.0f, store.loadFusedControls().spatial.amount, 0f)
+        assertEquals(1.0f, store.loadFusedControls().field.amount, 0f)
         assertEquals(0.002f, store.getHolosHarmonics(), 0f)
         assertEquals(1.2f, store.getHolosSpread(), 0f)
         assertEquals(6.0f, store.getHolosProximityDb(), 0f)
@@ -102,7 +102,7 @@ class FactoryProfileTest {
         // Valores vivos de Esse: se respetan, no los pisa el perfil.
         store.setHolosParams(0.359f, 0.35f, 1.0f, 3.0f, 0.5f, 0.298f, 0.5f, 1.0f, 1.0f, 1.0f, 0.34f, true, 24)
         store.setHolosEq(7.8f, -8.1f, -8.6f, 0f, 5.2f, 1000f)
-        assertEquals(0.359f, store.getHolosAmount(), 0f)
+        assertEquals(0.359f, store.loadFusedControls().field.amount, 0f)
         assertEquals(0.298f, store.getHolosHarmonics(), 0f)
         assertEquals(7.8f, store.getHolosEqLow(), 0f)
         assertEquals(-8.1f, store.getHolosEqMid(), 0f)
