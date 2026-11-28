@@ -13,7 +13,7 @@ Specifications implemented:
   * ``refactorizacion-muselink-autonoma.md`` §2.3 (deterministic analyzer),
     §4 (A/B machine: the 5 original promotion gates).
   * ``evolucion-magistral-autonomia-completa.md`` §§S2, S5 (via B), S6, S8,
-    S9 (server side).
+    S9 (server side), T7 (anti-poisoning, before aggregation).
 
 Baseline fixed by the specs: spectral error RMS 10.46 dB (v1.1 profile),
 promotion target <= 8.37 dB (0.8 x 10.46).
@@ -24,6 +24,10 @@ Public API (all pure functions):
   * S8  -- :func:`evaluate_ab`
   * S5  -- :func:`emit_ladder`
   * S9  -- :func:`coherence_guard`
+  * T7  -- :func:`validate_chunk`, :func:`check_token_rate`,
+    :func:`check_replay`, :func:`classify_session_outlier`,
+    :func:`quarantine_update`, :func:`log_rejection`,
+    :func:`rejection_summary`, :func:`gate_session`
   * §2.3 -- :func:`regional_correction`, :func:`detect_resonances`,
     :func:`region_rms`, :func:`compile_candidate`
 """
@@ -60,6 +64,27 @@ __all__ = [
     "COMB_STD_CONTRAST_MIN_DB",
     "AXIAL_MODES_HZ",
     "SPEED_OF_SOUND_M_S",
+    # T7 — anti-poisoning (proposals; see README §T7)
+    "CHUNK_ERROR_DB_MIN",
+    "CHUNK_ERROR_DB_MAX",
+    "CHUNK_MAGNITUDE_DB_MIN",
+    "CHUNK_MAGNITUDE_DB_MAX",
+    "CHUNK_COHERENCE_MIN",
+    "CHUNK_COHERENCE_MAX",
+    "CHUNK_LEVEL_DBFS_MIN",
+    "CHUNK_LEVEL_DBFS_MAX",
+    "CHUNK_RMS_DB_MAX",
+    "CHUNK_ERB_STD_DB_MIN",
+    "CHUNK_ERB_STD_DB_MAX",
+    "CHUNK_CREST_DB_MIN",
+    "CHUNK_CREST_DB_MAX",
+    "CHUNK_LUFS_MIN_DB",
+    "CHUNK_LUFS_MAX_DB",
+    "DEFAULT_MAX_SESSIONS_PER_HOUR",
+    "RATE_WINDOW_SECONDS",
+    "OUTLIER_DEVIATION_DB",
+    "OUTLIER_CONFIRM_DB",
+    "OUTLIER_CONFIRM_SESSIONS",
     # §2.3 helpers
     "region_error",
     "region_rms",
@@ -73,6 +98,15 @@ __all__ = [
     "emit_ladder",
     "coherence_guard",
     "compile_candidate",
+    # T7 — anti-poisoning, before aggregation
+    "validate_chunk",
+    "check_token_rate",
+    "check_replay",
+    "classify_session_outlier",
+    "quarantine_update",
+    "log_rejection",
+    "rejection_summary",
+    "gate_session",
 ]
 
 # ---------------------------------------------------------------------------
@@ -200,6 +234,58 @@ COMB_STD_CONTRAST_MIN_DB = 1.0
 # "near a comb peak" when > +0.5.
 COMB_NULL_COS = -0.5
 COMB_PEAK_COS = 0.5
+
+# ---------------------------------------------------------------------------
+# T7 — anti-poisoning thresholds (evolucion-magistral-autonomia-completa.md
+# T7). PROPOSAL, not measured data: the proposal leaves the thresholds to
+# the implementer when Esse does not fix them. Each value below is a
+# reasoned proposal from the known data (see README §T7); Esse confirms
+# or adjusts them. They are named constants so the server can tune them
+# from measured data without touching the rules.
+# ---------------------------------------------------------------------------
+
+# T7 rule 1: physical ranges for a chunk. A value outside these bounds
+# cannot be a measurement of this system (digital full scale, coherence
+# 0..1, room/speaker response of the known profile) and is rejected.
+# Known data the proposals start from: v1.1 measured band errors span
+# -12..+9.86 dB; magnitude is a digital level (<= 0 dBFS); 16-bit floor
+# is -96 dBFS; coherence is 0..1 by definition.
+CHUNK_ERROR_DB_MIN = -40.0     # per-band errorDb; proposal
+CHUNK_ERROR_DB_MAX = 40.0      # per-band errorDb; proposal
+CHUNK_MAGNITUDE_DB_MIN = -120.0  # per-band magnitudeDb, dBFS; proposal
+CHUNK_MAGNITUDE_DB_MAX = 0.0     # digital full scale; not a proposal
+CHUNK_COHERENCE_MIN = 0.0      # coherence, by definition
+CHUNK_COHERENCE_MAX = 1.0      # coherence, by definition
+CHUNK_LEVEL_DBFS_MIN = -120.0  # levelMean/levelMax, dBFS; proposal
+CHUNK_LEVEL_DBFS_MAX = 0.0     # digital full scale; not a proposal
+CHUNK_RMS_DB_MAX = 40.0        # spectralErrorRmsDb (<= max |error|); proposal
+CHUNK_ERB_STD_DB_MIN = 0.0     # erbStdDb is a dispersion; by definition
+CHUNK_ERB_STD_DB_MAX = 40.0    # erbStdDb; proposal
+CHUNK_CREST_DB_MIN = 0.0       # crest = peak - RMS, never negative
+CHUNK_CREST_DB_MAX = 60.0      # crest of real audio; proposal
+CHUNK_LUFS_MIN_DB = -70.0      # integrated loudness floor; proposal
+CHUNK_LUFS_MAX_DB = 0.0        # LUFS cannot exceed full scale
+
+# T7 rule 2: per-token rate limit. A PARAMETER, not a buried constant:
+# the server is the one that knows the token, so gate_session() takes
+# max_sessions_per_hour and the server passes its own value. The default
+# below is a proposal: an A/B needs 3 sessions per side and a phone
+# flushes at most a few listening sessions per hour in real use, so 6/h
+# is generous for one token and still blocks a replay flood.
+DEFAULT_MAX_SESSIONS_PER_HOUR = 6
+RATE_WINDOW_SECONDS = 3600
+
+# T7 rule 3: per-band outlier hold. A session whose error in any band
+# deviates from the aggregated profile by more than this does not enter
+# aggregation until 2 further sessions confirm the same deviation (same
+# band, same sign, more than OUTLIER_CONFIRM_DB). Proposal: 6 dB is well
+# above the 1 dB correction deadband and above any plausible single-band
+# drift of a real room change, while a genuine change (mic/speakers
+# moved) reappears in the next sessions and confirms; the confirmation
+# bar is half the hold bar so a real but weaker repeat still counts.
+OUTLIER_DEVIATION_DB = 6.0
+OUTLIER_CONFIRM_DB = 3.0
+OUTLIER_CONFIRM_SESSIONS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -952,6 +1038,455 @@ def coherence_guard(mean_coherence, per_band_coherence, corrections_by_band,
                   % (mean_coherence, COHERENCE_GUARD,
                      len(allowed), len(corrections_by_band), COHERENCE_GUARD),
     }
+
+
+# ---------------------------------------------------------------------------
+# T7 — anti-poisoning: the server rejects anomalous sessions BEFORE
+# aggregating (evolucion-magistral-autonomia-completa.md T7, closes
+# ARTEX risk no. 2 / C17).
+#
+# Threat model: the autonomous cycle learns from the sessions that are
+# uploaded. If the Bearer token leaks, if a buggy client sends corrupt
+# sessions, or if someone replays old sessions, the deterministic
+# analyzer would compile a poisoned profile and the A/B could promote
+# it on its own. The A/B compares against a baseline but cannot tell
+# "a real room that changed" from "false data". These rules run BEFORE
+# any session enters the aggregate, in this order:
+#   1. validate_chunk: physically impossible values are rejected.
+#   2. check_replay: a session_id seen before, or an error table
+#      bit-identical to an earlier accepted session, is rejected.
+#   3. check_token_rate: how many sessions one token may contribute
+#      per hour (a parameter -- the server knows the token).
+#   4. quarantine_update: a session deviating > OUTLIER_DEVIATION_DB
+#      in any band from the aggregated profile is HELD, not aggregated,
+#      until 2 further sessions confirm the same deviation (same band,
+#      same sign); otherwise it is discarded.
+#   Every rejection (and every hold) is recorded with its reason via
+#   log_rejection. gate_session() runs all four in order and is the
+#   entry point the server calls per incoming session.
+#
+# State the server must keep (this module is pure; it never stores):
+# per-token lists of accepted-session timestamps, the set of seen
+# session_ids, the list of accepted error tables (or their hashes),
+# the quarantine state dict, and the rejection log. All of it is
+# passed in and returned; nothing here touches disk or network.
+# ---------------------------------------------------------------------------
+
+def _is_finite_number(value):
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _check_band_list(field, values, low, high, reasons):
+    """Validate one 24-band field: list of 24 finite numbers in range.
+    Appends human-readable reasons; returns True when valid."""
+    if not isinstance(values, (list, tuple)):
+        reasons.append("%s: not a list of 24 numbers" % field)
+        return False
+    if len(values) != N_BANDS:
+        reasons.append("%s: %d bands, expected 24" % (field, len(values)))
+        return False
+    ok = True
+    for i, value in enumerate(values):
+        if not _is_finite_number(value):
+            reasons.append("%s: ERB-%d is not a finite number (%r)"
+                           % (field, i + 1, value))
+            ok = False
+        elif value < low or value > high:
+            reasons.append("%s: ERB-%d %.2f dB outside [%.1f, %.1f]"
+                           % (field, i + 1, value, low, high))
+            ok = False
+    return ok
+
+
+def _check_scalar(field, value, low, high, reasons):
+    """Validate one scalar field: finite number in range."""
+    if not _is_finite_number(value):
+        reasons.append("%s: not a finite number (%r)" % (field, value))
+        return False
+    if value < low or value > high:
+        reasons.append("%s: %.2f outside [%.1f, %.1f]"
+                       % (field, value, low, high))
+        return False
+    return True
+
+
+def validate_chunk(chunk):
+    """T7 rule 1: reject chunks with physically impossible values.
+
+    ``chunk`` is a session/chunk dict. ``error_mean_db`` (24 bands) is
+    required; every other field is optional and validated only when
+    present, like S8 treats optional telemetry: ``magnitude_db`` (24),
+    ``coherence`` (24, per-band), ``mean_coherence``, ``level_max_dbfs``,
+    ``level_mean_dbfs``, ``spectral_error_rms_db``, ``erb_std_db`` (24),
+    ``crest_db``, ``lufs``.
+
+    A value is rejected when it is not a finite number (NaN/inf from a
+    corrupt or truncated payload) or outside its physical range: error
+    +/-40 dB, magnitude -120..0 dBFS, coherence 0..1, levels -120..0
+    dBFS, RMS 0..40 dB, erbStdDb 0..40 dB, crest 0..60 dB, LUFS
+    -70..0 dB. All bounds are the CHUNK_* constants; the dBFS/coherence
+    ones follow from the definitions, the rest are proposals (see the
+    constants block and README §T7).
+
+    Returns ``{"ok": bool, "reasons": [str]}``; every reason names the
+    field, the band when it applies, and the offending value.
+    """
+    reasons = []
+    if not isinstance(chunk, dict):
+        return {"ok": False,
+                "reasons": ["chunk is not a dict (%r)" % (chunk,)]}
+    ok = True
+    if "error_mean_db" not in chunk:
+        return {"ok": False, "reasons": ["error_mean_db: missing (required)"]}
+    if not _check_band_list("error_mean_db", chunk["error_mean_db"],
+                            CHUNK_ERROR_DB_MIN, CHUNK_ERROR_DB_MAX, reasons):
+        ok = False
+    if "magnitude_db" in chunk and not _check_band_list(
+            "magnitude_db", chunk["magnitude_db"],
+            CHUNK_MAGNITUDE_DB_MIN, CHUNK_MAGNITUDE_DB_MAX, reasons):
+        ok = False
+    if "coherence" in chunk and not _check_band_list(
+            "coherence", chunk["coherence"],
+            CHUNK_COHERENCE_MIN, CHUNK_COHERENCE_MAX, reasons):
+        ok = False
+    if "erb_std_db" in chunk and not _check_band_list(
+            "erb_std_db", chunk["erb_std_db"],
+            CHUNK_ERB_STD_DB_MIN, CHUNK_ERB_STD_DB_MAX, reasons):
+        ok = False
+    for field, low, high in (
+            ("mean_coherence", CHUNK_COHERENCE_MIN, CHUNK_COHERENCE_MAX),
+            ("level_max_dbfs", CHUNK_LEVEL_DBFS_MIN, CHUNK_LEVEL_DBFS_MAX),
+            ("level_mean_dbfs", CHUNK_LEVEL_DBFS_MIN, CHUNK_LEVEL_DBFS_MAX),
+            ("spectral_error_rms_db", 0.0, CHUNK_RMS_DB_MAX),
+            ("crest_db", CHUNK_CREST_DB_MIN, CHUNK_CREST_DB_MAX),
+            ("lufs", CHUNK_LUFS_MIN_DB, CHUNK_LUFS_MAX_DB)):
+        if field in chunk and chunk[field] is not None:
+            if not _check_scalar(field, chunk[field], low, high, reasons):
+                ok = False
+    return {"ok": ok, "reasons": reasons}
+
+
+def check_token_rate(prior_timestamps, now_epoch,
+                     max_sessions_per_hour=DEFAULT_MAX_SESSIONS_PER_HOUR,
+                     window_seconds=RATE_WINDOW_SECONDS):
+    """T7 rule 2: how many sessions one token may contribute per hour.
+
+    ``prior_timestamps`` is the list of epoch seconds at which this
+    token's sessions were previously ACCEPTED (the server keeps it per
+    token); ``now_epoch`` is the current epoch second. Only timestamps
+    inside (now - window, now] count; older ones have expired and a
+    timestamp in the future is not counted. ``max_sessions_per_hour``
+    is a parameter -- the server passes its own value; the default is
+    the proposal (6/h, see the constants block).
+
+    Returns ``{"allowed": bool, "count_in_window": int,
+    "max_sessions_per_hour": int, "reason": str}``.
+    """
+    count = sum(1 for ts in prior_timestamps
+                if now_epoch - window_seconds < ts <= now_epoch)
+    allowed = count < max_sessions_per_hour
+    return {
+        "allowed": allowed,
+        "count_in_window": count,
+        "max_sessions_per_hour": max_sessions_per_hour,
+        "reason": ("token has %d session(s) in the last %d s (limit %d/h)"
+                   % (count, window_seconds, max_sessions_per_hour))
+                  + ("" if allowed else
+                     ": rate limit exceeded, session rejected"),
+    }
+
+
+def check_replay(session_id, seen_session_ids, error_mean_db=None,
+                 seen_error_tables=None):
+    """T7 replay check: a re-sent old session must not enter twice.
+
+    ``session_id`` is the session's id when the client sends one (None
+    when it does not); ``seen_session_ids`` is the set/list of ids the
+    server already accepted. A repeated id is a replay. Independently,
+    an error table bit-identical to an earlier accepted session's table
+    is a replay too: a genuine new listening session never reproduces
+    24 floats exactly. ``seen_error_tables`` is the list of accepted
+    tables (the server may store hashes instead and compare those --
+    this function compares tables as given).
+
+    Returns ``{"ok": bool, "reason": str}``; ok with an empty reason
+    when there is nothing to object to.
+    """
+    if session_id is not None and session_id in seen_session_ids:
+        return {"ok": False,
+                "reason": "replay: session_id %r was already accepted"
+                          % (session_id,)}
+    if error_mean_db is not None and seen_error_tables:
+        for table in seen_error_tables:
+            if list(table) == list(error_mean_db):
+                return {"ok": False,
+                        "reason": "replay: error table is identical to an "
+                                  "earlier accepted session"}
+    return {"ok": True, "reason": ""}
+
+
+def classify_session_outlier(error_mean_db, aggregate_error_db):
+    """T7 rule 3, classification half: compare one session's 24-band
+    error table against the aggregated profile.
+
+    A band deviates when |session - aggregate| > OUTLIER_DEVIATION_DB
+    (6 dB, proposal). With no aggregate yet (cold start) there is
+    nothing to deviate from and the session is accepted.
+
+    Returns ``{"status": "accepted" | "held", "deviating_bands":
+    {band: signed deviation in dB}, "max_deviation_db": float,
+    "reason": str}``. ``deviating_bands`` uses 1-based ERB indices.
+    """
+    if aggregate_error_db is None:
+        return {"status": "accepted", "deviating_bands": {},
+                "max_deviation_db": 0.0,
+                "reason": "no aggregate profile yet; nothing to compare against"}
+    if len(error_mean_db) != N_BANDS or len(aggregate_error_db) != N_BANDS:
+        raise ValueError("error tables must have exactly 24 bands")
+    deviating = {}
+    max_dev = 0.0
+    for i, (session_err, agg_err) in enumerate(
+            zip(error_mean_db, aggregate_error_db)):
+        dev = session_err - agg_err
+        if abs(dev) > max_dev:
+            max_dev = abs(dev)
+        if abs(dev) > OUTLIER_DEVIATION_DB:
+            deviating[i + 1] = dev
+    if not deviating:
+        return {"status": "accepted", "deviating_bands": {},
+                "max_deviation_db": max_dev,
+                "reason": "max band deviation %.2f dB <= %.1f dB threshold"
+                          % (max_dev, OUTLIER_DEVIATION_DB)}
+    bands = ", ".join("ERB-%d (%+.1f dB)" % (b, d)
+                      for b, d in sorted(deviating.items()))
+    return {"status": "held", "deviating_bands": deviating,
+            "max_deviation_db": max_dev,
+            "reason": "held: band deviation > %.1f dB in %s; enters "
+                      "aggregation only after %d further session(s) "
+                      "confirm the same deviation (same band, same sign)"
+                      % (OUTLIER_DEVIATION_DB, bands,
+                         OUTLIER_CONFIRM_SESSIONS)}
+
+
+def _empty_quarantine_state():
+    return {"held": []}
+
+
+def quarantine_update(state, session_id, error_mean_db, aggregate_error_db):
+    """T7 rule 3, stateful half: hold outliers until 2 sessions confirm.
+
+    ``state`` is ``{"held": [records]}``; a record carries
+    ``session_id``, ``error_mean_db``, ``deviating_bands`` (from
+    :func:`classify_session_outlier`), ``confirmations`` and
+    ``sessions_seen_after``. The function never mutates its input: it
+    returns ``(new_state, decision)``.
+
+    On each incoming session:
+      * every held record ages by one session (``sessions_seen_after``
+        += 1). The incoming session confirms a held record when, in at
+        least one of the record's deviating bands, the incoming
+        deviation from the aggregate has the same sign and exceeds
+        OUTLIER_CONFIRM_DB (3 dB, proposal); that adds one confirmation
+        (at most one per session, however many bands match). The
+        incoming session counts as a confirmer whether it is itself
+        accepted or held -- a real room change produces consecutive
+        deviating sessions.
+      * a record with >= 2 confirmations is RELEASED: it leaves the
+        quarantine and its error table is returned in
+        ``decision["released_sessions"]`` so the server can aggregate
+        it (the room really changed).
+      * a record that has seen 2 further sessions without 2
+        confirmations is DISCARDED: its id is returned in
+        ``decision["discarded_session_ids"]`` and it never enters the
+        aggregate. Release is checked before discard, so a record
+        confirmed on its second following session is released, not
+        discarded.
+      * the incoming session itself is classified; when held it is
+        appended as a new record (confirmations 0).
+
+    ``decision`` is ``{"status": "accepted" | "held", "session_id":
+    ..., "released_sessions": [...], "discarded_session_ids": [...],
+    "reason": str}``. ``status`` describes the incoming session only;
+    releases/discards of older held sessions ride along in the same
+    decision.
+    """
+    state = {"held": [dict(r) for r in state.get("held", [])]}
+    decision = {"status": "accepted", "session_id": session_id,
+                "released_sessions": [], "discarded_session_ids": [],
+                "reason": ""}
+    if aggregate_error_db is None:
+        decision["reason"] = ("no aggregate profile yet; session accepted, "
+                              "quarantine untouched")
+        return state, decision
+
+    incoming = classify_session_outlier(error_mean_db, aggregate_error_db)
+    incoming_dev = [s - a for s, a in zip(error_mean_db, aggregate_error_db)]
+
+    still_held = []
+    for record in state["held"]:
+        record["sessions_seen_after"] += 1
+        confirmed = False
+        for band, dev in record["deviating_bands"].items():
+            incoming_band_dev = incoming_dev[band - 1]
+            if (incoming_band_dev * dev > 0.0
+                    and abs(incoming_band_dev) > OUTLIER_CONFIRM_DB):
+                confirmed = True
+                break
+        if confirmed:
+            record["confirmations"] += 1
+        if record["confirmations"] >= OUTLIER_CONFIRM_SESSIONS:
+            decision["released_sessions"].append({
+                "session_id": record["session_id"],
+                "error_mean_db": list(record["error_mean_db"]),
+            })
+        elif record["sessions_seen_after"] >= OUTLIER_CONFIRM_SESSIONS:
+            decision["discarded_session_ids"].append(record["session_id"])
+        else:
+            still_held.append(record)
+    state["held"] = still_held
+
+    if incoming["status"] == "held":
+        state["held"].append({
+            "session_id": session_id,
+            "error_mean_db": list(error_mean_db),
+            "deviating_bands": dict(incoming["deviating_bands"]),
+            "confirmations": 0,
+            "sessions_seen_after": 0,
+        })
+        decision["status"] = "held"
+    decision["reason"] = incoming["reason"]
+    if decision["released_sessions"]:
+        decision["reason"] += ("; released held session(s) %s (confirmed "
+                               "by %d further session(s))"
+                               % ([r["session_id"]
+                                  for r in decision["released_sessions"]],
+                                  OUTLIER_CONFIRM_SESSIONS))
+    if decision["discarded_session_ids"]:
+        decision["reason"] += ("; discarded held session(s) %s (not "
+                               "confirmed by the next %d session(s))"
+                               % (decision["discarded_session_ids"],
+                                  OUTLIER_CONFIRM_SESSIONS))
+    return state, decision
+
+
+def log_rejection(log, session_id, rule, reason, decision="rejected",
+                  token=None):
+    """T7 rule 4: record every rejection (and every hold) with its reason.
+
+    ``log`` is the server's list of entries; a new list is returned, the
+    input is not mutated. An entry is ``{"session_id": ..., "token":
+    ..., "rule": ..., "decision": "rejected" | "held", "reason": ...}``.
+    The server stamps the entry with its own timestamp when it persists
+    it -- this module has no clock. ``rule`` is one of
+    ``chunk_out_of_range``, ``replay``, ``rate_limit``, ``outlier_hold``.
+    """
+    entry = {"session_id": session_id, "token": token, "rule": rule,
+             "decision": decision, "reason": reason}
+    return list(log) + [entry]
+
+
+def rejection_summary(log):
+    """Count a rejection log by rule and by decision, for the server's
+    triage view. Returns ``{"total": int, "by_rule": {...},
+    "by_decision": {...}}``."""
+    by_rule = {}
+    by_decision = {}
+    for entry in log:
+        by_rule[entry.get("rule", "?")] = by_rule.get(entry.get("rule", "?"), 0) + 1
+        by_decision[entry.get("decision", "?")] = (
+            by_decision.get(entry.get("decision", "?"), 0) + 1)
+    return {"total": len(log), "by_rule": by_rule, "by_decision": by_decision}
+
+
+def gate_session(session, aggregate_error_db, token_history, now_epoch,
+                 quarantine_state, rejection_log, token=None,
+                 seen_session_ids=None, seen_error_tables=None,
+                 max_sessions_per_hour=DEFAULT_MAX_SESSIONS_PER_HOUR):
+    """T7 entry point: gate ONE incoming session before aggregation.
+
+    Runs the rules in order; the first failure stops the pipeline and
+    the session never enters the aggregate:
+      1. :func:`validate_chunk` -- physically impossible values.
+      2. :func:`check_replay` -- re-sent session_id or identical table.
+      3. :func:`check_token_rate` -- sessions per hour for this token.
+      4. :func:`quarantine_update` -- per-band outlier hold.
+
+    ``session`` is the chunk dict (with optional ``session_id``);
+    ``aggregate_error_db`` is the current aggregated 24-band table (None
+    on cold start); ``token_history`` the token's accepted-session epoch
+    timestamps; ``now_epoch`` the current epoch second;
+    ``quarantine_state`` / ``rejection_log`` the server-kept state
+    (both returned updated, inputs untouched); ``seen_session_ids`` /
+    ``seen_error_tables`` the replay state (empty when the server does
+    not track it -- the replay check then only covers what is given).
+
+    Returns ``{"decision": {...}, "quarantine_state": ...,
+    "rejection_log": ...}``. ``decision`` is ``{"status": "accepted" |
+    "held" | "rejected", "reason": str, "released_sessions": [...],
+    "discarded_session_ids": [...]}``. On "accepted" the server
+    aggregates the session (and any released held sessions) and records
+    ``now_epoch`` in the token history, the session_id in the seen set,
+    and the error table in the seen tables. On "held" the server
+    aggregates nothing yet. On "rejected" the server aggregates
+    nothing and the reason is already in the returned rejection log.
+    """
+    session_id = session.get("session_id") if isinstance(session, dict) else None
+    released = []
+    discarded = []
+
+    check = validate_chunk(session)
+    if not check["ok"]:
+        reason = "chunk_out_of_range: " + "; ".join(check["reasons"])
+        new_log = log_rejection(rejection_log, session_id,
+                                "chunk_out_of_range", reason,
+                                decision="rejected", token=token)
+        return {"decision": {"status": "rejected", "reason": reason,
+                             "released_sessions": released,
+                             "discarded_session_ids": discarded},
+                "quarantine_state": quarantine_state,
+                "rejection_log": new_log}
+
+    replay = check_replay(session_id, seen_session_ids or [],
+                          error_mean_db=session.get("error_mean_db"),
+                          seen_error_tables=seen_error_tables)
+    if not replay["ok"]:
+        new_log = log_rejection(rejection_log, session_id, "replay",
+                                replay["reason"], decision="rejected",
+                                token=token)
+        return {"decision": {"status": "rejected", "reason": replay["reason"],
+                             "released_sessions": released,
+                             "discarded_session_ids": discarded},
+                "quarantine_state": quarantine_state,
+                "rejection_log": new_log}
+
+    rate = check_token_rate(token_history, now_epoch,
+                            max_sessions_per_hour=max_sessions_per_hour)
+    if not rate["allowed"]:
+        new_log = log_rejection(rejection_log, session_id, "rate_limit",
+                                rate["reason"], decision="rejected",
+                                token=token)
+        return {"decision": {"status": "rejected", "reason": rate["reason"],
+                             "released_sessions": released,
+                             "discarded_session_ids": discarded},
+                "quarantine_state": quarantine_state,
+                "rejection_log": new_log}
+
+    new_state, q_decision = quarantine_update(
+        quarantine_state, session_id, session["error_mean_db"],
+        aggregate_error_db)
+    status = q_decision["status"]
+    new_log = rejection_log
+    if status == "held":
+        new_log = log_rejection(rejection_log, session_id, "outlier_hold",
+                                q_decision["reason"], decision="held",
+                                token=token)
+    return {"decision": {"status": status, "reason": q_decision["reason"],
+                         "released_sessions": q_decision["released_sessions"],
+                         "discarded_session_ids": q_decision["discarded_session_ids"]},
+            "quarantine_state": new_state,
+            "rejection_log": new_log}
 
 
 # ---------------------------------------------------------------------------

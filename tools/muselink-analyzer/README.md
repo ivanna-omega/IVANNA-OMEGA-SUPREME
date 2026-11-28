@@ -19,7 +19,7 @@ constant in `analyzer.py`, taken from the specifications, never invented.
 - `refactorizacion-muselink-autonoma.md` §2.3 (deterministic analyzer),
   §4 (A/B machine, the 5 original promotion gates), §6 (v1.1 candidate).
 - `evolucion-magistral-autonomia-completa.md` §§S2, S5 (via B), S6, S8,
-  S9 (server side).
+  S9 (server side), **T7 (anti-poisoning, before aggregation)**.
 - Baseline fixed by the specs: spectral error RMS **10.46 dB** (v1.1
   profile), promotion target **≤ 8.37 dB** (0.8 × 10.46).
 
@@ -28,7 +28,7 @@ constant in `analyzer.py`, taken from the specifications, never invented.
 | File | What it is |
 |---|---|
 | `analyzer.py` | The rules. Pure functions + documented constants. |
-| `test_analyzer.py` | `unittest` suite (stdlib only). Run `python3 -m unittest test_analyzer -v` from this directory. |
+| `test_analyzer.py` | `unittest` suite (stdlib only, 70 tests). Run `python3 -m unittest test_analyzer -v` from this directory, or `python3 -m unittest discover -s tools/muselink-analyzer` from the repo root. |
 | `README.md` | This file. |
 
 ## Inputs / outputs
@@ -205,15 +205,79 @@ measurement.
 2. Feed it the compiled 24-band table the compiler already maintains
    (`errorMeanDb`, per-band coherence, `meanCoherence`,
    `spectralErrorRmsDb`, `levelMeanDbfs`, `levelMaxDbfs` per chunk).
-3. On each new compiled profile, call `compile_candidate(...)`; publish
+3. **T7 first: on every incoming session, call `gate_session(...)`
+   BEFORE the session enters the aggregate** (see §T7 below). Only a
+   session with decision `accepted` is aggregated; a `held` session
+   waits in the quarantine state; a `rejected` session never enters.
+   The server must persist, per token, the accepted-session timestamps,
+   the seen session_ids / error tables (or their hashes), the
+   quarantine state and the rejection log — all of it is passed in and
+   returned by `gate_session`, never stored by this module.
+4. On each new compiled profile, call `compile_candidate(...)`; publish
    the returned v1.1a / v1.1b as `candidate` versions through the
    existing `GET /api/v1/muse/ivanna/profile/current` endpoint.
-4. On the 3 A/B sessions of a candidate, call `evaluate_ab(base_3,
+5. On the 3 A/B sessions of a candidate, call `evaluate_ab(base_3,
    candidate_3)`; publish `promoted` or `rolled_back` from its verdict.
-5. After a promotion, the next rung of `ladder` becomes the next
+6. After a promotion, the next rung of `ladder` becomes the next
    candidate (each rung gets its own A/B; a failed rung rolls back to
    the previous rung, never to v1.0 directly unless the whole climb is
    abandoned).
+
+### T7 — Anti-poisoning: reject anomalous sessions before compiling
+
+Closes ARTEX risk no. 2 (C17): a corrupt, replayed or malicious session
+must not poison the profile that later self-applies. The A/B compares
+against a baseline but cannot tell "a real room that changed" from
+"false data", so the defence runs **before aggregation**, in this
+order, via `gate_session(session, aggregate_error_db, token_history,
+now_epoch, quarantine_state, rejection_log, ...)`:
+
+| # | Rule | Function | Behaviour |
+|---|---|---|---|
+| 1 | Physical ranges | `validate_chunk` | Rejects a chunk with a non-finite value (NaN/inf) or a value outside its physical range: per-band `errorDb` ±40 dB, `magnitudeDb` −120…0 dBFS, coherence 0…1, `levelMean/levelMax` −120…0 dBFS, `spectralErrorRmsDb` 0…40 dB, `erbStdDb` 0…40 dB, `crest` 0…60 dB, `lufs` −70…0 dB. Every reason names the field, the band and the offending value. |
+| 2 | Replay | `check_replay` | Rejects a `session_id` already accepted, or an error table bit-identical to an earlier accepted session (a genuine new session never reproduces 24 floats exactly). |
+| 3 | Per-token rate | `check_token_rate` | Rejects when the token already contributed `max_sessions_per_hour` sessions inside the last hour (default **6/h**). The limit is a **parameter** of `gate_session` — the server passes its own value, because it is the one that knows the token. |
+| 4 | Per-band outlier hold | `classify_session_outlier` + `quarantine_update` | A session deviating **> 6 dB** in any band from the aggregated profile is **held, not aggregated**, until **2 further sessions** confirm the same deviation (same band, same sign, > 3 dB). Confirmed → released and aggregated (the room really changed). Not confirmed by the next 2 sessions → discarded. A held session is logged as `held`, not as a rejection. |
+| — | Audit | `log_rejection` / `rejection_summary` | Every rejection and every hold is recorded with `session_id`, `token`, `rule` (`chunk_out_of_range` / `replay` / `rate_limit` / `outlier_hold`), `decision` (`rejected` / `held`) and a human-readable `reason`. The module has no clock: the server stamps entries with its own timestamp when it persists them. |
+
+**Thresholds — proposals, not measured data.** The T7 proposal leaves
+the thresholds to the implementer when Esse does not fix them. Every
+number above is a reasoned proposal from the known data, and each one
+is a named constant in `analyzer.py` so the server can tune it from
+measured data without touching the rules:
+
+- **Error ±40 dB:** the v1.1 measured band errors span −12…+9.86 dB; a
+  ±40 dB error in one ERB band means 100× energy excess/deficit and is
+  not a measurement of this system.
+- **Magnitude −120…0 dBFS:** 0 dBFS is digital full scale (not a
+  proposal); −120 dBFS is far below the 16-bit noise floor (−96 dBFS).
+- **Coherence 0…1, crest ≥ 0:** by definition, not proposals.
+- **Rate 6/h:** an A/B needs 3 sessions per side and a phone flushes at
+  most a few listening sessions per hour in real use; 6/h is generous
+  for one token and still blocks a replay flood.
+- **Outlier > 6 dB, confirm > 3 dB:** 6 dB is well above the 1 dB
+  correction deadband and above any plausible single-band drift of a
+  real room change, while a genuine change (mic/speakers moved)
+  reappears in the next sessions and confirms; the confirmation bar is
+  half the hold bar so a real but weaker repeat still counts.
+- **2 confirmations:** fixed by the T7 proposal itself ("hasta que se
+  confirme en 2 sesiones más").
+
+**What the server must do on each `gate_session` result:**
+
+- `accepted` → aggregate the session (and any `released_sessions`
+  returned in the decision), then record `now_epoch` in the token's
+  history, the `session_id` in the seen set and the error table in the
+  seen tables (or their hashes).
+- `held` → aggregate nothing yet; keep the returned
+  `quarantine_state` for the next sessions.
+- `rejected` → aggregate nothing; the reason is already in the
+  returned `rejection_log` — persist it (with the server's timestamp)
+  and surface it in triage (`rejection_summary` counts by rule).
+
+**Cold start:** with no aggregate profile yet, the outlier rule has
+nothing to compare against and accepts the session; the range, replay
+and rate rules still apply.
 
 The phone side (ProfileFetcher / ProfileApplier, next release) is
 unchanged by this module except for one obligation it already carries
@@ -258,6 +322,16 @@ is marked `ab_measurement_only`.
   levelMax pegged at −0.1 dBFS, `lufs()`) but gives no numbers for
   them. They are named constants (`AB_CREST_DROP_MAX_DB`,
   `AB_LUFS_MATCH_DB`) so the server can tune them from measured data.
+- **T7 thresholds are proposals, not measured data** (see §T7 above):
+  the T7 proposal leaves them to the implementer when Esse does not
+  fix them. Error ±40 dB, magnitude −120…0 dBFS, rate 6/h, outlier
+  > 6 dB with confirmation > 3 dB in 2 sessions — each is a named
+  constant (`CHUNK_*`, `DEFAULT_MAX_SESSIONS_PER_HOUR`,
+  `OUTLIER_DEVIATION_DB`, `OUTLIER_CONFIRM_DB`,
+  `OUTLIER_CONFIRM_SESSIONS`) for Esse to confirm or adjust. The
+  rate limit is a parameter of `gate_session`, not a buried constant.
+  The 0 dBFS / coherence 0…1 / crest ≥ 0 bounds follow from the
+  definitions and are not proposals.
 - **S8(a) transition bands (ERB 10–12)** belong to no named S8 region
   group in the spec; they are covered only by the global RMS gate.
   This is documented in the code, not silently assigned to a group.

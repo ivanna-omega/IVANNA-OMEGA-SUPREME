@@ -49,6 +49,13 @@ import java.io.File
  *      máximo y el usuario puede borrarla entera desde la tarjeta
  *      (clearQueue). Los JSON están en filesDir (privado de la app,
  *      sin cifrar en reposo).
+ *   6. FOREGROUND SERVICE (v2.5.510, fix del «nada» de la 509): sin
+ *      servicio en primer plano, al salir de la app Android congela
+ *      el proceso y silencia el mic, así que el organismo no captura
+ *      ni envía nada. start() arranca OrganismForegroundService
+ *      (tipo microphone, notificación persistente) y stop() lo
+ *      detiene al final. El servicio solo mantiene vivo el proceso;
+ *      la captura y el envío siguen aquí.
  *
  * ESTADO (el indicador de la UI):
  *   Capturando / En cola / Sin conexión / Error recuperable, más los
@@ -56,7 +63,10 @@ import java.io.File
  *
  * LÍMITES HONESTOS (consejo, no se esconden):
  *   * Android exige RECORD_AUDIO (una vez, revocable) y la notificación
- *     persistente del foreground service para captura prolongada.
+ *     persistente del foreground service para captura prolongada
+ *     (v2.5.510: OrganismForegroundService, tipo microphone; sin
+ *     RECORD_AUDIO no se arranca el servicio y el organismo corre sin
+ *     primer plano, como en la 509).
  *   * Si el token expira sin endpoint de refresh, hay que reautorizar
  *     una vez (el estado lo dice: "Token inválido").
  */
@@ -477,6 +487,17 @@ object OrganismController {
             _state.value = State(status = Status.OFF, enabled = false)
             return
         }
+        // 510 — FOREGROUND SERVICE (fix del «nada» de la 509): sin
+        // servicio en primer plano, al salir de la app Android congela
+        // el proceso (do_freezer_trap) y silencia el mic, así que el
+        // organismo no captura ni envía nada. El servicio solo mantiene
+        // vivo el proceso; la captura y el envío siguen en este
+        // controlador. Va ANTES del early-return de scope != null para
+        // re-asegurar el servicio si murió con el controlador vivo.
+        // Idempotente y con runCatching dentro (si el arranque desde
+        // segundo plano está restringido — p. ej. restore en boot — se
+        // registra y se reintenta en la próxima apertura; sin crash).
+        OrganismForegroundService.start(ctx)
         if (scope != null) {
             refreshState()
             return
@@ -597,6 +618,11 @@ object OrganismController {
         rollbackAttemptedThisBoot = false
         _state.value = State(status = Status.OFF, enabled = false)
         Log.i(TAG, "Organismo detenido (sin tráfico al organismo)")
+        // 510 — el servicio es hijo del interruptor maestro: solo vive
+        // mientras el organismo está enabled. Se detiene AL FINAL de
+        // stop(), para que el proceso siga en primer plano mientras se
+        // cierra la sesión y el chunk final queda durable en la cola.
+        appContext?.let { OrganismForegroundService.stop(it) }
     }
 
     /** Borra toda la cola local (defecto #9). Devuelve cuántos se borraron. */

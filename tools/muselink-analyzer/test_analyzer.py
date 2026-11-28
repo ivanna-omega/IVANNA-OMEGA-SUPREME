@@ -18,24 +18,37 @@ from analyzer import (
     AB_REGIONS,
     APEX_CEILING_DBFS,
     BASELINE_RMS_DB,
+    CHUNK_ERROR_DB_MAX,
     COHERENCE_GUARD,
     COMB_FIT_D_MAX_M,
     COMB_FIT_D_MIN_M,
+    DEFAULT_MAX_SESSIONS_PER_HOUR,
     ERB_CENTER_HZ,
     EQ_CLAMP_DB,
     LADDER_STEP_DB,
+    OUTLIER_CONFIRM_DB,
+    OUTLIER_CONFIRM_SESSIONS,
+    OUTLIER_DEVIATION_DB,
     REGIONS,
     TARGET_RMS_DB,
+    check_replay,
+    check_token_rate,
+    classify_session_outlier,
     coherence_guard,
     compile_candidate,
     detect_resonances,
     emit_ladder,
     evaluate_ab,
     fit_comb_vs_response,
+    gate_session,
+    log_rejection,
     precheck_headroom,
+    quarantine_update,
     region_rms,
     regional_correction,
+    rejection_summary,
     split_cut_boost,
+    validate_chunk,
 )
 
 SPEED_OF_SOUND_M_S = 343.0
@@ -420,6 +433,362 @@ class TestCompileCandidatePipeline(unittest.TestCase):
         self.assertEqual(out["split"]["v1_1a"]["eq_bands_db"],
                          {"low_60_120": -2.0})
         self.assertIsNone(out["split"]["v1_1b"])  # v1.1a not yet promoted
+
+
+class TestT7ValidateChunk(unittest.TestCase):
+    """T7 rule 1: physically impossible chunk values are rejected.
+
+    All anomalous chunks below are SYNTHETIC (hand-built to violate one
+    bound); the valid chunk is the v1.1 synthetic error table plus
+    plausible telemetry."""
+
+    def _chunk(self, **overrides):
+        chunk = {
+            "error_mean_db": list(V1_1_ERROR_DB),
+            "magnitude_db": [-20.0] * 24,
+            "coherence": [0.5] * 24,
+            "mean_coherence": 0.5,
+            "level_max_dbfs": -6.0,
+            "level_mean_dbfs": -18.0,
+            "spectral_error_rms_db": 10.46,
+            "erb_std_db": [0.3] * 24,
+            "crest_db": 12.0,
+            "lufs": -18.0,
+        }
+        chunk.update(overrides)
+        return chunk
+
+    def test_valid_chunk_passes(self):
+        self.assertTrue(validate_chunk(self._chunk())["ok"])
+
+    def test_only_error_table_is_required(self):
+        self.assertTrue(validate_chunk(
+            {"error_mean_db": list(V1_1_ERROR_DB)})["ok"])
+
+    def test_nan_error_is_rejected(self):
+        chunk = self._chunk()
+        chunk["error_mean_db"][4] = float("nan")
+        result = validate_chunk(chunk)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("ERB-5" in r and "finite" in r
+                            for r in result["reasons"]))
+
+    def test_infinite_magnitude_is_rejected(self):
+        chunk = self._chunk()
+        chunk["magnitude_db"][0] = float("inf")
+        self.assertFalse(validate_chunk(chunk)["ok"])
+
+    def test_error_beyond_plus_40_db_is_rejected_with_band(self):
+        chunk = self._chunk()
+        chunk["error_mean_db"][4] = 45.0  # ERB-5, +45 dB: impossible
+        result = validate_chunk(chunk)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("ERB-5" in r and "45.00" in r
+                            for r in result["reasons"]))
+
+    def test_error_below_minus_40_db_is_rejected(self):
+        chunk = self._chunk(error_mean_db=[-41.0] * 24)
+        self.assertFalse(validate_chunk(chunk)["ok"])
+
+    def test_magnitude_above_0_dbfs_is_rejected(self):
+        chunk = self._chunk(magnitude_db=[3.0] * 24)
+        result = validate_chunk(chunk)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("magnitude_db" in r for r in result["reasons"]))
+
+    def test_coherence_above_1_is_rejected(self):
+        chunk = self._chunk(coherence=[1.2] * 24)
+        self.assertFalse(validate_chunk(chunk)["ok"])
+
+    def test_level_max_above_0_dbfs_is_rejected(self):
+        chunk = self._chunk(level_max_dbfs=0.5)
+        result = validate_chunk(chunk)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("level_max_dbfs" in r for r in result["reasons"]))
+
+    def test_wrong_band_count_is_rejected(self):
+        chunk = self._chunk(error_mean_db=[0.0] * 23)
+        result = validate_chunk(chunk)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("23 bands" in r for r in result["reasons"]))
+
+    def test_missing_error_table_is_rejected(self):
+        self.assertFalse(validate_chunk({"level_max_dbfs": -6.0})["ok"])
+
+    def test_negative_crest_is_rejected(self):
+        self.assertFalse(validate_chunk(self._chunk(crest_db=-1.0))["ok"])
+
+
+class TestT7TokenRate(unittest.TestCase):
+    def test_under_limit_is_allowed(self):
+        now = 1_000_000
+        prior = [now - 600 * i for i in range(5)]  # 5 in the last hour
+        result = check_token_rate(prior, now)
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["count_in_window"], 5)
+
+    def test_at_limit_is_rejected(self):
+        now = 1_000_000
+        prior = [now - 600 * i for i in range(DEFAULT_MAX_SESSIONS_PER_HOUR)]
+        result = check_token_rate(prior, now)
+        self.assertFalse(result["allowed"])
+        self.assertIn("rate limit exceeded", result["reason"])
+
+    def test_timestamps_older_than_one_hour_do_not_count(self):
+        now = 1_000_000
+        prior = [now - 4000] * 10  # 10 sessions, all > 1 h ago
+        result = check_token_rate(prior, now)
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["count_in_window"], 0)
+
+    def test_limit_is_a_parameter_not_a_buried_constant(self):
+        now = 1_000_000
+        prior = [now - 100, now - 200]
+        self.assertTrue(check_token_rate(prior, now, max_sessions_per_hour=3)["allowed"])
+        self.assertFalse(check_token_rate(prior, now, max_sessions_per_hour=2)["allowed"])
+
+
+class TestT7Replay(unittest.TestCase):
+    def test_fresh_session_passes(self):
+        result = check_replay("s-1", {"s-0"}, list(V1_1_ERROR_DB),
+                              [list(V1_1_ERROR_DB)])
+        # Same table as a seen one -> replay even with a fresh id.
+        self.assertFalse(result["ok"])
+        result = check_replay("s-1", {"s-0"}, [0.0] * 24,
+                              [list(V1_1_ERROR_DB)])
+        self.assertTrue(result["ok"])
+
+    def test_repeated_session_id_is_replay(self):
+        result = check_replay("s-1", {"s-1", "s-0"})
+        self.assertFalse(result["ok"])
+        self.assertIn("already accepted", result["reason"])
+
+    def test_identical_error_table_is_replay(self):
+        result = check_replay("s-9", {"s-0"}, list(V1_1_ERROR_DB),
+                              [list(V1_1_ERROR_DB)])
+        self.assertFalse(result["ok"])
+        self.assertIn("identical", result["reason"])
+
+    def test_no_tracking_state_means_nothing_to_object_to(self):
+        self.assertTrue(check_replay(None, set())["ok"])
+
+
+class TestT7OutlierHold(unittest.TestCase):
+    AGGREGATE = V1_1_ERROR_DB
+
+    def _deviating(self, band, deviation_db):
+        """Synthetic session: aggregate with one band shifted."""
+        err = list(self.AGGREGATE)
+        err[band - 1] += deviation_db
+        return err
+
+    def test_session_within_threshold_is_accepted(self):
+        result = classify_session_outlier(self._deviating(5, 5.0),
+                                          self.AGGREGATE)
+        self.assertEqual(result["status"], "accepted")
+
+    def test_deviation_exactly_at_threshold_is_accepted(self):
+        result = classify_session_outlier(
+            self._deviating(5, OUTLIER_DEVIATION_DB), self.AGGREGATE)
+        self.assertEqual(result["status"], "accepted")
+
+    def test_session_beyond_threshold_is_held_with_band_and_reason(self):
+        result = classify_session_outlier(self._deviating(5, 8.0),
+                                          self.AGGREGATE)
+        self.assertEqual(result["status"], "held")
+        self.assertEqual(result["deviating_bands"], {5: 8.0})
+        self.assertAlmostEqual(result["max_deviation_db"], 8.0)
+        self.assertIn("ERB-5", result["reason"])
+
+    def test_no_aggregate_means_accepted(self):
+        result = classify_session_outlier(self._deviating(5, 30.0), None)
+        self.assertEqual(result["status"], "accepted")
+
+    def test_two_confirmations_release_the_held_session(self):
+        state = {"held": []}
+        # S1 deviates +8 dB in ERB-5 -> held.
+        state, d1 = quarantine_update(state, "s1", self._deviating(5, 8.0),
+                                      self.AGGREGATE)
+        self.assertEqual(d1["status"], "held")
+        self.assertEqual(len(state["held"]), 1)
+        # S2 deviates +5 dB, same band and sign: accepted itself (<= 6 dB)
+        # and counts as confirmation 1 for S1.
+        state, d2 = quarantine_update(state, "s2", self._deviating(5, 5.0),
+                                      self.AGGREGATE)
+        self.assertEqual(d2["status"], "accepted")
+        self.assertEqual(state["held"][0]["confirmations"], 1)
+        self.assertEqual(d2["released_sessions"], [])
+        # S3 deviates +4 dB, same band and sign: confirmation 2 -> S1 released.
+        state, d3 = quarantine_update(state, "s3", self._deviating(5, 4.0),
+                                      self.AGGREGATE)
+        self.assertEqual(len(state["held"]), 0)
+        self.assertEqual(len(d3["released_sessions"]), 1)
+        self.assertEqual(d3["released_sessions"][0]["session_id"], "s1")
+        self.assertEqual(d3["released_sessions"][0]["error_mean_db"],
+                         self._deviating(5, 8.0))
+
+    def test_no_confirmation_in_two_sessions_discards(self):
+        state = {"held": []}
+        state, _ = quarantine_update(state, "s1", self._deviating(5, 8.0),
+                                     self.AGGREGATE)
+        # Two ordinary sessions follow: no confirmation either time.
+        state, _ = quarantine_update(state, "s2", list(self.AGGREGATE),
+                                     self.AGGREGATE)
+        self.assertEqual(len(state["held"]), 1)
+        state, d3 = quarantine_update(state, "s3", list(self.AGGREGATE),
+                                      self.AGGREGATE)
+        self.assertEqual(len(state["held"]), 0)
+        self.assertEqual(d3["discarded_session_ids"], ["s1"])
+        self.assertEqual(d3["released_sessions"], [])
+
+    def test_opposite_sign_does_not_confirm(self):
+        state = {"held": []}
+        state, _ = quarantine_update(state, "s1", self._deviating(5, 8.0),
+                                     self.AGGREGATE)
+        # Two sessions deviate the OTHER way in ERB-5: same magnitude
+        # band, opposite sign -- not a confirmation of S1.
+        state, _ = quarantine_update(state, "s2", self._deviating(5, -5.0),
+                                     self.AGGREGATE)
+        self.assertEqual(state["held"][0]["confirmations"], 0)
+        state, d3 = quarantine_update(state, "s3", self._deviating(5, -5.0),
+                                      self.AGGREGATE)
+        self.assertEqual(d3["discarded_session_ids"], ["s1"])
+
+    def test_confirmation_below_half_threshold_does_not_count(self):
+        state = {"held": []}
+        state, _ = quarantine_update(state, "s1", self._deviating(5, 8.0),
+                                     self.AGGREGATE)
+        # +2 dB in ERB-5 is the same direction but below the 3 dB
+        # confirmation bar (OUTLIER_CONFIRM_DB).
+        state, _ = quarantine_update(state, "s2", self._deviating(5, 2.0),
+                                     self.AGGREGATE)
+        self.assertEqual(state["held"][0]["confirmations"], 0)
+
+    def test_one_confirmation_then_silence_discards(self):
+        state = {"held": []}
+        state, _ = quarantine_update(state, "s1", self._deviating(5, 8.0),
+                                     self.AGGREGATE)
+        state, _ = quarantine_update(state, "s2", self._deviating(5, 5.0),
+                                     self.AGGREGATE)
+        self.assertEqual(state["held"][0]["confirmations"], 1)
+        state, d3 = quarantine_update(state, "s3", list(self.AGGREGATE),
+                                      self.AGGREGATE)
+        self.assertEqual(d3["discarded_session_ids"], ["s1"])
+
+    def test_quarantine_does_not_mutate_its_input(self):
+        state = {"held": []}
+        state1, _ = quarantine_update(state, "s1", self._deviating(5, 8.0),
+                                      self.AGGREGATE)
+        self.assertEqual(state, {"held": []})
+        self.assertEqual(len(state1["held"]), 1)
+
+
+class TestT7GateSession(unittest.TestCase):
+    NOW = 1_000_000
+
+    def _session(self, session_id, error_db=None, **overrides):
+        session = {
+            "session_id": session_id,
+            "error_mean_db": list(error_db if error_db is not None
+                                  else V1_1_ERROR_DB),
+            "mean_coherence": 0.5,
+            "level_max_dbfs": -6.0,
+            "level_mean_dbfs": -18.0,
+            "spectral_error_rms_db": 10.46,
+        }
+        session.update(overrides)
+        return session
+
+    def _gate(self, session, **kwargs):
+        kwargs.setdefault("aggregate_error_db", V1_1_ERROR_DB)
+        kwargs.setdefault("token_history", [])
+        kwargs.setdefault("now_epoch", self.NOW)
+        kwargs.setdefault("quarantine_state", {"held": []})
+        kwargs.setdefault("rejection_log", [])
+        return gate_session(session, **kwargs)
+
+    def test_clean_session_is_accepted_and_log_stays_empty(self):
+        out = self._gate(self._session("s1"))
+        self.assertEqual(out["decision"]["status"], "accepted")
+        self.assertEqual(out["rejection_log"], [])
+        self.assertEqual(out["quarantine_state"], {"held": []})
+
+    def test_out_of_range_chunk_is_rejected_with_reason_logged(self):
+        bad = self._session("s1")
+        bad["error_mean_db"][4] = 45.0
+        out = self._gate(bad)
+        self.assertEqual(out["decision"]["status"], "rejected")
+        self.assertIn("chunk_out_of_range", out["decision"]["reason"])
+        self.assertEqual(len(out["rejection_log"]), 1)
+        entry = out["rejection_log"][0]
+        self.assertEqual(entry["rule"], "chunk_out_of_range")
+        self.assertEqual(entry["decision"], "rejected")
+        self.assertEqual(entry["session_id"], "s1")
+        self.assertIn("ERB-5", entry["reason"])
+
+    def test_replayed_session_is_rejected_and_logged(self):
+        session = self._session("s1", error_db=[0.0] * 24)
+        out = self._gate(session, seen_session_ids={"s1"})
+        self.assertEqual(out["decision"]["status"], "rejected")
+        self.assertEqual(out["rejection_log"][0]["rule"], "replay")
+
+    def test_rate_limited_session_is_rejected_and_logged(self):
+        history = [self.NOW - 600 * i
+                   for i in range(DEFAULT_MAX_SESSIONS_PER_HOUR)]
+        out = self._gate(self._session("s1"), token_history=history)
+        self.assertEqual(out["decision"]["status"], "rejected")
+        self.assertEqual(out["rejection_log"][0]["rule"], "rate_limit")
+
+    def test_outlier_session_is_held_not_rejected_and_logged_as_held(self):
+        err = list(V1_1_ERROR_DB)
+        err[4] += 8.0  # ERB-5 +8 dB vs aggregate
+        out = self._gate(self._session("s1", error_db=err))
+        self.assertEqual(out["decision"]["status"], "held")
+        self.assertEqual(len(out["quarantine_state"]["held"]), 1)
+        self.assertEqual(len(out["rejection_log"]), 1)
+        self.assertEqual(out["rejection_log"][0]["rule"], "outlier_hold")
+        self.assertEqual(out["rejection_log"][0]["decision"], "held")
+
+    def test_held_session_is_released_after_two_confirmations_via_gate(self):
+        err = list(V1_1_ERROR_DB)
+        err[4] += 8.0
+        out = self._gate(self._session("s1", error_db=err))
+        state, log = out["quarantine_state"], out["rejection_log"]
+        err2 = list(V1_1_ERROR_DB)
+        err2[4] += 5.0
+        out = self._gate(self._session("s2", error_db=err2),
+                         quarantine_state=state, rejection_log=log)
+        self.assertEqual(out["decision"]["status"], "accepted")
+        state, log = out["quarantine_state"], out["rejection_log"]
+        err3 = list(V1_1_ERROR_DB)
+        err3[4] += 4.0
+        out = self._gate(self._session("s3", error_db=err3),
+                         quarantine_state=state, rejection_log=log)
+        self.assertEqual(
+            [r["session_id"] for r in out["decision"]["released_sessions"]],
+            ["s1"])
+
+    def test_rejection_summary_counts_by_rule(self):
+        log = []
+        log = log_rejection(log, "a", "chunk_out_of_range", "bad value")
+        log = log_rejection(log, "b", "rate_limit", "too many")
+        log = log_rejection(log, "c", "rate_limit", "too many")
+        log = log_rejection(log, "d", "outlier_hold", "held", decision="held")
+        summary = rejection_summary(log)
+        self.assertEqual(summary["total"], 4)
+        self.assertEqual(summary["by_rule"],
+                         {"chunk_out_of_range": 1, "rate_limit": 2,
+                          "outlier_hold": 1})
+        self.assertEqual(summary["by_decision"],
+                         {"rejected": 3, "held": 1})
+
+    def test_gate_does_not_mutate_input_state(self):
+        state = {"held": []}
+        log = []
+        self._gate(self._session("s1"), quarantine_state=state,
+                   rejection_log=log)
+        self.assertEqual(state, {"held": []})
+        self.assertEqual(log, [])
 
 
 if __name__ == "__main__":
