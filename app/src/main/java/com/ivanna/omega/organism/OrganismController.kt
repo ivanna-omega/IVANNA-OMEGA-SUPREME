@@ -113,6 +113,39 @@ import java.io.File
  *      valor inválido se ignora en el fetcher, jamás pone el perfil
  *      en cuarentena. No se persiste: tras un reinicio vuelve a
  *      `unknown` hasta el primer sondeo (60 s).
+ *  11. TOPE DE EXCURSIÓN ACUMULADA + ANTICHURN (T6/510): el ciclo
+ *      sigue solo dentro de un corral seguro. (a) El TOPE DE
+ *      EXCURSIÓN por slot (±4 dB vs línea base de fábrica) y el freno
+ *      de UNA promoción por día viven en el ANALIZADOR
+ *      (`tools/muselink-analyzer/analyzer.py`: `gate_promotion`, con
+ *      el tope como default EXPLÍCITO pendiente de confirmación de
+ *      Esse — la propuesta lo deja a su decisión y solo lo ejemplifica
+ *      con «p. ej. ±4 dB»; ver README §T6 del analizador). El teléfono
+ *      NO re-chequea la excursión: C2 ya clampéa cada slot a ±2 dB
+ *      por versión, así que un solo perfil jamás la rompe; la deriva
+ *      acumulada es la que gatea el analizador antes de publicar. (b)
+ *      En el teléfono: DWELL mínimo — una versión debe ser la misma
+ *      en 2 sondeos consecutivos antes de aplicarse; TOPE diario —
+ *      máximo 2 aplicaciones automáticas por día (los rollbacks de
+ *      seguridad están exentos: son la salida de emergencia, no una
+ *      promoción), al superarlo estado visible y espera al día
+ *      siguiente (el contador persiste en SharedPreferences para que
+ *      un reinicio no lo reinicie); CUARENTENA DE VERSIÓN — una
+ *      versión que hizo rollback queda vetada 24 h con su hash
+ *      ([ProfileApplier.vetoVersion], lista junto al estable) aunque
+ *      el servidor la vuelva a publicar como `candidate`; TIMEOUT
+ *      DEL A/B — si `AB_RUNNING` no completa 3 sesiones en 4 h (sin
+ *      música, por ejemplo), rollback automático al estable sin
+ *      esperar al servidor (una sesión se completa cuando llega un
+ *      chunk con otro sessionId; el contador es un proxy del lado del
+ *      teléfono — el servidor cuenta las sesiones por su
+ *      lado con la atribución T2). (c) El INTERRUPTOR MAESTRO apaga
+ *      también el sondeo: `pollJob` ya era hijo del mismo `scope`
+ *      que `flushJob` (T1) y `pollProfileOnce` comprueba `isEnabled()`
+ *      en cada tick, no solo al arrancar — T6 lo verifica, no lo
+ *      cambia. Todo el estado T6 vive en el State y la tarjeta lo
+ *      muestra cuando hay algo que ver (dwell pendiente, tope
+ *      alcanzado, veto vigente, A/B en curso, último timeout).
  *
  * ESTADO (el indicador de la UI):
  *   Capturando / En cola / Sin conexión / Error recuperable, más los
@@ -136,6 +169,10 @@ object OrganismController {
     private const val KEY_ENABLED = "organism_enabled"
     /** C21/510: fecha (epoch ms) del último 401 con el token actual (0 = ninguno). */
     private const val KEY_LAST_401_MS = "organism_last_401_ms"
+    /** T6/510: día (LocalDate ISO, zona del sistema) del contador de aplicaciones automáticas. */
+    private const val KEY_APPLY_DAY = "organism_apply_day"
+    /** T6/510: aplicaciones automáticas ya hechas en [KEY_APPLY_DAY]. */
+    private const val KEY_APPLY_COUNT = "organism_apply_count_today"
 
     /**
      * T1/510 — sondeo de perfil (VUELTA §3.2): cada 30 min se pide el
@@ -259,6 +296,35 @@ object OrganismController {
     const val LLM_STATUS_DEGRADED = "degraded"
     /** Ningún LLM del combo respondió; informes solo deterministas. */
     const val LLM_STATUS_UNAVAILABLE = "unavailable"
+
+    // ── T6/510 — tope de excursión acumulada + antichurn ────────────────
+    /**
+     * Dwell mínimo: una versión candidata debe ser la misma en 2
+     * sondeos consecutivos antes de aplicarse. Un servidor que publica
+     * una versión nueva en cada sondeo (30 min) ya no puede mantener
+     * el teléfono aplicando sin parar: el A/B tiene tiempo de medir y
+     * el motor de asentarse.
+     */
+    const val DWELL_REQUIRED_POLLS = 2
+    /**
+     * Tope diario de aplicaciones AUTOMÁTICAS (candidato o estable
+     * promovido). Valor de la propuesta T6 («máximo 2 aplicaciones
+     * automáticas por día»); el freno de promociones del analizador
+     * (1/día) es el otro lado del mismo corral. Los rollbacks de
+     * seguridad (servidor o timeout del A/B) están EXENTOS: son la
+     * salida de emergencia, no una promoción. Al superarlo, estado
+     * visible y espera al día siguiente.
+     */
+    const val MAX_AUTO_APPLIES_PER_DAY = 2
+    /**
+     * Timeout del A/B: si `AB_RUNNING` no completa 3 sesiones en 4 h
+     * (sin música, por ejemplo), rollback automático al estable sin
+     * esperar al servidor. Se comprueba en cada tick del sondeo
+     * (30 min): dispara como mucho 30 min tarde.
+     */
+    const val AB_TIMEOUT_MS = 4L * 60L * 60L * 1000L
+    /** Sesiones que debe completar el A/B antes de que caduque el timeout. */
+    const val AB_SESSIONS_REQUIRED = 3
 
     /**
      * S13 — veredicto puro de la guarda de aplicación (testeable en JVM).
@@ -532,7 +598,51 @@ object OrganismController {
          */
         val llmDrafted: Boolean? = null,
         /** Fecha (epoch ms) de la última señal LLM recibida; 0 = ninguna. */
-        val lastLlmStatusAtMs: Long = 0L
+        val lastLlmStatusAtMs: Long = 0L,
+        // ── T6/510 — tope de excursión acumulada + antichurn ──
+        /**
+         * Versión en dwell (vista en sondeos consecutivos pero aún no
+         * aplicada). null = ninguna pendiente. Solo vive en memoria:
+         * tras un reinicio el dwell se reinicia (el sondeo vuelve a
+         * ver la versión dos veces antes de aplicarla).
+         */
+        val dwellVersion: Long? = null,
+        /** Sondeos consecutivos en los que se vio [dwellVersion] (0 = ninguna). */
+        val dwellSightings: Int = 0,
+        /**
+         * Aplicaciones automáticas hechas hoy (día local). Persiste en
+         * SharedPreferences ([KEY_APPLY_DAY]/[KEY_APPLY_COUNT]) para
+         * que un reinicio no reinicie el tope. Los rollbacks de
+         * seguridad no cuentan (exentos del tope).
+         */
+        val autoAppliesToday: Int = 0,
+        /**
+         * true si el último intento de aplicación se bloqueó por el
+         * tope diario (estado visible: la próxima espera a mañana).
+         * Se limpia al aplicar de nuevo (nuevo día) o al detener el
+         * controlador.
+         */
+        val autoApplyCapHit: Boolean = false,
+        /** Fecha (epoch ms) del último bloqueo por tope diario; 0 = ninguno. */
+        val lastApplyCapHitAtMs: Long = 0L,
+        /**
+         * Última versión vetada tras un rollback (null = ninguna).
+         * La lista vive en disco ([ProfileApplier.VETO_FILE_NAME]);
+         * esto es solo su reflejo visible.
+         */
+        val vetoedVersion: Long? = null,
+        /** Hasta cuándo está vetada [vetoedVersion] (epoch ms); 0 = no vetada. */
+        val vetoedUntilMs: Long = 0L,
+        /**
+         * Cuándo arrancó el A/B vigente (epoch ms); 0 = no hay A/B en
+         * curso. Solo vive en memoria: tras un reinicio el temporizador
+         * se reinicia (el perfil aplicado también vuelve a neutros).
+         */
+        val abStartedAtMs: Long = 0L,
+        /** Sesiones completadas desde que arrancó el A/B vigente (0 = ninguna). */
+        val abSessionsCompleted: Int = 0,
+        /** Fecha (epoch ms) del último rollback por timeout del A/B; 0 = ninguno. */
+        val lastAbTimeoutAtMs: Long = 0L
     )
 
     private val _state = MutableStateFlow(State())
@@ -653,6 +763,15 @@ object OrganismController {
         // C21 (e): la fecha del último 401 sobrevive a reinicios.
         last401AtMs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getLong(KEY_LAST_401_MS, 0L)
+        // T6/510: el tope diario de aplicaciones automáticas sobrevive
+        // a reinicios (si no, un reinicio reiniciaría el contador y el
+        // tope no frenaría nada). El dwell y el temporizador del A/B
+        // NO se persisten: son de este proceso (el perfil aplicado
+        // también vuelve a neutros tras reiniciar).
+        autoApplyDayKey = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_APPLY_DAY, "") ?: ""
+        autoApplyCountToday = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_APPLY_COUNT, 0)
         if (!isEnabled(ctx)) {
             _state.value = State(status = Status.OFF, enabled = false)
             return
@@ -773,6 +892,18 @@ object OrganismController {
         profileApplier = null
         lastAppliedValidated = null
         pendingConfirmation = null
+        // T6/510: el dwell y el temporizador del A/B son de este
+        // proceso (el perfil aplicado vuelve a neutros tras el stop).
+        // El contador diario NO se resetea: persiste en
+        // SharedPreferences y el tope sigue valiendo tras el reinicio.
+        // El flag de tope alcanzado sí se limpia (el estado visible
+        // vuelve a neutros con el controlador detenido).
+        dwellVersion = null
+        dwellSightings = 0
+        abStartedAtMs = 0L
+        abSessionsAtStart = 0L
+        lastChunkSessionId = null
+        autoApplyCapHit = false
         // CIERRE DIFERIDO (defecto #5): el scope se cancela ANTES de
         // cerrar el agregador, para que el enqueueChunk del chunk final
         // no pueda lanzar un flush que se cancelaría a medias. El chunk
@@ -1095,6 +1226,76 @@ object OrganismController {
     @Volatile
     private var lastPayloadDiscardAtMs: Long = 0L
 
+    // ── T6/510 — tope de excursión acumulada + antichurn ─────────────
+    /**
+     * Dwell: versión vista en sondeos consecutivos y cuántas veces.
+     * Solo vive en memoria (un reinicio reinicia el dwell: el sondeo
+     * vuelve a ver la versión dos veces antes de aplicarla).
+     */
+    @Volatile
+    private var dwellVersion: Long? = null
+
+    @Volatile
+    private var dwellSightings: Int = 0
+
+    /**
+     * Tope diario: día local + contador. Persiste en SharedPreferences
+     * ([KEY_APPLY_DAY]/[KEY_APPLY_COUNT], se carga en start()): un
+     * reinicio NO reinicia el tope. Los rollbacks de seguridad no
+     * cuentan (exentos).
+     */
+    @Volatile
+    private var autoApplyDayKey: String = ""
+
+    @Volatile
+    private var autoApplyCountToday: Int = 0
+
+    /** true si el último intento de aplicación se bloqueó por el tope diario. */
+    @Volatile
+    private var autoApplyCapHit: Boolean = false
+
+    /** Fecha (epoch ms) del último bloqueo por tope diario; 0 = ninguno. */
+    @Volatile
+    private var lastApplyCapHitAtMs: Long = 0L
+
+    /** Última versión vetada tras un rollback (reflejo visible; la lista vive en disco). */
+    @Volatile
+    private var vetoedVersion: Long? = null
+
+    /** Hasta cuándo está vetada [vetoedVersion] (epoch ms); 0 = no vetada. */
+    @Volatile
+    private var vetoedUntilMs: Long = 0L
+
+    /**
+     * Temporizador del A/B vigente: cuándo arrancó y cuántas sesiones
+     * llevaba completadas el contador monótono en ese momento. Solo
+     * vive en memoria (tras un reinicio el perfil aplicado vuelve a
+     * neutros y el temporizador se reinicia con la próxima aplicación).
+     */
+    @Volatile
+    private var abStartedAtMs: Long = 0L
+
+    @Volatile
+    private var abSessionsAtStart: Long = 0L
+
+    /**
+     * Sesiones completadas (monótono, sobrevive a stop()/start()): se
+     * incrementa en [enqueueChunk] cuando llega un chunk con otro
+     * sessionId que el anterior — la sesión anterior terminó. El
+     * cierre de sesión de stop() no se cuenta aparte: el temporizador
+     * del A/B ya se resetea en stop().
+     */
+    @Volatile
+    private var sessionsCompletedTotal: Long = 0L
+
+    /** sessionId del último chunk encolado (para detectar el fin de sesión). */
+    @Volatile
+    private var lastChunkSessionId: String? = null
+
+    /** Fecha (epoch ms) del último rollback por timeout del A/B; 0 = ninguno. */
+    @Volatile
+    private var lastAbTimeoutAtMs: Long = 0L
+
     /**
      * C21 — veredicto puro de la re-validación de un token recién
      * pegado (testeable en JVM). El GET barato de versión es el mismo
@@ -1211,6 +1412,18 @@ object OrganismController {
     }
 
     private fun enqueueChunk(chunk: SessionAggregator.SessionChunk, q: OrganismQueue) {
+        // T6(b) — una sesión se completa cuando llega un chunk con otro
+        // sessionId que el anterior: la sesión anterior terminó (sus
+        // chunks ya están en la cola o enviados). El A/B necesita 3
+        // sesiones completadas; el contador monótono se compara con el
+        // valor que tenía al arrancar el A/B (ver
+        // [abSessionsCompleted]). El primer chunk de un proceso no
+        // cuenta nada (no hay sesión anterior en este proceso).
+        val prevSession = lastChunkSessionId
+        if (prevSession != null && prevSession != chunk.sessionId) {
+            sessionsCompletedTotal++
+        }
+        lastChunkSessionId = chunk.sessionId
         // T2/510: el chunk lleva el perfil aplicado actual en telemetry.
         val body = OrganismPayload.sessionBody(chunk, applied = appliedProfile())
         val enqueued = q.enqueue(chunk.sessionId, chunk.chunkId, body)
@@ -1333,7 +1546,22 @@ object OrganismController {
             llmStatus = _state.value.llmStatus,
             llmModel = _state.value.llmModel,
             llmDrafted = _state.value.llmDrafted,
-            lastLlmStatusAtMs = _state.value.lastLlmStatusAtMs
+            lastLlmStatusAtMs = _state.value.lastLlmStatusAtMs,
+            // T6/510: el dwell, el tope diario, el veto y el
+            // temporizador del A/B viven en los vars volátiles (como
+            // sentTotal/last401AtMs); aquí se reflejan. Las sesiones
+            // del A/B se derivan del contador monótono (ver
+            // [abSessionsCompleted]).
+            dwellVersion = dwellVersion,
+            dwellSightings = dwellSightings,
+            autoAppliesToday = autoApplyCountToday,
+            autoApplyCapHit = autoApplyCapHit,
+            lastApplyCapHitAtMs = lastApplyCapHitAtMs,
+            vetoedVersion = vetoedVersion,
+            vetoedUntilMs = vetoedUntilMs,
+            abStartedAtMs = abStartedAtMs,
+            abSessionsCompleted = abSessionsCompleted(abStartedAtMs, abSessionsAtStart, sessionsCompletedTotal),
+            lastAbTimeoutAtMs = lastAbTimeoutAtMs
         )
     }
 
@@ -1437,6 +1665,159 @@ object OrganismController {
         refreshState()
     }
 
+    // ── T6/510 — antichurn (estado del ciclo) ───────────────────────────
+
+    /**
+     * T6(b) — registra una aplicación automática en el tope diario
+     * (día local + contador, persistidos en SharedPreferences para que
+     * un reinicio no reinicie el tope). Solo la llama el camino de
+     * aplicación normal tras un commit; los rollbacks de seguridad no
+     * cuentan (exentos del tope). Limpia el flag de tope alcanzado.
+     */
+    private fun recordAutoApply(nowMs: Long = System.currentTimeMillis()) {
+        val today = dayKey(nowMs)
+        autoApplyCountToday = nextAutoApplyCount(autoApplyDayKey, autoApplyCountToday, today)
+        autoApplyDayKey = today
+        autoApplyCapHit = false
+        appContext?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            ?.edit()
+            ?.putString(KEY_APPLY_DAY, today)
+            ?.putInt(KEY_APPLY_COUNT, autoApplyCountToday)
+            ?.apply()
+    }
+
+    /** T6(b) — el dwell se consume al aplicar (la próxima versión empieza de cero). */
+    private fun resetDwell() {
+        dwellVersion = null
+        dwellSightings = 0
+    }
+
+    /** T6(b) — arranca el temporizador del A/B vigente (un candidato acaba de aplicarse). */
+    private fun startAbTimer(nowMs: Long = System.currentTimeMillis()) {
+        abStartedAtMs = nowMs
+        abSessionsAtStart = sessionsCompletedTotal
+    }
+
+    /** T6(b) — el A/B terminó (promoción, rollback o timeout): el temporizador se limpia. */
+    private fun clearAbTimer() {
+        abStartedAtMs = 0L
+        abSessionsAtStart = 0L
+    }
+
+    /**
+     * T6(b) — timeout del A/B: si `AB_RUNNING` no completa 3 sesiones
+     * en 4 h (sin música, por ejemplo), rollback automático al estable
+     * sin esperar al servidor. Reusa el camino del rollback del
+     * servidor ([handleRollback] con un sobre sintético `rolled_back`):
+     * veta la versión que sonaba y restaura el estable verificado, o
+     * marca el estado si no hay estable que restaurar. No hace nada si
+     * no hay A/B en curso, si ya completó 3 sesiones o si aún no
+     * pasaron 4 h. Se comprueba en cada tick del sondeo (30 min).
+     */
+    private fun checkAbTimeout(ctx: Context) {
+        val nowMs = System.currentTimeMillis()
+        val completed = abSessionsCompleted(abStartedAtMs, abSessionsAtStart, sessionsCompletedTotal)
+        if (!abTimedOut(abStartedAtMs, completed, nowMs)) return
+        val timedOutVersion = _state.value.appliedProfileVersion
+        lastAbTimeoutAtMs = nowMs
+        Log.w(TAG, "T6: A/B v$timedOutVersion sin $AB_SESSIONS_REQUIRED sesiones en ${AB_TIMEOUT_MS / 3_600_000L} h ($completed completadas); rollback automático al estable sin esperar al servidor")
+        // El sobre sintético lleva el estado rolled_back y la señal LLM
+        // vigente (la fresca ya la registró el sondeo anterior); el
+        // cuerpo no se usa (handleRollback lee el estable de disco).
+        val synthetic = ProfileFetcher.Result.Current(
+            profileId = _state.value.appliedProfileId,
+            version = timedOutVersion,
+            status = "rolled_back",
+            abState = "rolled_back",
+            profileBody = "{}",
+            llmStatus = _state.value.llmStatus.takeIf { it != LLM_STATUS_UNKNOWN },
+            llmModel = _state.value.llmModel,
+            llmDrafted = _state.value.llmDrafted
+        )
+        handleRollback(ctx, synthetic, timedOutVersion)
+        refreshState()
+    }
+
+    // ── T6/510 — tope de excursión acumulada + antichurn (decisiones puras) ──
+
+    /** Estado del dwell mínimo (testeable en JVM). */
+    data class DwellState(
+        val version: Long?,
+        val sightings: Int,
+        val ready: Boolean
+    )
+
+    /**
+     * T6(b) — avance del dwell: una versión debe ser la misma en
+     * [DWELL_REQUIRED_POLLS] sondeos consecutivos antes de aplicarse.
+     * Ver otra versión reinicia el conteo a 1; ver la misma lo suma.
+     * `ready` es true a partir del segundo sondeo consecutivo.
+     */
+    fun dwellAdvance(seenVersion: Long?, seenSightings: Int, candidateVersion: Long): DwellState {
+        return if (seenVersion == candidateVersion) {
+            val count = seenSightings + 1
+            DwellState(candidateVersion, count, count >= DWELL_REQUIRED_POLLS)
+        } else {
+            DwellState(candidateVersion, 1, DWELL_REQUIRED_POLLS <= 1)
+        }
+    }
+
+    /**
+     * T6(b) — clave del día local (ISO `yyyy-MM-dd`, zona del sistema)
+     * para el tope diario. Pura en `epochMs` para poder testearla en
+     * JVM (la zona es la del sistema, igual que el resto de la app).
+     */
+    fun dayKey(epochMs: Long): String =
+        java.time.LocalDate.ofInstant(
+            java.time.Instant.ofEpochMilli(epochMs),
+            java.time.ZoneId.systemDefault()
+        ).toString()
+
+    /**
+     * T6(b) — ¿cabe otra aplicación automática hoy? El contador es por
+     * día local: en un día nuevo siempre cabe (el conteo se reinicia);
+     * en el mismo día, solo si aún no se llegó al tope.
+     */
+    fun autoApplyAllowed(storedDayKey: String, storedCount: Int, todayKey: String): Boolean =
+        storedDayKey != todayKey || storedCount < MAX_AUTO_APPLIES_PER_DAY
+
+    /**
+     * T6(b) — contador de hoy DESPUÉS de registrar una aplicación
+     * automática: 1 si es un día nuevo, el anterior + 1 si es el
+     * mismo día. (El día se guarda junto al contador en
+     * SharedPreferences; ver [recordAutoApply].)
+     */
+    fun nextAutoApplyCount(storedDayKey: String, storedCount: Int, todayKey: String): Int =
+        if (storedDayKey != todayKey) 1 else storedCount + 1
+
+    /**
+     * T6(b) — ¿sigue vetada esta versión? Un veto caduca a las 24 h
+     * ([ProfileApplier.VETO_DURATION_MS]): en el instante exacto de
+     * caducidad ya no bloquea (`vetoedUntilMs > nowMs`, no `>=`).
+     */
+    fun isVersionVetoed(vetoedUntilMs: Long, nowMs: Long): Boolean =
+        vetoedUntilMs > nowMs
+
+    /**
+     * T6(b) — ¿caducó el A/B por timeout? Solo si arrancó (`> 0`), aún
+     * no completó [AB_SESSIONS_REQUIRED] sesiones y pasaron
+     * [AB_TIMEOUT_MS] desde su arranque.
+     */
+    fun abTimedOut(abStartedAtMs: Long, sessionsCompleted: Int, nowMs: Long): Boolean =
+        abStartedAtMs > 0L &&
+            sessionsCompleted < AB_SESSIONS_REQUIRED &&
+            nowMs - abStartedAtMs >= AB_TIMEOUT_MS
+
+    /**
+     * T6(b) — sesiones completadas desde que arrancó el A/B vigente:
+     * diferencia entre el contador monótono de sesiones completadas y
+     * el valor que tenía al arrancar el A/B. Sin A/B en curso, 0.
+     * Nunca negativo (un reinicio del contador no resta sesiones).
+     */
+    fun abSessionsCompleted(abStartedAtMs: Long, sessionsAtStart: Long, sessionsTotal: Long): Int =
+        if (abStartedAtMs <= 0L) 0
+        else (sessionsTotal - sessionsAtStart).toInt().coerceAtLeast(0)
+
     /**
      * Decisión pura del sondeo (testeable en JVM): ¿toca pedir el perfil
      * vigente? El interruptor maestro en OFF apaga también el sondeo
@@ -1515,6 +1896,11 @@ object OrganismController {
             // Cinturón y tirantes: el job muere con stop(), pero un
             // lanzamiento residual no debe sondear con el interruptor OFF.
             if (!isEnabled(ctx)) return
+            // T6(b) — timeout del A/B (sin esperar al servidor): corre
+            // antes del fetch, en cada tick, para que dispare aunque la
+            // red esté caída. El fetch sigue después (refresca las
+            // señales C24/C16 aunque el A/B acabe de volver al estable).
+            checkAbTimeout(ctx)
             lastProfileCheckMs = System.currentTimeMillis()
             when (val res = runCatching { fetcher.fetch(appliedVersionOrNull()) }.getOrNull()) {
                 null -> Log.w(TAG, "sondeo de perfil: fetch lanzó excepción; se reintenta en el próximo ciclo")
@@ -1558,6 +1944,45 @@ object OrganismController {
             "stable", "promoted", "candidate", "ab_running" -> {
                 if (!shouldApplyServerVersion(current.status, current.abState, current.version, previousVersion)) {
                     Log.i(TAG, "sondeo: v${current.version} ${current.status}/${current.abState} no se aplica (aplicada v$previousVersion)")
+                    return
+                }
+                // T6(b) — cuarentena de versión: una versión que hizo
+                // rollback queda vetada 24 h aunque el servidor la
+                // vuelva a publicar como `candidate`. El veto se
+                // consulta ANTES del dwell: una versión vetada no
+                // acumula sightings (no se acerca a aplicarse).
+                val applier = profileApplier ?: return
+                val nowMs = System.currentTimeMillis()
+                if (applier.isVersionVetoed(current.version, nowMs)) {
+                    vetoedVersion = current.version
+                    vetoedUntilMs = applier.vetoedUntilMs(current.version, nowMs)
+                    Log.w(TAG, "T6: v${current.version} vetada 24 h tras rollback (hasta ${java.time.Instant.ofEpochMilli(vetoedUntilMs)}); no se aplica aunque el servidor la publique como ${current.status}")
+                    refreshState()
+                    return
+                }
+                // T6(b) — dwell mínimo: la versión debe ser la misma en
+                // 2 sondeos consecutivos antes de aplicarse. El primer
+                // sondeo solo la registra; el segundo aplica.
+                val dwell = dwellAdvance(dwellVersion, dwellSightings, current.version)
+                dwellVersion = dwell.version
+                dwellSightings = dwell.sightings
+                if (!dwell.ready) {
+                    Log.i(TAG, "T6: dwell v${current.version} visto ${dwell.sightings}/$DWELL_REQUIRED_POLLS sondeos; se espera al siguiente sondeo (antichurn)")
+                    refreshState()
+                    return
+                }
+                // T6(b) — tope diario de aplicaciones automáticas (los
+                // rollbacks de seguridad están exentos: van por
+                // handleRollback, no por aquí). Al superarlo, estado
+                // visible y espera al día siguiente; el dwell queda
+                // listo, así que al día siguiente se aplica en el
+                // primer sondeo.
+                val today = dayKey(nowMs)
+                if (!autoApplyAllowed(autoApplyDayKey, autoApplyCountToday, today)) {
+                    autoApplyCapHit = true
+                    lastApplyCapHitAtMs = nowMs
+                    Log.w(TAG, "T6: tope diario de $MAX_AUTO_APPLIES_PER_DAY aplicaciones automáticas alcanzado ($autoApplyCountToday hoy); v${current.version} espera a mañana")
+                    refreshState()
                     return
                 }
                 val isCandidate = current.status == "candidate" || current.status == "ab_running"
@@ -1646,6 +2071,22 @@ object OrganismController {
                     profileHash = ProfileApplier.sha256Hex(current.profileBody),
                     profileStatus = profileStatus
                 )
+                // T6(b): la aplicación automática cuenta para el tope
+                // diario (los rollbacks de seguridad NO cuentan: son
+                // la salida de emergencia, no una promoción) y consume
+                // el dwell (la próxima versión empieza de cero). Un
+                // candidato AB arranca el temporizador de timeout; un
+                // estable/promoción o un rollback lo limpian (el A/B
+                // terminó).
+                if (!rolledBack) {
+                    recordAutoApply()
+                }
+                resetDwell()
+                if (profileStatus == PROFILE_STATUS_AB_RUNNING) {
+                    startAbTimer()
+                } else {
+                    clearAbTimer()
+                }
                 confirmApplied(applied, previousVersion)
                 refreshState()
                 Log.i(TAG, "perfil v${current.version} ${current.status} aplicado y confirmado (abState=$abState)")
@@ -1755,6 +2196,28 @@ object OrganismController {
         previousVersion: Long
     ) {
         val applier = profileApplier ?: return
+        // T6(b) — cuarentena de versión: la versión que hizo rollback
+        // queda vetada 24 h (con su hash) aunque el servidor la vuelva
+        // a publicar como `candidate`. Se veta la versión que SONABA
+        // (previousVersion), no la del sobre: el sobre trae el estado,
+        // no la versión fallida. Se veta aunque no haya estable que
+        // restaurar (la versión falló igual) y aunque el estable sea
+        // lo aplicado (el veto solo bloquea versiones MAYORES que la
+        // aplicada, así que vetar el estable no bloquea nada). El A/B
+        // terminó y el dwell queda obsoleto: se limpian.
+        if (previousVersion > 0L) {
+            applier.vetoVersion(
+                version = previousVersion,
+                hashSha256 = _state.value.appliedProfileHash,
+                reason = "rolled_back",
+                atMs = System.currentTimeMillis()
+            )
+            vetoedVersion = previousVersion
+            vetoedUntilMs = applier.vetoedUntilMs(previousVersion)
+            Log.w(TAG, "T6: v$previousVersion vetada 24 h tras rollback (hash ${_state.value.appliedProfileHash.take(12)})")
+        }
+        resetDwell()
+        clearAbTimer()
         val stableBody = applier.readStableBody()
         val journal = applier.readJournal()
         val stableVersion = journal?.stableVersion

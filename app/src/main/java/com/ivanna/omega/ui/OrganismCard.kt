@@ -121,6 +121,55 @@ fun OrganismCard(
                     style = MaterialTheme.typography.bodySmall
                 )
             }
+            // T6/510 — antichurn: dwell, tope diario, veto de versión
+            // y timeout del A/B. Solo se muestra cuando hay algo que
+            // ver; con todo a cero no añade ruido. El tope y el veto
+            // son estado visible, no silencio: si el ciclo se detiene,
+            // la tarjeta dice por qué y hasta cuándo.
+            if (state.dwellVersion != null && state.dwellSightings in 1 until OrganismController.DWELL_REQUIRED_POLLS) {
+                Text(
+                    "Versión v${state.dwellVersion} vista ${state.dwellSightings}/${OrganismController.DWELL_REQUIRED_POLLS} sondeos: se aplica cuando el servidor la repita (antichurn).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            if (state.autoAppliesToday > 0) {
+                Text(
+                    "Aplicaciones automáticas hoy: ${state.autoAppliesToday}/${OrganismController.MAX_AUTO_APPLIES_PER_DAY}.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            if (state.autoApplyCapHit) {
+                Text(
+                    "Tope diario alcanzado: la próxima aplicación automática espera a mañana.",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                if (state.lastApplyCapHitAtMs > 0L) {
+                    Text(
+                        "Último tope: ${format401Date(state.lastApplyCapHitAtMs)}.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            if (state.vetoedVersion != null && state.vetoedUntilMs > System.currentTimeMillis()) {
+                Text(
+                    "Versión v${state.vetoedVersion} vetada hasta ${format401Date(state.vetoedUntilMs)} (hizo rollback): no se aplica aunque el servidor la vuelva a publicar.",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            if (state.abStartedAtMs > 0L) {
+                Text(
+                    "A/B en curso desde ${format401Date(state.abStartedAtMs)}: ${state.abSessionsCompleted}/${OrganismController.AB_SESSIONS_REQUIRED} sesiones; sin 3 sesiones en 4 h vuelve solo al estable.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            if (state.lastAbTimeoutAtMs > 0L) {
+                Text(
+                    "Último timeout de A/B: ${format401Date(state.lastAbTimeoutAtMs)} (sin 3 sesiones en 4 h; vuelta al estable).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
             if (state.queued > 0) {
                 Text(
                     "En cola: ${state.queued} chunk(s) · Enviados: ${state.sentTotal}",

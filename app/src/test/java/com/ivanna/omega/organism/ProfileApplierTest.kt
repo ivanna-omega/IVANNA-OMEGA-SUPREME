@@ -656,6 +656,78 @@ class ProfileApplierTest {
         assertEquals(null, journal.stableVersion)
     }
 
+    // T6/510 — cuarentena de versión (veto de 24 h tras un rollback).
+
+    @Test
+    fun `sin vetos nada esta vetado`() {
+        assertFalse(applier.isVersionVetoed(5L, nowMs = 1_000L))
+        assertEquals(0L, applier.vetoedUntilMs(5L, nowMs = 1_000L))
+        assertEquals(emptyList<ProfileApplier.VersionVeto>(), applier.readVetoes(nowMs = 1_000L))
+    }
+
+    @Test
+    fun `veto bloquea 24 h exactas y caduca despues`() {
+        applier.vetoVersion(5L, "abc123", "rolled_back", atMs = 1_000L)
+        assertTrue(applier.isVersionVetoed(5L, nowMs = 1_000L))
+        assertTrue(applier.isVersionVetoed(5L, nowMs = 1_000L + ProfileApplier.VETO_DURATION_MS - 1L))
+        assertEquals(1_000L + ProfileApplier.VETO_DURATION_MS, applier.vetoedUntilMs(5L, nowMs = 1_000L))
+        assertFalse(applier.isVersionVetoed(5L, nowMs = 1_000L + ProfileApplier.VETO_DURATION_MS))
+        assertFalse(applier.isVersionVetoed(5L, nowMs = 1_000L + ProfileApplier.VETO_DURATION_MS + 1L))
+        // Otra versión no está vetada.
+        assertFalse(applier.isVersionVetoed(6L, nowMs = 1_000L))
+    }
+
+    @Test
+    fun `veto persiste en disco y sobrevive a otra instancia`() {
+        applier.vetoVersion(5L, "abc123", "rolled_back", atMs = 1_000L)
+        val other = ProfileApplier(dir)
+        assertTrue(other.isVersionVetoed(5L, nowMs = 2_000L))
+        assertEquals("abc123", other.readVetoes(nowMs = 2_000L).single().hashSha256)
+        assertEquals("rolled_back", other.readVetoes(nowMs = 2_000L).single().reason)
+    }
+
+    @Test
+    fun `re-vetar la misma version refresca su fecha sin duplicarla`() {
+        applier.vetoVersion(5L, "aaa", "rolled_back", atMs = 1_000L)
+        applier.vetoVersion(5L, "bbb", "rolled_back", atMs = 2_000L)
+        val vetoes = applier.readVetoes(nowMs = 2_000L)
+        assertEquals(1, vetoes.size)
+        assertEquals(2_000L, vetoes.single().vetoedAtMs)
+        assertEquals("bbb", vetoes.single().hashSha256)
+        // Con la fecha nueva, el veto viejo ya no caduca a las 24 h de la primera fecha.
+        assertTrue(applier.isVersionVetoed(5L, nowMs = 1_000L + ProfileApplier.VETO_DURATION_MS))
+    }
+
+    @Test
+    fun `vetos caducados se podan al escribir el siguiente`() {
+        applier.vetoVersion(5L, "aaa", "rolled_back", atMs = 1_000L)
+        applier.vetoVersion(6L, "bbb", "rolled_back", atMs = 1_000L + ProfileApplier.VETO_DURATION_MS + 1L)
+        val vetoes = applier.readVetoes(nowMs = 1_000L + ProfileApplier.VETO_DURATION_MS + 1L)
+        assertEquals(listOf(6L), vetoes.map { it.version })
+    }
+
+    @Test
+    fun `archivo de vetos corrupto se lee como vacio y se sobrescribe en el proximo veto`() {
+        File(dir, ProfileApplier.VETO_FILE_NAME).writeText("{ esto no es json")
+        assertFalse(applier.isVersionVetoed(5L, nowMs = 1_000L))
+        assertEquals(emptyList<ProfileApplier.VersionVeto>(), applier.readVetoes(nowMs = 1_000L))
+        applier.vetoVersion(5L, "abc", "rolled_back", atMs = 1_000L)
+        assertTrue(applier.isVersionVetoed(5L, nowMs = 1_000L))
+    }
+
+    @Test
+    fun `borrar el estable no borra los vetos`() {
+        applier.applyAndCommit(
+            V11_JSON, version = 2L, appliedVersion = 1L,
+            profileId = "omega-1",
+            install = ::installOk,
+            readAppliedProfileId = { ProfileApplier.LIVE_PROFILE_ID }
+        )
+        applier.vetoVersion(5L, "abc", "rolled_back", atMs = 1_000L)
+        assertTrue(applier.deleteStable())
+        assertTrue(applier.isVersionVetoed(5L, nowMs = 2_000L))
+    }
+
     companion object {
         /**
          * v1.1 candidata, verbatim del archivo entregado salvo la marca

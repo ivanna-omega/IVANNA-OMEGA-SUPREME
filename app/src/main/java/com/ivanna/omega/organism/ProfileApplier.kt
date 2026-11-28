@@ -66,6 +66,17 @@ import java.io.File
  * contienen secretos (el token nunca va en ellos), así que `filesDir`
  * privado sin cifrar en reposo es aceptable, documentado igual que la
  * cola ([OrganismQueue]).
+ *
+ * T6 (release 510): cuarentena de versión. Una versión que hizo
+ * rollback queda vetada 24 h aunque el servidor la vuelva a publicar
+ * como `candidate`: la lista de vetos vive junto al estable
+ * (`muselink-profile-vetoes.json`, con el hash SHA-256 del perfil
+ * vetado) y el controlador la consulta antes de aplicar. Un veto
+ * caducado se poda al escribir el siguiente; un archivo de vetos
+ * corrupto se lee como vacío (la lista es un freno, no la única
+ * defensa: el dwell y el tope diario siguen frenando). Borrar el
+ * estable ([deleteStable]) NO borra los vetos: un borrado manual no
+ * debe re-habilitar una versión que hizo rollback antes de sus 24 h.
  */
 class ProfileApplier(
     private val dir: File,
@@ -180,6 +191,101 @@ class ProfileApplier(
                 atMs = obj.get("atMs").asLong
             )
         }.getOrNull()
+    }
+
+    // ------------------------------------------------------------------
+    // T6: cuarentena de versión (veto de 24 h tras un rollback).
+    //
+    // Una versión que hizo rollback queda vetada 24 h aunque el
+    // servidor la vuelva a publicar como `candidate`. La lista vive
+    // junto al estable (`muselink-profile-vetoes.json`) con el hash
+    // SHA-256 del perfil vetado y el motivo, para que el veto sea
+    // auditable sin el cuerpo del perfil. Escritura atómica
+    // tmp+rename, igual que el diario. Un veto caducado no bloquea:
+    // se poda al escribir el siguiente veto (las lecturas filtran sin
+    // escribir). Un archivo corrupto o con forma inesperada se lee
+    // como lista vacía y se sobrescribe en el próximo veto.
+    // ------------------------------------------------------------------
+
+    /** Una versión vetada tras un rollback (T6). */
+    data class VersionVeto(
+        val version: Long,
+        val hashSha256: String,
+        val vetoedAtMs: Long,
+        val reason: String
+    )
+
+    /**
+     * Veta una versión durante [VETO_DURATION_MS] (upsert por versión:
+     * re-vetar la misma versión refresca su fecha). Poda los vetos
+     * caducados antes de escribir. `hashSha256` es el SHA-256 del
+     * cuerpo del perfil vetado ("" si no se conoce: el veto es por
+     * versión, el hash es auditoría).
+     */
+    fun vetoVersion(version: Long, hashSha256: String, reason: String, atMs: Long = clockMs()) {
+        dir.mkdirs()
+        // readVetoes filtra los caducados: escribir poda la lista.
+        val kept = readVetoes(atMs).filter { it.version != version }
+        val updated = kept + VersionVeto(version, hashSha256, atMs, reason)
+        writeVetoes(updated)
+    }
+
+    /** Vetos vigentes (no caducados) a `nowMs`; lista vacía si no hay archivo o no parsea. */
+    fun readVetoes(nowMs: Long = clockMs()): List<VersionVeto> =
+        readVetoesRaw().filter { nowMs - it.vetoedAtMs < VETO_DURATION_MS }
+
+    /** True si `version` está vetada y su veto aún no caducó a `nowMs`. */
+    fun isVersionVetoed(version: Long, nowMs: Long = clockMs()): Boolean =
+        readVetoes(nowMs).any { it.version == version }
+
+    /** Hasta cuándo está vetada `version` (epoch ms); 0 si no está vetada a `nowMs`. */
+    fun vetoedUntilMs(version: Long, nowMs: Long = clockMs()): Long {
+        val veto = readVetoes(nowMs).find { it.version == version } ?: return 0L
+        return veto.vetoedAtMs + VETO_DURATION_MS
+    }
+
+    /** Lee el archivo de vetos sin filtrar caducidad (nulls y formas raras se descartan). */
+    private fun readVetoesRaw(): List<VersionVeto> {
+        val file = File(dir, VETO_FILE_NAME)
+        if (!file.isFile) return emptyList()
+        return runCatching {
+            val obj = gson.fromJson(file.readText(), JsonObject::class.java)
+            val arr = obj.getAsJsonArray("vetoes") ?: return emptyList()
+            arr.mapNotNull { el ->
+                runCatching {
+                    val o = el.asJsonObject
+                    val version = o.get("version")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asLong
+                        ?: return@mapNotNull null
+                    val atMs = o.get("vetoedAtMs")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asLong
+                        ?: return@mapNotNull null
+                    // Un veto del futuro (reloj movido) no bloquea para
+                    // siempre: se trata como recién vetado (el filtro de
+                    // readVetoes lo conserva 24 h desde su fecha).
+                    VersionVeto(
+                        version = version,
+                        hashSha256 = o.get("hashSha256")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString ?: "",
+                        vetoedAtMs = atMs,
+                        reason = o.get("reason")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString ?: ""
+                    )
+                }.getOrNull()
+            }
+        }.getOrNull() ?: emptyList()
+    }
+
+    private fun writeVetoes(vetoes: List<VersionVeto>) {
+        val obj = JsonObject().apply {
+            val arr = JsonArray()
+            vetoes.forEach { veto ->
+                arr.add(JsonObject().apply {
+                    addProperty("version", veto.version)
+                    addProperty("hashSha256", veto.hashSha256)
+                    addProperty("vetoedAtMs", veto.vetoedAtMs)
+                    addProperty("reason", veto.reason)
+                })
+            }
+            add("vetoes", arr)
+        }
+        writeAtomic(File(dir, VETO_FILE_NAME), gson.toJson(obj))
     }
 
     // ------------------------------------------------------------------
@@ -485,8 +591,11 @@ class ProfileApplier(
      * C22/510 — borrado EXPLÍCITO del perfil estable. Borra el estable,
      * su sidecar `.sha256` y el diario (su `stableVersion` quedaría
      * colgando sin estable al que apuntar). Los candidatos NO se tocan:
-     * los borra `clearQueue` / los poda la próxima instalación. Solo lo
-     * llama `OrganismController.deleteStableProfile()`, que exige el
+     * los borra `clearQueue` / los poda la próxima instalación. Los
+     * VETOS (T6) tampoco se tocan: un borrado manual no debe
+     * re-habilitar una versión que hizo rollback antes de sus 24 h
+     * (caducan solos). Solo lo llama
+     * `OrganismController.deleteStableProfile()`, que exige el
      * interruptor maestro en OFF. Devuelve true solo si había un estable
      * y se borró; false si no había nada que borrar.
      */
@@ -676,6 +785,18 @@ class ProfileApplier(
         }
 
         const val QUARANTINE_STATUS_FILE_NAME = "muselink-profile-quarantine.json"
+
+        /**
+         * T6/510 — lista de versiones vetadas tras un rollback
+         * (`muselink-profile-vetoes.json`, junto al estable, con el
+         * hash SHA-256 de cada versión vetada). La lee el controlador
+         * antes de aplicar; una versión vetada no se aplica aunque el
+         * servidor la vuelva a publicar como `candidate`.
+         */
+        const val VETO_FILE_NAME = "muselink-profile-vetoes.json"
+
+        /** T6/510 — duración del veto de una versión que hizo rollback: 24 h. */
+        const val VETO_DURATION_MS = 24L * 60L * 60L * 1000L
 
         fun candidateFileName(version: Long): String = "muselink-profile-$version.ivanna.json"
 

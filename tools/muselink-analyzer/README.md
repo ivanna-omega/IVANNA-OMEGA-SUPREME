@@ -19,7 +19,8 @@ constant in `analyzer.py`, taken from the specifications, never invented.
 - `refactorizacion-muselink-autonoma.md` §2.3 (deterministic analyzer),
   §4 (A/B machine, the 5 original promotion gates), §6 (v1.1 candidate).
 - `evolucion-magistral-autonomia-completa.md` §§S2, S5 (via B), S6, S8,
-  S9 (server side), **T7 (anti-poisoning, before aggregation)**.
+  S9 (server side), **T6 (excursion cap + promotion brake)**,
+  **T7 (anti-poisoning, before aggregation)**.
 - Baseline fixed by the specs: spectral error RMS **10.46 dB** (v1.1
   profile), promotion target **≤ 8.37 dB** (0.8 × 10.46).
 
@@ -28,7 +29,7 @@ constant in `analyzer.py`, taken from the specifications, never invented.
 | File | What it is |
 |---|---|
 | `analyzer.py` | The rules. Pure functions + documented constants. |
-| `test_analyzer.py` | `unittest` suite (stdlib only, 70 tests). Run `python3 -m unittest test_analyzer -v` from this directory, or `python3 -m unittest discover -s tools/muselink-analyzer` from the repo root. |
+| `test_analyzer.py` | `unittest` suite (stdlib only, 85 tests). Run `python3 -m unittest test_analyzer -v` from this directory, or `python3 -m unittest discover -s tools/muselink-analyzer` from the repo root. |
 | `README.md` | This file. |
 
 ## Inputs / outputs
@@ -222,6 +223,13 @@ measurement.
    candidate (each rung gets its own A/B; a failed rung rolls back to
    the previous rung, never to v1.0 directly unless the whole climb is
    abandoned).
+7. **T6 before every promotion: call `gate_promotion(rung_slots,
+   promotions_today)`** (see §T6 below). A promotion the gate refuses
+   is not published; an excursion breach (`halt_needs_human`) stops
+   the cycle until Esse decides — do not publish that rung or any
+   later one. `compile_candidate` already reports the excursion
+   verdict of the whole planned climb in its `"t6"` entry, so the
+   server knows in advance which rung would breach the cap.
 
 ### T7 — Anti-poisoning: reject anomalous sessions before compiling
 
@@ -284,6 +292,52 @@ unchanged by this module except for one obligation it already carries
 in the spec: reject a candidate whose `mean_coherence < 0.20` unless it
 is marked `ab_measurement_only`.
 
+### T6 — Cumulative excursion cap + promotion brake (antichurn)
+
+Successive +2 dB rungs can walk a slot to +6/+8 dB over several
+versions without any human ever listening — the per-version clamp
+(±2 dB) does not limit the accumulated drift. And without a brake, a
+server publishing a new version at every poll can keep the phone
+applying profiles non-stop: the A/B never completes its 3 stable
+sessions, the motor never settles, and a rollback can be reversed at
+the next poll. The server-side half of T6 is two pure gates, run
+before a promotion is published, via
+`gate_promotion(candidate_slots_db, promotions_today)`:
+
+| # | Rule | Function | Behaviour |
+|---|---|---|---|
+| 1 | Cumulative excursion cap | `check_cumulative_excursion` | No slot's cumulative value vs the factory baseline (0.0 dB in every slot — the factory profile carries no EQ correction) may exceed **±4 dB**. Exactly at the cap is allowed. A breach **HALTS the cycle** (`halt_needs_human`): the server stops publishing and asks Esse — it does not silently truncate the climb. `compile_candidate` reports the same verdict for the whole planned climb in its `"t6"` entry, with `first_breaching_rung` naming the first rung that would breach it. |
+| 2 | Promotion brake | `check_promotion_brake` | At most **1 promotion per calendar day**. The server counts how many promotions it already published today and passes the count. A breach is a **WAIT** (publish again tomorrow), not a halt. |
+
+**Values — proposals, not measured data.** The T6 proposal leaves
+the cap and the brake to Esse ("solo él puede fijar ese límite"), and
+gives the cap only as an example ("p. ej. ±4 dB"). The values above
+are that example taken as the explicit default until Esse confirms or
+changes them: `CUMULATIVE_EXCURSION_CAP_DB = 4.0`,
+`MAX_PROMOTIONS_PER_DAY = 1`. They are named constants so the server
+can tune them — and Esse can fix them with one number each — without
+touching the rules. The phone-side half of T6 (dwell of 2 polls, max
+2 automatic applies per day, 24 h veto of a rolled-back version, A/B
+timeout of 4 h without 3 sessions, master switch also stopping the
+poll) lives in `OrganismController.kt`, not here: this module never
+sees the phone.
+
+**What the server must do on each `gate_promotion` result:**
+
+- `allowed` → publish the promotion; count it in today's promotions.
+- `allowed` False with `halt_needs_human` False → promotion brake:
+  do not publish today; the rung stays queued for tomorrow.
+- `halt_needs_human` True → stop the cycle: do not publish this rung
+  or any later one, and surface the excursion reason to Esse for a
+  human decision. The climb resumes only when he fixes a new cap (or
+  accepts the excursion explicitly).
+
+**Honest note on the v1.1 climb:** the v1.1 ladder as planned (targets
++4 dB mid, +9 dB brillo/presencia) breaches the ±4 dB cap at rung
+v1.3 — the T6 gate says the climb stops there unless Esse raises the
+cap. That is the proposal working as designed: +9 dB in a slot is a
+change no one should make without him listening first.
+
 ## Pending data from the server (not invented here)
 
 1. **`erbStdDb` per band of the compiled profile — MISSING.** The phone
@@ -332,6 +386,14 @@ is marked `ab_measurement_only`.
   rate limit is a parameter of `gate_session`, not a buried constant.
   The 0 dBFS / coherence 0…1 / crest ≥ 0 bounds follow from the
   definitions and are not proposals.
+- **T6 values are proposals too** (see §T6 above): the proposal leaves
+  the cap and the brake to Esse and gives the cap only as an example
+  ("p. ej. ±4 dB"). The defaults (`CUMULATIVE_EXCURSION_CAP_DB =
+  4.0`, `MAX_PROMOTIONS_PER_DAY = 1`; phone side: dwell 2 polls, max
+  2 auto-applies/day, 24 h veto, 4 h A/B timeout) are the proposal's
+  own numbers taken as explicit defaults until Esse confirms or
+  changes them. The 0.0 dB factory baseline is not a proposal: the
+  factory profile carries no EQ correction.
 - **S8(a) transition bands (ERB 10–12)** belong to no named S8 region
   group in the spec; they are covered only by the global RMS gate.
   This is documented in the code, not silently assigned to a group.

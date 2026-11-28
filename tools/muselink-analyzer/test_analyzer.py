@@ -22,15 +22,19 @@ from analyzer import (
     COHERENCE_GUARD,
     COMB_FIT_D_MAX_M,
     COMB_FIT_D_MIN_M,
+    CUMULATIVE_EXCURSION_CAP_DB,
     DEFAULT_MAX_SESSIONS_PER_HOUR,
     ERB_CENTER_HZ,
     EQ_CLAMP_DB,
     LADDER_STEP_DB,
+    MAX_PROMOTIONS_PER_DAY,
     OUTLIER_CONFIRM_DB,
     OUTLIER_CONFIRM_SESSIONS,
     OUTLIER_DEVIATION_DB,
     REGIONS,
     TARGET_RMS_DB,
+    check_cumulative_excursion,
+    check_promotion_brake,
     check_replay,
     check_token_rate,
     classify_session_outlier,
@@ -40,6 +44,7 @@ from analyzer import (
     emit_ladder,
     evaluate_ab,
     fit_comb_vs_response,
+    gate_promotion,
     gate_session,
     log_rejection,
     precheck_headroom,
@@ -789,6 +794,132 @@ class TestT7GateSession(unittest.TestCase):
                    rejection_log=log)
         self.assertEqual(state, {"held": []})
         self.assertEqual(log, [])
+
+
+class TestT6CumulativeExcursion(unittest.TestCase):
+    """T6 rule (a): cumulative excursion per slot vs the factory baseline.
+
+    The cap is the proposal's own example (+/-4 dB, "p. ej. ±4 dB"),
+    taken as the explicit default until Esse confirms or changes it.
+    """
+
+    def test_within_cap_is_ok(self):
+        result = check_cumulative_excursion(
+            {"low_60_120": -2.0, "mid_500_1k": 2.0,
+             "high_2k_4k": 3.5, "presence_4k_8k": -3.5})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["max_excursion_db"], 3.5)
+        self.assertEqual(result["exceeded_slots"], [])
+
+    def test_exactly_at_the_cap_is_allowed(self):
+        result = check_cumulative_excursion(
+            {"high_2k_4k": 4.0, "presence_4k_8k": -4.0})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["max_excursion_db"], 4.0)
+
+    def test_just_beyond_the_cap_breaches_and_names_the_slot(self):
+        result = check_cumulative_excursion(
+            {"low_60_120": -3.0, "high_2k_4k": 4.01})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exceeded_slots"], ["high_2k_4k"])
+        self.assertIn("high_2k_4k", result["reason"])
+        self.assertIn("+4.01", result["reason"])
+
+    def test_negative_breach_counts_the_same(self):
+        result = check_cumulative_excursion({"low_60_120": -6.0})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exceeded_slots"], ["low_60_120"])
+
+    def test_empty_slots_and_unknown_slots_are_ignored(self):
+        self.assertTrue(check_cumulative_excursion({})["ok"])
+        self.assertTrue(
+            check_cumulative_excursion({"room_corr_db": 9.0})["ok"])
+
+    def test_cap_is_a_parameter_not_a_buried_constant(self):
+        self.assertTrue(
+            check_cumulative_excursion({"high_2k_4k": 6.0},
+                                       cap_db=6.0)["ok"])
+        self.assertFalse(
+            check_cumulative_excursion({"high_2k_4k": 6.0},
+                                       cap_db=5.0)["ok"])
+
+
+class TestT6PromotionBrake(unittest.TestCase):
+    """T6 rule (a): at most one promotion per calendar day."""
+
+    def test_no_promotion_today_is_allowed(self):
+        result = check_promotion_brake(0)
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["max_promotions_per_day"],
+                         MAX_PROMOTIONS_PER_DAY)
+
+    def test_one_promotion_today_blocks_the_second(self):
+        result = check_promotion_brake(1)
+        self.assertFalse(result["allowed"])
+        self.assertIn("wait until tomorrow", result["reason"])
+
+    def test_negative_count_is_a_caller_bug(self):
+        with self.assertRaises(ValueError):
+            check_promotion_brake(-1)
+
+
+class TestT6GatePromotion(unittest.TestCase):
+    """T6 entry point: both rules together, before publishing."""
+
+    def test_clean_promotion_is_allowed_without_halt(self):
+        result = gate_promotion({"high_2k_4k": 2.0}, promotions_today=0)
+        self.assertTrue(result["allowed"])
+        self.assertFalse(result["halt_needs_human"])
+        self.assertEqual(result["reasons"], [])
+
+    def test_excursion_breach_halts_the_cycle(self):
+        result = gate_promotion({"high_2k_4k": 6.0}, promotions_today=0)
+        self.assertFalse(result["allowed"])
+        self.assertTrue(result["halt_needs_human"])
+        self.assertFalse(result["excursion"]["ok"])
+        self.assertTrue(result["promotion_brake"]["allowed"])
+
+    def test_brake_alone_waits_without_halting(self):
+        result = gate_promotion({"high_2k_4k": 2.0}, promotions_today=1)
+        self.assertFalse(result["allowed"])
+        self.assertFalse(result["halt_needs_human"])
+        self.assertTrue(result["excursion"]["ok"])
+        self.assertFalse(result["promotion_brake"]["allowed"])
+
+    def test_both_failures_are_reported_together(self):
+        result = gate_promotion({"high_2k_4k": 8.0}, promotions_today=2)
+        self.assertFalse(result["allowed"])
+        self.assertTrue(result["halt_needs_human"])
+        self.assertEqual(len(result["reasons"]), 2)
+
+
+class TestT6CompileCandidate(unittest.TestCase):
+    """T6 verdict on the whole planned climb (compile_candidate "t6")."""
+
+    def test_v1_1_climb_breaches_the_cap_at_rung_v1_3(self):
+        # The v1.1 ladder as planned: v1.2 sits exactly at the cap
+        # (+/-4.0 dB), v1.3 walks brillo/presencia to +6 dB. The gate
+        # says the climb stops there unless Esse raises the cap.
+        out = compile_candidate(
+            V1_1_ERROR_DB, [0.9] * 24, 0.9,
+            erb_std_db=[0.3] * 24, level_max_dbfs=-6.0)
+        t6 = out["t6"]
+        self.assertTrue(t6["halt_needs_human"])
+        self.assertEqual(t6["first_breaching_rung"], "v1.3")
+        self.assertEqual(t6["excursion"]["max_excursion_db"], 9.0)
+        self.assertEqual(t6["excursion"]["cap_db"],
+                         CUMULATIVE_EXCURSION_CAP_DB)
+
+    def test_small_correction_stays_within_the_cap(self):
+        # -1.5 dB error everywhere: proposed +1.5 dB per slot, no
+        # ladder left to climb, excursion 1.5 dB — no halt.
+        out = compile_candidate(
+            [-1.5] * 24, [0.9] * 24, 0.9,
+            erb_std_db=[0.3] * 24, level_max_dbfs=-6.0)
+        t6 = out["t6"]
+        self.assertFalse(t6["halt_needs_human"])
+        self.assertIsNone(t6["first_breaching_rung"])
+        self.assertEqual(t6["excursion"]["max_excursion_db"], 1.5)
 
 
 if __name__ == "__main__":

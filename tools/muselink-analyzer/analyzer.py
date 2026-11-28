@@ -13,7 +13,8 @@ Specifications implemented:
   * ``refactorizacion-muselink-autonoma.md`` §2.3 (deterministic analyzer),
     §4 (A/B machine: the 5 original promotion gates).
   * ``evolucion-magistral-autonomia-completa.md`` §§S2, S5 (via B), S6, S8,
-    S9 (server side), T7 (anti-poisoning, before aggregation).
+    S9 (server side), T6 (cumulative excursion cap + promotion brake),
+    T7 (anti-poisoning, before aggregation).
 
 Baseline fixed by the specs: spectral error RMS 10.46 dB (v1.1 profile),
 promotion target <= 8.37 dB (0.8 x 10.46).
@@ -28,6 +29,9 @@ Public API (all pure functions):
     :func:`check_replay`, :func:`classify_session_outlier`,
     :func:`quarantine_update`, :func:`log_rejection`,
     :func:`rejection_summary`, :func:`gate_session`
+  * T6  -- :func:`check_cumulative_excursion`,
+    :func:`check_promotion_brake`, :func:`gate_promotion`
+    (and the ``"t6"`` entry of :func:`compile_candidate`).
   * §2.3 -- :func:`regional_correction`, :func:`detect_resonances`,
     :func:`region_rms`, :func:`compile_candidate`
 """
@@ -85,6 +89,10 @@ __all__ = [
     "OUTLIER_DEVIATION_DB",
     "OUTLIER_CONFIRM_DB",
     "OUTLIER_CONFIRM_SESSIONS",
+    # T6 — cumulative excursion cap + promotion brake (proposals; see
+    # README §T6)
+    "CUMULATIVE_EXCURSION_CAP_DB",
+    "MAX_PROMOTIONS_PER_DAY",
     # §2.3 helpers
     "region_error",
     "region_rms",
@@ -107,6 +115,10 @@ __all__ = [
     "log_rejection",
     "rejection_summary",
     "gate_session",
+    # T6 — cumulative excursion cap + promotion brake
+    "check_cumulative_excursion",
+    "check_promotion_brake",
+    "gate_promotion",
 ]
 
 # ---------------------------------------------------------------------------
@@ -286,6 +298,39 @@ RATE_WINDOW_SECONDS = 3600
 OUTLIER_DEVIATION_DB = 6.0
 OUTLIER_CONFIRM_DB = 3.0
 OUTLIER_CONFIRM_SESSIONS = 2
+
+
+# ---------------------------------------------------------------------------
+# T6 — cumulative excursion cap + promotion brake
+# (evolucion-magistral-autonomia-completa.md T6). PROPOSALS, not measured
+# data: the proposal leaves the cap and the brake to Esse ("solo él puede
+# fijar ese límite"). Each value below is the proposal's own example
+# ("p. ej. ±4 dB", "máximo una promoción por día" / "máximo 2
+# aplicaciones automáticas por día" on the phone), taken as the explicit
+# default until Esse confirms or changes it. They are named constants so
+# the server can tune them without touching the rules — and so Esse can
+# fix them with one number each.
+# ---------------------------------------------------------------------------
+
+# T6 rule (a): cumulative excursion per slot vs the FACTORY baseline.
+# The factory baseline is no correction at all: 0.0 dB in every slot
+# (the v1.0/v1.1 factory profile carries no EQ correction of its own).
+# The per-version clamp (EQ_CLAMP_DB, +/-2 dB) does NOT limit the drift:
+# successive +2 dB rungs can walk a slot to +6/+8 dB over several
+# versions without any human ever listening. The cumulative value of a
+# slot — the EQ the profile actually carries after the whole climb,
+# i.e. a ladder rung's eq_bands_db — must stay within +/-4 dB.
+# Exactly at the cap is allowed; beyond it the cycle STOPS and asks a
+# human (see gate_promotion: halt_needs_human), it does not silently
+# truncate the climb.
+CUMULATIVE_EXCURSION_CAP_DB = 4.0
+
+# T6 rule (a): at most one promotion per calendar day. The server
+# counts how many promotions it already published today and passes the
+# count to check_promotion_brake / gate_promotion; the brake is a
+# WAIT (publish again tomorrow), not a halt — unlike the excursion
+# breach, which stops the cycle until a human decides.
+MAX_PROMOTIONS_PER_DAY = 1
 
 
 # ---------------------------------------------------------------------------
@@ -1490,6 +1535,137 @@ def gate_session(session, aggregate_error_db, token_history, now_epoch,
 
 
 # ---------------------------------------------------------------------------
+# T6 — cumulative excursion cap + promotion brake
+# (evolucion-magistral-autonomia-completa.md T6).
+#
+# Threat model: successive +2 dB rungs can walk the EQ to +6/+8 dB over
+# several versions without any human ever listening — the per-version
+# clamp does not limit the accumulated drift. And without an antichurn
+# brake, a server publishing a new version at every poll can keep the
+# phone applying profiles non-stop: the A/B never completes its 3
+# stable sessions, the motor never settles, and a rollback can be
+# reversed at the next poll. These rules run on the SERVER, before a
+# promotion is published:
+#   1. check_cumulative_excursion: no slot's cumulative value vs the
+#      factory baseline (0.0 dB) may exceed +/-CUMULATIVE_EXCURSION_CAP_DB.
+#      A breach HALTS the cycle (halt_needs_human): the server stops
+#      publishing and asks Esse — it does not truncate silently.
+#   2. check_promotion_brake: at most MAX_PROMOTIONS_PER_DAY promotions
+#      per calendar day. A breach is a WAIT (publish again tomorrow),
+#      not a halt.
+# gate_promotion() runs both and is the entry point the server calls
+# before publishing a promotion. compile_candidate() also reports the
+# excursion verdict of the whole planned climb in its "t6" entry, so
+# the server knows in advance which rung would breach the cap.
+#
+# The phone-side half of T6 (dwell, daily auto-apply cap, 24 h version
+# veto, A/B timeout, master switch also stopping the poll) lives in
+# OrganismController.kt, not here: this module never sees the phone.
+# ---------------------------------------------------------------------------
+
+def check_cumulative_excursion(slot_values_db,
+                               cap_db=CUMULATIVE_EXCURSION_CAP_DB):
+    """T6 rule (a): cumulative excursion per slot vs the factory baseline.
+
+    ``slot_values_db`` maps motor slot -> the CUMULATIVE EQ value the
+    profile would carry (dB), i.e. a ladder rung's ``eq_bands_db`` (the
+    total after the whole climb), not a single version's increment.
+    The factory baseline is 0.0 dB in every slot (no correction). Slots
+    outside EQ_SLOTS are ignored (the motor has no such slot).
+
+    Exactly at the cap is allowed; beyond it is a breach. Returns
+    ``{"ok": bool, "excursions_db": {slot: value},
+    "max_excursion_db": float, "exceeded_slots": [slot],
+    "cap_db": float, "reason": str}``.
+    """
+    excursions = {slot: float(slot_values_db.get(slot, 0.0))
+                  for slot in EQ_SLOTS if slot in slot_values_db}
+    max_excursion = max([abs(v) for v in excursions.values()] or [0.0])
+    exceeded = sorted(slot for slot, value in excursions.items()
+                      if abs(value) > cap_db + 1e-9)
+    ok = not exceeded
+    if ok:
+        reason = ("max cumulative excursion %.2f dB <= cap +/-%.1f dB "
+                  "(factory baseline 0.0 dB per slot)"
+                  % (max_excursion, cap_db))
+    else:
+        reason = ("cumulative excursion exceeds the cap +/-%.1f dB in "
+                  "%s (factory baseline 0.0 dB per slot): %s"
+                  % (cap_db, exceeded,
+                     ", ".join("%s %+.2f dB" % (slot, excursions[slot])
+                               for slot in exceeded)))
+    return {
+        "ok": ok,
+        "excursions_db": excursions,
+        "max_excursion_db": max_excursion,
+        "exceeded_slots": exceeded,
+        "cap_db": cap_db,
+        "reason": reason,
+    }
+
+
+def check_promotion_brake(promotions_today,
+                          max_promotions_per_day=MAX_PROMOTIONS_PER_DAY):
+    """T6 rule (a): at most one promotion per calendar day.
+
+    ``promotions_today`` is how many promotions the server already
+    published today (the server counts per calendar day and passes the
+    count; this module has no clock). A breach is a WAIT — the server
+    publishes again tomorrow — not a halt.
+
+    Returns ``{"allowed": bool, "promotions_today": int,
+    "max_promotions_per_day": int, "reason": str}``.
+    """
+    if promotions_today < 0:
+        raise ValueError("promotions_today must be >= 0")
+    allowed = promotions_today < max_promotions_per_day
+    return {
+        "allowed": allowed,
+        "promotions_today": promotions_today,
+        "max_promotions_per_day": max_promotions_per_day,
+        "reason": ("promotions today: %d/%d" % (promotions_today,
+                                                max_promotions_per_day))
+                  + ("" if allowed else
+                     ": daily promotion brake — wait until tomorrow"),
+    }
+
+
+def gate_promotion(candidate_slots_db, promotions_today,
+                   cap_db=CUMULATIVE_EXCURSION_CAP_DB,
+                   max_promotions_per_day=MAX_PROMOTIONS_PER_DAY):
+    """T6 entry point: gate ONE promotion before the server publishes it.
+
+    ``candidate_slots_db`` is the CUMULATIVE slot values the promoted
+    profile would carry (a ladder rung's ``eq_bands_db``); see
+    :func:`check_cumulative_excursion`. ``promotions_today`` is the
+    server's count of promotions already published today; see
+    :func:`check_promotion_brake`.
+
+    Returns ``{"allowed": bool, "halt_needs_human": bool,
+    "excursion": {...}, "promotion_brake": {...}, "reasons": [str]}``.
+    ``allowed`` is False when either rule fails. ``halt_needs_human``
+    is True only on an excursion breach: the cycle STOPS and asks Esse
+    (the cap is his limit — "solo él puede fijar ese límite"). A
+    promotion-brake failure alone only waits until tomorrow.
+    """
+    excursion = check_cumulative_excursion(candidate_slots_db, cap_db=cap_db)
+    brake = check_promotion_brake(promotions_today,
+                                  max_promotions_per_day=max_promotions_per_day)
+    reasons = []
+    if not excursion["ok"]:
+        reasons.append(excursion["reason"])
+    if not brake["allowed"]:
+        reasons.append(brake["reason"])
+    return {
+        "allowed": excursion["ok"] and brake["allowed"],
+        "halt_needs_human": not excursion["ok"],
+        "excursion": excursion,
+        "promotion_brake": brake,
+        "reasons": reasons,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Pipeline: §2.3 regional correction + S9 guard + S6 split (+ S5 ladder)
 # ---------------------------------------------------------------------------
 
@@ -1511,10 +1687,19 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
        ``v1_1a_promoted``), each headroom pre-checked.
     5. S5 ladder for the remaining positive residual (rungs after the
        current version), so the server knows the whole climb in advance.
+    6. T6 excursion verdict on the whole planned climb: the cumulative
+       slot values of every ladder rung are checked against the
+       +/-CUMULATIVE_EXCURSION_CAP_DB cap vs the factory baseline
+       (0.0 dB). ``t6["halt_needs_human"]`` is True when any rung would
+       breach the cap, with ``first_breaching_rung`` naming the first
+       rung that does; the server must not publish that rung or any
+       later one, and must stop the cycle pending a human decision.
+       With no ladder (nothing left to climb) the check runs on the
+       currently applied (clamped) slots instead.
 
     ``coherence_mean_db`` is the 24-band per-band coherence list.
     Returns a dict with keys ``regional``, ``s2``, ``coherence_guard``,
-    ``split`` and ``ladder``. Pure function; the server decides whether
+    ``split``, ``ladder`` and ``t6``. Pure function; the server decides whether
     to publish the returned candidates.
     """
     regional = regional_correction(error_mean_db)
@@ -1589,10 +1774,46 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
                     for slot in EQ_SLOTS}
     ladder = emit_ladder(regional["applied_db"], target_slots,
                          base_version=base_version)
+
+    # T6: excursion verdict on the whole planned climb. A rung's
+    # eq_bands_db IS the cumulative value the profile would carry, so
+    # every rung is checked; the headline is the rung with the largest
+    # excursion and first_breaching_rung is the first rung that
+    # breaches (None when none does). With no ladder the check runs on
+    # the currently applied (clamped) slots.
+    if ladder:
+        rung_checks = [check_cumulative_excursion(rung["eq_bands_db"])
+                       for rung in ladder]
+        worst = max(rung_checks, key=lambda c: c["max_excursion_db"])
+        first_breach = next(
+            (rung["version"] for rung, check in zip(ladder, rung_checks)
+             if not check["ok"]),
+            None)
+        t6_excursion = worst
+    else:
+        t6_excursion = check_cumulative_excursion(regional["applied_db"])
+        first_breach = None if t6_excursion["ok"] else "current"
+    t6 = {
+        "excursion": t6_excursion,
+        "first_breaching_rung": first_breach,
+        "halt_needs_human": not t6_excursion["ok"],
+        "reason": (
+            "planned climb stays within the +/-%.1f dB cumulative "
+            "excursion cap (max %.2f dB)"
+            % (CUMULATIVE_EXCURSION_CAP_DB, t6_excursion["max_excursion_db"])
+            if t6_excursion["ok"] else
+            "planned climb would breach the +/-%.1f dB cumulative "
+            "excursion cap at rung %s: %s — STOP the cycle, do not "
+            "publish that rung or any later one, ask Esse"
+            % (CUMULATIVE_EXCURSION_CAP_DB, first_breach,
+               t6_excursion["reason"])),
+    }
+
     return {
         "regional": regional,
         "s2": s2,
         "coherence_guard": guard,
         "split": split,
         "ladder": ladder,
+        "t6": t6,
     }

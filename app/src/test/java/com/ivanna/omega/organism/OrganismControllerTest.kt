@@ -464,4 +464,116 @@ class OrganismControllerTest {
         assertEquals(false, state.llmDrafted)
         assertEquals(1_000L, state.lastLlmStatusAtMs)
     }
+
+    // T6/510 — tope de excursión acumulada + antichurn.
+
+    @Test
+    fun `State por defecto no lleva dwell tope veto ni temporizador A-B`() {
+        val state = OrganismController.State()
+        assertNull(state.dwellVersion)
+        assertEquals(0, state.dwellSightings)
+        assertEquals(0, state.autoAppliesToday)
+        assertFalse(state.autoApplyCapHit)
+        assertEquals(0L, state.lastApplyCapHitAtMs)
+        assertNull(state.vetoedVersion)
+        assertEquals(0L, state.vetoedUntilMs)
+        assertEquals(0L, state.abStartedAtMs)
+        assertEquals(0, state.abSessionsCompleted)
+        assertEquals(0L, state.lastAbTimeoutAtMs)
+    }
+
+    @Test
+    fun `dwell primera vista no aplica segunda si`() {
+        val first = OrganismController.dwellAdvance(null, 0, 5L)
+        assertEquals(5L, first.version)
+        assertEquals(1, first.sightings)
+        assertFalse(first.ready)
+        val second = OrganismController.dwellAdvance(first.version, first.sightings, 5L)
+        assertEquals(5L, second.version)
+        assertEquals(2, second.sightings)
+        assertTrue(second.ready)
+        // Una tercera vista seguida sigue lista (el dwell queda latido
+        // hasta aplicar; el tope diario es el que frena entonces).
+        val third = OrganismController.dwellAdvance(second.version, second.sightings, 5L)
+        assertTrue(third.ready)
+        assertEquals(3, third.sightings)
+    }
+
+    @Test
+    fun `dwell otra version reinicia el conteo a 1`() {
+        val dwelled = OrganismController.dwellAdvance(5L, 2, 5L)
+        assertTrue(dwelled.ready)
+        val other = OrganismController.dwellAdvance(dwelled.version, dwelled.sightings, 6L)
+        assertEquals(6L, other.version)
+        assertEquals(1, other.sightings)
+        assertFalse(other.ready)
+    }
+
+    @Test
+    fun `dayKey agrupa el mismo dia y separa dias distintos`() {
+        // 1970-01-01 00:16 y 00:33 UTC: mismo día en cualquier zona
+        // (±14 h no cruza la medianoche entre ambas).
+        assertEquals(
+            OrganismController.dayKey(1_000_000L),
+            OrganismController.dayKey(2_000_000L)
+        )
+        // 1970-01-02 03:46 UTC: día distinto en cualquier zona.
+        assertFalse(
+            OrganismController.dayKey(1_000_000L) ==
+                OrganismController.dayKey(100_000_000L)
+        )
+    }
+
+    @Test
+    fun `tope diario dos aplicaciones y la tercera espera a manana`() {
+        val today = "2026-11-28"
+        assertTrue(OrganismController.autoApplyAllowed(today, 0, today))
+        assertTrue(OrganismController.autoApplyAllowed(today, 1, today))
+        assertFalse(OrganismController.autoApplyAllowed(today, 2, today))
+        // Día nuevo: el contador se reinicia aunque ayer se llegara al tope.
+        assertTrue(OrganismController.autoApplyAllowed("2026-11-27", 2, today))
+        assertTrue(OrganismController.autoApplyAllowed("", 0, today))
+    }
+
+    @Test
+    fun `nextAutoApplyCount suma en el mismo dia y reinicia en dia nuevo`() {
+        val today = "2026-11-28"
+        assertEquals(1, OrganismController.nextAutoApplyCount(today, 0, today))
+        assertEquals(2, OrganismController.nextAutoApplyCount(today, 1, today))
+        assertEquals(1, OrganismController.nextAutoApplyCount("2026-11-27", 2, today))
+        assertEquals(1, OrganismController.nextAutoApplyCount("", 0, today))
+    }
+
+    @Test
+    fun `veto bloquea hasta su caducidad exacta y no despues`() {
+        val until = 5_000L
+        assertTrue(OrganismController.isVersionVetoed(until, 4_999L))
+        assertFalse(OrganismController.isVersionVetoed(until, 5_000L))
+        assertFalse(OrganismController.isVersionVetoed(until, 5_001L))
+        assertFalse(OrganismController.isVersionVetoed(0L, 1_000L))
+    }
+
+    @Test
+    fun `timeout A-B sin 3 sesiones en 4 h`() {
+        val timeout = OrganismController.AB_TIMEOUT_MS
+        val start = 10_000_000L
+        // Sin A/B en curso no hay timeout.
+        assertFalse(OrganismController.abTimedOut(0L, 0, start + timeout))
+        // Antes de las 4 h no caduca aunque no haya sesiones.
+        assertFalse(OrganismController.abTimedOut(start, 0, start + timeout - 1L))
+        // A las 4 h exactas, sin sesiones, caduca.
+        assertTrue(OrganismController.abTimedOut(start, 0, start + timeout))
+        // Con 2 sesiones sigue caducando; con 3 ya no.
+        assertTrue(OrganismController.abTimedOut(start, 2, start + timeout + 1L))
+        assertFalse(OrganismController.abTimedOut(start, 3, start + timeout + 1L))
+    }
+
+    @Test
+    fun `abSessionsCompleted es el delta desde el arranque del A-B`() {
+        assertEquals(0, OrganismController.abSessionsCompleted(0L, 10L, 12L))
+        assertEquals(2, OrganismController.abSessionsCompleted(1_000L, 10L, 12L))
+        assertEquals(0, OrganismController.abSessionsCompleted(1_000L, 10L, 10L))
+        // Un contador que retrocede no resta sesiones.
+        assertEquals(0, OrganismController.abSessionsCompleted(1_000L, 12L, 10L))
+    }
 }
