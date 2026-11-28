@@ -1,11 +1,16 @@
 package com.ivanna.omega.organism
 
+import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import java.security.KeyFactory
+import java.security.Signature
+import java.security.spec.X509EncodedKeySpec
+import java.util.Base64
 
 /**
  * ProfileFetcher — GET del perfil vigente + POST de confirmación (T1,
@@ -56,15 +61,75 @@ import okhttp3.Response
  * false si el perfil se compiló solo con el analizador determinista
  * («sin redacción LLM»).
  *
- * PUNTO DE ENGANCHE (C3, Fase 2 — verificación de firma Ed25519): en
- * [fetch], tras parsear el sobre y ANTES de devolver [Result.Current],
- * irá la verificación de la firma del sobre contra la clave pública del
- * servidor. Hoy el sobre no trae firma y la verificación NO existe: un
- * servidor comprometido o un token robado podrían servir un perfil
- * válido pero no firmado. NO se implementa en T1 por diseño (C3 es
- * Fase 2 posterior); el perfil que se devuelve aquí pasa de todos modos
- * por la validación fail-closed de [ProfileApplier] antes de tocar el
- * motor.
+ * C3/510 — verificación de firma Ed25519 (Fase 6): el servidor firma
+ * el `.ivanna.json` canónico con Ed25519 y sirve
+ * `{profile, version, signature, signerKeyId}` — en concreto el
+ * sobre trae `signature` (firma Ed25519, 64 bytes, Base64 estándar o
+ * URL-safe) y `signerKeyId` (qué clave firmó). [parseCurrent] verifica
+ * la firma contra la clave pública ANTES de devolver [Result.Current]
+ * (y antes de [Result.NotModified]: un sobre sin firma válida no se
+ * acepta en ningún caso cuando el enforcement está ON). Lo que se
+ * verifica es exactamente lo que se aplica: los bytes UTF-8 de
+ * `profileEl.toString()` (la misma cadena que viaja como
+ * `profileBody` a la validación fail-closed de [ProfileApplier]).
+ *
+ * CONTRATO DE FIRMA (lo que debe hacer el servidor al firmar):
+ *  - Firmar los bytes UTF-8 exactos del valor del campo `profile` tal
+ *    como se sirve en el sobre: JSON compacto, mismo orden de claves y
+ *    mismos literales numéricos que en el sobre. El teléfono re-deriva
+ *    esos bytes con Gson (`JsonObject.toString()`), que preserva orden
+ *    y literales y NO escapa `<>&='` (verificado en JVM con Gson
+ *    2.15.0); el servidor DEBE firmar la cadena exacta que embebe en
+ *    el sobre, no una re-serialización (una re-serialización que
+ *    reescriba `1.0` como `1` o reordene claves rompe la verificación).
+ *  - `signature` = firma Ed25519 pura (RFC 8032, sin contexto) de 64
+ *    bytes, en Base64 estándar (con padding) o Base64 URL-safe.
+ *  - `signerKeyId` = identificador de la clave que firmó; el teléfono
+ *    busca la clave pública en [signerPublicKeys] por ese id.
+ *  - Clave pública = 32 bytes crudos Ed25519 en Base64 (estándar o
+ *    URL-safe). El teléfono la envuelve en SubjectPublicKeyInfo X.509
+ *    (prefijo DER de Ed25519) para `KeyFactory`.
+ *  - Los metadatos del sobre (`version`, `status`, `abState`) NO van
+ *    cubiertos por la firma: la firma autentica el contenido del
+ *    perfil (un perfil firmado es salida genuina del servidor, sea
+ *    cual sea el sobre que lo acompañe); la política de versiones
+ *    (solo `rolled_back` aplica una versión menor) la decide el
+ *    controlador. Si en el futuro se quiere ligar versión y perfil, el
+ *    contrato de firma debe cambiar en ambos lados a la vez.
+ *
+ * ⛔ GATED OFF POR DEFECTO — LEER ANTES DE ACTIVAR ([enforceSignature]
+ * = false): el servidor AÚN NO firma y Esse NO ha decidido dónde vive
+ * la clave privada. Si el enforcement se activara ahora, TODOS los
+ * perfiles irían a cuarentena y la VUELTA se rompería. Por eso la
+ * verificación existe y se prueba, pero NO se exige: con enforcement
+ * OFF los perfiles sin firma se aceptan igual (la validación C2 de
+ * [ProfileApplier] se aplica siempre) y, si el sobre trae firma y hay
+ * claves configuradas, el resultado solo se registra en el log (modo
+ * monitor: sirve para desplegar la firma en el servidor y ver que
+ * verifica antes de exigirla). PARA ACTIVAR EL ENFORCEMENT falta, en
+ * este orden: (1) decisión de Esse sobre la custodia de la clave
+ * privada del servidor; (2) servidor firmando cada perfil con esa
+ * clave y sirviendo `signature` + `signerKeyId`; (3) clave(s)
+ * pública(s) REAL(es) provisionada(s) en [signerPublicKeys] (vacío
+ * por defecto: sin claves no hay nada que verificar y con
+ * enforcement ON todo iría a cuarentena); (4) poner
+ * `enforceSignature = true` donde se construye el fetcher. La clave
+ * privada del servidor NO existe en este repo ni debe existir jamás:
+ * aquí solo vive la pública.
+ *
+ * Rotación: [signerPublicKeys] es un mapa `signerKeyId → clave
+ * pública Base64`. En operación normal tiene UNA entrada; durante una
+ * rotación tiene DOS (clave vieja + clave nueva) y el servidor indica
+ * con `signerKeyId` cuál firmó cada perfil. Un `signerKeyId`
+ * desconocido no verifica (fail-closed con enforcement ON).
+ *
+ * Implementación: API de plataforma (`java.security.Signature` con
+ * «Ed25519», `KeyFactory` «Ed25519»; minSdk 33) sin dependencias
+ * nuevas. Si el algoritmo no existiera en el dispositivo, la
+ * verificación devuelve false (fail-closed con enforcement ON, sin
+ * efecto con OFF). Toda la verificación es pura y testeable en JVM:
+ * [verifyEd25519Signature] se prueba con los vectores de RFC 8032
+ * §7.1 (ver ProfileFetcherTest).
  *
  * PENDIENTE END-TO-END: el endpoint del servidor (`GET current` +
  * `POST applied` + analizador determinista) NO está en este repo (vive
@@ -82,7 +147,30 @@ class ProfileFetcher(
     private val client: OkHttpClient = OrganismSender.defaultClient(),
     private val hosts: List<String> = OrganismSender.DEFAULT_HOSTS,
     private val enforceAllowlist: Boolean = true,
-    private val logger: OrganismLogger = AndroidOrganismLogger(TAG)
+    private val logger: OrganismLogger = AndroidOrganismLogger(TAG),
+    /**
+     * C3/510 — enforcement de la firma Ed25519. ⛔ OFF POR DEFECTO y
+     * debe seguir así hasta que se cumplan las 4 condiciones de la
+     * cabecera (decisión de custodia de Esse + servidor firmando +
+     * clave pública real provisionada en [signerPublicKeys] + este
+     * flag a true): con enforcement ON, un sobre sin firma, con firma
+     * inválida, con `signerKeyId` desconocido o sin claves
+     * provisionadas va a [Result.Quarantine] (mismo camino que C2).
+     * Con OFF, los perfiles sin firma se aceptan igual (C2 se aplica
+     * siempre) y una firma presente solo se verifica en modo monitor
+     * (resultado en el log, sin cuarentena).
+     */
+    private val enforceSignature: Boolean = false,
+    /**
+     * C3/510 — claves públicas Ed25519 del servidor, por
+     * `signerKeyId`: `signerKeyId → clave pública de 32 bytes crudos
+     * en Base64 (estándar o URL-safe)`. Vacío por defecto: la clave
+     * pública real NO existe aún (el servidor aún no firma) y NO debe
+     * hardcodearse aquí ninguna clave «real». Una entrada en operación
+     * normal; DOS durante una rotación (vieja + nueva). Sin entrada
+     * para el `signerKeyId` del sobre, la firma no verifica.
+     */
+    private val signerPublicKeys: Map<String, String> = emptyMap()
 ) {
     companion object {
         private const val TAG = "ProfileFetcher"
@@ -111,6 +199,77 @@ class ProfileFetcher(
          * solo display, ver cabecera).
          */
         val KNOWN_LLM_STATUSES: Set<String> = setOf("ok", "degraded", "unavailable")
+
+        /**
+         * C3/510 — prefijo DER de SubjectPublicKeyInfo para Ed25519
+         * (OID 1.3.101.112): `SEQUENCE { SEQUENCE { OID Ed25519 }
+         * BIT STRING }`. La clave pública configurada son 32 bytes
+         * crudos; `KeyFactory` «Ed25519» exige el envoltorio X.509
+         * completo (44 bytes), así que se antepone este prefijo de 12
+         * bytes. Verificado en JVM (JDK 17): el `encoded` X.509 de
+         * una clave generada con `KeyPairGenerator` «Ed25519» es
+         * exactamente este prefijo + los 32 bytes crudos.
+         */
+        private val ED25519_X509_PREFIX = byteArrayOf(
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00
+        )
+
+        /**
+         * C3/510 — verifica una firma Ed25519 pura (RFC 8032, sin
+         * contexto) sobre [message].
+         *
+         * [publicKeyBase64] es la clave pública de 32 bytes crudos en
+         * Base64 (estándar con padding, o URL-safe con o sin padding);
+         * [signatureBase64] es la firma de 64 bytes en el mismo
+         * formato. Cualquier entrada malformada (Base64 inválido,
+         * longitudes distintas de 32/64, clave que `KeyFactory`
+         * rechaza, algoritmo ausente en el dispositivo) devuelve
+         * false — jamás lanza. Pura y sin estado: testeable en JVM
+         * con los vectores de RFC 8032 §7.1 (ver ProfileFetcherTest).
+         */
+        fun verifyEd25519Signature(
+            publicKeyBase64: String,
+            message: ByteArray,
+            signatureBase64: String
+        ): Boolean {
+            return try {
+                val publicKeyBytes = decodeBase64Lenient(publicKeyBase64)
+                    ?: return false
+                if (publicKeyBytes.size != 32) return false
+                val signatureBytes = decodeBase64Lenient(signatureBase64)
+                    ?: return false
+                if (signatureBytes.size != 64) return false
+                val x509 = ED25519_X509_PREFIX + publicKeyBytes
+                val publicKey = KeyFactory.getInstance("Ed25519")
+                    .generatePublic(X509EncodedKeySpec(x509))
+                val verifier = Signature.getInstance("Ed25519")
+                verifier.initVerify(publicKey)
+                verifier.update(message)
+                verifier.verify(signatureBytes)
+            } catch (e: Exception) {
+                false
+            }
+        }
+
+        /**
+         * C3/510 — Base64 tolerante: acepta estándar (con padding) y
+         * URL-safe (con o sin padding), ignorando espacios en blanco.
+         * null = no es Base64 válido en ninguno de los dos alfabetos.
+         */
+        private fun decodeBase64Lenient(value: String): ByteArray? {
+            val compact = value.filterNot { it.isWhitespace() }
+            if (compact.isEmpty()) return null
+            try {
+                return Base64.getDecoder().decode(compact)
+            } catch (ignored: IllegalArgumentException) {
+                // No es Base64 estándar: probar URL-safe.
+            }
+            return try {
+                Base64.getUrlDecoder().decode(compact)
+            } catch (ignored: IllegalArgumentException) {
+                null
+            }
+        }
     }
 
     sealed class Result {
@@ -386,10 +545,33 @@ class ProfileFetcher(
                 }
             }
         }
-        // PUNTO DE ENGANCHE (C3, Fase 2 — verificación de firma Ed25519):
-        // aquí se verificará la firma del sobre (campo `signature`,
-        // clave pública del servidor) ANTES de devolver Current. Hoy el
-        // sobre no trae firma y la verificación no existe (ver cabecera).
+        // C3/510 — verificación de firma Ed25519, ANTES de devolver
+        // Current o NotModified: un sobre sin firma válida no se acepta
+        // en ningún caso cuando el enforcement está ON. Lo firmado son
+        // los bytes UTF-8 de `profileBody` (la misma cadena que recibe
+        // ProfileApplier.validate: lo verificado es lo aplicado).
+        // Con enforcement OFF (defecto: el servidor aún no firma) un
+        // sobre sin firma se acepta igual y una firma presente solo se
+        // verifica en modo monitor (log, sin cuarentena).
+        val profileBody = profileEl.toString()
+        val signaturePresent = data.has("signature") || data.has("signerKeyId")
+        val signatureValid = verifyEnvelopeSignature(data, profileBody)
+        if (enforceSignature && !signatureValid) {
+            val keyId = data.get("signerKeyId")
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                ?.asString
+            return Result.Quarantine(
+                "GET current: firma Ed25519 ausente o inválida " +
+                    "(enforcement ON; signerKeyId=${keyId ?: "ausente"})"
+            )
+        }
+        if (!enforceSignature && signaturePresent && signerPublicKeys.isNotEmpty()) {
+            logger.i(
+                "GET current: firma Ed25519 " +
+                    (if (signatureValid) "VÁLIDA" else "INVÁLIDA") +
+                    " (monitor: enforcement OFF, el perfil se acepta igual)"
+            )
+        }
         if (appliedVersion != null && version == appliedVersion) {
             return Result.NotModified(
                 minSupportedPayloadVersion,
@@ -403,11 +585,36 @@ class ProfileFetcher(
             version = version,
             status = status,
             abState = abState,
-            profileBody = profileEl.toString(),
+            profileBody = profileBody,
             minSupportedPayloadVersion = minSupportedPayloadVersion,
             llmStatus = llmStatus,
             llmModel = llmModel,
             llmDrafted = llmDrafted
+        )
+    }
+
+    /**
+     * C3/510 — resuelve la clave pública por `signerKeyId` y verifica
+     * la `signature` del sobre sobre los bytes UTF-8 de [profileBody].
+     * Devuelve false si falta `signature` o `signerKeyId` (o no son
+     * strings no vacíos), si el `signerKeyId` no está en
+     * [signerPublicKeys] (rotación: clave desconocida) o si la firma
+     * no verifica. No lanza nunca.
+     */
+    private fun verifyEnvelopeSignature(data: JsonObject, profileBody: String): Boolean {
+        val signature = data.get("signature")
+            ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+            ?.asString?.takeIf { it.isNotBlank() }
+            ?: return false
+        val signerKeyId = data.get("signerKeyId")
+            ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+            ?.asString?.takeIf { it.isNotBlank() }
+            ?: return false
+        val publicKeyBase64 = signerPublicKeys[signerKeyId] ?: return false
+        return verifyEd25519Signature(
+            publicKeyBase64,
+            profileBody.toByteArray(Charsets.UTF_8),
+            signature
         )
     }
 }
