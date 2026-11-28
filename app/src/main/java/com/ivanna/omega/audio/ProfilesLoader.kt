@@ -195,6 +195,8 @@ object ProfilesLoader {
     private const val TAG = "ProfilesLoader"
     private const val RES_NAME = "audio_profiles"
     private const val FILE_NAME = "audio_profiles.json"
+    private const val BACKUP_FILE_NAME = "audio_profiles.json.bak"
+    private const val TMP_FILE_NAME = "audio_profiles.json.tmp"
     private const val ASSET_NAME = "audio_profiles.json"
 
     private val json = Json {
@@ -215,16 +217,26 @@ object ProfilesLoader {
      *   3) res/raw/audio_profiles.json      — fallback histórico (compat original)
      */
     fun load(context: Context): List<IvannaAudioProfile> {
-        // 1) filesDir override
-        try {
-            val f = java.io.File(context.filesDir, FILE_NAME)
-            if (f.isFile && f.length() > 0) {
-                val list = parse(f.readText(Charsets.UTF_8))
-                Log.i(TAG, "✓ Cargados ${list.size} perfiles (filesDir)")
-                return list
+        // 1) filesDir override. C8: si el principal no parsea (corte a
+        // mitad de escritura en una versión vieja sin tmp+rename, o disco
+        // corrupto), se restaura el .bak y se registra; si el .bak tampoco
+        // parsea, se sigue al fallback de assets/res como antes.
+        val override = java.io.File(context.filesDir, FILE_NAME)
+        if (override.isFile && override.length() > 0) {
+            runCatching { parse(override.readText(Charsets.UTF_8)) }
+                .onSuccess { list ->
+                    Log.i(TAG, "✓ Cargados ${list.size} perfiles (filesDir)")
+                    return list
+                }
+                .onFailure { Log.w(TAG, "override corrupto (${it.message}); intentando .bak") }
+            if (restoreBackup(context.filesDir)) {
+                runCatching { parse(override.readText(Charsets.UTF_8)) }
+                    .onSuccess { list ->
+                        Log.i(TAG, "✓ Cargados ${list.size} perfiles (filesDir, restaurado desde .bak)")
+                        return list
+                    }
+                    .onFailure { Log.w(TAG, ".bak restaurado pero tampoco parsea; se sigue al fallback") }
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "filesDir load falló: ${e.message}")
         }
         // 2) assets
         try {
@@ -257,10 +269,59 @@ object ProfilesLoader {
         try {
             val container = IvannaProfilesContainer(profiles, meta)
             val text = json.encodeToString(IvannaProfilesContainer.serializer(), container)
-            java.io.File(context.filesDir, FILE_NAME).writeText(text, Charsets.UTF_8)
+            writeOverrideAtomic(context.filesDir, text)
         } catch (e: Exception) {
             Log.e(TAG, "saveOverride falló: ${e.message}", e)
         }
+    }
+
+    /**
+     * C8 (a): escritura atómica del override, mismo patrón que
+     * `OrganismQueue.writeItem()`: antes de reemplazar, el archivo vigente
+     * se copia a `audio_profiles.json.bak`; el contenido nuevo se escribe
+     * a `audio_profiles.json.tmp` y solo entonces se renombra al principal.
+     * Un corte de proceso deja el principal intacto (el .tmp huérfano se
+     * ignora y se sobrescribe en la próxima escritura). Puro java.io,
+     * testeable en JVM sobre un directorio cualquiera.
+     */
+    internal fun writeOverrideAtomic(dir: java.io.File, text: String) {
+        dir.mkdirs()
+        val dest = java.io.File(dir, FILE_NAME)
+        val backup = java.io.File(dir, BACKUP_FILE_NAME)
+        val tmp = java.io.File(dir, TMP_FILE_NAME)
+        if (dest.isFile) dest.copyTo(backup, overwrite = true)
+        tmp.writeText(text, Charsets.UTF_8)
+        if (!tmp.renameTo(dest)) {
+            tmp.copyTo(dest, overwrite = true)
+            tmp.delete()
+        }
+    }
+
+    /**
+     * C8 (a): restaura el `.bak` sobre el principal (vía tmp+rename) solo
+     * si el `.bak` parsea como contenedor válido. Devuelve true si el
+     * principal quedó restaurado. Un `.bak` corrupto o ausente no toca
+     * nada: el llamador sigue al fallback de assets/res.
+     */
+    internal fun restoreBackup(dir: java.io.File): Boolean {
+        val backup = java.io.File(dir, BACKUP_FILE_NAME)
+        if (!backup.isFile || backup.length() == 0L) return false
+        return runCatching {
+            val text = backup.readText(Charsets.UTF_8)
+            parse(text) // solo se restaura contenido que parsea
+            val dest = java.io.File(dir, FILE_NAME)
+            val tmp = java.io.File(dir, TMP_FILE_NAME)
+            tmp.writeText(text, Charsets.UTF_8)
+            if (!tmp.renameTo(dest)) {
+                tmp.copyTo(dest, overwrite = true)
+                tmp.delete()
+            }
+            Log.i(TAG, "override restaurado desde .bak")
+            true
+        }.onFailure {
+            Log.w(TAG, "restoreBackup falló (.bak no parsea o no se pudo escribir): ${it.message}")
+            false
+        }.getOrDefault(false)
     }
 
     fun loadMetadata(context: Context): IvannaProfileMetadata? = try {

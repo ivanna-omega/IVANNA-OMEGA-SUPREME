@@ -27,6 +27,32 @@ object OrganismPayload {
     const val DEFAULT_ROOM = "Sala 4.0x7.0 m, escucha a 3 m"
     const val DEFAULT_EQUIPMENT = "Genezi MHC-PZ1D"
 
+    /**
+     * T2/510 — atribución A/B: valores neutros cuando aún no hay ningún
+     * perfil de Muselink aplicado. `id = "factory"` = perfil de fábrica;
+     * `version = 0` = ninguna versión del servidor (el sobre de
+     * `GET /profile/current` usa `version: Long >= 1`, igual que
+     * `ProfileApplier`); `abState = "none"` = vocabulario del §3.1 de la
+     * especificación de la VUELTA (`none | candidate | ab_running |
+     * promoted | rolled_back`); `hash = ""` = sin hash conocido.
+     */
+    const val DEFAULT_APPLIED_PROFILE_ID = "factory"
+    const val DEFAULT_APPLIED_PROFILE_VERSION = 0L
+    const val DEFAULT_AB_STATE = "none"
+
+    /**
+     * T2/510 — perfil aplicado que sonó en este chunk. Lo mantiene
+     * `OrganismController` tras cada aplicación (`recordAppliedProfile`)
+     * y lo lee `enqueueChunk` para etiquetar cada chunk; `OrganismPayload`
+     * no toca el controlador directamente para seguir siendo puro JVM.
+     */
+    data class AppliedProfile(
+        val id: String = DEFAULT_APPLIED_PROFILE_ID,
+        val version: Long = DEFAULT_APPLIED_PROFILE_VERSION,
+        val abState: String = DEFAULT_AB_STATE,
+        val hash: String = ""
+    )
+
     private val erbCenters: FloatArray by lazy { SessionAggregator.erbCenterHz() }
 
     /** audioFeatures en el schema que normalizeAudioFeatures acepta. */
@@ -49,13 +75,21 @@ object OrganismPayload {
         return out
     }
 
-    /** Cuerpo completo del POST de sesión para UN chunk agregado. */
+    /** Cuerpo completo del POST de sesión para UN chunk agregado.
+     *
+     * T2/510: `applied` etiqueta el chunk con el perfil que sonó
+     * (id, versión, abState, hash). Sin perfil aplicado lleva los
+     * valores neutros (`factory` / 0 / `none` / `""`): el chunk sigue
+     * siendo válido y el servidor lo atribuye a fábrica, sin inferir
+     * la versión por correlación temporal con el `POST applied`.
+     */
     fun sessionBody(
         chunk: SessionAggregator.SessionChunk,
         song: String = DEFAULT_SONG,
         artist: String = DEFAULT_ARTIST,
         room: String = DEFAULT_ROOM,
-        equipment: String = DEFAULT_EQUIPMENT
+        equipment: String = DEFAULT_EQUIPMENT,
+        applied: AppliedProfile = AppliedProfile()
     ): JsonObject {
         val body = JsonObject()
         body.addProperty("song", song.take(140).ifBlank { DEFAULT_SONG })
@@ -80,7 +114,42 @@ object OrganismPayload {
         telemetry.addProperty("framesReferenceFresh", chunk.framesReferenceFresh)
         telemetry.addProperty("referenceLevelMeanDbfs", chunk.referenceLevelMeanDbfs.toDouble())
         telemetry.addProperty("engineVersion", chunk.engineVersion)
+        // T2/510 — atribución A/B: con qué perfil sonó este chunk.
+        // Campos nuevos; el servidor debe ignorarlos si no los conoce
+        // (pendiente de verificar: si los rechaza con 4xx, los chunks
+        // irían a cuarentena — verificar con un chunk de prueba en vivo).
+        telemetry.addProperty("appliedProfileId", applied.id)
+        telemetry.addProperty("appliedProfileVersion", applied.version)
+        telemetry.addProperty("abState", applied.abState)
+        telemetry.addProperty("appliedProfileHash", applied.hash)
         body.add("telemetry", telemetry)
+        return body
+    }
+
+    /**
+     * T2/510 — cuerpo del `POST /api/v1/muse/ivanna/profile/applied`
+     * (VUELTA §3.1): `{ profileId, version, appliedAt, engineVersion,
+     * previousVersion }`, más `profileHash` (extensión T2: el hash del
+     * perfil aplicado, para que el servidor correlacione versión
+     * aplicada ↔ ERB medido sin depender solo de la versión).
+     * `appliedAt` en ISO-8601 UTC, igual que `compiledAt` del GET.
+     * PUNTO DE ENGANCHE — el POST aún no existe (lo crea T1 en Fase 2):
+     * quien lo envíe construye el cuerpo con esta función a partir del
+     * `AppliedProfile` que devuelve `OrganismController.recordAppliedProfile`.
+     */
+    fun appliedConfirmation(
+        applied: AppliedProfile,
+        previousVersion: Long,
+        engineVersion: String,
+        appliedAtMs: Long = System.currentTimeMillis()
+    ): JsonObject {
+        val body = JsonObject()
+        body.addProperty("profileId", applied.id)
+        body.addProperty("version", applied.version)
+        body.addProperty("appliedAt", java.time.Instant.ofEpochMilli(appliedAtMs).toString())
+        body.addProperty("engineVersion", engineVersion)
+        body.addProperty("previousVersion", previousVersion)
+        body.addProperty("profileHash", applied.hash)
         return body
     }
 }

@@ -72,7 +72,24 @@ object OrganismController {
         val sentTotal: Long = 0L,
         val micReanchors: Int = 0,
         /** Dispositivo por el que entra el mic ahora mismo (defecto #11). */
-        val micRoutedDevice: String = "desconocido"
+        val micRoutedDevice: String = "desconocido",
+        /**
+         * T2/510 — perfil aplicado que está sonando (atribución A/B).
+         * Lo actualiza [recordAppliedProfile] tras cada aplicación y lo
+         * lee `enqueueChunk` para etiquetar cada chunk en `telemetry`.
+         * Neutros = fábrica (`factory` / 0 / `none` / sin hash).
+         * `version` es `Long` como el sobre de `GET /profile/current`
+         * y como `ProfileApplier` (>= 1 cuando viene del servidor).
+         * `abState` usa el vocabulario de la VUELTA §3.1:
+         * `none | candidate | ab_running | promoted | rolled_back`.
+         * Solo vive en memoria: tras un reinicio vuelve a neutros hasta
+         * la próxima aplicación (pendiente T1: re-derivarlo del
+         * `.ivanna.json` guardado o persistirlo).
+         */
+        val appliedProfileId: String = OrganismPayload.DEFAULT_APPLIED_PROFILE_ID,
+        val appliedProfileVersion: Long = OrganismPayload.DEFAULT_APPLIED_PROFILE_VERSION,
+        val abState: String = OrganismPayload.DEFAULT_AB_STATE,
+        val appliedProfileHash: String = ""
     )
 
     private val _state = MutableStateFlow(State())
@@ -138,6 +155,13 @@ object OrganismController {
             refreshState()
             return
         }
+        // C8: diario de aplicación pendiente (muerte a mitad de VUELTA).
+        // Se intenta como mucho una vez por arranque: el flag se levanta
+        // aquí y se resetea en stop(); start() además retorna antes si
+        // scope != null, así que en un mismo proceso solo se intenta una
+        // vez por arranque. No toca State (otro agente trabaja ahí): el
+        // resultado queda visible en lastRollbackAttempt + Log.
+        restorePendingApplyOnce(ctx)
         val qDir = File(ctx.filesDir, "organism-queue")
         val q = OrganismQueue(qDir)
         val tokens = OrganismTokenStore(ctx)
@@ -218,6 +242,8 @@ object OrganismController {
         queue = null
         sender = null
         tokenStore = null
+        // C8: el próximo start() es un arranque nuevo y tiene su propio intento de rollback.
+        rollbackAttemptedThisBoot = false
         _state.value = State(status = Status.OFF, enabled = false)
         Log.i(TAG, "Organismo detenido (sin tráfico al organismo)")
     }
@@ -245,6 +271,50 @@ object OrganismController {
 
     fun hasToken(): Boolean = tokenStore?.getToken()?.isNotBlank() == true
 
+    /**
+     * T2/510 — registra el perfil que se acaba de aplicar (lo llama el
+     * camino de aplicación de T1 tras validar + traducir + aplicar, y
+     * también al restaurar el estable en un rollback). Devuelve el
+     * snapshot aplicado para construir el `POST /profile/applied` con
+     * [OrganismPayload.appliedConfirmation] (hash + versión incluidos).
+     * El siguiente chunk que se encole ya lleva la nueva versión en
+     * `telemetry` (vía [enqueueChunk]); no hay que esperar al sondeo.
+     * PUNTO DE ENGANCHE — el POST aún no existe (lo crea T1 en Fase 2).
+     */
+    @Synchronized
+    fun recordAppliedProfile(
+        profileId: String,
+        version: Long,
+        abState: String,
+        profileHash: String = ""
+    ): OrganismPayload.AppliedProfile {
+        val applied = OrganismPayload.AppliedProfile(
+            id = profileId,
+            version = version,
+            abState = abState,
+            hash = profileHash
+        )
+        _state.value = _state.value.copy(
+            appliedProfileId = applied.id,
+            appliedProfileVersion = applied.version,
+            abState = applied.abState,
+            appliedProfileHash = applied.hash
+        )
+        Log.i(TAG, "Perfil aplicado registrado: $profileId v$version abState=$abState hash=${profileHash.take(12)}")
+        return applied
+    }
+
+    /** Snapshot del perfil aplicado actual (para etiquetar chunks y para T1). */
+    fun appliedProfile(): OrganismPayload.AppliedProfile =
+        _state.value.let {
+            OrganismPayload.AppliedProfile(
+                id = it.appliedProfileId,
+                version = it.appliedProfileVersion,
+                abState = it.abState,
+                hash = it.appliedProfileHash
+            )
+        }
+
     @Volatile
     private var lastFlushOutcome: OrganismSender.Outcome? = null
     @Volatile
@@ -256,8 +326,83 @@ object OrganismController {
     @Volatile
     private var lastRoutedDevice: String = "desconocido"
 
+    // C8: diario de aplicación. Un intento de restauración por arranque
+    // como mucho (mitigación contra bucle de rollback).
+    @Volatile
+    private var rollbackAttemptedThisBoot: Boolean = false
+
+    /** Estado visible del último intento de restauración por diario PENDING (C8). */
+    data class RollbackAttemptInfo(
+        val journalVersion: Long?,
+        val restored: Boolean,
+        val reason: String,
+        val atMs: Long
+    )
+
+    @Volatile
+    var lastRollbackAttempt: RollbackAttemptInfo? = null
+        private set
+
+    /** Decisión pura del intento de rollback por arranque (C8, testeable en JVM). */
+    fun shouldAttemptRollback(
+        alreadyAttempted: Boolean,
+        check: ProfileApplier.RollbackCheck
+    ): Boolean = !alreadyAttempted && check !is ProfileApplier.RollbackCheck.None
+
+    /**
+     * C8: al arrancar, si el diario quedó PENDING (la app murió a mitad de
+     * aplicar un candidato), reinstala el estable verificado como candidato
+     * para que el próximo intento de T1 re-aplique el estable y no el
+     * candidato a medias. El diario queda PENDING hasta que T1 lo marque
+     * COMMITTED o ROLLED_BACK tras re-aplicar con read-back; la re-aplicación
+     * al DSP es T1 (aquí no hay DSP a mano). Si el hash del estable no
+     * verifica, NO se restaura nada. Máximo 1 intento por arranque.
+     */
+    private fun restorePendingApplyOnce(ctx: Context) {
+        val check = ProfileApplier(ctx.filesDir).checkPendingRollback()
+        if (!shouldAttemptRollback(rollbackAttemptedThisBoot, check)) return
+        rollbackAttemptedThisBoot = true
+        val nowMs = System.currentTimeMillis()
+        when (check) {
+            is ProfileApplier.RollbackCheck.Ready -> {
+                val restored = ProfileApplier(ctx.filesDir).restoreStableCandidate()
+                lastRollbackAttempt = RollbackAttemptInfo(
+                    journalVersion = check.version,
+                    restored = restored,
+                    reason = if (restored) {
+                        "estable v${check.version} verificado (SHA-256) y reinstalado como candidato; re-aplicación al DSP pendiente de T1"
+                    } else {
+                        "no se pudo reinstalar el candidato aunque el estable verificó"
+                    },
+                    atMs = nowMs
+                )
+                Log.i(TAG, "C8 rollback: diario PENDING v${check.version}, estable restaurado=$restored")
+            }
+            is ProfileApplier.RollbackCheck.StableMissing -> {
+                lastRollbackAttempt = RollbackAttemptInfo(
+                    journalVersion = check.version,
+                    restored = false,
+                    reason = "diario PENDING v${check.version} pero no hay estable en disco; nada que restaurar",
+                    atMs = nowMs
+                )
+                Log.w(TAG, "C8 rollback: diario PENDING v${check.version} sin estable; no se restaura nada")
+            }
+            is ProfileApplier.RollbackCheck.StableHashMismatch -> {
+                lastRollbackAttempt = RollbackAttemptInfo(
+                    journalVersion = check.version,
+                    restored = false,
+                    reason = "estable v${check.version} NO verifica su SHA-256 (esperado ${check.expectedHash}, actual ${check.actualHash}); no se restaura",
+                    atMs = nowMs
+                )
+                Log.w(TAG, "C8 rollback: estable v${check.version} con hash distinto; NO se restaura")
+            }
+            is ProfileApplier.RollbackCheck.None -> { /* inalcanzable: shouldAttemptRollback ya lo filtró */ }
+        }
+    }
+
     private fun enqueueChunk(chunk: SessionAggregator.SessionChunk, q: OrganismQueue) {
-        val body = OrganismPayload.sessionBody(chunk)
+        // T2/510: el chunk lleva el perfil aplicado actual en telemetry.
+        val body = OrganismPayload.sessionBody(chunk, applied = appliedProfile())
         val enqueued = q.enqueue(chunk.sessionId, chunk.chunkId, body)
         if (enqueued) {
             scope?.launch(Dispatchers.IO) { flushOnce() }
@@ -312,7 +457,13 @@ object OrganismController {
             queued = queued,
             sentTotal = sentTotal,
             micReanchors = sensorReanchorsSeen + pipelineReanchorsSeen,
-            micRoutedDevice = lastRoutedDevice
+            micRoutedDevice = lastRoutedDevice,
+            // T2/510: refreshState reconstruye el State; el perfil
+            // aplicado se conserva (solo lo cambia recordAppliedProfile).
+            appliedProfileId = _state.value.appliedProfileId,
+            appliedProfileVersion = _state.value.appliedProfileVersion,
+            abState = _state.value.abState,
+            appliedProfileHash = _state.value.appliedProfileHash
         )
     }
 }

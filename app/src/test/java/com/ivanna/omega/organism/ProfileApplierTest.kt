@@ -3,6 +3,7 @@ package com.ivanna.omega.organism
 import com.google.gson.JsonParser
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -209,6 +210,156 @@ class ProfileApplierTest {
         assertTrue("se esperaba Validated, fue $result", result is ProfileApplier.ApplyResult.Validated)
         assertEquals(null, applier.readQuarantineStatus())
         assertTrue(dir.listFiles()?.none { it.name.contains("quarantine") } ?: true)
+    }
+
+    // ------------------------------------------------------------------
+    // C8: diario + estable verificado + rollback.
+    // ------------------------------------------------------------------
+
+    private fun installOk(profile: ValidatedProfile): Boolean = true
+
+    @Test
+    fun `applyAndCommit con read-back ok commitea y promueve el estable`() {
+        val result = applier.applyAndCommit(
+            V11_JSON, version = 2L, appliedVersion = 1L,
+            install = ::installOk,
+            readAppliedProfileId = { ProfileApplier.LIVE_PROFILE_ID }
+        )
+        assertTrue("se esperaba Committed, fue $result", result is ProfileApplier.CommitResult.Committed)
+        val journal = applier.readJournal()
+        assertTrue(journal != null)
+        assertEquals(2L, journal!!.version)
+        assertEquals(ProfileApplier.JournalState.COMMITTED, journal.estado)
+        assertEquals(ProfileApplier.sha256Hex(V11_JSON), journal.hashSha256)
+        val stable = File(dir, ProfileApplier.STABLE_FILE_NAME)
+        assertTrue(stable.isFile)
+        assertEquals(V11_JSON, stable.readText())
+        assertTrue("el estable debe verificar su hash", applier.verifyStableHash())
+        assertEquals(V11_JSON, applier.readStableBody())
+    }
+
+    @Test
+    fun `read-back distinto deja PENDING y no promueve estable`() {
+        val result = applier.applyAndCommit(
+            V11_JSON, version = 2L, appliedVersion = 1L,
+            install = ::installOk,
+            readAppliedProfileId = { "rock_70s" }
+        )
+        assertTrue("se esperaba NotCommitted, fue $result", result is ProfileApplier.CommitResult.NotCommitted)
+        assertEquals(ProfileApplier.JournalState.PENDING, applier.readJournal()!!.estado)
+        assertFalse("sin read-back no hay estable", File(dir, ProfileApplier.STABLE_FILE_NAME).exists())
+    }
+
+    @Test
+    fun `install que falla deja PENDING sin estable`() {
+        val result = applier.applyAndCommit(
+            V11_JSON, version = 2L, appliedVersion = 1L,
+            install = { false },
+            readAppliedProfileId = { ProfileApplier.LIVE_PROFILE_ID }
+        )
+        assertTrue("se esperaba NotCommitted, fue $result", result is ProfileApplier.CommitResult.NotCommitted)
+        assertEquals(ProfileApplier.JournalState.PENDING, applier.readJournal()!!.estado)
+        assertFalse(File(dir, ProfileApplier.STABLE_FILE_NAME).exists())
+        // El candidato sí quedó escrito (es lo que se estaba instalando).
+        assertEquals(V11_JSON, File(dir, ProfileApplier.candidateFileName(2L)).readText())
+    }
+
+    @Test
+    fun `applyAndCommit invalido va a cuarentena sin diario`() {
+        val badBody = V11_JSON.replace("\"trim_db\":-4.0", "\"trim_db\":0.0")
+        val result = applier.applyAndCommit(
+            badBody, version = 2L, appliedVersion = 1L,
+            install = ::installOk,
+            readAppliedProfileId = { ProfileApplier.LIVE_PROFILE_ID }
+        )
+        assertTrue("se esperaba Rejected, fue $result", result is ProfileApplier.CommitResult.Rejected)
+        assertEquals(null, applier.readJournal())
+    }
+
+    @Test
+    fun `diario PENDING al arrancar restaura el estable`() {
+        assertTrue(applier.promoteStable(V11_JSON, 1L))
+        applier.installCandidate(V11_JSON, 2L)
+        // Candidato a medias (la app murió durante la instalación).
+        File(dir, ProfileApplier.candidateFileName(2L)).writeText("a-medias")
+        val check = applier.checkPendingRollback()
+        assertTrue("se esperaba Ready, fue $check", check is ProfileApplier.RollbackCheck.Ready)
+        assertEquals(V11_JSON, (check as ProfileApplier.RollbackCheck.Ready).stableBody)
+        assertTrue(applier.restoreStableCandidate())
+        assertEquals("el candidato debe volver a ser el estable", V11_JSON, File(dir, ProfileApplier.candidateFileName(2L)).readText())
+        // El diario sigue PENDING hasta que T1 re-aplique con read-back.
+        assertEquals(ProfileApplier.JournalState.PENDING, applier.readJournal()!!.estado)
+    }
+
+    @Test
+    fun `hash del estable distinto no restaura`() {
+        assertTrue(applier.promoteStable(V11_JSON, 1L))
+        applier.installCandidate(V11_JSON, 2L)
+        File(dir, ProfileApplier.STABLE_FILE_NAME).appendText("x")
+        val check = applier.checkPendingRollback()
+        assertTrue("se esperaba StableHashMismatch, fue $check", check is ProfileApplier.RollbackCheck.StableHashMismatch)
+        assertFalse(applier.restoreStableCandidate())
+        assertEquals("el candidato no se toca", V11_JSON, File(dir, ProfileApplier.candidateFileName(2L)).readText())
+        assertEquals(null, applier.readStableBody())
+    }
+
+    @Test
+    fun `diario PENDING sin estable no restaura`() {
+        applier.installCandidate(V11_JSON, 2L)
+        val check = applier.checkPendingRollback()
+        assertTrue("se esperaba StableMissing, fue $check", check is ProfileApplier.RollbackCheck.StableMissing)
+        assertFalse(applier.restoreStableCandidate())
+    }
+
+    @Test
+    fun `sin diario pendiente no hay nada que restaurar`() {
+        assertTrue(applier.checkPendingRollback() is ProfileApplier.RollbackCheck.None)
+        assertFalse(applier.restoreStableCandidate())
+        assertTrue(applier.promoteStable(V11_JSON, 1L))
+        applier.writeJournal(
+            ProfileApplier.ApplyJournal(1L, ProfileApplier.sha256Hex(V11_JSON), ProfileApplier.JournalState.COMMITTED, 0L)
+        )
+        assertTrue(applier.checkPendingRollback() is ProfileApplier.RollbackCheck.None)
+    }
+
+    @Test
+    fun `tope de archivos solo estable mas candidato vigente mas diario`() {
+        assertTrue(applier.promoteStable(V11_JSON, 1L))
+        applier.installCandidate(V11_JSON, 2L)
+        applier.installCandidate(V11_JSON, 3L)
+        applier.installCandidate(V11_JSON, 4L)
+        val names = dir.listFiles()!!.map { it.name }.toSet()
+        assertFalse(names.contains(ProfileApplier.candidateFileName(2L)))
+        assertFalse(names.contains(ProfileApplier.candidateFileName(3L)))
+        assertTrue(names.contains(ProfileApplier.candidateFileName(4L)))
+        assertTrue(names.contains(ProfileApplier.STABLE_FILE_NAME))
+        assertTrue(names.contains(ProfileApplier.JOURNAL_FILE_NAME))
+    }
+
+    @Test
+    fun `corte simulado tmp huerfano no reemplaza al candidato`() {
+        applier.installCandidate(V11_JSON, 2L)
+        File(dir, "${ProfileApplier.candidateFileName(2L)}.tmp").writeText("{basura")
+        assertEquals(V11_JSON, File(dir, ProfileApplier.candidateFileName(2L)).readText())
+        assertEquals(ProfileApplier.JournalState.PENDING, applier.readJournal()!!.estado)
+    }
+
+    @Test
+    fun `completeRollback marca ROLLED_BACK solo con version y PENDING`() {
+        applier.installCandidate(V11_JSON, 2L)
+        applier.completeRollback(99L)
+        assertEquals(ProfileApplier.JournalState.PENDING, applier.readJournal()!!.estado)
+        applier.completeRollback(2L)
+        assertEquals(ProfileApplier.JournalState.ROLLED_BACK, applier.readJournal()!!.estado)
+        assertTrue(applier.checkPendingRollback() is ProfileApplier.RollbackCheck.None)
+    }
+
+    @Test
+    fun `sha256Hex es estable y distingue cuerpos`() {
+        val h1 = ProfileApplier.sha256Hex(V11_JSON)
+        assertEquals(64, h1.length)
+        assertEquals(h1, ProfileApplier.sha256Hex(V11_JSON))
+        assertTrue(h1 != ProfileApplier.sha256Hex("$V11_JSON "))
     }
 
     companion object {

@@ -112,4 +112,68 @@ class OrganismControllerTest {
             )
         )
     }
+
+    // T2/510 — estado del perfil aplicado (atribución A/B).
+
+    @Test
+    fun `State por defecto lleva perfil aplicado neutro de fabrica`() {
+        val state = OrganismController.State()
+        assertEquals("factory", state.appliedProfileId)
+        assertEquals(0L, state.appliedProfileVersion)
+        assertEquals("none", state.abState)
+        assertEquals("", state.appliedProfileHash)
+    }
+
+    @Test
+    fun `recordAppliedProfile actualiza el estado y el siguiente chunk lo refleja`() {
+        try {
+            val applied = OrganismController.recordAppliedProfile(
+                profileId = "omega-1795857152818-9lec",
+                version = 3L,
+                abState = "ab_running",
+                profileHash = "sha256:abc123"
+            )
+            assertEquals("omega-1795857152818-9lec", applied.id)
+            assertEquals(3L, applied.version)
+            val state = OrganismController.state.value
+            assertEquals("omega-1795857152818-9lec", state.appliedProfileId)
+            assertEquals(3L, state.appliedProfileVersion)
+            assertEquals("ab_running", state.abState)
+            assertEquals("sha256:abc123", state.appliedProfileHash)
+            // El snapshot que lee enqueueChunk es el mismo estado.
+            assertEquals(applied, OrganismController.appliedProfile())
+        } finally {
+            // Restaura los neutros: el controlador es un singleton.
+            OrganismController.recordAppliedProfile("factory", 0L, "none", "")
+        }
+    }
+
+    // C8 — decisión pura del intento de rollback por arranque (máximo 1 vez).
+
+    @Test
+    fun `rollback se intenta una sola vez por arranque`() {
+        val ready = ProfileApplier.RollbackCheck.Ready(2L, "{}")
+        assertEquals(true, OrganismController.shouldAttemptRollback(false, ready))
+        assertEquals(false, OrganismController.shouldAttemptRollback(true, ready))
+    }
+
+    @Test
+    fun `sin diario pendiente no se intenta nada`() {
+        assertEquals(false, OrganismController.shouldAttemptRollback(false, ProfileApplier.RollbackCheck.None))
+        assertEquals(false, OrganismController.shouldAttemptRollback(true, ProfileApplier.RollbackCheck.None))
+    }
+
+    @Test
+    fun `hash distinto tambien consume el unico intento del arranque`() {
+        val mismatch = ProfileApplier.RollbackCheck.StableHashMismatch(2L, "aaa", "bbb")
+        assertEquals(true, OrganismController.shouldAttemptRollback(false, mismatch))
+        assertEquals(false, OrganismController.shouldAttemptRollback(true, mismatch))
+    }
+
+    @Test
+    fun `estable ausente tambien consume el unico intento del arranque`() {
+        val missing = ProfileApplier.RollbackCheck.StableMissing(2L)
+        assertEquals(true, OrganismController.shouldAttemptRollback(false, missing))
+        assertEquals(false, OrganismController.shouldAttemptRollback(true, missing))
+    }
 }

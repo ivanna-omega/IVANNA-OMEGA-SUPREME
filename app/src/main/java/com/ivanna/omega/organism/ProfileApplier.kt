@@ -37,6 +37,13 @@ import java.io.File
  *   recorrido de todo el árbol antes de cualquier otra comprobación.
  * - Claves JSON duplicadas: Gson conserva la última sin avisar; el
  *   perfil se valida sobre el valor superviviente.
+ *
+ * C8 (release 510): diario de aplicación + estable con SHA-256
+ * ([applyAndCommit], [checkPendingRollback], [restoreStableCandidate]).
+ * El diario marca PENDING al instalar el candidato y solo pasa a
+ * COMMITTED tras la lectura de vuelta del perfil aplicado; al arrancar,
+ * `OrganismController.start()` restaura el estable verificado si el
+ * diario quedó PENDING (máximo 1 intento por arranque).
  */
 class ProfileApplier(
     private val dir: File,
@@ -153,6 +160,239 @@ class ProfileApplier(
         }.getOrNull()
     }
 
+    // ------------------------------------------------------------------
+    // C8: diario de aplicación + estable verificado + rollback.
+    //
+    // El flujo multi-paso de la VUELTA (candidato → saveOverride() →
+    // applyProfile("muselink-live") → motor) puede morir a mitad: el
+    // diario deja constancia de lo que quedó a medias y el estable con
+    // su SHA-256 es el segundo nivel de rollback de T1. La traducción al
+    // DSP y el applyProfile NO viven aquí (eso es T1): [applyAndCommit]
+    // recibe el paso de instalación como callback y solo marca COMMITTED
+    // tras leer de vuelta el perfil aplicado.
+    // ------------------------------------------------------------------
+
+    /** Estado del diario de aplicación (visible; lo lee OrganismController al arrancar). */
+    enum class JournalState { PENDING, COMMITTED, ROLLED_BACK }
+
+    /** Una entrada del diario `muselink-apply-journal.json`. */
+    data class ApplyJournal(
+        val version: Long,
+        val hashSha256: String,
+        val estado: JournalState,
+        val atMs: Long
+    )
+
+    sealed class CommitResult {
+        /** Validado, instalado y confirmado por lectura de vuelta; estable promovido. */
+        data class Committed(val profile: ValidatedProfile) : CommitResult()
+
+        /** Validado pero NO confirmado: el diario queda PENDING y el estable intacto. */
+        data class NotCommitted(val profile: ValidatedProfile, val reason: String) : CommitResult()
+
+        /** Rechazado y puesto en cuarentena; nunca aplicado. */
+        data class Rejected(
+            val validation: ValidationResult.Invalid,
+            val quarantineFile: File
+        ) : CommitResult()
+    }
+
+    sealed class RollbackCheck {
+        /** Sin diario PENDING: nada que restaurar. */
+        data object None : RollbackCheck()
+
+        /** Diario PENDING y estable presente con hash verificado: listo para restaurar. */
+        data class Ready(val version: Long, val stableBody: String) : RollbackCheck()
+
+        /** Diario PENDING pero no hay estable en disco. */
+        data class StableMissing(val version: Long) : RollbackCheck()
+
+        /** Diario PENDING pero el estable NO verifica su hash: NO se restaura. */
+        data class StableHashMismatch(
+            val version: Long,
+            val expectedHash: String,
+            val actualHash: String
+        ) : RollbackCheck()
+    }
+
+    /**
+     * Punto de entrada para T1: valida, instala con diario y confirma por
+     * lectura de vuelta. Orden exacto:
+     *   1. valida (inválido → cuarentena, [CommitResult.Rejected]);
+     *   2. escribe el candidato (`muselink-profile-<version>.ivanna.json`,
+     *      tmp+rename) + diario `{version, hashSha256, estado: PENDING}`;
+     *   3. llama a [install]: T1 traduce a `IvannaAudioProfile`, hace
+     *      `saveOverride()` + `applyProfile("muselink-live", …)`. Si
+     *      devuelve false, el diario queda PENDING y se devuelve
+     *      [CommitResult.NotCommitted] (el estable queda intacto);
+     *   4. lee de vuelta el estado aplicado con [readAppliedProfileId]
+     *      (T1 lo cablea a `ProfileManagerBridge.getCurrentProfileId()`;
+     *      el snapshot del daemon no lleva id de perfil, ver reporte C8).
+     *      Solo si devuelve `"muselink-live"` se marca el diario
+     *      COMMITTED y se promueve el estable (archivo + SHA-256).
+     *      Cualquier otro valor (o null) deja el diario PENDING para que
+     *      el próximo arranque restaure el estable.
+     */
+    fun applyAndCommit(
+        body: String,
+        version: Long,
+        appliedVersion: Long?,
+        rolledBack: Boolean = false,
+        previous: ValidatedProfile? = null,
+        install: (ValidatedProfile) -> Boolean,
+        readAppliedProfileId: () -> String?
+    ): CommitResult {
+        val validated = when (val result = validate(body, version, appliedVersion, rolledBack, previous)) {
+            is ValidationResult.Valid -> result.profile
+            is ValidationResult.Invalid -> {
+                val file = quarantine(body, version, result.reasons)
+                return CommitResult.Rejected(result, file)
+            }
+        }
+        installCandidate(body, version)
+        if (!install(validated)) {
+            return CommitResult.NotCommitted(validated, "install() devolvió false; diario queda PENDING")
+        }
+        val appliedId = runCatching { readAppliedProfileId() }.getOrNull()
+        if (appliedId != LIVE_PROFILE_ID) {
+            return CommitResult.NotCommitted(
+                validated,
+                "read-back: perfil aplicado '$appliedId', se esperaba '$LIVE_PROFILE_ID'; diario queda PENDING"
+            )
+        }
+        promoteStable(body, version)
+        writeJournal(ApplyJournal(version, sha256Hex(body), JournalState.COMMITTED, clockMs()))
+        pruneCandidates(keepVersion = null)
+        return CommitResult.Committed(validated)
+    }
+
+    /**
+     * Escribe el candidato con tmp+rename y el diario en PENDING con el
+     * SHA-256 del cuerpo. Conserva solo estable + este candidato + diario.
+     */
+    fun installCandidate(body: String, version: Long): File {
+        dir.mkdirs()
+        val file = File(dir, candidateFileName(version))
+        writeAtomic(file, body)
+        writeJournal(ApplyJournal(version, sha256Hex(body), JournalState.PENDING, clockMs()))
+        pruneCandidates(keepVersion = version)
+        return file
+    }
+
+    /** Diario actual, o null si nunca se escribió uno o no parsea. */
+    fun readJournal(): ApplyJournal? {
+        val file = File(dir, JOURNAL_FILE_NAME)
+        if (!file.isFile) return null
+        return runCatching {
+            val obj = gson.fromJson(file.readText(), JsonObject::class.java)
+            ApplyJournal(
+                version = obj.get("version").asLong,
+                hashSha256 = obj.get("hashSha256").asString,
+                estado = JournalState.valueOf(obj.get("estado").asString),
+                atMs = obj.get("atMs").asLong
+            )
+        }.getOrNull()
+    }
+
+    fun writeJournal(journal: ApplyJournal) {
+        dir.mkdirs()
+        val obj = JsonObject().apply {
+            addProperty("version", journal.version)
+            addProperty("hashSha256", journal.hashSha256)
+            addProperty("estado", journal.estado.name)
+            addProperty("atMs", journal.atMs)
+        }
+        writeAtomic(File(dir, JOURNAL_FILE_NAME), gson.toJson(obj))
+    }
+
+    /**
+     * Promueve el cuerpo a estable: escribe `muselink-profile-stable.ivanna.json`
+     * (tmp+rename) + su SHA-256 en el sidecar `.sha256`, y verifica el hash
+     * tras escribir. Devuelve true solo si la verificación posterior pasa.
+     */
+    fun promoteStable(body: String, version: Long): Boolean {
+        dir.mkdirs()
+        writeAtomic(File(dir, STABLE_FILE_NAME), body)
+        writeAtomic(File(dir, STABLE_HASH_FILE_NAME), sha256Hex(body))
+        return verifyStableHash()
+    }
+
+    /** True solo si el estable existe, tiene sidecar `.sha256` y el hash coincide. */
+    fun verifyStableHash(): Boolean {
+        val stable = File(dir, STABLE_FILE_NAME)
+        val hashFile = File(dir, STABLE_HASH_FILE_NAME)
+        if (!stable.isFile || !hashFile.isFile) return false
+        val expected = runCatching { hashFile.readText().trim() }.getOrNull() ?: return false
+        val actual = runCatching { sha256Hex(stable.readText()) }.getOrNull() ?: return false
+        return expected.equals(actual, ignoreCase = true)
+    }
+
+    /** Cuerpo del estable solo si su hash verifica; null en cualquier otro caso. */
+    fun readStableBody(): String? {
+        if (!verifyStableHash()) return null
+        return runCatching { File(dir, STABLE_FILE_NAME).readText() }.getOrNull()
+    }
+
+    /**
+     * Lo que lee `OrganismController.start()`: si el diario está PENDING,
+     * decide si el estable puede restaurarse. Un hash distinto (estable
+     * corrupto o manipulado) devuelve [RollbackCheck.StableHashMismatch]
+     * y NUNCA restaura: mejor quedarse con el último bueno en el motor
+     * que aplicar un estable no verificado.
+     */
+    fun checkPendingRollback(): RollbackCheck {
+        val journal = readJournal() ?: return RollbackCheck.None
+        if (journal.estado != JournalState.PENDING) return RollbackCheck.None
+        val stable = File(dir, STABLE_FILE_NAME)
+        if (!stable.isFile) return RollbackCheck.StableMissing(journal.version)
+        val body = readStableBody()
+        if (body == null) {
+            val expected = runCatching { File(dir, STABLE_HASH_FILE_NAME).readText().trim() }.getOrNull() ?: ""
+            val actual = runCatching { sha256Hex(stable.readText()) }.getOrNull() ?: ""
+            return RollbackCheck.StableHashMismatch(journal.version, expected, actual)
+        }
+        return RollbackCheck.Ready(journal.version, body)
+    }
+
+    /**
+     * Restaura el estable verificado como candidato de la versión pendiente
+     * (tmp+rename), para que el próximo intento de T1 re-aplique el estable
+     * y no el candidato a medias. El diario queda PENDING a propósito:
+     * solo T1 lo marca COMMITTED (tras re-aplicar + read-back) o
+     * ROLLED_BACK (vía [completeRollback]). Devuelve false si no había
+     * nada que restaurar o el hash no verificó.
+     */
+    fun restoreStableCandidate(): Boolean {
+        val check = checkPendingRollback()
+        if (check !is RollbackCheck.Ready) return false
+        writeAtomic(File(dir, candidateFileName(check.version)), check.stableBody)
+        return true
+    }
+
+    /** Marca el diario ROLLED_BACK tras re-aplicar el estable con read-back ok (lo llama T1). */
+    fun completeRollback(version: Long) {
+        val journal = readJournal() ?: return
+        if (journal.version != version || journal.estado != JournalState.PENDING) return
+        writeJournal(journal.copy(estado = JournalState.ROLLED_BACK, atMs = clockMs()))
+    }
+
+    /**
+     * Tope de archivos (C8): solo estable + candidato vigente + diario.
+     * Borra candidatos viejos (`muselink-profile-<n>.ivanna.json`) y sus
+     * `.tmp` huérfanos. La cuarentena no se toca (otro prefijo).
+     */
+    private fun pruneCandidates(keepVersion: Long?) {
+        val files = dir.listFiles() ?: return
+        for (f in files) {
+            val name = f.name
+            val match = CANDIDATE_FILE_REGEX.matchEntire(name) ?: continue
+            val v = match.groupValues[1].toLongOrNull()
+            if (v != keepVersion) f.delete()
+            val tmp = File(dir, "$name.tmp")
+            if (tmp.isFile) tmp.delete()
+        }
+    }
+
     private fun writeAtomic(dest: File, text: String) {
         val tmp = File(dir, "${dest.name}.tmp")
         tmp.writeText(text)
@@ -181,9 +421,28 @@ class ProfileApplier(
         /** Nombre del último perfil bueno (destino del rollback; T1 lo gestiona). */
         const val STABLE_FILE_NAME = "muselink-profile-stable.ivanna.json"
 
+        /** Sidecar con el SHA-256 del estable; se verifica antes de cada rollback (C8). */
+        const val STABLE_HASH_FILE_NAME = "muselink-profile-stable.ivanna.json.sha256"
+
+        /** Diario de aplicación multi-paso (C8): {version, hashSha256, estado}. */
+        const val JOURNAL_FILE_NAME = "muselink-apply-journal.json"
+
+        /** Id del perfil vivo en el motor; el read-back debe devolver exactamente este valor. */
+        const val LIVE_PROFILE_ID = "muselink-live"
+
+        /** SHA-256 hex (minúsculas) del cuerpo; usado por diario y sidecar del estable. */
+        fun sha256Hex(text: String): String {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(text.toByteArray(Charsets.UTF_8))
+            return digest.joinToString("") { "%02x".format(it) }
+        }
+
         const val QUARANTINE_STATUS_FILE_NAME = "muselink-profile-quarantine.json"
 
         fun candidateFileName(version: Long): String = "muselink-profile-$version.ivanna.json"
+
+        /** Solo candidatos versionados (`muselink-profile-<n>.ivanna.json`); nunca el estable ni la cuarentena. */
+        val CANDIDATE_FILE_REGEX = Regex("""muselink-profile-(\d+)\.ivanna\.json""")
 
         fun quarantineFileName(version: Long, atMs: Long): String =
             "muselink-profile-quarantine-v$version-$atMs.ivanna.json"

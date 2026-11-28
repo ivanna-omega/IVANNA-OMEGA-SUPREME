@@ -75,4 +75,77 @@ class OrganismPayloadTest {
         assertEquals("Sesión en vivo IVANNA", body.get("song").asString)
         assertEquals("IVANNA OMEGA", body.get("artist").asString)
     }
+
+    // T2/510 — atribución A/B en telemetry.
+
+    @Test
+    fun `telemetry lleva appliedProfileId version abState y hash del estado aplicado`() {
+        val applied = OrganismPayload.AppliedProfile(
+            id = "omega-1795857152818-9lec",
+            version = 3L,
+            abState = "ab_running",
+            hash = "sha256:abc123"
+        )
+        val telemetry = OrganismPayload.sessionBody(chunk(), applied = applied)
+            .getAsJsonObject("telemetry")
+        assertEquals("omega-1795857152818-9lec", telemetry.get("appliedProfileId").asString)
+        assertEquals(3L, telemetry.get("appliedProfileVersion").asLong)
+        assertEquals("ab_running", telemetry.get("abState").asString)
+        assertEquals("sha256:abc123", telemetry.get("appliedProfileHash").asString)
+    }
+
+    @Test
+    fun `sin perfil aplicado telemetry lleva neutros y el chunk sigue valido`() {
+        val telemetry = OrganismPayload.sessionBody(chunk())
+            .getAsJsonObject("telemetry")
+        assertEquals("factory", telemetry.get("appliedProfileId").asString)
+        assertEquals(0L, telemetry.get("appliedProfileVersion").asLong)
+        assertEquals("none", telemetry.get("abState").asString)
+        assertEquals("", telemetry.get("appliedProfileHash").asString)
+        // El chunk sigue válido: los campos previos no cambian.
+        assertTrue(telemetry.has("sessionId"))
+        assertTrue(telemetry.has("chunkId"))
+        assertTrue(telemetry.has("engineVersion"))
+        assertEquals(60, telemetry.get("framesValid").asInt)
+    }
+
+    @Test
+    fun `tras actualizar el estado aplicado el siguiente chunk refleja la nueva version`() {
+        val first = OrganismPayload.sessionBody(
+            chunk(),
+            applied = OrganismPayload.AppliedProfile(id = "omega-v1", version = 1L, abState = "promoted")
+        ).getAsJsonObject("telemetry")
+        assertEquals(1L, first.get("appliedProfileVersion").asLong)
+        assertEquals("promoted", first.get("abState").asString)
+        val second = OrganismPayload.sessionBody(
+            chunk(),
+            applied = OrganismPayload.AppliedProfile(id = "omega-v2", version = 2L, abState = "candidate", hash = "sha256:def456")
+        ).getAsJsonObject("telemetry")
+        assertEquals("omega-v2", second.get("appliedProfileId").asString)
+        assertEquals(2L, second.get("appliedProfileVersion").asLong)
+        assertEquals("candidate", second.get("abState").asString)
+        assertEquals("sha256:def456", second.get("appliedProfileHash").asString)
+    }
+
+    @Test
+    fun `appliedConfirmation lleva profileId version hash previousVersion y appliedAt ISO`() {
+        val applied = OrganismPayload.AppliedProfile(
+            id = "omega-1795857152818-9lec",
+            version = 3L,
+            abState = "candidate",
+            hash = "sha256:abc123"
+        )
+        val body = OrganismPayload.appliedConfirmation(
+            applied = applied,
+            previousVersion = 2L,
+            engineVersion = "2.5.510",
+            appliedAtMs = 1_795_857_152_818L
+        )
+        assertEquals("omega-1795857152818-9lec", body.get("profileId").asString)
+        assertEquals(3L, body.get("version").asLong)
+        assertEquals("sha256:abc123", body.get("profileHash").asString)
+        assertEquals(2L, body.get("previousVersion").asLong)
+        assertEquals("2.5.510", body.get("engineVersion").asString)
+        assertTrue(body.get("appliedAt").asString.startsWith("2026-11-"))
+    }
 }
