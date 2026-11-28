@@ -109,6 +109,32 @@ endforeach()
 # y en el self-hosted, donde la carga es conocida. Salida: N noches verdes
 # seguidas (se proponen 4, a confirmar por Esse — propuesta, no dato medido)
 # → se quita la etiqueta. Una noche roja mantiene el test en cuarentena.
+# C13/510 — etiquetas de ÁREA (sharding): cada binario lleva además UNA
+# etiqueta de área — dsp, acoustic, daemon, spatial o fused — que describe
+# qué parte del motor cubre (ver scripts/ctest_ledger.py, que lista el
+# reparto por etiqueta). Las etiquetas de área son DISJUNTAS (un binario,
+# un área) para que los shards de .github/workflows/tests-host.yml
+# partan la suite sin solapes ni huecos: `ctest -L '<area>'` selecciona
+# un área, y cada shard corre `-L '<areas>' -LE QUARANTINED`. QUARANTINED
+# es ORTOGONAL al área (un test puede llevar ambas, p. ej. test_perf_auditor
+# es "acoustic;QUARANTINED"): los shards excluyen cuarentena igual que la
+# puerta por push, y el carril semanal la corre por -L QUARANTINED.
+# SLOW-A/SLOW-B (C13, ledger 2026-11-28, 2a corrida): 5 binarios del área
+# fused concentran el 67% del tiempo de ejecución (998 de 1498 s·proc):
+# p1_adversarial_matrix (302 s) + p1p4_ablation (199 s) llevan slow-a
+# (517 s·proc) y p0_reference_lock (177 s) + evol_genezi (149 s) +
+# tronidos_layer_step (124 s) llevan slow-b (482 s·proc). Sin este segundo
+# nivel, el shard fused sería 12x el shard dsp+acoustic y el sharding no
+# ganaría nada. El reparto se re-mide en cada run (job ctest-ledger): si
+# los tiempos se mueven, se mueven las etiquetas, no la maquinaria.
+# OJO — UNA sola etiqueta por binario, nunca "fused;slow-a": verificado
+# 2026-11-28 que gtest_discover_tests serializa LABELS multivalor SIN
+# comillas (LABELS fused slow-a) y el parser de CTest toma solo la
+# primera y tira el resto EN SILENCIO (ctest -N -L slow-a daba 0 con el
+# archivo generado diciendo LABELS fused slow-a). La etiqueta slow ES el
+# área fused a efectos del ledger (scripts/ctest_ledger.py la mapea a
+# fused); el shard de área '-L fused' ya no las incluye, y eso es lo que
+# se quiere: cada test corre en exactamente un shard.
 function(ivanna_add_test name)
   cmake_parse_arguments(ARG "" "" "LABELS" ${ARGN})
   add_executable(${name} ${name}.cpp)
@@ -126,19 +152,19 @@ function(ivanna_add_test name)
   endif()
 endfunction()
 
-ivanna_add_test(gammatone_numerical_stability)
-ivanna_add_test(no_denormals_low_level)
-ivanna_add_test(test_phase_oracle_kalman)
-ivanna_add_test(dsp_core_stability)
+ivanna_add_test(gammatone_numerical_stability LABELS dsp)
+ivanna_add_test(no_denormals_low_level LABELS dsp)
+ivanna_add_test(test_phase_oracle_kalman LABELS fused)
+ivanna_add_test(dsp_core_stability LABELS dsp)
 # Fatigue Mitigator local (v2.5.428): high-cut IIR 1er orden en Ruta A.
-ivanna_add_test(test_fatigue_highcut)
+ivanna_add_test(test_fatigue_highcut LABELS dsp)
 # Paquete IVH2 de kernels Volterra + carga segura (coeficientes SINTÉTICOS; no calibra el Genezy).
-ivanna_add_test(test_volterra_kernel_package)
+ivanna_add_test(test_volterra_kernel_package LABELS dsp)
 # Kernel Volterra H1/H2 del Sony Genezi MHC-PZ1D (IVK1 GENEZY01, K=64,
 # h1 normalizada por L1). El .ivk1 lo genera
 # tools/volterra_h2/build_genezy_mhc_pz1d_ivk1.py; la ruta llega por
 # definición para que el test lea el paquete generado (no embebido).
-ivanna_add_test(test_volterra_genezy_mhc_pz1d)
+ivanna_add_test(test_volterra_genezy_mhc_pz1d LABELS dsp)
 target_compile_definitions(test_volterra_genezy_mhc_pz1d PRIVATE
   IVANNA_GENEZY_IVK1_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../assets/kernels/genezy_mhc_pz1d.ivk1")
 # Kernel Volterra H1/H2 REFINADO de la cadena Moto G85 5G + DAC USB-C +
@@ -146,76 +172,76 @@ target_compile_definitions(test_volterra_genezy_mhc_pz1d PRIVATE
 # h2 solo diagonal, device MOTO_G85_PZ1D). El .ivk1 lo genera
 # tools/volterra_h2/build_moto_g85_pz1d_ivk1.py; es el kernel DEFAULT
 # de Volterra en v2.5.369 (el Genezi anterior queda como alternativo).
-ivanna_add_test(test_volterra_moto_g85_pz1d)
+ivanna_add_test(test_volterra_moto_g85_pz1d LABELS dsp)
 target_compile_definitions(test_volterra_moto_g85_pz1d PRIVATE
   IVANNA_PZ1D_IVK1_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../assets/kernels/moto_g85_pz1d.ivk1")
 # Selector de kernel Volterra en runtime (v2.5.369): reemplazo PZ1D <->
 # Genezi vía VolterraH2Symmetric::replaceKernelPackage (fail-closed,
 # quiescencia con tope, puerta de producción antes de aplicar). Lee
 # AMBOS .ivk1 (el default PZ1D y el alternativo Genezi).
-ivanna_add_test(test_volterra_kernel_switch)
+ivanna_add_test(test_volterra_kernel_switch LABELS dsp)
 target_compile_definitions(test_volterra_kernel_switch PRIVATE
   IVANNA_PZ1D_IVK1_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../assets/kernels/moto_g85_pz1d.ivk1"
   IVANNA_GENEZY_IVK1_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../assets/kernels/genezy_mhc_pz1d.ivk1")
-ivanna_add_test(test_hires_config)
+ivanna_add_test(test_hires_config LABELS dsp)
 # Continuidad de ganancia del techo por etapa (tronidos al subir volumen).
-ivanna_add_test(test_stage_ceiling_continuity)
+ivanna_add_test(test_stage_ceiling_continuity LABELS dsp)
 # Codificación Ambisonics (HOA) real, plano horizontal, orden ≤2 — ver
 # spatial/HoaGainMatrix.hpp. Header-only (pura matemática, sin estado), no
 # necesita entrar a la librería ivanna_dsp_under_test.
-ivanna_add_test(test_hoa_gain_matrix)
+ivanna_add_test(test_hoa_gain_matrix LABELS spatial)
 # Closed-form bounded MAP solver, exact minimizer and projected KKT residual.
-ivanna_add_test(test_perceptual_optimizer_v2)
+ivanna_add_test(test_perceptual_optimizer_v2 LABELS fused)
 # Experimental Fisher-Rao natural-gradient step; isolated from production DSP.
-ivanna_add_test(test_perceptual_geometry_v3)
+ivanna_add_test(test_perceptual_geometry_v3 LABELS fused)
 # Production-path integration tests: exercise SaFRoomOptimizer, not only its helper.
-ivanna_add_test(test_saf_room_optimizer)
-ivanna_add_test(test_wasserstein_latent_flow)
+ivanna_add_test(test_saf_room_optimizer LABELS fused)
+ivanna_add_test(test_wasserstein_latent_flow LABELS fused)
 # Bounded adaptive residual geometry feedback on the SAF 7-D control state.
-ivanna_add_test(test_topological_feedback_operator)
+ivanna_add_test(test_topological_feedback_operator LABELS fused)
 # Bounded Berry-phase LUT and fixed-size complex FIR primitives.
-ivanna_add_test(test_gauge_field_engine)
+ivanna_add_test(test_gauge_field_engine LABELS fused)
 # Second-order phase/frequency tracking PLL (userspace; not a DAC clock driver).
-ivanna_add_test(test_g_pll_core)
+ivanna_add_test(test_g_pll_core LABELS dsp)
 # Dinámica del bucle de escritura del BridgePlayer (Ruta A, v2.5.457):
 # reproduce el fallo del snap 455 (buffer clavado en lleno + contenido
 # perdido) y valida el fix raíz (pacing: nivel al objetivo sin soltar nada).
-ivanna_add_test(test_bridgeplayer_level_control)
+ivanna_add_test(test_bridgeplayer_level_control LABELS dsp)
 # FIX 5 (v2.5.465) — trim LUFS del reproductor: zona muerta ±0.5 dB,
 # pendiente máx 0.5 dB/s (no por bloque), freeze en silencio, tope ±6 dB.
 # Header-only (perceptual_loudness.hpp); valida que el trim ya no
 # cabalgue la música dentro del tema (volumen sube/baja, Ruta A).
-ivanna_add_test(test_bridgeplayer_lufs_trim)
+ivanna_add_test(test_bridgeplayer_lufs_trim LABELS dsp)
 # Monotonic software clock monitor for callback cadence (diagnostic only, not DAC phase).
-ivanna_add_test(test_audio_callback_clock)
+ivanna_add_test(test_audio_callback_clock LABELS dsp)
 # EVOL-LIVEPATH (2026-11-26): tasa del FusionCore desde el reloj de
 # callback medido (SET_CONFIG jamás llega en este HAL).
-ivanna_add_test(test_effect_sample_rate)
+ivanna_add_test(test_effect_sample_rate LABELS daemon)
 # Estimator fed only by real HAL/driver presentation timestamps and frame positions.
-ivanna_add_test(test_audio_hardware_clock)
-ivanna_add_test(test_audio_hardware_clock_bridge)
+ivanna_add_test(test_audio_hardware_clock LABELS daemon)
+ivanna_add_test(test_audio_hardware_clock_bridge LABELS daemon)
 # EVOL-LIVEPATH (2026-11-26): muestra de reloj HAL desde el músculo ASRC
 # (hardware_rate_millihz en 0 por falta de publicador en vivo).
-ivanna_add_test(test_hardware_clock_from_muscle)
+ivanna_add_test(test_hardware_clock_from_muscle LABELS daemon)
 # IVANNA-ASRC-X1: núcleo variable y control fail-closed (sin ruta productiva habilitada).
-ivanna_add_test(test_variable_asrc)
-ivanna_add_test(test_hal_output_rate_control)
+ivanna_add_test(test_variable_asrc LABELS daemon)
+ivanna_add_test(test_hal_output_rate_control LABELS daemon)
 # Route-B adaptive bypass: per-sample bounded ramp back to unity on disable.
-ivanna_add_test(test_adaptive_gain_ramp)
+ivanna_add_test(test_adaptive_gain_ramp LABELS dsp)
 # v2.5.386 — Ruta B: limitadores de pendiente del objetivo de ganancia
 # adaptativa y tope 4:1 del compresor (bombeo de la 384/385). Header-only.
-ivanna_add_test(test_rt_gain_slew)
+ivanna_add_test(test_rt_gain_slew LABELS dsp)
 
 # Detector de transientes real (envolvente rápida vs lenta) — sub-módulo
 # propio de la Fase 1 del encargo HOA->Binaural->Upmixing, con sus propios
 # tests por exigencia del encargo (NO mezclado dentro del upmixer).
 # Header-only, sin estado compartido: no entra a ivanna_dsp_under_test.
-ivanna_add_test(test_transient_detector)
+ivanna_add_test(test_transient_detector LABELS dsp)
 
 # Módulo 1 (Fase Cero): PredictiveAudioEngine. Prueba lo que SÍ puede hacer
 # (pronóstico de señal predecible, onset por residuo, cuantización entera) y lo
 # que NO (ruido → confidence 0, el motor no finge acertar).
-ivanna_add_test(test_predictive_audio_engine)
+ivanna_add_test(test_predictive_audio_engine LABELS dsp)
 
 # FIX (gap encontrado en auditoría de Fase 3): test_adaptive_engine.cpp
 # existía desde el merge de feature/safetylimiter pero no estaba
@@ -238,6 +264,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_adaptive_engine PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_adaptive_engine COMMAND test_adaptive_engine)
+set_tests_properties(test_adaptive_engine PROPERTIES LABELS dsp)
 # FIX (auditoría CI 2026-09-14, corrida 34319106345 — falso positivo real
 # reproducido y confirmado, no una suposición): este ejecutable YA hace
 # `return g_failures == 0 ? 0 : 1;` en su main(), así que CTest ya detecta
@@ -269,6 +296,7 @@ target_include_directories(test_ihr1_format PRIVATE
 )
 target_compile_options(test_ihr1_format PRIVATE -Wall -Wextra)
 add_test(NAME test_ihr1_format COMMAND test_ihr1_format)
+set_tests_properties(test_ihr1_format PROPERTIES LABELS spatial)
 # Ver comentario junto a test_adaptive_engine (arriba): FAIL_REGULAR_EXPRESSION
 # removido por redundante con el código de salida y vulnerable a contaminación
 # cruzada de stdout entre tests bajo ctest -j (falso positivo confirmado).
@@ -293,6 +321,7 @@ target_include_directories(test_shm_lifecycle PRIVATE
 target_compile_options(test_shm_lifecycle PRIVATE -Wall -Wextra)
 target_link_libraries(test_shm_lifecycle PRIVATE Threads::Threads)
 add_test(NAME test_shm_lifecycle COMMAND test_shm_lifecycle)
+set_tests_properties(test_shm_lifecycle PROPERTIES LABELS daemon)
 
 # ── test_daemon_command_responder: regresión v2.5.440 (Ruta B muerta) ──────
 # El daemon v2 bindeaba @omega_daemon_socket pero nadie aceptaba: la app
@@ -314,6 +343,7 @@ target_include_directories(test_daemon_command_responder PRIVATE
 target_compile_options(test_daemon_command_responder PRIVATE -Wall -Wextra)
 target_link_libraries(test_daemon_command_responder PRIVATE Threads::Threads)
 add_test(NAME test_daemon_command_responder COMMAND test_daemon_command_responder)
+set_tests_properties(test_daemon_command_responder PROPERTIES LABELS daemon)
 
 # ── test_route_b_perceptual_state: regresión Ruta B neutra (2026-11-14) ─────
 # La app envía ORBE/HOLOS solo por SET_PERCEPTUAL_STATE, pero el daemon v2
@@ -330,6 +360,7 @@ target_include_directories(test_route_b_perceptual_state PRIVATE
 target_compile_options(test_route_b_perceptual_state PRIVATE -Wall -Wextra)
 target_link_libraries(test_route_b_perceptual_state PRIVATE Threads::Threads)
 add_test(NAME test_route_b_perceptual_state COMMAND test_route_b_perceptual_state)
+set_tests_properties(test_route_b_perceptual_state PROPERTIES LABELS daemon)
 
 # ── test_route_b_output_mode: regresión FIX 1 (bofo Genezi, v2.5.465) ───────
 # El snapshot traía ORBE=1.0, HOLOS=0.5 al Genezi aunque la puerta de la
@@ -348,6 +379,7 @@ target_include_directories(test_route_b_output_mode PRIVATE
 target_compile_options(test_route_b_output_mode PRIVATE -Wall -Wextra)
 target_link_libraries(test_route_b_output_mode PRIVATE Threads::Threads)
 add_test(NAME test_route_b_output_mode COMMAND test_route_b_output_mode)
+set_tests_properties(test_route_b_output_mode PROPERTIES LABELS daemon)
 
 # ── test_corona_control_route: HOLOS EN VIVO (evol-holos, 2026-11-26) ──────
 # El preset CORONA (HOLOS 1.0 / diffuse 0.85 / spread 1.2) no llegaba al
@@ -363,13 +395,14 @@ target_include_directories(test_corona_control_route PRIVATE
 target_compile_options(test_corona_control_route PRIVATE -Wall -Wextra)
 target_link_libraries(test_corona_control_route PRIVATE Threads::Threads)
 add_test(NAME test_corona_control_route COMMAND test_corona_control_route)
+set_tests_properties(test_corona_control_route PROPERTIES LABELS daemon)
 
 # ── test_p2_telemetry_preserve: P2 (2026-11-26, RMS=0 en vivo) ──────────
 # El efecto medía RMS/pico por bloque pero cada adopción del snapshot del
 # daemon borraba la telemetría con sus ceros (el daemon nunca escribe esos
 # campos). omega_preserve_effect_telemetry() (include/) conserva los campos
 # medidos al adoptar. Header-only: no necesita omega_control_bus.cpp.
-ivanna_add_test(test_p2_telemetry_preserve)
+ivanna_add_test(test_p2_telemetry_preserve LABELS daemon)
 
 # ── test_p2_telemetry_mirror: P2 (2026-11-26, RMS=0 en vivo) ─────────────
 # El daemon nunca leía el bus local del efecto: el snapshot de control
@@ -385,7 +418,7 @@ add_executable(test_p2_telemetry_mirror
 target_include_directories(test_p2_telemetry_mirror PRIVATE .. ../include)
 target_compile_options(test_p2_telemetry_mirror PRIVATE -Wall -Wextra)
 target_link_libraries(test_p2_telemetry_mirror PRIVATE GTest::gtest_main Threads::Threads)
-gtest_discover_tests(test_p2_telemetry_mirror)
+gtest_discover_tests(test_p2_telemetry_mirror PROPERTIES LABELS daemon)
 
 # ── test_p2_snapshot_watchdog: P2 (2026-11-26) ────────────────────────────
 # Si el daemon deja de publicar, el efecto seguía eternamente con los
@@ -393,7 +426,7 @@ gtest_discover_tests(test_p2_telemetry_mirror)
 # a defaults seguros con rampa de 100 ms tras 3000 ms sin snapshot nuevo
 # y recupera con la misma rampa. Header-only, simulación de daemon muerto
 # en host con bloques de 40 ms.
-ivanna_add_test(test_p2_snapshot_watchdog)
+ivanna_add_test(test_p2_snapshot_watchdog LABELS daemon)
 
 # ── test_route_b_snapshot_status: GET_STATUS expone el snapshot (2026-11-14)
 # 4 campos aditivos (snapshot_generation, perceptual_generation,
@@ -414,6 +447,7 @@ target_include_directories(test_route_b_snapshot_status PRIVATE
 target_compile_options(test_route_b_snapshot_status PRIVATE -Wall -Wextra)
 target_link_libraries(test_route_b_snapshot_status PRIVATE Threads::Threads)
 add_test(NAME test_route_b_snapshot_status COMMAND test_route_b_snapshot_status)
+set_tests_properties(test_route_b_snapshot_status PROPERTIES LABELS daemon)
 
 # ── test_route_b_kill_switches: kill switches de Ruta B (2026-11-14) ────────
 # El daemon v2 miraba /data/vendor/ivanna_audio/pal_asrc.off (write-stage
@@ -431,6 +465,7 @@ target_include_directories(test_route_b_kill_switches PRIVATE
 target_compile_options(test_route_b_kill_switches PRIVATE -Wall -Wextra)
 target_link_libraries(test_route_b_kill_switches PRIVATE Threads::Threads)
 add_test(NAME test_route_b_kill_switches COMMAND test_route_b_kill_switches)
+set_tests_properties(test_route_b_kill_switches PROPERTIES LABELS daemon)
 
 # ── 0023 bofo Ruta B: snapshot neutro de verdad + evidencia espectral ──────
 # CAUSA RAÍZ: makeDefault() es el default MAGISTRAL de Ruta A (HRTF on,
@@ -445,6 +480,7 @@ target_include_directories(test_route_b_neutral_snapshot PRIVATE
 target_compile_options(test_route_b_neutral_snapshot PRIVATE -Wall -Wextra)
 target_link_libraries(test_route_b_neutral_snapshot PRIVATE Threads::Threads)
 add_test(NAME test_route_b_neutral_snapshot COMMAND test_route_b_neutral_snapshot)
+set_tests_properties(test_route_b_neutral_snapshot PROPERTIES LABELS daemon)
 
 # ── ABI v14 (Física Nueva): 17 campos np_* al final del snapshot ────────────
 # sizeof 688 -> 752, crc32 680 -> 748, OMEGA_CTRL_VERSION 13 -> 14; ningún
@@ -462,6 +498,7 @@ target_include_directories(test_abi_v17_conservation_snapshot PRIVATE
 target_compile_options(test_abi_v17_conservation_snapshot PRIVATE -Wall -Wextra)
 target_link_libraries(test_abi_v17_conservation_snapshot PRIVATE Threads::Threads)
 add_test(NAME test_abi_v17_conservation_snapshot COMMAND test_abi_v17_conservation_snapshot)
+set_tests_properties(test_abi_v17_conservation_snapshot PROPERTIES LABELS daemon)
 
 # Exoneración del ASRC del módulo: a ratio 1.0 es memcpy bit-exacto y a la
 # deriva real (+8.5 ppm) su FIR es plano hasta 20 kHz. Si el bofo fuera el
@@ -477,6 +514,7 @@ target_include_directories(test_route_b_asrc_neutral_response PRIVATE
 target_compile_options(test_route_b_asrc_neutral_response PRIVATE -Wall -Wextra)
 target_link_libraries(test_route_b_asrc_neutral_response PRIVATE Threads::Threads)
 add_test(NAME test_route_b_asrc_neutral_response COMMAND test_route_b_asrc_neutral_response)
+set_tests_properties(test_route_b_asrc_neutral_response PROPERTIES LABELS daemon)
 
 # Peine en captura: la mezcla (original 100% + procesado 40% retrasado
 # 130 ms) es EN EL MEZCLADOR (dos AudioTracks), no acústica. Simulación
@@ -486,6 +524,7 @@ add_executable(test_capture_comb_filter test_capture_comb_filter.cpp)
 target_compile_options(test_capture_comb_filter PRIVATE -Wall -Wextra)
 target_link_libraries(test_capture_comb_filter PRIVATE Threads::Threads)
 add_test(NAME test_capture_comb_filter COMMAND test_capture_comb_filter)
+set_tests_properties(test_capture_comb_filter PROPERTIES LABELS acoustic)
 
 # -- test_effect_beacon: senal REAL de que omega_effect procesa (Ruta A/B) ------
 # Contrato del beacon mmap (omega_effect_beacon.h): clasificacion pura, round-trip
@@ -495,6 +534,7 @@ target_include_directories(test_effect_beacon PRIVATE .. ../include)
 target_compile_options(test_effect_beacon PRIVATE -Wall -Wextra)
 target_link_libraries(test_effect_beacon PRIVATE Threads::Threads)
 add_test(NAME test_effect_beacon COMMAND test_effect_beacon)
+set_tests_properties(test_effect_beacon PROPERTIES LABELS daemon)
 
 # -- test_no_effect_rearm: re-arme del auto-enable tras DISABLE espurio (v2.5.470) --
 # En este HAL EFFECT_CMD_ENABLE jamás llega pero EFFECT_CMD_DISABLE sí (al
@@ -509,6 +549,7 @@ target_include_directories(test_no_effect_rearm PRIVATE .. ../include)
 target_compile_options(test_no_effect_rearm PRIVATE -Wall -Wextra)
 target_link_libraries(test_no_effect_rearm PRIVATE Threads::Threads)
 add_test(NAME test_no_effect_rearm COMMAND test_no_effect_rearm)
+set_tests_properties(test_no_effect_rearm PROPERTIES LABELS daemon)
 
 # -- test_omega_pcm_format: regresion v2.5.382 (sin audio + tronidos) ---------
 # La 382 puso el default de creación del efecto en PCM_16_BIT, pero
@@ -521,6 +562,7 @@ target_include_directories(test_omega_pcm_format PRIVATE .. ../include)
 target_compile_options(test_omega_pcm_format PRIVATE -Wall -Wextra)
 target_link_libraries(test_omega_pcm_format PRIVATE Threads::Threads)
 add_test(NAME test_omega_pcm_format COMMAND test_omega_pcm_format)
+set_tests_properties(test_omega_pcm_format PROPERTIES LABELS daemon)
 
 # ── test_effect_local_files: pre-creación 0666 de archivos locales de Ruta B ──
 # Regresión del FIX Moto G85 2026-11-09 (daemon/effect_local_files.h): el efecto
@@ -533,6 +575,7 @@ target_include_directories(test_effect_local_files PRIVATE .. ../include)
 target_compile_options(test_effect_local_files PRIVATE -Wall -Wextra)
 target_link_libraries(test_effect_local_files PRIVATE Threads::Threads)
 add_test(NAME test_effect_local_files COMMAND test_effect_local_files)
+set_tests_properties(test_effect_local_files PROPERTIES LABELS daemon)
 
 # ── test_audio_effect_library_tag: AUDIO_EFFECT_LIBRARY_TAG == valor real AOSP ──
 # Regresión del hallazgo v2.5.139: el shim audio_effect_compat.h tenía los
@@ -545,7 +588,7 @@ add_executable(test_audio_effect_library_tag test_audio_effect_library_tag.cpp)
 target_include_directories(test_audio_effect_library_tag PRIVATE .. ../include)
 target_compile_options(test_audio_effect_library_tag PRIVATE -Wall -Wextra)
 target_link_libraries(test_audio_effect_library_tag PRIVATE GTest::gtest_main)
-gtest_discover_tests(test_audio_effect_library_tag)
+gtest_discover_tests(test_audio_effect_library_tag PROPERTIES LABELS daemon)
 
 # ── test_audio_effect_abi_layout: layouts de structs/vtables contra AOSP ──────
 # Caza la corrupción ABI de effect_descriptor_t (cpuLoad/memoryUsage son uint16_t)
@@ -554,7 +597,7 @@ add_executable(test_audio_effect_abi_layout test_audio_effect_abi_layout.cpp)
 target_include_directories(test_audio_effect_abi_layout PRIVATE .. ../include)
 target_compile_options(test_audio_effect_abi_layout PRIVATE -Wall -Wextra)
 target_link_libraries(test_audio_effect_abi_layout PRIVATE GTest::gtest_main)
-gtest_discover_tests(test_audio_effect_abi_layout)
+gtest_discover_tests(test_audio_effect_abi_layout PROPERTIES LABELS daemon)
 
 # ── test_upmixing_control_plane: evidencia del canal app->daemon->SHM->effect ──
 # Compila el omega_control_bus.cpp REAL (writer/reader seqlock + CRC32) y
@@ -568,7 +611,7 @@ add_executable(test_upmixing_control_plane
 target_include_directories(test_upmixing_control_plane PRIVATE .. ../include)
 target_compile_options(test_upmixing_control_plane PRIVATE -Wall -Wextra)
 target_link_libraries(test_upmixing_control_plane PRIVATE GTest::gtest_main Threads::Threads)
-gtest_discover_tests(test_upmixing_control_plane)
+gtest_discover_tests(test_upmixing_control_plane PROPERTIES LABELS daemon)
 # Ver comentario junto a test_adaptive_engine (arriba): FAIL_REGULAR_EXPRESSION
 # removido por redundante con el código de salida y vulnerable a contaminación
 # cruzada de stdout entre tests bajo ctest -j (falso positivo confirmado).
@@ -586,7 +629,7 @@ add_executable(test_user_flags_channel
 target_include_directories(test_user_flags_channel PRIVATE .. ../include host_stubs)   # android/log.h de command_server.cpp
 target_compile_options(test_user_flags_channel PRIVATE -Wall -Wextra)
 target_link_libraries(test_user_flags_channel PRIVATE GTest::gtest_main Threads::Threads)
-gtest_discover_tests(test_user_flags_channel)
+gtest_discover_tests(test_user_flags_channel PROPERTIES LABELS daemon)
 
 # RIR dataset (200 salas medidas, integrado 2026-08-12): valida el loader
 # contra el CSV+WAV reales shippeados en magisk_module/, no fixtures
@@ -609,6 +652,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_rir_dataset PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_rir_dataset COMMAND test_rir_dataset)
+set_tests_properties(test_rir_dataset PROPERTIES LABELS spatial)
 # Ver comentario junto a test_adaptive_engine (arriba): FAIL_REGULAR_EXPRESSION
 # removido por redundante con el código de salida y vulnerable a contaminación
 # cruzada de stdout entre tests bajo ctest -j (falso positivo confirmado).
@@ -633,6 +677,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_close_loop PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_close_loop COMMAND test_close_loop)
+set_tests_properties(test_close_loop PROPERTIES LABELS dsp)
 
 # Gap D) del prompt de Fase 1 (cerrar loop adaptativo): existían tests de
 # valores puntuales (test_close_loop) y de concurrencia corta (stress test
@@ -661,6 +706,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_stability PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_stability COMMAND test_stability)
+set_tests_properties(test_stability PROPERTIES LABELS dsp)
 # Ver comentario junto a test_adaptive_engine (arriba): FAIL_REGULAR_EXPRESSION
 # removido por redundante con el código de salida y vulnerable a contaminación
 # cruzada de stdout entre tests bajo ctest -j (falso positivo confirmado).
@@ -696,6 +742,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_control_frame_bus_stress PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_control_frame_bus_stress COMMAND test_control_frame_bus_stress)
+set_tests_properties(test_control_frame_bus_stress PROPERTIES LABELS daemon)
 # Ver comentario junto a test_adaptive_engine (arriba): FAIL_REGULAR_EXPRESSION
 # removido por redundante con el código de salida y vulnerable a contaminación
 # cruzada de stdout entre tests bajo ctest -j (falso positivo confirmado).
@@ -739,6 +786,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_audio_bus PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_audio_bus COMMAND test_audio_bus)
+set_tests_properties(test_audio_bus PROPERTIES LABELS daemon)
 # Ver comentario junto a test_adaptive_engine (arriba): FAIL_REGULAR_EXPRESSION
 # removido por redundante con el código de salida y vulnerable a contaminación
 # cruzada de stdout entre tests bajo ctest -j (falso positivo confirmado).
@@ -747,58 +795,58 @@ add_test(NAME test_audio_bus COMMAND test_audio_bus)
 # - SafetyLimiter: clipCount no se duplica (Parche 6)
 # - SafetyLimiter: gainReduction se almacena en dB (Parche 6)
 # - Compressor: makeup compensa runtimeAmount_ (Parche 7)
-ivanna_add_test(test_regression_tuning)
+ivanna_add_test(test_regression_tuning LABELS dsp)
 
 # ── Audio Quality Metrics: SNR · THD · Latencia · Piso numérico ──────────────
 # Tests que miden propiedades de calidad del audio procesado, no solo
 # que el código no crasha. Umbrales basados en los valores de IvannaLabMonitor:
 #   SNR > 90 dB en bypass, THD < 10% en clipping deliberado,
 #   latencia < 1ms por bloque de 512 frames, 0 NaN en 1000 bloques.
-ivanna_add_test(test_audio_quality_metrics)
+ivanna_add_test(test_audio_quality_metrics LABELS acoustic)
 
 # ── Overshoot del HarmonicExciter: barrera de regresión del clipping digital ──
 # softClip() (Padé [3/2]) no saturaba hacia ±1 (llegaba a 1.94 con drive máximo)
 # y la mezcla dry+wet alcanzaba 1.52 — clipping digital dentro del exciter,
 # antes del SafetyLimiter. Este test barre drive × wet × 6 señales de peor
 # caso y falla si cualquiera de los dos límites se rompe otra vez.
-ivanna_add_test(test_harmonic_exciter_overshoot)
+ivanna_add_test(test_harmonic_exciter_overshoot LABELS dsp)
 
 # ── Etapa final maestro 64-bit (v2.5.461): True-Peak 4x a -0.2 dBTP + TPDF ──
 # Guarda inter-muestra tras SafetyLimiter + mezcla dry/wet en double + dither
 # triangular exacto (±1 LSB, solo 16/24-bit con efecto activo, bypass bit-exacto).
-ivanna_add_test(test_master_output_stage)
+ivanna_add_test(test_master_output_stage LABELS dsp)
 
 # ── Excitador: SOLO armónicos (sin ganancia lineal en la fundamental) ─────────
 # Medido: el shaper sumaba la fundamental amplificada al seco (+3.4 dB a 3.5 kHz con los
 # defaults de arranque) = realce de 3-8 kHz dependiente del nivel. 6 tests: ganancia lineal
 # < 0.02 a 6 niveles x 3 frecuencias, peor caso drive/wet, armónicos presentes, drive
 # efectivo, sin ráfaga en el onset y acotado/finito.
-ivanna_add_test(test_harmonic_exciter_fundamental)
+ivanna_add_test(test_harmonic_exciter_fundamental LABELS dsp)
 
 # ── Timing hi-res del SafetyLimiter: barrera de regresión del bug 2026-08-27 ──
 # setSampleRate()/setParams() nunca se llamaban: soft-knee anulado (threshold
 # == ceiling) y ataque/release a 48 kHz fijos (a 384 kHz: ataque 12 ms,
 # release 400 ms -> clipping en transientes + bombeo). 4 tests miden el
 # comportamiento temporal real del limiter a 48k y 384k.
-ivanna_add_test(test_limiter_hires_timing)
+ivanna_add_test(test_limiter_hires_timing LABELS dsp)
 
 # ── SafetyLimiter con los parámetros REALES de las rutas A y B (-1 dBFS / -0.1 dBFS) ──
 # Transparente bajo el umbral, sin aplastar masters calientes (<= 1 dB a 0 dBFS), techo
 # inviolable con senos +5 dBFS/impulsos/ruido/percusión, y release limpio. Medido; los
 # defaults de setParams() (-4 dBFS) perderían 2.8 dB y ninguna ruta los usa.
-ivanna_add_test(test_limiter_route_params)
-ivanna_add_test(test_differential_reinjector)
+ivanna_add_test(test_limiter_route_params LABELS dsp)
+ivanna_add_test(test_differential_reinjector LABELS dsp)
 # Anillo lock-free de eventos RT (v2.5.446): fija el fix de las 6 violaciones
 # de check_rt_safety (LOG en omega_process / logDspShedStateThrottled).
-ivanna_add_test(test_rt_log_ring)
+ivanna_add_test(test_rt_log_ring LABELS dsp)
 # Matriz de aislamiento bofo/tronidos + presupuesto RT real (v2.5.446):
 # peine original+copia, guardián del reinjector, crossfade Volterra 18 ms.
-ivanna_add_test(test_bofo_isolation_matrix)
-ivanna_add_test(test_neuromorphic_ab_harness)
-ivanna_add_test(test_block_peak_guard)
-ivanna_add_test(test_measure_baseline)
-ivanna_add_test(test_npe_analysis_tap)
-ivanna_add_test(test_genre_smooth_state)  # 0046: estabilizador género/mix
+ivanna_add_test(test_bofo_isolation_matrix LABELS dsp)
+ivanna_add_test(test_neuromorphic_ab_harness LABELS fused)
+ivanna_add_test(test_block_peak_guard LABELS dsp)
+ivanna_add_test(test_measure_baseline LABELS dsp)
+ivanna_add_test(test_npe_analysis_tap LABELS acoustic)
+ivanna_add_test(test_genre_smooth_state LABELS dsp)  # 0046: estabilizador género/mix
 
 # ── Rescatados del olvido (flanco Tests host): huérfanos sin target ──────────
 # test_audio_regression.cpp (677 líneas): cada TEST_F documenta un bug real de
@@ -806,7 +854,7 @@ ivanna_add_test(test_genre_smooth_state)  # 0046: estabilizador género/mix
 # reproducción. Dependía solo de include/*.h + dsp/*.cpp — ya todo en
 # ivanna_dsp_under_test. Nunca tuvo target: la suite completa de regresión
 # auditiva no se ejecutaba en ninguna parte.
-ivanna_add_test(test_audio_regression)
+ivanna_add_test(test_audio_regression LABELS dsp)
 
 # test_oem_stability_suite.cpp: suite de regresión OEM (transparencia de mix,
 # estabilidad IIR, peak guard, smoothing, stress de hilos del daemon). Solo
@@ -819,14 +867,14 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_oem_stability_suite PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_oem_stability_suite PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_oem_stability_suite)
+gtest_discover_tests(test_oem_stability_suite PROPERTIES LABELS dsp)
 
 # ── test_adaptive_eq_stress: 10 s @ 48 kHz contra ParametricEQ real ─────────
-ivanna_add_test(test_adaptive_eq_stress)
+ivanna_add_test(test_adaptive_eq_stress LABELS dsp)
 
 # ── Curva real del ParametricEQ: shelves verdaderos (graves profundos / agudos sin plateau) ──
-ivanna_add_test(test_eq_shelf_response)
-ivanna_add_test(test_eq_fatigue_tilt)
+ivanna_add_test(test_eq_shelf_response LABELS dsp)
+ivanna_add_test(test_eq_fatigue_tilt LABELS dsp)
 
 # ── test_ivannalab: suite host del laboratorio de medición IvannaLab ────────
 # Coordinación pendiente del flanco IvannaLab (commit 2c0826c3, marcado
@@ -834,7 +882,7 @@ ivanna_add_test(test_eq_fatigue_tilt)
 # que es de este flanco. Resuelto por el dueño del flanco Tests host —
 # los 7 tests (Peak/True Peak, THD, IMD SMPTE, SNR estadístico, LUFS con
 # gates, LRA, estado vacío) corren ahora en la puerta y en CI.
-ivanna_add_test(test_ivannalab)
+ivanna_add_test(test_ivannalab LABELS acoustic)
 
 # ── ivanna_benchmark: benchmark de CPU/latencia del DSP — OPCIONAL, fuera de la puerta ──
 # Flanco Benchmarks (CLAIMS/benchmarks.md): benchmark_suite.cpp llevaba CERO
@@ -876,6 +924,7 @@ if(IVANNA_SAN_FLAGS)
 endif()
 set_target_properties(test_evolutionary_kernel PROPERTIES ENABLE_EXPORTS ON)
 add_test(NAME test_evolutionary_kernel COMMAND test_evolutionary_kernel)
+set_tests_properties(test_evolutionary_kernel PROPERTIES LABELS dsp)
 
 # ── EQ evolutivo 512 bandas (EvolutionaryEQ.cpp real): barrera de regresión ──
 # Sustituye la documentación pasiva de la auditoría dc2ea33f por evidencia
@@ -894,6 +943,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_evolutionary_eq PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_evolutionary_eq COMMAND test_evolutionary_eq)
+set_tests_properties(test_evolutionary_eq PROPERTIES LABELS dsp)
 
 # ── Auto-evolución 0001 (2026-11-09): PhiSAFInfinity con SAF_GUARD ──
 # El motor de evolución detectó que esta ruta SAF no tenía las guardas
@@ -912,6 +962,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_saf_phi_infinity PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_saf_phi_infinity COMMAND test_saf_phi_infinity)
+set_tests_properties(test_saf_phi_infinity PROPERTIES LABELS fused)
 
 # ── Auto-Auditoría de Dispositivo (2026-11-09): perfilador nativo ──
 # test_device_cpu_profiler.cpp es standalone (su propio main(), sin gtest),
@@ -927,6 +978,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_device_cpu_profiler PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_device_cpu_profiler COMMAND test_device_cpu_profiler)
+set_tests_properties(test_device_cpu_profiler PROPERTIES LABELS acoustic)
 
 
 # FIX (build rojo, 2026-09-15): HoaBinauralDecoder e IntelligentUpmixer usan
@@ -950,19 +1002,19 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_intelligent_upmixer PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_intelligent_upmixer PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_intelligent_upmixer)
+gtest_discover_tests(test_intelligent_upmixer PROPERTIES LABELS spatial)
 
 # ORBE (Binaural Esférico de Campo Cercano): el modelo de cabeza es
 # header-only; el núcleo STFT se compila directo (como
 # test_intelligent_upmixer) porque IvannaFusionCore no se enlaza en host.
-ivanna_add_test(test_near_field_head_model)
+ivanna_add_test(test_near_field_head_model LABELS spatial)
 # Propagación física de la onda + Ley de Curvatura de ORBE (Trabajador B,
 # 2026-11-18): piso (1/r, r/c, ISO 9613-1, Doppler, potencia constante) y
 # ley nueva (ITD por curvatura κ=1/r: Woodworth exacto en κ→0, +11.7 % a
 # 0.15 m/90°, inversión distancia-desde-exceso-ITD). Verificado contra
 # tablas ISO publicadas y contra NearFieldHeadModel (ver
 # fused/PHYSICAL_PROPAGATION_MAP.md).
-ivanna_add_test(test_physical_propagation)
+ivanna_add_test(test_physical_propagation LABELS spatial)
 # Modelo físico de cabeza — esfera rígida exacta (Trabajador A, 2026-11-18):
 # serie de Bessel/Hankel + Legendre, verificado contra implementación
 # independiente en scipy y contra límites analíticos. Piso físico de ORBE·Ω;
@@ -979,7 +1031,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_physical_head_model PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_physical_head_model PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_physical_head_model)
+gtest_discover_tests(test_physical_head_model PROPERTIES LABELS spatial)
 # Física nueva — Operador de Interferencia Geodésica del pabellón
 # (Trabajador A, 2026-11-18): Ley Geodésica del Notch, dos familias
 # verificadas leave-one-out contra el SOFA MIT KEMAR (ver
@@ -996,7 +1048,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_geodesic_pinna_model PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_geodesic_pinna_model PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_geodesic_pinna_model)
+gtest_discover_tests(test_geodesic_pinna_model PROPERTIES LABELS spatial)
 # Kernel unificado — Operador Holográfico Único TΩ(ω) 2×2 en 64-bit double
 # (IVANNA-APEX v2.6, 2026-11-18): matriz compleja única que reemplaza 3 STFT
 # + 30 IIRs + shuffler XTC. STANDALONE (no conectado a FusedChain aún): la
@@ -1012,10 +1064,10 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_unified_field_kernel PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_unified_field_kernel PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_unified_field_kernel)
+gtest_discover_tests(test_unified_field_kernel PROPERTIES LABELS spatial)
 # NEU·Ω Fase 1 (SpectralCore, header-only): núcleo mínimo con FFT
 # compartida L+jR, M=I, OLA único. Criterio de salida: E1 (identidad).
-ivanna_add_test(test_spectral_core)
+ivanna_add_test(test_spectral_core LABELS fused)
 # NEU·Ω Fase 3 (0028): cola difusa en frecuencia — la cola RIR vive en la
 # matriz espectral (un solo IFFT), con EDC/T60, coste y sin clic; el
 # RirConvolver salta su cola FDL cuando NEU la lleva (tailEnabled).
@@ -1033,7 +1085,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_neu_fase3_tail PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_neu_fase3_tail PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_neu_fase3_tail)
+gtest_discover_tests(test_neu_fase3_tail PROPERTIES LABELS fused)
 add_executable(test_orbe_binaural
   test_orbe_binaural.cpp
   ../spatial/OrbeBinaural.cpp
@@ -1045,7 +1097,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_orbe_binaural PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_orbe_binaural PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_orbe_binaural)
+gtest_discover_tests(test_orbe_binaural PROPERTIES LABELS spatial)
 
 # ── test_orbe_power_conservation: fix L1/L2 del defecto M1 (Fase 1, 2026-11-24) ──
 # BandPowerConserver + kSideGain=1.0 en OrbeBinaural, detrás del flag
@@ -1065,7 +1117,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_orbe_power_conservation PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_orbe_power_conservation PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_orbe_power_conservation)
+gtest_discover_tests(test_orbe_power_conservation PROPERTIES LABELS spatial)
 add_executable(test_neu_compiler
   test_neu_compiler.cpp
   ../spatial/OrbeBinaural.cpp
@@ -1080,7 +1132,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_neu_compiler PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_neu_compiler PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_neu_compiler)
+gtest_discover_tests(test_neu_compiler PROPERTIES LABELS fused)
 add_executable(test_orbe_chain
   test_orbe_chain.cpp
   ../spatial/OrbeBinaural.cpp
@@ -1092,7 +1144,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_orbe_chain PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_orbe_chain PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_orbe_chain)
+gtest_discover_tests(test_orbe_chain PROPERTIES LABELS spatial)
 
 # HOLOS — Operador Único de Campo Acústico (FUSION.md, v2.5.364).
 # Mismo patrón que los tests ORBE. Las fuentes DSP (Compressor,
@@ -1109,7 +1161,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_holos_green_kernel PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_holos_green_kernel PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_holos_green_kernel)
+gtest_discover_tests(test_holos_green_kernel PROPERTIES LABELS spatial)
 
 add_executable(test_holos_gain_field
   test_holos_gain_field.cpp
@@ -1121,7 +1173,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_holos_gain_field PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_holos_gain_field PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_holos_gain_field)
+gtest_discover_tests(test_holos_gain_field PROPERTIES LABELS spatial)
 
 # Ley 1 — Dominio Total del Tiempo y la Fase (Γ complejo, alineación
 # entera+fraccional, filtro inverso de fase mínima).
@@ -1135,7 +1187,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_ley1_tiempo_fase PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_ley1_tiempo_fase PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_ley1_tiempo_fase)
+gtest_discover_tests(test_ley1_tiempo_fase PROPERTIES LABELS spatial)
 
 add_executable(test_holos_volterra_kernel
   test_holos_volterra_kernel.cpp
@@ -1148,7 +1200,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_holos_volterra_kernel PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_holos_volterra_kernel PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_holos_volterra_kernel)
+gtest_discover_tests(test_holos_volterra_kernel PROPERTIES LABELS spatial)
 
 add_executable(test_holos_operator
   test_holos_operator.cpp
@@ -1163,7 +1215,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_holos_operator PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_holos_operator PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_holos_operator)
+gtest_discover_tests(test_holos_operator PROPERTIES LABELS spatial)
 
 # ── test_power_mix: mezcla seco/wet de potencia constante (P3/3.1) ──
 # PowerMixer en ORBE y HOLOS: unidad (coherente/incorrelado/antifase/
@@ -1184,7 +1236,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_power_mix PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_power_mix PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_power_mix)
+gtest_discover_tests(test_power_mix PROPERTIES LABELS fused)
 
 # ── test_holos_multidim: HOLOS multidimensional (P3/3.3) ──
 # Equivalente a test_orbe_power_conservation pero para HOLOS: energía
@@ -1204,7 +1256,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_holos_multidim PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_holos_multidim PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_holos_multidim)
+gtest_discover_tests(test_holos_multidim PROPERTIES LABELS spatial)
 
 # Perfil de coste de HOLOS por componente (F2 / v2.5.453): imprime
 # media/p99 por bloque de 320 f con distintos parámetros. No es un test
@@ -1222,12 +1274,12 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_holos_perf_profile PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_holos_perf_profile PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_holos_perf_profile)
+gtest_discover_tests(test_holos_perf_profile PROPERTIES LABELS fused)
 
 # Ω — Operador Universal (v2.5.444). Núcleo header-only (matemática pura,
 # sin estado global): el test solo necesita el .cpp. Verificación §11.1
 # del documento privado (U1–U9 + tope N1).
-ivanna_add_test(test_omega_operator)
+ivanna_add_test(test_omega_operator LABELS fused)
 
 # ── Coste por etapa de la cadena DSP de Ruta A (v2.5.410, SOLO MEDICION) ──
 # test_route_a_chain_cost_410.cpp: timea cada etapa con los defaults en vivo
@@ -1263,7 +1315,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_route_a_chain_cost_410 PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_route_a_chain_cost_410 PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_route_a_chain_cost_410)
+gtest_discover_tests(test_route_a_chain_cost_410 PROPERTIES LABELS fused)
 
 # ── Firma de rebalanceo de Ruta A (v2.5.410, SOLO MEDICION) ──
 # test_route_a_signature_410.cpp: HOLOS 12 vs 24 bandas (coste + THD+N),
@@ -1298,7 +1350,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_route_a_signature_410 PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_route_a_signature_410 PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_route_a_signature_410)
+gtest_discover_tests(test_route_a_signature_410 PROPERTIES LABELS fused)
 
 add_executable(test_holos_chain
   test_holos_chain.cpp
@@ -1314,7 +1366,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_holos_chain PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_holos_chain PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_holos_chain)
+gtest_discover_tests(test_holos_chain PROPERTIES LABELS spatial)
 
 # ── test_fase5_quality_gate: FASE 5 — Banco de Laboratorio Automático en CI
 # (Audio Quality Gate). Null-test maestro (ORBE 0 + HOLOS 0 en serie,
@@ -1338,7 +1390,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fase5_quality_gate PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fase5_quality_gate PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fase5_quality_gate)
+gtest_discover_tests(test_fase5_quality_gate PROPERTIES LABELS fused)
 
 # Barrido de retuneo HOLOS v2.5.369: THD+N en rejilla (amount × harmonics)
 # para elegir el default que cumpla THD+N ≤ −70 dB con efecto medible.
@@ -1356,7 +1408,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_holos_retune_sweep PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_holos_retune_sweep PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_holos_retune_sweep)
+gtest_discover_tests(test_holos_retune_sweep PROPERTIES LABELS spatial)
 
 # Native 3D stem pose contract: the production NeuralUpmixer implementation is
 # compiled directly so these tests exercise the same atomic buffer publication
@@ -1374,7 +1426,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_native_stem_pose PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_native_stem_pose PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_native_stem_pose)
+gtest_discover_tests(test_native_stem_pose PROPERTIES LABELS spatial)
 
 # Sensor timestamps use Android elapsed-realtime; the audio renderer must not
 # compare them with a block-duration clock. Exercise the production tracker.
@@ -1391,7 +1443,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_head_tracker_latest_pose PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_head_tracker_latest_pose PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_head_tracker_latest_pose)
+gtest_discover_tests(test_head_tracker_latest_pose PROPERTIES LABELS spatial)
 
 # SO(3) completo + parallax por traslación (Fase 2, ítem E, v2.5.472):
 # cuaternión yaw/pitch/roll, fusión gyro+RV, hook de traslación ARCore y
@@ -1409,7 +1461,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_head_tracker_so3 PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_head_tracker_so3 PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_head_tracker_so3)
+gtest_discover_tests(test_head_tracker_so3 PROPERTIES LABELS spatial)
 
 # Contrato SHM IvannaFusionState v2 + etapa HAL F5 (Fase 2, ítem E,
 # v2.5.472): round-trip v2, seqlock, gate engage/passthrough, kill
@@ -1426,7 +1478,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_ivanna_fusion_shm PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_ivanna_fusion_shm PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_ivanna_fusion_shm)
+gtest_discover_tests(test_ivanna_fusion_shm PROPERTIES LABELS daemon)
 
 add_executable(test_hoa_binaural_decoder
   test_hoa_binaural_decoder.cpp
@@ -1443,7 +1495,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_hoa_binaural_decoder PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_hoa_binaural_decoder PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_hoa_binaural_decoder)
+gtest_discover_tests(test_hoa_binaural_decoder PROPERTIES LABELS spatial)
 
 
 # ── Wave Field Synthesis (2026-09-18) ──
@@ -1459,6 +1511,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_route_a_wfs_engine PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_route_a_wfs_engine COMMAND test_route_a_wfs_engine)
+set_tests_properties(test_route_a_wfs_engine PROPERTIES LABELS spatial)
 
 add_executable(test_wfs_renderer
   test_wfs_renderer.cpp
@@ -1471,7 +1524,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_wfs_renderer PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_wfs_renderer COMMAND test_wfs_renderer)
-set_tests_properties(test_wfs_renderer PROPERTIES FAIL_REGULAR_EXPRESSION "FALLARON")
+set_tests_properties(test_wfs_renderer PROPERTIES FAIL_REGULAR_EXPRESSION "FALLARON" LABELS spatial)
 
 
 # ── WFS activación glitch-free (2026-09-19) ──
@@ -1486,7 +1539,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_wfs_activation_crossfade PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_wfs_activation_crossfade COMMAND test_wfs_activation_crossfade)
-set_tests_properties(test_wfs_activation_crossfade PROPERTIES FAIL_REGULAR_EXPRESSION "FALLARON")
+set_tests_properties(test_wfs_activation_crossfade PROPERTIES FAIL_REGULAR_EXPRESSION "FALLARON" LABELS spatial)
 
 # ── Music Intelligence Engine bridge (2026-09-24) ──
 add_executable(test_ime_bridge
@@ -1504,7 +1557,7 @@ if(IVANNA_SAN_FLAGS)
 endif()
 set_target_properties(test_ime_bridge PROPERTIES ENABLE_EXPORTS ON)
 add_test(NAME test_ime_bridge COMMAND test_ime_bridge)
-set_tests_properties(test_ime_bridge PROPERTIES FAIL_REGULAR_EXPRESSION "FALLARON")
+set_tests_properties(test_ime_bridge PROPERTIES FAIL_REGULAR_EXPRESSION "FALLARON" LABELS spatial)
 
 # ── Master Acoustic Orchestrator: Arbitraje Unificado y Estabilidad de Referencia ──
 add_executable(test_master_acoustic_orchestrator
@@ -1519,6 +1572,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_master_acoustic_orchestrator PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_master_acoustic_orchestrator COMMAND test_master_acoustic_orchestrator)
+set_tests_properties(test_master_acoustic_orchestrator PROPERTIES LABELS fused)
 
 # EJE 1: descomposición estéreo→objetos WFS (decomposer + renderer reales).
 add_executable(test_wfs_object_decomposition
@@ -1527,7 +1581,7 @@ add_executable(test_wfs_object_decomposition
 target_include_directories(test_wfs_object_decomposition PRIVATE .. ../include ../spatial host_stubs)
 target_compile_options(test_wfs_object_decomposition PRIVATE -Wall -Wextra)
 add_test(NAME test_wfs_object_decomposition COMMAND test_wfs_object_decomposition)
-set_tests_properties(test_wfs_object_decomposition PROPERTIES FAIL_REGULAR_EXPRESSION "FALLARON")
+set_tests_properties(test_wfs_object_decomposition PROPERTIES FAIL_REGULAR_EXPRESSION "FALLARON" LABELS spatial)
 
 # EJE 7: Final Performance, RT-Safety & Latency Certification
 add_executable(test_perf_auditor
@@ -1555,7 +1609,7 @@ add_test(NAME test_perf_auditor COMMAND test_perf_auditor)
 # (latencia por muestras, estabilidad numérica) son deterministas y viajan
 # con el binario por granularidad CTest (add_test registra el binario
 # entero); si el consejo quiere afinarlo, se parte con --gtest_filter.
-set_tests_properties(test_perf_auditor PROPERTIES LABELS QUARANTINED)
+set_tests_properties(test_perf_auditor PROPERTIES LABELS "acoustic;QUARANTINED")
 
 # EJE 2/4 — auditoria 2026-09-24: canal_resonance_boost_db e itdScale_
 # (HrtfPersonalizer) estaban calculados pero sin ningun consumidor real.
@@ -1573,6 +1627,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_hrtf_personalizer_wiring PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_hrtf_personalizer_wiring COMMAND test_hrtf_personalizer_wiring)
+set_tests_properties(test_hrtf_personalizer_wiring PROPERTIES LABELS spatial)
 
 # Cadena HRTF de la rejilla: HRTFDatabase (carga desde .ihr1 medidos) ->
 # HRTFInterpolator -> BinauralRenderer/HybridRenderer (fallback observable).
@@ -1603,6 +1658,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_hrtf_database PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_hrtf_database COMMAND test_hrtf_database)
+set_tests_properties(test_hrtf_database PROPERTIES LABELS spatial)
 
 # Interpolación de HRIR alineada en el tiempo (HrirTimeAlign.hpp): mide peine de ITD y ITD interpolada.
 add_executable(test_hrtf_time_align
@@ -1623,6 +1679,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_hrtf_time_align PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_hrtf_time_align COMMAND test_hrtf_time_align)
+set_tests_properties(test_hrtf_time_align PROPERTIES LABELS spatial)
 
 # Selección de HRIR por pose (az+el, con envoltura) y ley de distancia de la escena (Ruta B).
 add_executable(test_hrir_pose_select test_hrir_pose_select.cpp)
@@ -1634,6 +1691,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_hrir_pose_select PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_hrir_pose_select COMMAND test_hrir_pose_select)
+set_tests_properties(test_hrir_pose_select PROPERTIES LABELS spatial)
 
 # BinauralRenderer: el cambio de filtro HRTF (head-tracking / fuente móvil) se funde, no parte la onda.
 add_executable(test_binaural_crossfade
@@ -1653,6 +1711,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_binaural_crossfade PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_binaural_crossfade COMMAND test_binaural_crossfade)
+set_tests_properties(test_binaural_crossfade PROPERTIES LABELS spatial)
 
 # ── Eje Supremo Neuroacústico: Inversión Biomecánica Coclear Activa ───────────
 # CochlearActiveInverseModel.hpp es header-only (cero .cpp propios):
@@ -1676,7 +1735,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_cochlear_inverse_model PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_cochlear_inverse_model PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_cochlear_inverse_model)
+gtest_discover_tests(test_cochlear_inverse_model PROPERTIES LABELS fused)
 
 # ── Interfaz Neuro-Acústica en Bucle Cerrado v1 ─────────────────────────────
 # neuro_acoustic_closed_loop.hpp es header-only (cero .cpp propios):
@@ -1699,14 +1758,14 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_neuro_acoustic_closed_loop PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_neuro_acoustic_closed_loop PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_neuro_acoustic_closed_loop)
+gtest_discover_tests(test_neuro_acoustic_closed_loop PROPERTIES LABELS fused)
 
 # ── M0 (salto, Luna): contrato temporal único ─────────────────────────────
 # AudioStatePublisher (seqlock): round-trip, generación monótona,
 # coherencia bajo concurrencia, bypass con valid=false y detección de
 # cambio de ruta/calibration. La librería ivanna_dsp_under_test ya
 # incluye fused/closed_loop/audio_state.cpp (arriba).
-ivanna_add_test(test_audio_state)
+ivanna_add_test(test_audio_state LABELS fused)
 
 # Ruta AUX Genezi / auto (v2.5.366): presets, puerta Volterra IVK1 y
 # coste O(K^2) que hace inviable K=4096 en tiempo real.
@@ -1725,7 +1784,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_aux_genezi_route PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_aux_genezi_route PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_aux_genezi_route)
+gtest_discover_tests(test_aux_genezi_route PROPERTIES LABELS dsp)
 
 # Fusión Homogénea Φ (v2.5.367): un solo estado (neuro + ruta AUX +
 # puerta Volterra), Z_emf siempre identidad, fail-closed.
@@ -1744,7 +1803,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_homogeneous_fusion PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_homogeneous_fusion PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_homogeneous_fusion)
+gtest_discover_tests(test_homogeneous_fusion PROPERTIES LABELS fused)
 
 # Pilares pendientes (v2.5.368): Volterra diagonal K=4096, DoP v1.1,
 # EQ de elevación por pinna (Blauert), estimador EMF Thiele-Small.
@@ -1763,7 +1822,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_pilares_pendientes PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_pilares_pendientes PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_pilares_pendientes)
+gtest_discover_tests(test_pilares_pendientes PROPERTIES LABELS fused)
 
 # Hiper-Operador de Estado Φ v2.5.369: muestra a muestra, sin FFT.
 # BiquadEnvelopeBank llama phase_oracle_tick (igual que test_npe_core):
@@ -1784,7 +1843,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_hyper_state_operator PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_hyper_state_operator PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_hyper_state_operator)
+gtest_discover_tests(test_hyper_state_operator PROPERTIES LABELS fused)
 
 # Curvas objetivo ÉLITE v2.5.369 (Harman 2018, élite-lean, campo difuso,
 # altavoces en sala): header-only, sin dependencias de DSP.
@@ -1800,7 +1859,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_elite_target_curves PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_elite_target_curves PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_elite_target_curves)
+gtest_discover_tests(test_elite_target_curves PROPERTIES LABELS acoustic)
 
 # ── 5 Ejes de Supremacía Neuroacústica (Warped Lattice, CVNN+DDSP, SNN+NMF HOA, Pinna INR, SHM+Farrow5) ──
 add_executable(test_supreme_five_axes
@@ -1823,7 +1882,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_supreme_five_axes PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_supreme_five_axes PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_supreme_five_axes)
+gtest_discover_tests(test_supreme_five_axes PROPERTIES LABELS fused)
 
 # ── ACOUSTIC REALITY RECONSTRUCTION HYPERENGINE (Fases 1 a 8 + 6 Pruebas de Validación) ──
 add_executable(test_acoustic_reality_hyperengine
@@ -1847,7 +1906,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_acoustic_reality_hyperengine PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_acoustic_reality_hyperengine PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_acoustic_reality_hyperengine)
+gtest_discover_tests(test_acoustic_reality_hyperengine PROPERTIES LABELS fused)
 
 # ── SUPREME ZERO-POP STATE TRANSITION LAYER (Certificación Fases 5 y 6) ──
 add_executable(test_supreme_zero_pop_transition
@@ -1872,7 +1931,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_supreme_zero_pop_transition PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_supreme_zero_pop_transition PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_supreme_zero_pop_transition)
+gtest_discover_tests(test_supreme_zero_pop_transition PROPERTIES LABELS fused)
 
 # ── SUPREME ACOUSTIC STATE CONTINUITY ARCHITECTURE ──
 add_executable(test_supreme_acoustic_continuity
@@ -1898,7 +1957,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_supreme_acoustic_continuity PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_supreme_acoustic_continuity PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_supreme_acoustic_continuity)
+gtest_discover_tests(test_supreme_acoustic_continuity PROPERTIES LABELS fused)
 
 # ── PROMPT MAESTRO v3: UNIFIED STAGE ARCHITECTURE & SAFETY BENCH (FASES 1–6) ──
 add_library(ivanna_unified_pipeline_under_test STATIC
@@ -1956,6 +2015,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_unified_master_v3_safety_bench PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME UnifiedMasterV3SafetyBench COMMAND test_unified_master_v3_safety_bench)
+set_tests_properties(UnifiedMasterV3SafetyBench PROPERTIES LABELS fused)
 
 # SofaHRTFLoader: valida la firma HDF5 y RECONSTRUYE el HRIR desde la base SOFA-PCA (no lee
 # mediciones). Estas pruebas fijan ese contrato y los errores de archivo inexistente/truncado/
@@ -1967,7 +2027,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_sofa_hrtf_loader PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_sofa_hrtf_loader PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_sofa_hrtf_loader)
+gtest_discover_tests(test_sofa_hrtf_loader PROPERTIES LABELS spatial)
 
 # ── FASE 2: 12 nativos conectados con external fun y consumidores Kotlin ──────
 add_executable(test_phase2_jni_natives
@@ -1998,6 +2058,7 @@ if(IVANNA_SAN_FLAGS)
 endif()
 set_target_properties(test_phase2_jni_natives PROPERTIES ENABLE_EXPORTS ON)
 add_test(NAME test_phase2_jni_natives COMMAND test_phase2_jni_natives)
+set_tests_properties(test_phase2_jni_natives PROPERTIES LABELS daemon)
 
 # ── test_pi_lstm_bridge_jni: bridge JNI Pi-LSTM (0015) ────────────────────────
 # pi_lstm_bridge_jni.cpp (278 líneas) estaba entre los 19 módulos sin tests:
@@ -2021,7 +2082,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_pi_lstm_bridge_jni PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_pi_lstm_bridge_jni PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_pi_lstm_bridge_jni)
+gtest_discover_tests(test_pi_lstm_bridge_jni PROPERTIES LABELS daemon)
 
 # ── test_benchmark_jni: latencia round-trip Ruta A (0016) ────────────────────
 # ivanna_benchmark_jni.cpp (72 líneas) estaba entre los 19 módulos sin tests:
@@ -2046,7 +2107,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_benchmark_jni PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_benchmark_jni PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_benchmark_jni)
+gtest_discover_tests(test_benchmark_jni PROPERTIES LABELS daemon)
 
 # ── test_saf_jni_bridge: bridge JNI SAF (0017) ───────────────────────────────
 # SaFJniBridge.cpp (130 líneas) estaba entre los 19 módulos sin tests:
@@ -2072,7 +2133,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_saf_jni_bridge PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_saf_jni_bridge PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_saf_jni_bridge)
+gtest_discover_tests(test_saf_jni_bridge PROPERTIES LABELS daemon)
 
 # ── test_omega_daemon_bridge: puente SHM al daemon (0018) ────────────────────
 # omega_daemon_bridge.cpp (156 líneas) estaba entre los 19 módulos sin tests:
@@ -2098,7 +2159,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_omega_daemon_bridge PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 gtest_discover_tests(test_omega_daemon_bridge
-  PROPERTIES RUN_SERIAL TRUE)
+  PROPERTIES RUN_SERIAL TRUE LABELS daemon)
 # RUN_SERIAL (ver arriba): los 3 tests comparten el socket abstracto FIJO
 # @omega_daemon_socket — el puente de producción lo tiene fijo, no se puede
 # uniquificar — y CTest ejecuta cada caso gtest en un proceso aparte: bajo
@@ -2153,6 +2214,7 @@ if(IVANNA_SAN_FLAGS)
 endif()
 set_target_properties(test_phase3_jni_callers PROPERTIES ENABLE_EXPORTS ON)
 add_test(NAME test_phase3_jni_callers COMMAND test_phase3_jni_callers)
+set_tests_properties(test_phase3_jni_callers PROPERTIES LABELS daemon)
 
 # ── FASE 4 y 5: 22 headers de producción consolidados + RT-Safety ─────────────
 add_executable(test_phase4_5_header_rt_wiring
@@ -2187,6 +2249,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_phase4_5_header_rt_wiring PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_phase4_5_header_rt_wiring COMMAND test_phase4_5_header_rt_wiring)
+set_tests_properties(test_phase4_5_header_rt_wiring PROPERTIES LABELS daemon)
 
 # ── FASE A4: Detector dinámico en host de 0 malloc / 0 new en callbacks RT ───
 add_executable(test_rt_no_alloc
@@ -2206,6 +2269,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_rt_no_alloc PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_rt_no_alloc COMMAND test_rt_no_alloc)
+set_tests_properties(test_rt_no_alloc PROPERTIES LABELS dsp)
 
 # ── 1.6 D6: Registrar test_hrtf_convolver_rt_safety, test_wfs_adaptive_protection y test_music_intelligence ──
 add_executable(test_hrtf_convolver_rt_safety test_hrtf_convolver_rt_safety.cpp)
@@ -2216,7 +2280,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_hrtf_convolver_rt_safety PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_hrtf_convolver_rt_safety PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_hrtf_convolver_rt_safety)
+gtest_discover_tests(test_hrtf_convolver_rt_safety PROPERTIES LABELS spatial)
 
 add_executable(test_wfs_adaptive_protection
   test_wfs_adaptive_protection.cpp
@@ -2230,6 +2294,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_wfs_adaptive_protection PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_wfs_adaptive_protection COMMAND test_wfs_adaptive_protection)
+set_tests_properties(test_wfs_adaptive_protection PROPERTIES LABELS spatial)
 
 add_executable(test_music_intelligence
   test_music_intelligence.cpp
@@ -2245,15 +2310,16 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_music_intelligence PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_music_intelligence COMMAND test_music_intelligence)
+set_tests_properties(test_music_intelligence PROPERTIES LABELS acoustic)
 
 # ── ATLAS-ESCENA 12D & SINGULARIDAD ACÚSTICA: Pruebas T3–T10 ────────────────
-ivanna_add_test(test_ime_style_blender)
-ivanna_add_test(test_scene_bus)
-ivanna_add_test(test_late_reverb_suppressor)
-ivanna_add_test(test_woodworth_itd)
-ivanna_add_test(test_headphone_crossfeed)
-ivanna_add_test(test_er_tap_time)
-ivanna_add_test(test_cheb_shaper)
+ivanna_add_test(test_ime_style_blender LABELS fused)
+ivanna_add_test(test_scene_bus LABELS spatial)
+ivanna_add_test(test_late_reverb_suppressor LABELS spatial)
+ivanna_add_test(test_woodworth_itd LABELS spatial)
+ivanna_add_test(test_headphone_crossfeed LABELS spatial)
+ivanna_add_test(test_er_tap_time LABELS spatial)
+ivanna_add_test(test_cheb_shaper LABELS dsp)
 
 add_executable(test_cold_start_sim
   test_cold_start_sim.cpp
@@ -2282,7 +2348,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_cold_start_sim PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_cold_start_sim PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_cold_start_sim)
+gtest_discover_tests(test_cold_start_sim PROPERTIES LABELS fused)
 
 add_executable(test_tinyml_kernel
   test_tinyml_kernel.cpp
@@ -2295,7 +2361,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_tinyml_kernel PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_tinyml_kernel PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_tinyml_kernel)
+gtest_discover_tests(test_tinyml_kernel PROPERTIES LABELS acoustic)
 
 # ── CORONA Frente A, defecto 3: frontend mel real del clasificador NEURO ──
 # FFT radix-2 + banco triangular detrás de flag (default OFF). El test
@@ -2313,17 +2379,17 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_audio_classifier_frontend PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_audio_classifier_frontend PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_audio_classifier_frontend)
+gtest_discover_tests(test_audio_classifier_frontend PROPERTIES LABELS acoustic)
 
 # ── IVANNA Acoustic Unity Engine (v2.6.0) ──
-ivanna_add_test(test_acoustic_unity_engine)
-ivanna_add_test(test_unity_closed_loop)
+ivanna_add_test(test_acoustic_unity_engine LABELS fused)
+ivanna_add_test(test_unity_closed_loop LABELS fused)
 # M8 (salto, Luna): supervisor de incertidumbre + rollback. Umbrales
 # NOMINALES del contrato (0.80 / 0.50 / 0.20, kMaxAgeSeconds 300 s);
 # el umbral de la Puerta lo actualiza el coordinador al integrar.
-ivanna_add_test(test_uncertainty_supervisor)
-ivanna_add_test(test_true_peak_limiter)
-ivanna_add_test(test_punch_engine)
+ivanna_add_test(test_uncertainty_supervisor LABELS fused)
+ivanna_add_test(test_true_peak_limiter LABELS dsp)
+ivanna_add_test(test_punch_engine LABELS dsp)
 
 
 
@@ -2340,7 +2406,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_aux_field_coherence PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_aux_field_coherence PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_aux_field_coherence)
+gtest_discover_tests(test_aux_field_coherence PROPERTIES LABELS spatial)
 
 add_executable(test_temporal_spatial test_temporal_spatial.cpp)
 target_link_libraries(test_temporal_spatial PRIVATE GTest::gtest_main)
@@ -2350,7 +2416,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_temporal_spatial PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_temporal_spatial PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_temporal_spatial)
+gtest_discover_tests(test_temporal_spatial PROPERTIES LABELS spatial)
 
 add_executable(test_room_probe test_room_probe.cpp)
 target_link_libraries(test_room_probe PRIVATE GTest::gtest_main)
@@ -2360,7 +2426,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_room_probe PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_room_probe PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_room_probe)
+gtest_discover_tests(test_room_probe PROPERTIES LABELS spatial)
 
 # Downsampler sinc polifásico Kaiser (Fase 4): 192k→48k con rechazo de alias
 # >130 dB medido. Header-only (polyphase_sinc_downsampler.hpp), solo GTest.
@@ -2372,7 +2438,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_polyphase_sinc_downsampler PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_polyphase_sinc_downsampler PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_polyphase_sinc_downsampler)
+gtest_discover_tests(test_polyphase_sinc_downsampler PROPERTIES LABELS dsp)
 
 # Sensor acústico real por micrófono (Moto G85, v2.5.369): header-only,
 # sin ivanna_dsp_under_test (solo GTest + FFTRadix2 + RoomProbe).
@@ -2384,7 +2450,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_real_acoustic_sensor PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_real_acoustic_sensor PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_real_acoustic_sensor)
+gtest_discover_tests(test_real_acoustic_sensor PROPERTIES LABELS acoustic)
 
 # Canal lateral del sensor (v2.5.506, cableado mic → organismo): snapshot
 # versionado + puerta kind 5 + fail-closed. Header-only (SensorSnapshot +
@@ -2397,7 +2463,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_sensor_snapshot PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_sensor_snapshot PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_sensor_snapshot)
+gtest_discover_tests(test_sensor_snapshot PROPERTIES LABELS acoustic)
 
 add_executable(test_ab_harness test_ab_harness.cpp)
 target_link_libraries(test_ab_harness PRIVATE GTest::gtest_main)
@@ -2407,7 +2473,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_ab_harness PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_ab_harness PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_ab_harness)
+gtest_discover_tests(test_ab_harness PROPERTIES LABELS acoustic)
 
 # ── Cadena 4D de excitación (conductor predictivo 5–10 ms, háptica multibanda,
 #    cancelación de diafonía para AUX y dosímetro de exposición WHO/H.870) ──
@@ -2420,7 +2486,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_4d_ultra_chain PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_4d_ultra_chain PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_4d_ultra_chain)
+gtest_discover_tests(test_4d_ultra_chain PROPERTIES LABELS fused)
 
 # ── Superficie de control GLOBAL de la Cadena 4D (cableado punta a punta, v2.5.47) ──
 # Ejercita el MISMO camino que usa el dispositivo (ensureInit / setEnabled / feedPlanar /
@@ -2441,7 +2507,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_4d_control_surface PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_4d_control_surface PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_4d_control_surface)
+gtest_discover_tests(test_4d_control_surface PROPERTIES LABELS fused)
 
 # ── Arco narrativo (MacroArcConductor, escala de segundos) ──
 # Aislado con características MEDIDAS en el extractor real y, a nivel cadena, con el extractor
@@ -2458,7 +2524,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_macro_arc_conductor PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_macro_arc_conductor PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_macro_arc_conductor)
+gtest_discover_tests(test_macro_arc_conductor PROPERTIES LABELS fused)
 
 add_executable(test_npe_core test_npe_core.cpp ../phase_oracle.cpp)
 target_link_libraries(test_npe_core PRIVATE GTest::gtest_main)
@@ -2468,7 +2534,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_npe_core PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_npe_core PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_npe_core)
+gtest_discover_tests(test_npe_core PROPERTIES LABELS fused)
 
 # 0024 (elevación magistral del DSP): NPE a parámetros VIVOS de
 # AdaptiveControlsPrefs (harm 0.60 / lat 0.50 / ohc 0.40 / master +2.5 dB),
@@ -2481,7 +2547,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_route_a_npe_live_params PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_route_a_npe_live_params PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_route_a_npe_live_params)
+gtest_discover_tests(test_route_a_npe_live_params PROPERTIES LABELS fused)
 
 # 0025 (hallazgos en vivo 2026-11-16 11:18 CST): pacing de nivel por
 # descarte en la CAPTURA — el PLL se saturaba en el riel (-500 ppm,
@@ -2496,7 +2562,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_capture_level_control PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_capture_level_control PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_capture_level_control)
+gtest_discover_tests(test_capture_level_control PROPERTIES LABELS dsp)
 
 # 0027 (elevación omnipotente del DSP): compresor MULTIBANDA 3 bandas
 # (crossovers Linkwitz-Riley 4º orden, 200 Hz / 4 kHz) — el monobanda
@@ -2509,7 +2575,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_multiband_compressor PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_multiband_compressor PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_multiband_compressor)
+gtest_discover_tests(test_multiband_compressor PROPERTIES LABELS dsp)
 
 # ── Contrato de read-back del ancho espacial (Fotoholografía, v2.5.68) ──
 # El read-back (nativeGetSpatialWidthDirect) vive en ivanna_omega_jni.cpp, que no se compila
@@ -2523,7 +2589,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_spatial_width_readback PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_spatial_width_readback PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_spatial_width_readback)
+gtest_discover_tests(test_spatial_width_readback PROPERTIES LABELS spatial)
  
 # RP-88 spatial angle command read-back: bounded native command, not acoustic measurement.
 add_executable(test_spatial_angle_readback test_spatial_angle_readback.cpp)
@@ -2534,7 +2600,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_spatial_angle_readback PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_spatial_angle_readback PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_spatial_angle_readback)
+gtest_discover_tests(test_spatial_angle_readback PROPERTIES LABELS spatial)
 
 add_executable(test_physical_scene_readback test_physical_scene_readback.cpp)
 target_link_libraries(test_physical_scene_readback PRIVATE GTest::gtest_main)
@@ -2544,7 +2610,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_physical_scene_readback PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_physical_scene_readback PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_physical_scene_readback)
+gtest_discover_tests(test_physical_scene_readback PROPERTIES LABELS spatial)
 
 
 # ── IVANNA autonomous acoustic transaction and 3D geometry renderer ──
@@ -2556,7 +2622,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_scene_geometry_renderer PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_scene_geometry_renderer PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_scene_geometry_renderer)
+gtest_discover_tests(test_scene_geometry_renderer PROPERTIES LABELS spatial)
 
 add_executable(test_autonomous_acoustic_transaction test_autonomous_acoustic_transaction.cpp)
 target_link_libraries(test_autonomous_acoustic_transaction PRIVATE GTest::gtest_main)
@@ -2566,11 +2632,11 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_autonomous_acoustic_transaction PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_autonomous_acoustic_transaction PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_autonomous_acoustic_transaction)
+gtest_discover_tests(test_autonomous_acoustic_transaction PROPERTIES LABELS fused)
 
 
 # Control-plane peer authentication: reject untrusted app UIDs before command/SHM handling.
-ivanna_add_test(test_daemon_peer_auth)
+ivanna_add_test(test_daemon_peer_auth LABELS daemon)
 # PAL integration test registration
 # USB ASRC cutoff contract (kernel cutoff is normalized to Nyquist).
 add_executable(test_usb_asrc_clock_servo test_usb_asrc_clock_servo.cpp)
@@ -2581,7 +2647,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_usb_asrc_clock_servo PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_usb_asrc_clock_servo PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_usb_asrc_clock_servo)
+gtest_discover_tests(test_usb_asrc_clock_servo PROPERTIES LABELS daemon)
 
 add_executable(test_usb_asrc_cutoff test_usb_asrc_cutoff.cpp)
 target_link_libraries(test_usb_asrc_cutoff PRIVATE GTest::gtest_main)
@@ -2591,7 +2657,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_usb_asrc_cutoff PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_usb_asrc_cutoff PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_usb_asrc_cutoff)
+gtest_discover_tests(test_usb_asrc_cutoff PROPERTIES LABELS daemon)
 
 # Exercise the exact production USB ASRC coefficients in host spectral regressions.
 add_executable(test_usb_asrc_spectral_response test_usb_asrc_spectral_response.cpp)
@@ -2602,7 +2668,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_usb_asrc_spectral_response PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_usb_asrc_spectral_response PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_usb_asrc_spectral_response)
+gtest_discover_tests(test_usb_asrc_spectral_response PROPERTIES LABELS daemon)
 
 
 # Full-circle MAJESTY 3D azimuth: preserve rear hemisphere and wrap head yaw.
@@ -2614,10 +2680,10 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_azimuth_math PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_azimuth_math PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_azimuth_math)
+gtest_discover_tests(test_azimuth_math PROPERTIES LABELS spatial)
 
-ivanna_add_test(test_qualcomm_pal_clock_integration)
-ivanna_add_test(test_pal_mmap_position_adapter)
+ivanna_add_test(test_qualcomm_pal_clock_integration LABELS daemon)
+ivanna_add_test(test_pal_mmap_position_adapter LABELS daemon)
 
 # ── Productor del reloj HAL (daemon): descubrimiento /proc/asound, puerta de
 # correlacion y publicacion real en el snapshot compartido. Fail-closed sin ASRC
@@ -2626,7 +2692,7 @@ add_executable(test_hal_clock_producer test_hal_clock_producer.cpp ../daemon/hal
 target_link_libraries(test_hal_clock_producer PRIVATE GTest::gtest_main)
 target_include_directories(test_hal_clock_producer PRIVATE ../include ../daemon)
 target_compile_options(test_hal_clock_producer PRIVATE -Wall -Wextra)
-gtest_discover_tests(test_hal_clock_producer)
+gtest_discover_tests(test_hal_clock_producer PROPERTIES LABELS daemon)
 
 # AsrcClockController antes no tenia ningun consumidor real fuera de su propio
 # test (2026-10-24). Este test valida el canal IPC nuevo (asrc_state_bridge.hpp)
@@ -2635,7 +2701,7 @@ add_executable(test_asrc_state_bridge test_asrc_state_bridge.cpp)
 target_link_libraries(test_asrc_state_bridge PRIVATE GTest::gtest_main)
 target_include_directories(test_asrc_state_bridge PRIVATE ../include ../dsp)
 target_compile_options(test_asrc_state_bridge PRIVATE -Wall -Wextra)
-gtest_discover_tests(test_asrc_state_bridge)
+gtest_discover_tests(test_asrc_state_bridge PROPERTIES LABELS daemon)
 
 # Relevo del dump del write-stage ASRC PAL v5 (2026-11-10): el daemon lee
 # /data/vendor/ivanna_audio/pal_asrc_stage.txt y lo releva en
@@ -2645,7 +2711,7 @@ add_executable(test_write_stage_asrc_telemetry test_write_stage_asrc_telemetry.c
 target_link_libraries(test_write_stage_asrc_telemetry PRIVATE GTest::gtest_main)
 target_include_directories(test_write_stage_asrc_telemetry PRIVATE ../include)
 target_compile_options(test_write_stage_asrc_telemetry PRIVATE -Wall -Wextra)
-gtest_discover_tests(test_write_stage_asrc_telemetry)
+gtest_discover_tests(test_write_stage_asrc_telemetry PROPERTIES LABELS daemon)
 
 # Regression: signed stereo 4x true-peak interpolation must preserve phase and
 # cannot report a lower peak than sample peak when both observe the same stream.
@@ -2657,17 +2723,17 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_loudness_true_peak PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_loudness_true_peak PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_loudness_true_peak)
+gtest_discover_tests(test_loudness_true_peak PROPERTIES LABELS acoustic)
 
 # 16-to-5 logical bus dispatcher: bounded SIMD/scalar kernel and sensor-gated thermal guard.
-ivanna_add_test(test_physical_target_dispatcher)
+ivanna_add_test(test_physical_target_dispatcher LABELS spatial)
 
 # ── Gobernador del spread WFS: apertura acotada, suavizado y defensa NaN ──
 add_executable(test_wfs_spread_governor test_wfs_spread_governor.cpp)
 target_link_libraries(test_wfs_spread_governor PRIVATE GTest::gtest_main)
 target_include_directories(test_wfs_spread_governor PRIVATE ../ ../spatial ../include)
 target_compile_options(test_wfs_spread_governor PRIVATE -Wall -Wextra)
-gtest_discover_tests(test_wfs_spread_governor)
+gtest_discover_tests(test_wfs_spread_governor PROPERTIES LABELS spatial)
 
 # Production SAF update and persistence regression coverage.
 add_executable(test_saf_optimizer_state test_saf_optimizer_state.cpp)
@@ -2677,11 +2743,11 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_saf_optimizer_state PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_saf_optimizer_state PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_saf_optimizer_state)
+gtest_discover_tests(test_saf_optimizer_state PROPERTIES LABELS fused)
 
 
 # FotoHolo Route B: 64-band Bark observer, fail-closed silence and bounded modulation.
-ivanna_add_test(test_fotoholo_bark_meter)
+ivanna_add_test(test_fotoholo_bark_meter LABELS acoustic)
 
 
 # Evidencia medida por procesador: HRTF / RIR / SAF (con controles negativos).
@@ -2704,6 +2770,7 @@ target_link_libraries(test_processor_evidence PRIVATE GTest::gtest_main Threads:
 target_include_directories(test_processor_evidence PRIVATE .. ../include ../spatial host_stubs)
 target_compile_options(test_processor_evidence PRIVATE -Wall -Wextra)
 add_test(NAME test_processor_evidence COMMAND test_processor_evidence)
+set_tests_properties(test_processor_evidence PROPERTIES LABELS acoustic)
 
 # LGN cableada en HrtfManager::synthesizeHrtf (2026-11-18): el pabellón se
 # aplica al HRIR y el notch medido coincide con la predicción; OFF = esfera
@@ -2727,7 +2794,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_hrtf_pinna_lgn PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_hrtf_pinna_lgn PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_hrtf_pinna_lgn)
+gtest_discover_tests(test_hrtf_pinna_lgn PROPERTIES LABELS spatial)
 
 # IVANNA-APEX (2026-11-18): motor holográfico unificado 64-bit, standalone
 # (sin enchufar en FusedChain). El header es header-only; las fuentes son
@@ -2744,7 +2811,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_ivanna_apex_kernel PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_ivanna_apex_kernel PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_ivanna_apex_kernel)
+gtest_discover_tests(test_ivanna_apex_kernel PROPERTIES LABELS fused)
 
 
 # HAL PAL -> bounded servo -> variable-ratio ASRC output path.
@@ -2764,7 +2831,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_pal_asrc_output_path PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_pal_asrc_output_path PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_pal_asrc_output_path)
+gtest_discover_tests(test_pal_asrc_output_path PROPERTIES LABELS daemon)
 
 
 # Compile the Moto G85 write-stage header in host CI. This validates the
@@ -2788,7 +2855,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_moto_g85_pal_asrc_write_stage PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_moto_g85_pal_asrc_write_stage PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_moto_g85_pal_asrc_write_stage)
+gtest_discover_tests(test_moto_g85_pal_asrc_write_stage PROPERTIES LABELS daemon)
 
 # ── Perfil de sala MAGISTRAL + geometría del transaural derivada de la sala ──
 add_executable(test_magistral_room_xtc test_magistral_room_xtc.cpp)
@@ -2799,7 +2866,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_magistral_room_xtc PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_magistral_room_xtc PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_magistral_room_xtc)
+gtest_discover_tests(test_magistral_room_xtc PROPERTIES LABELS spatial)
 
 # ── test_session_discovery: daemon root descubre sessionId real (Ruta B, v2.5.379) ──
 # La sesión 0 es un callejón sin salida (el efecto se crea pero nunca recibe
@@ -2807,41 +2874,41 @@ gtest_discover_tests(test_magistral_room_xtc)
 # ejecuta `dumpsys media.audio_flinger` y parsea "Global session refs".
 # Header-only (session_discovery.hpp); cubre parseo moderno/antiguo, selección
 # de sesión de música y ABI v11 del snapshot (offsets viejos sin cambio).
-ivanna_add_test(test_session_discovery)
+ivanna_add_test(test_session_discovery LABELS daemon)
 
 # ── 5D FASE 0 (PROPUESTA_5D.md §5, v2.5.383): BioControl5D + EEG sintético ──
 # Header-only (spatial/BioControl5D.hpp): dinámica neural (3.2), lazo de
 # control Γ_b/r_ORBE/K con clamps y slew-rates (3.3), fail-closed sin sensor
 # y tras perderlo, tono 884 Hz modulado por η (3.7). Host-only, sin cableado
 # al DSP real ni al hilo RT. Sin sensor EEG real no hay Fases 1–3.
-ivanna_add_test(test_5d_phase0)
+ivanna_add_test(test_5d_phase0 LABELS fused)
 
 # ── FORMULACIÓN MAGISTRAL Ψ (2026-11-10): campo unificado acústico-neural ──
 # spatial/PsiField.hpp: Ec. 2 (ley de distancia campo cercano, corregida
 # contra el modelo geométrico), Ec. 3 (operador de personalización CIPIC),
 # Ec. 4 (factor Γ y EDO con pérdida en BioControl5D). Header-only.
-ivanna_add_test(test_psi_field)
+ivanna_add_test(test_psi_field LABELS fused)
 
 # ── P0-b (2026-11-10): planificación del hal-clock-asrc-poller ──────────────
 # include/poller_sched.hpp: decisión pura (FIFO rtprio 2 si se permite,
 # SCHED_OTHER si no). El daemon intenta FIFO primero y cae a best-effort.
-ivanna_add_test(test_poller_sched)
+ivanna_add_test(test_poller_sched LABELS fused)
 
 # ── Reformulación Ψ por vía (2026-11-10): el campo conoce la vía ─────────────
 # (audífonos/AUX/celular/estéreo/5.1/7.1/cine): ILD percibido por crosstalk,
 # bocinas por ley dipolar, radio de cabeza personalizado cableado a ORBE.
-ivanna_add_test(test_psi_field_routes)
+ivanna_add_test(test_psi_field_routes LABELS fused)
 
 # ── Operador de transducción universal (MANT Ec. 1, núcleo usable) ───────────
 # Compensación por banda con límite WNG (mínimos cuadrados + Tikhonov por
 # bisección). Sin medida del transductor devuelve no-op (no inventa).
-ivanna_add_test(test_transducer_operator)
+ivanna_add_test(test_transducer_operator LABELS fused)
 
 # ── FÍSICA NUEVA CONSOLIDADA (Fase 2, v2.5.472) ────────────────────────────
 # Headers-only (fused/new_physics_*.hpp + neuromorphic/laguerre_volterra_h2.hpp):
 # bypass bit-exacto, LGN 3D, Laguerre H2 68.5 Hz, Ω D_max + regla de banda,
 # motor completo NaN/Inf + presupuesto CPU por hop (6670 µs).
-ivanna_add_test(test_new_physics_consolidated)
+ivanna_add_test(test_new_physics_consolidated LABELS fused)
 
 # ── Tiempos por etapa del DSP (v2.5.411, tarea 4) ────────────────────────────
 # ivanna_stage_timings.h: media/p99/max por etapa (lock-free, anillo 256).
@@ -2861,7 +2928,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_stage_timings PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_stage_timings PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_stage_timings)
+gtest_discover_tests(test_stage_timings PROPERTIES LABELS acoustic)
 
 # ── test_route_a_asrc: ASRC magistral Ruta A (v2.5.404+, Ψ viva) ─────────────
 # ivanna_route_a_asrc_test.cpp vivía en app/src/main/cpp/ SIN cablear en
@@ -2888,7 +2955,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_route_a_asrc PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_route_a_asrc COMMAND test_route_a_asrc)
-set_tests_properties(test_route_a_asrc PROPERTIES RUN_SERIAL TRUE)
+set_tests_properties(test_route_a_asrc PROPERTIES RUN_SERIAL TRUE LABELS daemon)
 
 # ── 0029 (doble precisión): acumulación float64 en el FIR ASRC 319 taps y
 # en la FDL del RirConvolver, con fallback a float32 por coste. ──────────
@@ -2907,7 +2974,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_double_precision PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_double_precision PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_double_precision)
+gtest_discover_tests(test_double_precision PROPERTIES LABELS fused)
 
 # ── 0033: bypass nativo del ASRC (decisión de Esse 2026-11-16) ────────
 # El ASRC no va en el Snapdragon: setEnabled(false) = passthrough
@@ -2924,7 +2991,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_route_a_asrc_bypass PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_route_a_asrc_bypass PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_route_a_asrc_bypass)
+gtest_discover_tests(test_route_a_asrc_bypass PROPERTIES LABELS daemon)
 
 # ── 0031: gobernador de shed POR RUTA (tronidos continuos en la 458) ──
 # Un solo DspLoadShedGovernor global servía a BridgePlayer (41.3 ms) y
@@ -2942,7 +3009,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_shed_governor_split PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_shed_governor_split PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_shed_governor_split)
+gtest_discover_tests(test_shed_governor_split PROPERTIES LABELS dsp)
 
 # ── 0021: tests para los módulos sin tests restantes (decisión del Consejo ──
 # Supremo 2026-11-16, ronda 1 unánime: candidato (e)). audio_orchestrator.cpp
@@ -2969,7 +3036,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_audio_orchestrator PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_audio_orchestrator PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_audio_orchestrator)
+gtest_discover_tests(test_audio_orchestrator PROPERTIES LABELS fused)
 
 # ── test_master_bypass: bypass maestro (2.5.461, propuesta 0035). Compila
 # la TU REAL ivanna_jni_stub.cpp (flag g_masterBypass + stub
@@ -2999,7 +3066,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_master_bypass PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_master_bypass PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_master_bypass)
+gtest_discover_tests(test_master_bypass PROPERTIES LABELS dsp)
 
 # ── test_usb_audio_pro_manager: gestor USB Pro (endpoint isócrono + ASRC + ──
 # feedback UAC). Compila el .cpp REAL en host con host_stubs (jni.h
@@ -3017,7 +3084,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_usb_audio_pro_manager PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_usb_audio_pro_manager PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_usb_audio_pro_manager)
+gtest_discover_tests(test_usb_audio_pro_manager PROPERTIES LABELS daemon)
 
 # ── 0022: medidor THD+N (Punto 3 de la crítica externa, mediciones físicas) ──
 # Decisión del Consejo Supremo 2026-11-16, ronda 1 unánime: punto (A).
@@ -3033,7 +3100,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_thd_meter PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_thd_meter PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_thd_meter)
+gtest_discover_tests(test_thd_meter PROPERTIES LABELS acoustic)
 
 # ── FUSIÓN MAGISTRAL (2026-11-18, directiva de Esse) ──
 # 7 operadores únicos fusionados de los ~45 efectos. Cada test sigue el
@@ -3051,7 +3118,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fused_transducer PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fused_transducer PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fused_transducer)
+gtest_discover_tests(test_fused_transducer PROPERTIES LABELS fused)
 
 add_executable(test_fused_dynamics
   test_fused_dynamics.cpp
@@ -3064,7 +3131,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fused_dynamics PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fused_dynamics PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fused_dynamics)
+gtest_discover_tests(test_fused_dynamics PROPERTIES LABELS fused)
 
 add_executable(test_fused_tonal
   test_fused_tonal.cpp
@@ -3079,7 +3146,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fused_tonal PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fused_tonal PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fused_tonal)
+gtest_discover_tests(test_fused_tonal PROPERTIES LABELS fused)
 
 add_executable(test_fused_brain
   test_fused_brain.cpp
@@ -3099,7 +3166,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fused_brain PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fused_brain PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fused_brain)
+gtest_discover_tests(test_fused_brain PROPERTIES LABELS fused)
 
 add_executable(test_fused_spatial
   test_fused_spatial.cpp
@@ -3132,7 +3199,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fused_spatial PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fused_spatial PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fused_spatial)
+gtest_discover_tests(test_fused_spatial PROPERTIES LABELS fused)
 
 # ── test_poincare_pan: pan Poincaré de campo cercano (2026-11-23) ──────────
 # Cableado en FusedSpatial (sustituye el spread WFS) detrás del flag
@@ -3169,7 +3236,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_poincare_pan PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_poincare_pan PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_poincare_pan)
+gtest_discover_tests(test_poincare_pan PROPERTIES LABELS spatial)
 
 # ── test_sofa_comparison: arnes de comparacion SOFA (Trabajador C, 2026-11-18) ──
 # HRTF medida (kemar.ihr1, conversion de MIT_KEMAR_normal_pinna.sofa) vs
@@ -3211,7 +3278,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_sofa_comparison PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_sofa_comparison PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_sofa_comparison)
+gtest_discover_tests(test_sofa_comparison PROPERTIES LABELS spatial)
 
 add_executable(test_fused_field
   test_fused_field.cpp
@@ -3228,7 +3295,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fused_field PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fused_field PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fused_field)
+gtest_discover_tests(test_fused_field PROPERTIES LABELS fused)
 
 add_executable(test_fused_listener_room
   test_fused_listener_room.cpp
@@ -3242,7 +3309,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fused_listener_room PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fused_listener_room PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fused_listener_room)
+gtest_discover_tests(test_fused_listener_room PROPERTIES LABELS fused)
 
 # Fuentes compartidas de la cadena (unión de los 7 operadores + sus motores).
 # volterra_h2_symmetric.cpp y predictive_audio_engine.cpp ya están en
@@ -3308,7 +3375,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fused_chain PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fused_chain PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fused_chain)
+gtest_discover_tests(test_fused_chain PROPERTIES LABELS fused)
 
 # ── P1 (2026-11-22): matriz adversarial bypass vs IVANNA vs cada operador ─
 # El núcleo de medición es el del banco adversarial (tests/adversarial, C++17,
@@ -3327,7 +3394,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_p1_adversarial_matrix PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_p1_adversarial_matrix PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_p1_adversarial_matrix)
+gtest_discover_tests(test_p1_adversarial_matrix PROPERTIES LABELS slow-a)
 
 # ── P0 (2026-11-22): referencia congelada REFERENCE_LOCKED ───────────────
 # WAV de referencia fijo (10 s, 6 segmentos) + configuración IVANNA fija,
@@ -3347,7 +3414,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_p0_reference_lock PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_p0_reference_lock PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_p0_reference_lock)
+gtest_discover_tests(test_p0_reference_lock PROPERTIES LABELS slow-b)
 
 # ── Determinismo de NEURO·Ω (hallazgo mayor de P0, 2026-11-22) ─────────────
 # op_neuro con dos cadenas frescas debe ser bit-idéntico; la causa raíz es
@@ -3364,7 +3431,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_neuro_determinism PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_neuro_determinism PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_neuro_determinism)
+gtest_discover_tests(test_neuro_determinism PROPERTIES LABELS fused)
 # ── Caza de los tronidos de la 493 (2026-11-22) ────────────────────────────
 # Salto muestra a muestra por capa al cambiar parámetros en mitad del stream.
 # Mismo patrón que la matriz P1 (FusedChain real + ${FUSED_CHAIN_SOURCES}).
@@ -3379,7 +3446,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_tronidos_layer_step PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_tronidos_layer_step PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_tronidos_layer_step)
+gtest_discover_tests(test_tronidos_layer_step PROPERTIES LABELS slow-b)
 
 # ── S12/510 — fundido de aplicación por hop (slew) ───────────────────────
 # setControlsRamped(): la aplicación de un perfil interpola EQ/trim/
@@ -3396,7 +3463,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_param_ramp_s12 PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_param_ramp_s12 PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_param_ramp_s12)
+gtest_discover_tests(test_param_ramp_s12 PROPERTIES LABELS fused)
 
 # ── Piso double de la cadena enganchada (labor grande, v2.5.486) ─────────
 # THD+N ≤ −200 dB con la cadena enganchada pero lineal a 1 kHz (ver
@@ -3412,7 +3479,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_double_floor PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_double_floor PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_double_floor)
+gtest_discover_tests(test_double_floor PROPERTIES LABELS fused)
 
 # ── HARNESS ACÚSTICO OFFLINE (2026-11-27, plan ajustado) ───────────────────
 # Laboratorio offline: reproduce con números la degradación al subir HOLOS +
@@ -3435,7 +3502,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_acoustic_harness PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_acoustic_harness PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_acoustic_harness)
+gtest_discover_tests(test_acoustic_harness PROPERTIES LABELS acoustic)
 
 # C11/510 — la puerta CPU por hop (AcousticHarness.CpuPerHopWithinBudget) NO
 # lleva etiqueta QUARANTINED aquí a propósito: gtest_discover_tests con
@@ -3466,7 +3533,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_d10_corona PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_d10_corona PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_d10_corona)
+gtest_discover_tests(test_d10_corona PROPERTIES LABELS fused)
 
 # ── REFINAMIENTO TOTAL MAGISTRAL P1+P4 (2026-11-26) ───────────────────────
 # Ablación por operador + Regla de Oro por banda ERB (test_p1p4_ablation),
@@ -3488,7 +3555,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_p1p4_ablation PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_p1p4_ablation PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_p1p4_ablation)
+gtest_discover_tests(test_p1p4_ablation PROPERTIES LABELS slow-a)
 
 # ── MEJORA EVOLUTIVA, bloque GENEZI + NOTCH + 11.5 kHz (2026-11-26) ──────
 # Carga real del asset .ivk1 Genezi en el motor fusionado + diferencia
@@ -3507,7 +3574,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_evol_genezi PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_evol_genezi PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_evol_genezi)
+gtest_discover_tests(test_evol_genezi PROPERTIES LABELS slow-b)
 
 # test_p1p4_neuro: explícito (no ivanna_add_test) porque phase_oracle.cpp
 # necesita el stub JNI de host (host_stubs/jni.h) y BiquadEnvelopeBank
@@ -3525,7 +3592,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_p1p4_neuro PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_p1p4_neuro PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_p1p4_neuro)
+gtest_discover_tests(test_p1p4_neuro PROPERTIES LABELS fused)
 
 add_executable(test_p1p4_hrtf test_p1p4_hrtf.cpp)
 target_link_libraries(test_p1p4_hrtf PRIVATE ivanna_unified_pipeline_under_test GTest::gtest_main Threads::Threads m dl)
@@ -3534,7 +3601,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_p1p4_hrtf PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_p1p4_hrtf PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_p1p4_hrtf)
+gtest_discover_tests(test_p1p4_hrtf PROPERTIES LABELS spatial)
 
 # ── Calibración P8 medida (P3, 3.4, 2026-11-26) ─────────────────────────────
 # Bloquea la tabla medida operador x banda x canal x estímulo x nivel y
@@ -3551,7 +3618,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_p8_calibration PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_p8_calibration PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_p8_calibration)
+gtest_discover_tests(test_p8_calibration PROPERTIES LABELS fused)
 
 # ── Capa de conservación perceptual (árbitro de campo, 2026-11-21) ─────────
 # Solver (nunca crea energía, techo, silencio) + capa standalone (bypass
@@ -3569,7 +3636,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_perceptual_conservation PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_perceptual_conservation PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_perceptual_conservation)
+gtest_discover_tests(test_perceptual_conservation PROPERTIES LABELS fused)
 
 add_executable(test_fused_dual_route
   test_fused_dual_route.cpp
@@ -3582,7 +3649,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_fused_dual_route PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_fused_dual_route PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_fused_dual_route)
+gtest_discover_tests(test_fused_dual_route PROPERTIES LABELS fused)
 
 # ── MPC perceptual en modo sombra (próximo salto magistral, 2026-11-21) ─────
 # Controlador predictivo (vector P[t] por banda, simulador lineal de los 7
@@ -3601,13 +3668,13 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_perceptual_mpc PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_perceptual_mpc PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_perceptual_mpc)
+gtest_discover_tests(test_perceptual_mpc PROPERTIES LABELS fused)
 
 # ── M5 — Simulador de acciones (salto, Luna) ─────────────────────────────────
 # Función de costo J + restricciones duras sobre OperatorSimulator (que
 # entra en ivanna_dsp_under_test, arriba). Pesos NOMINALES (calibrar con
 # ABX, Orden 6); los tests verifican reglas y orden, no valores medidos.
-ivanna_add_test(test_action_simulator)
+ivanna_add_test(test_action_simulator LABELS fused)
 
 # ── Banco adversarial del control cerrado (plan del salto, Luna) ─────────────
 # Casos adversariales contra el sistema cerrado (M0/M3/M5/M6/M8/telemetría)
@@ -3639,7 +3706,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_closed_loop_adversarial PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_closed_loop_adversarial PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_closed_loop_adversarial)
+gtest_discover_tests(test_closed_loop_adversarial PROPERTIES LABELS fused)
 
 # ── Gemelo acústico del trayecto completo (próximo salto, 2026-11-21) ───────
 # Estimador del trayecto fuente→DSP→DAC→amp→transductor→sala→oído. Solo
@@ -3662,6 +3729,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_acoustic_twin PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_acoustic_twin COMMAND test_acoustic_twin)
+set_tests_properties(test_acoustic_twin PROPERTIES LABELS fused)
 
 # ── M3: estimador del gemelo (confianza por variable, plan del salto) ──
 # TwinEstimator llena TwinConfidence desde AcousticTwinEstimate:
@@ -3688,7 +3756,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_twin_estimator PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_twin_estimator PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_twin_estimator)
+gtest_discover_tests(test_twin_estimator PROPERTIES LABELS fused)
 
 # ── Modelo Universal de Audición P6 (Majestuosidad Total, 2026-11-21) ────
 # Predictor de la experiencia completa P(experiencia | x, H, R, L, C).
@@ -3719,6 +3787,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_universal_hearing PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_universal_hearing COMMAND test_universal_hearing)
+set_tests_properties(test_universal_hearing PROPERTIES LABELS fused)
 
 # ── CORONA P7–P10 (cableado 2026-11-24, rama corona-cableado) ─────────────
 # Los 4 módulos entran a la suite principal con su propio main()
@@ -3749,6 +3818,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_total_conservation PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_total_conservation COMMAND test_total_conservation)
+set_tests_properties(test_total_conservation PROPERTIES LABELS fused)
 
 add_executable(test_experience_compiler
   ../fused/experience_compiler/experience_compiler_test.cpp
@@ -3768,6 +3838,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_experience_compiler PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_experience_compiler COMMAND test_experience_compiler)
+set_tests_properties(test_experience_compiler PROPERTIES LABELS fused)
 
 add_executable(test_living_room
   ../fused/living_room/living_room_test.cpp
@@ -3787,6 +3858,7 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_living_room PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_living_room COMMAND test_living_room)
+set_tests_properties(test_living_room PROPERTIES LABELS fused)
 
 add_executable(test_human_twin
   ../fused/human_twin/human_twin_test.cpp
@@ -3806,13 +3878,14 @@ if(IVANNA_SAN_FLAGS)
   target_link_options(test_human_twin PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
 add_test(NAME test_human_twin COMMAND test_human_twin)
+set_tests_properties(test_human_twin PROPERTIES LABELS fused)
 
 # ── Telemetría del control cerrado (plan del salto, Luna 3.14) ───────────
 # Solo registra, nunca decide: frames a 10 Hz + fallos inmediatos, anillo
 # lock-free con sobrescritura del más viejo. 9 tests: round-trip, FIFO,
 # fallo inmediato, NaN -> valid=false, buffer lleno conserva el reciente,
 # dos productores concurrentes.
-ivanna_add_test(test_telemetry)
+ivanna_add_test(test_telemetry LABELS fused)
 
 # ── MPC perceptual en sombra (Luna M6, plan del salto, 2026-11-21) ───────────
 # MpcShadow sobre el MpcController + OperatorSimulator existentes: horizonte
@@ -3834,7 +3907,7 @@ if(IVANNA_SAN_FLAGS)
   target_compile_options(test_mpc_shadow PRIVATE ${IVANNA_SAN_FLAGS})
   target_link_options(test_mpc_shadow PRIVATE ${IVANNA_SAN_FLAGS})
 endif()
-gtest_discover_tests(test_mpc_shadow)
+gtest_discover_tests(test_mpc_shadow PROPERTIES LABELS fused)
 
 # ── FASE 3 — MODELO ACOPLADO NO LINEAL (D10) ─────────────────────────────
 # 17 tests (test_coupled_model): modos de sala (35 exactos), Gamma_k
@@ -3847,4 +3920,4 @@ gtest_discover_tests(test_mpc_shadow)
 # (us/hop), modos RIR (rir_0000), Sabine/Z_w desde RIR, y lectura
 # KEMAR dos oídos + 2.1 (mismo estado, varios receptores).
 # Header-only: ivanna_add_test vale (sin FUSED_CHAIN_SOURCES).
-ivanna_add_test(test_coupled_model)
+ivanna_add_test(test_coupled_model LABELS fused)
