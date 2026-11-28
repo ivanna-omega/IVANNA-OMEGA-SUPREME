@@ -343,7 +343,7 @@ fun IvannaControlPanel(
     organismState: com.ivanna.omega.organism.OrganismController.State =
         com.ivanna.omega.organism.OrganismController.State(),
     onOrganismToggle: (Boolean) -> Unit = {},
-    onOrganismSaveToken: (String) -> Unit = {},
+    onOrganismSaveToken: (String) -> Boolean = { false },
     onOrganismClearQueue: () -> Unit = {},
     initialPunchAmount: Float = 0f,
     initialCrossfeed: Float = 0f,
