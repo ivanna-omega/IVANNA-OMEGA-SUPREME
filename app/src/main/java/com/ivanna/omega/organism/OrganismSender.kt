@@ -2,6 +2,7 @@ package com.ivanna.omega.organism
 
 import android.util.Log
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -130,6 +131,57 @@ class OrganismSender(
         const val SESSION_PATH = "/api/v1/muse/ivanna/session"
         private val JSON = "application/json; charset=utf-8".toMediaType()
 
+        /**
+         * T9/510 — header en el que el servidor PUEDE anunciar la
+         * versión vigente del perfil en la respuesta del POST de
+         * sesión. Contrato PENDIENTE de confirmación por el lado del
+         * servidor (ver [parsePiggybackVersion]): hasta que lo
+         * confirme, el poll de T1 sigue siendo el respaldo.
+         */
+        const val PROFILE_VERSION_HEADER = "X-Muselink-Profile-Version"
+
+        /**
+         * T9/510 — claves de cuerpo en las que el servidor PUEDE
+         * anunciar la versión vigente del perfil en la respuesta del
+         * POST de sesión (en orden de preferencia). A propósito NO se
+         * lee una clave `version` genérica: en una respuesta de
+         * sesión `version` podría ser la versión del payload o del
+         * API, y disparar un fetch por ella sería un falso positivo.
+         * Contrato PENDIENTE de confirmación por el lado del servidor:
+         * si el campo no viene, el poll de T1 sigue como respaldo (no
+         * se rompe nada). Puro JVM, testeable sin red.
+         */
+        val PROFILE_VERSION_BODY_KEYS: List<String> = listOf(
+            "currentProfileVersion",
+            "profileVersion"
+        )
+
+        /**
+         * T9/510 — extrae la versión vigente del perfil piggybackeada
+         * en la respuesta del POST de sesión (header o cuerpo). null
+         * = la respuesta no anuncia ninguna (el caso hoy: el
+         * servidor no confirma el campo). Solo vale un número entero
+         * > 0; cualquier otra cosa (vacío, no numérico, ≤ 0, JSON
+         * inválido, cuerpo truncado) es null, nunca una versión
+         * inventada. El llamador decide si es mayor que la aplicada.
+         */
+        fun parsePiggybackVersion(headerValue: String?, bodyText: String?): Long? {
+            headerValue?.trim()?.takeIf { it.isNotEmpty() }?.toLongOrNull()
+                ?.takeIf { it > 0L }?.let { return it }
+            val text = bodyText?.takeIf { it.isNotBlank() } ?: return null
+            val root = runCatching { JsonParser.parseString(text) }.getOrNull()
+                ?: return null
+            if (!root.isJsonObject) return null
+            val data = root.asJsonObject
+            for (key in PROFILE_VERSION_BODY_KEYS) {
+                val el = data.get(key) ?: continue
+                if (!el.isJsonPrimitive || !el.asJsonPrimitive.isNumber) continue
+                val v = el.asDouble
+                if (v.isFinite() && v > 0.0) return v.toLong()
+            }
+            return null
+        }
+
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .dns(OrganismDns()) // DNS propio: no depende de netd/MagicDNS
             .connectTimeout(15, TimeUnit.SECONDS)
@@ -143,6 +195,20 @@ class OrganismSender(
     }
 
     enum class Outcome { SENT, RETRY, QUARANTINE, TOKEN_INVALID, NO_TOKEN }
+
+    /**
+     * T9/510 — callback de versión piggybackeada: se invoca (en el
+     * hilo del envío, Dispatchers.IO) cuando una respuesta 2xx del
+     * POST de sesión anuncia una versión vigente del perfil
+     * ([parsePiggybackVersion]). Lo cablea `OrganismController` en
+     * `start()` (y en el arranque ligero de `flushAndPollOnce`); null
+     * = nadie escucha (el envío no cambia). El callback NO decide si
+     * la versión es mayor que la aplicada: eso lo hace el controlador
+     * (que es quien conoce la aplicada) y solo entonces fuerza un
+     * sondeo T1. Invocar nunca tumba el envío: va con runCatching.
+     */
+    @Volatile
+    var onServerProfileVersion: ((Long) -> Unit)? = null
 
     /** Resultado de un intento de vaciado (para el indicador de estado). */
     data class FlushResult(
@@ -224,7 +290,26 @@ class OrganismSender(
                     val code = resp.code
                     logger.i("POST $host$SESSION_PATH → HTTP $code (chunk ${item.key})")
                     return when {
-                        code in 200..299 -> Outcome.SENT
+                        code in 200..299 -> {
+                            // T9/510 — piggyback de versión: la respuesta
+                            // PUEDE anunciar la versión vigente del perfil
+                            // (header o cuerpo). Si no la trae, no pasa
+                            // nada: el poll de T1 sigue como respaldo. El
+                            // cuerpo se lee entero aquí (una vez) y se
+                            // recorta a 16 KB antes de parsear: una
+                            // respuesta hostil no debe llenar la memoria
+                            // y un JSON truncado parsea a null (fail-
+                            // closed). El callback nunca tumba el envío.
+                            val piggyback = parsePiggybackVersion(
+                                resp.header(PROFILE_VERSION_HEADER),
+                                runCatching { resp.body?.string() }.getOrNull()?.take(16_384)
+                            )
+                            if (piggyback != null) {
+                                runCatching { onServerProfileVersion?.invoke(piggyback) }
+                                    .onFailure { logger.w("T9: onServerProfileVersion falló: ${it.javaClass.simpleName}") }
+                            }
+                            Outcome.SENT
+                        }
                         code == 401 -> Outcome.TOKEN_INVALID
                         code == 429 || code in 500..599 -> Outcome.RETRY
                         else -> Outcome.QUARANTINE

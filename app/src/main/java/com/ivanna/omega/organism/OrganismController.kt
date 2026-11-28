@@ -9,6 +9,8 @@ import com.ivanna.omega.audio.OmegaMetrics
 import com.ivanna.omega.audio.ProfilesLoader
 import com.ivanna.omega.audio.RealAcousticSensor
 import com.ivanna.omega.core.ParameterStore
+import com.ivanna.omega.dsp.DSPBridge
+import com.ivanna.omega.magisk.OmegaEngineBridge
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -178,6 +180,61 @@ import java.io.File
  *      vs ese conteo. El prune dejó de ser silencioso: la cola
  *      cuenta los podados ([OrganismQueue.prunedTotal]) y el
  *      borrado del usuario también se contabiliza ([clearQueue]).
+ *  13. P0/D10 COMO COVARIABLES (S15/510): cada `SessionChunk` lleva
+ *      la telemetría D10 existente (`hamiltonianAction`) y el P0/trim
+ *      efectivo como campos OPCIONALES (null cuando no disponibles —
+ *      ver `SessionAggregator`: hoy NO hay ningún lector Kotlin/JNI
+ *      que los exponga, así que van en null y el payload los omite;
+ *      falta un JNI del motor). El payload sigue siendo
+ *      retrocompatible y no se toca el árbitro ni el kernel D10.
+ *  14. «SONANDO, NO SOLO INSTALADO» (T3/510): la confirmación `POST
+ *      /profile/applied` y el primer chunk tras aplicar llevan
+ *      evidencia de que suena (`effectBeaconFrames` de
+ *      `DSPBridge`, `snapshotsAccepted` del consumidor, `framesValid`
+ *      del chunk). El State expone además `daemonOk`
+ *      (`OmegaEngineBridge.isConnected`, la salud que mantiene el
+ *      loop de reconexión de `IVANNAApplication`): «aplicado sin
+ *      daemon» ≠ «aplicado y sonando».
+ *  15. PIGGYBACK DE VERSIÓN (T9/510): `OrganismSender.sendOne()`
+ *      ya no mira solo el código HTTP: si la respuesta del POST de
+ *      sesión anuncia una versión vigente del perfil (header
+ *      `X-Muselink-Profile-Version` o cuerpo `currentProfileVersion`
+ *      / `profileVersion`), y es mayor que la aplicada, se fuerza
+ *      un sondeo T1. Si el campo no viene, el poll de T1 sigue como
+ *      respaldo (no se rompe nada). La confirmación del lado servidor
+ *      está PENDIENTE: el campo aún no está confirmado por MuseLink.
+ *  16. VERIFICACIÓN LOCAL DE LA VUELTA (T5 + T4/510): el teléfono
+ *      NO se fía solo del servidor. Guarda la línea base local (RMS
+ *      y coherencia medios de las 3 últimas sesiones estables,
+ *      calculados de los `SessionChunk` que ya emite) y mide al
+ *      candidato con sus 3 sesiones. T5: si el candidato no mejora
+ *      ≥ 20% sobre la referencia (línea base local, o el dato fijo
+ *      de la fase 10,46 dB si aún no hay base local), restaura el
+ *      estable y lo aplica sin esperar al GET. T4: al recibir
+ *      `promoted`, compara con la medición local: si la mejora es
+ *      < 20%, aparece una resonancia nueva (error ≥ +6 dB en una
+ *      banda que no la tenía) o `levelMaxDbfs ≥ 0`, NO promueve:
+ *      restaura el estable, confirma `rolled_back` al servidor con
+ *      el motivo local y lo registra. Fail-closed: sin línea base
+ *      local (solo existe tras 3 sesiones estables con la release
+ *      que traiga la VUELTA), no se promueve. El rollback local reusa
+ *      el camino del servidor (`applyServerProfile` con el estable
+ *      verificado: validación C2, diario C8, read-back, veto 24 h,
+ *      exento del tope diario) — no hay segundo aplicador.
+ *  17. SUPERVIVENCIA EN FONDO (T8/510, entrada pública): el worker
+ *      de WorkManager (`OrganismFlushWorker`, frente D) llama a
+ *      [flushAndPollOnce], que reutiliza `flushOnce()` +
+ *      `pollProfileOnce()` con TODAS sus guardas (dwell, tope
+ *      diario, veto, timeout A/B, single-flight, C2, C8, read-back,
+ *      confirmación). Sin controlador vivo en el proceso, la entrada
+ *      hace un arranque ligero SOLO-transporte (sin mic, sin
+ *      foreground service, sin UI): vacía la cola, sondea y procesa
+ *      las señales del servidor; la APLICACIÓN queda para el próximo
+ *      arranque del controlador (sin UI viva `onApplyProfile` es
+ *      null y el install falla cerrado con diario PENDING, y el
+ *      dwell es memoria por proceso). `stop()` cancela además el
+ *      trabajo encolado (`OrganismWorkScheduler.cancel`) y `start()`
+ *      lo re-programa (KEEP, idempotente).
  *
  * ESTADO (el indicador de la UI):
  *   Capturando / En cola / Sin conexión / Error recuperable, más los
@@ -357,6 +414,30 @@ object OrganismController {
     const val AB_TIMEOUT_MS = 4L * 60L * 60L * 1000L
     /** Sesiones que debe completar el A/B antes de que caduque el timeout. */
     const val AB_SESSIONS_REQUIRED = 3
+
+    // ── T4/T5/510 — verificación local de la VUELTA ────────────────
+    /**
+     * Línea base RMS FIJA de la Fase 6 (dato de la fase, no medido en
+     * este teléfono): 10,46 dB. Es la referencia de reserva de T5
+     * cuando aún no hay línea base LOCAL; T4 NUNCA la usa (fail-
+     * closed: sin base local no se promueve).
+     */
+    const val FIXED_BASELINE_RMS_DB = 10.46f
+    /** Objetivo de la Fase 6: 8,37 dB = 10,46 × (1 − 0,20). */
+    const val FIXED_TARGET_RMS_DB = 8.37f
+    /** Mejora mínima exigida al candidato: 20% sobre la referencia. */
+    const val IMPROVEMENT_REQUIRED_FRACTION = 0.20f
+    /**
+     * Resonancia NUEVA: error ≥ +6 dB en una banda que en la línea
+     * base estaba por debajo de +6 dB.
+     */
+    const val NEW_RESONANCE_THRESHOLD_DB = 6.0f
+    /**
+     * Sesiones que forman la línea base local y la medición del
+     * candidato (3, igual que [AB_SESSIONS_REQUIRED]: el A/B y la
+     * verificación local miden lo mismo).
+     */
+    const val LOCAL_BASELINE_SESSIONS_REQUIRED = 3
 
     // ── T10/510 — auditoría de la IDA (chunks emitidos vs enviados) ──
     /**
@@ -729,7 +810,44 @@ object OrganismController {
         /** Fecha (epoch ms) del último check de auditoría; 0 = ninguno. */
         val lastAuditAtMs: Long = 0L,
         /** Fecha (epoch ms) de la última pausa por auditoría; 0 = ninguna. */
-        val lastAuditPauseAtMs: Long = 0L
+        val lastAuditPauseAtMs: Long = 0L,
+        // ── T3/510 — salud del daemon + evidencia de «sonando» ──
+        /**
+         * Salud del puente al daemon (`OmegaEngineBridge.isConnected`,
+         * la que mantiene el loop de reconexión de
+         * `IVANNAApplication` + keepalive). false = aplicado sin
+         * daemon (o daemon caído); true = puente vivo. Junto a
+         * `snapshotsAccepted` distingue «aplicado sin daemon» de
+         * «aplicado y sonando».
+         */
+        val daemonOk: Boolean = false,
+        /** Evidencia de «sonando» del último perfil aplicado (null = aún no hay ninguna). */
+        val lastSoundingEvidence: OrganismPayload.SoundingEvidence? = null,
+        // ── T9/510 — versión piggybackeada en el POST de sesión ──
+        /** Última versión vigente anunciada en una respuesta del POST de sesión (null = ninguna). */
+        val lastPiggybackVersion: Long? = null,
+        /** Fecha (epoch ms) del último piggyback; 0 = ninguno. */
+        val lastPiggybackAtMs: Long = 0L,
+        // ── T4/T5/510 — verificación local de la VUELTA ──
+        /**
+         * RMS medio de la línea base local (media de las 3 últimas
+         * sesiones estables). null = aún no hay base local (hacen
+         * falta 3 sesiones estables con esta release): T4 no promueve
+         * sin ella (fail-closed) y T5 usa el dato fijo de la fase.
+         */
+        val localBaselineRmsDb: Float? = null,
+        /** Coherencia media de la línea base local (null = sin base local; informativa, no es puerta). */
+        val localBaselineCoherence: Float? = null,
+        /** Sesiones estables que forman la base local (0..3). */
+        val localBaselineSessions: Int = 0,
+        /** Sesiones medidas del candidato vigente (0..3). */
+        val candidateSessionsMeasured: Int = 0,
+        /** RMS medio del candidato vigente (null = aún no medido). */
+        val candidateMeanRmsDb: Float? = null,
+        /** Motivo local del último rollback local (T4/T5; null = ninguno). */
+        val lastLocalRollbackReason: String? = null,
+        /** Fecha (epoch ms) del último rollback local; 0 = ninguno. */
+        val lastLocalRollbackAtMs: Long = 0L
     )
 
     private val _state = MutableStateFlow(State())
@@ -874,6 +992,12 @@ object OrganismController {
         // segundo plano está restringido — p. ej. restore en boot — se
         // registra y se reintenta en la próxima apertura; sin crash).
         OrganismForegroundService.start(ctx)
+        // T8/510 — re-programar el trabajo periódico en fondo al
+        // re-encender (KEEP, idempotente): `stop()` lo cancela, y el
+        // Initializer de D solo programa al crear el proceso; sin
+        // esta línea, un OFF→ON en el mismo proceso dejaría el T8
+        // muerto hasta el próximo arranque del proceso.
+        OrganismWorkScheduler.schedule(ctx)
         if (scope != null) {
             refreshState()
             return
@@ -890,7 +1014,11 @@ object OrganismController {
         val tokens = OrganismTokenStore(ctx)
         queue = q
         tokenStore = tokens
-        sender = OrganismSender(tokens, q)
+        // T9/510 — piggyback de versión en la respuesta del POST de
+        // sesión (el sender avisa, el controlador decide y sondea).
+        val s = OrganismSender(tokens, q)
+        s.onServerProfileVersion = { v -> onPiggybackProfileVersion(v) }
+        sender = s
         // T1/510 — la VUELTA: el fetcher GET + el validador/aplicador.
         profileApplier = ProfileApplier(ctx.filesDir)
         profileFetcher = ProfileFetcher(tokens)
@@ -1030,6 +1158,86 @@ object OrganismController {
         // stop(), para que el proceso siga en primer plano mientras se
         // cierra la sesión y el chunk final queda durable en la cola.
         appContext?.let { OrganismForegroundService.stop(it) }
+        // T8/510 — apagar el interruptor cancela TAMBIÉN el trabajo
+        // encolado en fondo (flush + sondeo juntos); sin esto el
+        // worker seguiría despertando cada 15 min (no-op por la
+        // guarda OFF, pero encolado). `start()` lo re-programa.
+        appContext?.let { OrganismWorkScheduler.cancel(it) }
+    }
+
+    /**
+     * T8/510 — entrada pública para el worker de fondo
+     * (`OrganismFlushWorker`, frente D): vacía la cola y sondea el
+     * perfil vigente en UNA llamada, reutilizando [flushOnce] +
+     * [pollProfileOnce] CON todas sus guardas (dwell 2 sondeos, tope
+     * diario 2/día, veto 24 h, timeout A/B, single-flight,
+     * validación C2, diario C8, read-back, confirmación POST). NO
+     * duplica la lógica de aplicación en el worker: esta entrada es
+     * el único camino. El worker la llama en fondo (Dispatchers.IO);
+     * es @Synchronized como [start]/[stop] para no pisarse con ellos.
+     *
+     * Sin controlador vivo en este proceso (`scope == null`), la
+     * entrada hace un arranque ligero SOLO-transporte (ver
+     * [ensureBackgroundTransport]): cola + token + sender + fetcher
+     * + applier, SIN mic, SIN agregador, SIN foreground service y
+     * SIN UI. Con el interruptor maestro en OFF no hace nada (nada
+     * sale del teléfono). El sondeo en fondo procesa las señales del
+     * servidor (C24/C16) y las confirmaciones pendientes, pero la
+     * APLICACIÓN queda para el próximo arranque del controlador, por
+     * DOS razones exactas: (1) `onApplyProfile` solo lo registra
+     * MainActivity con la UI viva — sin él el install falla cerrado
+     * (diario PENDING, reintento en el próximo sondeo con UI); (2)
+     * el dwell es memoria por proceso: un proceso nacido por el
+     * worker no acumula 2 sondeos de la misma versión. NO se llama
+     * a [start] aquí: arrancar el pipeline entero (mic + servicio
+     * en primer plano) desde un worker en fondo es lo que T8 evita.
+     */
+    @Synchronized
+    fun flushAndPollOnce(context: Context) {
+        val ctx = context.applicationContext
+        if (!isEnabled(ctx)) {
+            Log.i(TAG, "T8: flushAndPollOnce con el interruptor OFF; no sale nada")
+            return
+        }
+        if (scope == null) ensureBackgroundTransport(ctx)
+        flushOnce()
+        // El sondeo es forzado (sin comprobar el intervalo de 30 min):
+        // el worker corre cada 15 min y el GET es idempotente y
+        // diminuto; el dwell, el tope y el veto siguen gateando la
+        // aplicación dentro de pollProfileOnce. Si un sondeo ya corre,
+        // el mutex lo rechaza sin hacer nada.
+        pollProfileOnce()
+    }
+
+    /**
+     * T8/510 — arranque ligero SOLO-transporte para [flushAndPollOnce]
+     * cuando el controlador no vive en este proceso. Crea SOLO lo que
+     * `flushOnce()` + `pollProfileOnce()` necesitan (cola, token,
+     * sender con su callback T9, fetcher, applier) y carga los
+     * contadores persistidos que las guardas leen (último 401, tope
+     * diario — sin ellos el tope diario se evaluaría como día nuevo
+     * en cada proceso del worker). NO crea scope, jobs, consumidor,
+     * agregador ni servicio en primer plano, y NO toca el micrófono
+     * ni el audio. Si el controlador arranca después en este mismo
+     * proceso, `start()` recrea sus piezas como siempre.
+     */
+    private fun ensureBackgroundTransport(ctx: Context) {
+        appContext = ctx
+        last401AtMs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getLong(KEY_LAST_401_MS, 0L)
+        autoApplyDayKey = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_APPLY_DAY, "") ?: ""
+        autoApplyCountToday = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_APPLY_COUNT, 0)
+        val q = queue ?: OrganismQueue(File(ctx.filesDir, "organism-queue")).also { queue = it }
+        val ts = tokenStore ?: OrganismTokenStore(ctx).also { tokenStore = it }
+        if (sender == null) {
+            val s = OrganismSender(ts, q)
+            s.onServerProfileVersion = { v -> onPiggybackProfileVersion(v) }
+            sender = s
+        }
+        if (profileApplier == null) profileApplier = ProfileApplier(ctx.filesDir)
+        if (profileFetcher == null) profileFetcher = ProfileFetcher(ts)
     }
 
     /**
@@ -1241,6 +1449,17 @@ object OrganismController {
             appliedProfileHash = applied.hash,
             appliedProfileStatus = profileStatus ?: _state.value.appliedProfileStatus
         )
+        // T3/510: el próximo chunk encolado es el primero tras aplicar
+        // y lleva la evidencia de «sonando».
+        firstChunkEvidencePending = true
+        // T4/T5: un candidato nuevo empieza su medición de cero (los
+        // segmentos de la versión anterior no cuentan para este).
+        synchronized(segmentLock) {
+            if (version != candidateSegmentsVersion) {
+                candidateSegments.clear()
+                candidateSegmentsVersion = version
+            }
+        }
         Log.i(TAG, "Perfil aplicado registrado: $profileId v$version abState=$abState hash=${profileHash.take(12)}")
         return applied
     }
@@ -1463,6 +1682,70 @@ object OrganismController {
     @Volatile
     private var lastAuditSnapshot: ChunkAuditSnapshot? = null
 
+    // ── T3/510 — evidencia de «sonando» ────────────────────────────
+    /** framesValid del último chunk encolado (null = aún no hay chunk; alimenta la confirmación). */
+    @Volatile
+    private var lastChunkFramesValid: Int? = null
+
+    /** true si el próximo chunk encolado es el primero tras aplicar (lleva la evidencia T3). */
+    @Volatile
+    private var firstChunkEvidencePending: Boolean = false
+
+    /** Evidencia de «sonando» del último perfil aplicado (null = aún no hay ninguna). */
+    @Volatile
+    private var lastSoundingEvidence: OrganismPayload.SoundingEvidence? = null
+
+    // ── T9/510 — versión piggybackeada en el POST de sesión ───────
+    /** Última versión vigente anunciada en una respuesta del POST de sesión (null = ninguna). */
+    @Volatile
+    private var lastPiggybackVersion: Long? = null
+
+    /** Fecha (epoch ms) del último piggyback; 0 = ninguno. */
+    @Volatile
+    private var lastPiggybackAtMs: Long = 0L
+
+    // ── T4/T5/510 — medición local de sesiones (segmentos) ───────
+    /**
+     * Acumulador del segmento abierto (una sessionId bajo una clase).
+     * Solo vive en memoria y solo lo toca [enqueueChunk] (vía
+     * [accumulateChunkForLocalVerification], bajo [segmentLock]) y
+     * [recordAppliedProfile] (limpieza al cambiar de candidato). El
+     * segmento abierto se finaliza al cambiar de sesión o de clase;
+     * el parcial al detener el controlador se pierde (como el
+     * contador de sesiones de T6).
+     */
+    private val segmentLock = Any()
+    private var segmentSessionId: String? = null
+    private var segmentIsCandidate: Boolean = false
+    private var segmentVersion: Long = 0L
+    private var segmentAbState: String = ""
+    private var segmentChunks: Int = 0
+    private var segmentRmsSum: Double = 0.0
+    private var segmentCohSum: Double = 0.0
+    private val segmentErrSum = FloatArray(SessionAggregator.BANDS)
+    private var segmentLevelMax: Float = Float.NEGATIVE_INFINITY
+
+    /** Últimas 3 sesiones estables completadas (la línea base local). */
+    private val stableSegments = ArrayDeque<LocalSessionMeasurement>()
+
+    /** Últimas 3 sesiones completadas del candidato vigente (solo su versión; ver [candidateSegmentsVersion]). */
+    private val candidateSegments = ArrayDeque<LocalSessionMeasurement>()
+
+    /** Versión a la que pertenecen [candidateSegments] (0 = ninguna). */
+    private var candidateSegmentsVersion: Long = 0L
+
+    /** Versión con un rollback local ya lanzado (anti-duplicado en vuelo); null = ninguno. */
+    @Volatile
+    private var localRollbackInFlightForVersion: Long? = null
+
+    /** Motivo local del último rollback local (T4/T5; null = ninguno). */
+    @Volatile
+    private var lastLocalRollbackReason: String? = null
+
+    /** Fecha (epoch ms) del último rollback local; 0 = ninguno. */
+    @Volatile
+    private var lastLocalRollbackAtMs: Long = 0L
+
     /**
      * C21 — veredicto puro de la re-validación de un token recién
      * pegado (testeable en JVM). El GET barato de versión es el mismo
@@ -1597,18 +1880,35 @@ object OrganismController {
         // El conteo va ANTES de la pausa para que un rechazo en pausa
         // cuente en ambos lados de la identidad (emitido + rechazado).
         chunksEmitted++
+        // T3/510: framesValid del último chunk (alimenta la
+        // confirmación `POST applied`); se actualiza también en
+        // pausa (es el último chunk VISTO, no el último enviado).
+        lastChunkFramesValid = chunk.framesValid
         if (auditPaused) {
             // Pausa de la auditoría: no se alimenta una tubería con
             // pérdida persistente. El rechazo es una disposición
             // contabilizada, no pérdida: mientras la entrada está en
             // pausa el vaciado drena la cola y la auditoría puede
             // volver a cuadrar y reanudar sola. El audio no se toca.
+            // Los chunks rechazados TAMPOCO alimentan la verificación
+            // local T4/T5: la medición se hace solo con lo encolado.
             chunksDroppedWhilePaused++
             refreshState()
             return
         }
         // T2/510: el chunk lleva el perfil aplicado actual en telemetry.
-        val body = OrganismPayload.sessionBody(chunk, applied = appliedProfile())
+        val applied = appliedProfile()
+        // T4/T5: acumular la medición local de este chunk (segmento
+        // por sesión y clase). Si se cerró un segmento, `finalized`
+        // trae su medición (null = el segmento sigue abierto).
+        val finalized = accumulateChunkForLocalVerification(chunk, applied)
+        // T3/510: el primer chunk tras aplicar lleva la evidencia de
+        // «sonando» (beacon + snapshots + daemonOk); los demás no.
+        val sounding = if (firstChunkEvidencePending) {
+            firstChunkEvidencePending = false
+            captureSoundingEvidence().also { lastSoundingEvidence = it }
+        } else null
+        val body = OrganismPayload.sessionBody(chunk, applied = applied, sounding = sounding)
         // T10/510: un fallo de escritura al encolar (disco) antes
         // propagaba la excepción al consumidor; ahora se cuenta como
         // pérdida explicada en la auditoría y el consumidor sigue
@@ -1622,7 +1922,327 @@ object OrganismController {
         if (enqueued) {
             scope?.launch(Dispatchers.IO) { flushOnce() }
         }
+        // T5/510: si se acaba de cerrar una sesión del candidato, el
+        // teléfono juzga ya (sin esperar al GET): con 3 sesiones del
+        // candidato medidas y sin mejora ≥ 20%, rollback local.
+        if (finalized != null && isCandidateAbState(finalized.abState)) maybeCheckT5()
         refreshState()
+    }
+
+    // ── T3/T9/510 — evidencia de «sonando» y piggyback ─────────────
+
+    /**
+     * T3/510 — evidencia de «sonando, no solo instalado» con lecturas
+     * vivas: beacon de Ruta B (crece solo si el efecto procesa audio
+     * en audioserver), snapshots aceptados por el consumidor,
+     * framesValid del último chunk y salud del daemon. Todo con
+     * runCatching / nullables: una lectura que falla deja su campo
+     * en null, nunca tumba la confirmación. La llamada es barata (un
+     * JNI + contadores) y corre como mucho una vez por aplicación
+     * (confirmación) y una vez por primer chunk.
+     */
+    private fun captureSoundingEvidence(): OrganismPayload.SoundingEvidence {
+        val beacon = runCatching { DSPBridge.effectBeaconFrames() }.getOrDefault(-1L)
+            .takeIf { it >= 0L }
+        return OrganismPayload.SoundingEvidence(
+            effectBeaconFrames = beacon,
+            snapshotsAccepted = consumer?.snapshotsAccepted,
+            framesValid = lastChunkFramesValid,
+            daemonOk = runCatching { OmegaEngineBridge.isConnected }.getOrDefault(false)
+        )
+    }
+
+    /**
+     * T9/510 — el POST de sesión piggybackeó una versión vigente
+     * mayor que la aplicada: se fuerza un sondeo T1 (el dwell, el
+     * tope diario y el veto siguen gateando la aplicación dentro de
+     * `pollProfileOnce`; el piggyback solo acorta la espera, nunca
+     * salta el corral). Sin scope (arranque ligero de
+     * `flushAndPollOnce`) no se lanza nada aquí: el llamador sondea
+     * justo después de vaciar. Sin versión mayor no se hace nada.
+     */
+    private fun onPiggybackProfileVersion(serverVersion: Long) {
+        val applied = _state.value.appliedProfileVersion
+        if (serverVersion <= 0L || serverVersion <= applied) return
+        lastPiggybackVersion = serverVersion
+        lastPiggybackAtMs = System.currentTimeMillis()
+        Log.i(TAG, "T9: el POST de sesión anuncia perfil v$serverVersion (aplicada v$applied); se fuerza un sondeo (dwell + tope + veto siguen valiendo)")
+        refreshState()
+        scope?.launch { pollProfileOnce() }
+    }
+
+    // ── T4/T5/510 — medición local de sesiones y rollback local ────
+
+    /**
+     * T4/T5 — acumula UN chunk en el segmento abierto (sesión +
+     * clase). Si el chunk abre otra sesión, otra clase u otra
+     * versión, finaliza el segmento anterior y lo registra en el
+     * historial de su clase (estables: línea base; candidato:
+     * medición del vigente). Devuelve el segmento finalizado (null
+     * = el segmento sigue abierto). Bajo [segmentLock]: lo llama
+     * solo [enqueueChunk] (hilo del consumidor).
+     */
+    private fun accumulateChunkForLocalVerification(
+        chunk: SessionAggregator.SessionChunk,
+        applied: OrganismPayload.AppliedProfile
+    ): LocalSessionMeasurement? {
+        synchronized(segmentLock) {
+            val isCand = isCandidateAbState(applied.abState)
+            var finalized: LocalSessionMeasurement? = null
+            if (segmentSessionId != null &&
+                (segmentSessionId != chunk.sessionId ||
+                    segmentIsCandidate != isCand ||
+                    segmentVersion != applied.version)
+            ) {
+                finalized = finalizeSegmentLocked()
+                if (finalized != null) recordFinalizedSegmentLocked(finalized)
+            }
+            if (segmentSessionId == null) {
+                segmentSessionId = chunk.sessionId
+                segmentIsCandidate = isCand
+                segmentVersion = applied.version
+                segmentAbState = applied.abState
+            }
+            segmentChunks++
+            segmentRmsSum += chunk.spectralErrorRmsDb.toDouble()
+            segmentCohSum += chunk.meanCoherence.toDouble()
+            for (b in 0 until SessionAggregator.BANDS) {
+                segmentErrSum[b] += chunk.errorMeanDb.getOrElse(b) { 0f }
+            }
+            if (chunk.levelMaxDbfs > segmentLevelMax) segmentLevelMax = chunk.levelMaxDbfs
+            return finalized
+        }
+    }
+
+    /** T4/T5 — cierra el segmento abierto y devuelve su medición (null = sin chunks). */
+    private fun finalizeSegmentLocked(): LocalSessionMeasurement? {
+        val sid = segmentSessionId ?: return null
+        if (segmentChunks <= 0) {
+            resetSegmentLocked()
+            return null
+        }
+        val m = LocalSessionMeasurement(
+            sessionId = sid,
+            appliedVersion = segmentVersion,
+            abState = segmentAbState,
+            chunks = segmentChunks,
+            meanRmsDb = (segmentRmsSum / segmentChunks).toFloat(),
+            meanCoherence = (segmentCohSum / segmentChunks).toFloat(),
+            meanErrorDb = FloatArray(SessionAggregator.BANDS) { segmentErrSum[it] / segmentChunks },
+            levelMaxDbfs = if (segmentLevelMax.isFinite()) segmentLevelMax else -120f
+        )
+        resetSegmentLocked()
+        return m
+    }
+
+    /** T4/T5 — vacía el acumulador del segmento (sin registrar nada). */
+    private fun resetSegmentLocked() {
+        segmentSessionId = null
+        segmentChunks = 0
+        segmentRmsSum = 0.0
+        segmentCohSum = 0.0
+        segmentErrSum.fill(0f)
+        segmentLevelMax = Float.NEGATIVE_INFINITY
+    }
+
+    /** T4/T5 — registra un segmento cerrado en el historial de su clase (máximo 3; el más viejo cae). */
+    private fun recordFinalizedSegmentLocked(m: LocalSessionMeasurement) {
+        if (isCandidateAbState(m.abState)) {
+            if (candidateSegmentsVersion != m.appliedVersion) {
+                candidateSegments.clear()
+                candidateSegmentsVersion = m.appliedVersion
+            }
+            candidateSegments.addLast(m)
+            while (candidateSegments.size > LOCAL_BASELINE_SESSIONS_REQUIRED) candidateSegments.removeFirst()
+            Log.i(TAG, "T4/T5: sesión del candidato v${m.appliedVersion} cerrada: ${m.chunks} chunks, RMS ${"%.2f".format(m.meanRmsDb)} dB, coherencia ${"%.2f".format(m.meanCoherence)} (${candidateSegments.size}/$LOCAL_BASELINE_SESSIONS_REQUIRED sesiones)")
+        } else {
+            stableSegments.addLast(m)
+            while (stableSegments.size > LOCAL_BASELINE_SESSIONS_REQUIRED) stableSegments.removeFirst()
+            Log.i(TAG, "T4/T5: sesión estable cerrada: ${m.chunks} chunks, RMS ${"%.2f".format(m.meanRmsDb)} dB, coherencia ${"%.2f".format(m.meanCoherence)} (${stableSegments.size}/$LOCAL_BASELINE_SESSIONS_REQUIRED sesiones para la base local)")
+        }
+    }
+
+    /**
+     * T5/510 — tras cerrar una sesión del candidato: con 3 sesiones
+     * medidas y sin mejora ≥ 20% sobre la referencia, rollback local
+     * sin esperar al GET. La referencia es la línea base local si
+     * existe; si aún no, el dato fijo de la fase
+     * ([FIXED_BASELINE_RMS_DB]). No hace nada si el candidato ya no
+     * es lo aplicado (otro camino lo cambió), si aún no hay 3
+     * sesiones, si SÍ mejoró, o si ya hay un rollback en vuelo para
+     * esa versión.
+     */
+    private fun maybeCheckT5() {
+        val applied = _state.value
+        if (!isCandidateAbState(applied.abState)) return
+        val (baseline, candidate) = synchronized(segmentLock) {
+            buildLocalBaseline(stableSegments.toList()) to
+                candidateSummary(candidateSegments.toList())
+        }
+        val cand = candidate ?: return
+        if (cand.sessions < AB_SESSIONS_REQUIRED) return
+        if (cand.version != applied.appliedProfileVersion) return
+        if (localRollbackInFlightForVersion == cand.version) return
+        val referenceRms = baseline?.rmsDb ?: FIXED_BASELINE_RMS_DB
+        val referenceKind = if (baseline != null) "base local" else "dato fijo de la fase"
+        if (!shouldRollbackForNoImprovement(cand.meanRmsDb, referenceRms)) {
+            Log.i(TAG, "T5: candidato v${cand.version} mejora ${"%.1f".format(improvementFraction(referenceRms, cand.meanRmsDb) * 100f)}% sobre $referenceKind (${"%.2f".format(referenceRms)} dB → ${"%.2f".format(cand.meanRmsDb)} dB); sigue en medición")
+            return
+        }
+        Log.w(TAG, "T5: candidato v${cand.version} NO mejora ≥ 20% (${"%.2f".format(cand.meanRmsDb)} dB vs $referenceKind ${"%.2f".format(referenceRms)} dB, mejora ${"%.1f".format(improvementFraction(referenceRms, cand.meanRmsDb) * 100f)}%); rollback local al estable sin esperar al GET")
+        requestLocalRollback("t5_no_improvement", cand.version)
+    }
+
+    /**
+     * T5/T4 — pide un rollback local (veto + estable + confirmación)
+     * sin bloquear al llamador: corre en Dispatchers.IO (el
+     * llamador es el hilo del consumidor en T5 y el del sondeo en
+     * T4, que llama a [doLocalRollback] directo). Anti-duplicado por
+     * versión en vuelo; el flag se limpia al terminar el rollback.
+     */
+    private fun requestLocalRollback(reason: String, failedVersion: Long) {
+        if (failedVersion <= 0L || localRollbackInFlightForVersion == failedVersion) return
+        val ctx = appContext ?: return
+        localRollbackInFlightForVersion = failedVersion
+        val s = scope
+        if (s != null) {
+            s.launch(Dispatchers.IO) {
+                try {
+                    doLocalRollback(ctx, reason, failedVersion)
+                } finally {
+                    localRollbackInFlightForVersion = null
+                }
+            }
+        } else {
+            // Sin scope (arranque ligero): corre en el hilo que llama.
+            try {
+                doLocalRollback(ctx, reason, failedVersion)
+            } finally {
+                localRollbackInFlightForVersion = null
+            }
+        }
+    }
+
+    /**
+     * T5/T4 — rollback LOCAL: veta la versión fallida 24 h, restaura
+     * el estable verificado y lo aplica por el camino del servidor
+     * ([applyServerProfile] con `rolledBack=true`: validación C2,
+     * diario C8, read-back, exento del tope diario), y confirma
+     * `rolled_back` al servidor con el motivo local. Es el mismo
+     * camino que [handleRollback] (el del servidor), con el motivo
+     * local añadido: no hay segundo aplicador. Si no hay estable
+     * verificado, o el estable ES lo aplicado, no se re-aplica nada:
+     * se marca el estado y se confirma lo aplicado con el motivo
+     * (el servidor debe re-publicar el estable anterior como versión
+     * nueva). Corre en Dispatchers.IO (nunca en el hilo de audio).
+     */
+    private fun doLocalRollback(ctx: Context, reason: String, failedVersion: Long) {
+        val applier = profileApplier ?: return
+        val nowMs = System.currentTimeMillis()
+        val previousVersion = _state.value.appliedProfileVersion
+        if (failedVersion > 0L) {
+            applier.vetoVersion(
+                version = failedVersion,
+                hashSha256 = _state.value.appliedProfileHash,
+                reason = "local_$reason",
+                atMs = nowMs
+            )
+            vetoedVersion = failedVersion
+            vetoedUntilMs = applier.vetoedUntilMs(failedVersion)
+            Log.w(TAG, "T4/T5: v$failedVersion vetada 24 h tras rollback local ($reason)")
+        }
+        resetDwell()
+        clearAbTimer()
+        lastLocalRollbackReason = reason
+        lastLocalRollbackAtMs = nowMs
+        // La medición del candidato fallido no se reutiliza: si el
+        // servidor la vuelve a publicar tras el veto, empieza de cero.
+        synchronized(segmentLock) { candidateSegments.clear() }
+        val stableBody = applier.readStableBody()
+        val journal = applier.readJournal()
+        val stableVersion = journal?.stableVersion
+        if (stableBody == null || stableVersion == null) {
+            Log.w(TAG, "rollback local ($reason) v$failedVersion sin estable verificado en disco; se conserva lo aplicado (v$previousVersion)")
+            _state.value = _state.value.copy(appliedProfileStatus = PROFILE_STATUS_ROLLED_BACK)
+            refreshState()
+            confirmApplied(appliedProfile(), previousVersion, rollbackReason = reason)
+            return
+        }
+        if (!shouldRestoreStable(previousVersion, stableVersion)) {
+            Log.w(TAG, "rollback local ($reason): el estable guardado es v$stableVersion y lo aplicado es v$previousVersion; no hay versión anterior que restaurar")
+            _state.value = _state.value.copy(appliedProfileStatus = PROFILE_STATUS_ROLLED_BACK)
+            refreshState()
+            confirmApplied(appliedProfile(), previousVersion, rollbackReason = reason)
+            return
+        }
+        val stableCurrent = ProfileFetcher.Result.Current(
+            profileId = journal?.profileId?.ifBlank { _state.value.appliedProfileId } ?: _state.value.appliedProfileId,
+            version = stableVersion,
+            status = "rolled_back",
+            abState = "rolled_back",
+            profileBody = stableBody,
+            llmStatus = _state.value.llmStatus.takeIf { it != LLM_STATUS_UNKNOWN },
+            llmModel = _state.value.llmModel,
+            llmDrafted = _state.value.llmDrafted
+        )
+        val ok = applyServerProfile(
+            ctx = ctx,
+            current = stableCurrent,
+            rolledBack = true,
+            promoteToStable = true,
+            previousVersion = previousVersion,
+            rollbackReason = reason
+        )
+        if (!ok) {
+            Log.w(TAG, "rollback local ($reason): no se pudo re-aplicar el estable v$stableVersion; se conserva lo aplicado (v$previousVersion)")
+        }
+    }
+
+    /**
+     * T4/510 — verificación local de una promoción del servidor.
+     * true = la promoción pasa y el sondeo sigue (dwell, tope, veto,
+     * aplicación); false = NO se promueve: ya se hizo el rollback
+     * local y el llamador debe parar. Falla cerrado en tres casos:
+     * (a) sin línea base local (menos de 3 sesiones estables con
+     * esta release); (b) candidato sin medir (menos de 3 sesiones
+     * del candidato con esta versión — incluye el caso en que el
+     * teléfono nunca aplicó el candidato: no hay nada local que
+     * verifique la promoción); (c) el veredicto local
+     * ([evaluateLocalPromotion]) no pasa (mejora < 20%, resonancia
+     * nueva o clipping). Mientras el servidor siga promoviendo una
+     * versión no verificada, cada sondeo se niega y confirma
+     * `rolled_back` (idempotente por (profileId, version)); el
+     * bucle termina cuando la base local existe y el candidato se
+     * mide (3 sesiones estables + 3 del candidato, con música).
+     * NOTA DE LECTURA — «los 3 chunks del candidato»: se lee como
+     * las 3 SESIONES del candidato (el mismo conjunto que T5 y que
+     * exige el A/B, [AB_SESSIONS_REQUIRED]); 3 chunks sueltos (15 s)
+     * no pueden establecer una promoción.
+     */
+    private fun verifyPromotionLocally(ctx: Context, current: ProfileFetcher.Result.Current): Boolean {
+        val baseline = synchronized(segmentLock) { buildLocalBaseline(stableSegments.toList()) }
+        val candidate = synchronized(segmentLock) {
+            candidateSummary(candidateSegments.filter { it.appliedVersion == current.version })
+        }
+        if (baseline == null) {
+            val have = synchronized(segmentLock) { stableSegments.size }
+            Log.w(TAG, "T4: el servidor promueve v${current.version} sin línea base local ($have/$LOCAL_BASELINE_SESSIONS_REQUIRED sesiones estables); NO se promueve")
+            doLocalRollback(ctx, "t4_no_local_baseline", current.version)
+            return false
+        }
+        if (candidate == null || candidate.sessions < AB_SESSIONS_REQUIRED) {
+            Log.w(TAG, "T4: el servidor promueve v${current.version} con el candidato medido ${candidate?.sessions ?: 0}/$AB_SESSIONS_REQUIRED sesiones; NO se promueve")
+            doLocalRollback(ctx, "t4_candidate_not_measured", current.version)
+            return false
+        }
+        val verdict = evaluateLocalPromotion(baseline, candidate)
+        if (!verdict.promote) {
+            Log.w(TAG, "T4: promoción v${current.version} RECHAZADA en local: ${verdict.reason} (mejora ${"%.1f".format(verdict.improvement * 100f)}% sobre base ${"%.2f".format(baseline.rmsDb)} dB; candidato ${"%.2f".format(candidate.meanRmsDb)} dB; resonancia=${verdict.newResonanceBand}; clipping=${verdict.clipped})")
+            doLocalRollback(ctx, "t4_${verdict.reason}", current.version)
+            return false
+        }
+        Log.i(TAG, "T4: promoción v${current.version} verificada en local: mejora ${"%.1f".format(verdict.improvement * 100f)}% (base ${"%.2f".format(baseline.rmsDb)} dB → candidato ${"%.2f".format(candidate.meanRmsDb)} dB), sin resonancia nueva ni clipping")
+        return true
     }
 
     private fun flushOnce() {
@@ -1766,6 +2386,22 @@ object OrganismController {
             droppedWhilePaused = chunksDroppedWhilePaused,
             enqueueFailures = enqueueFailures
         )
+        // T3/510: salud del puente al daemon (accesor público exacto:
+        // `OmegaEngineBridge.isConnected`, la que mantiene el loop de
+        // reconexión de `IVANNAApplication` + keepalive). No confundir
+        // con el `daemonOk` local de `IVANNAApplication.kt:483`
+        // (`OmegaDaemon.start()`, intento de arranque del daemon
+        // Magisk — suele ser false sin root y NO es la salud del
+        // puente): el loop de la :542 lee `omegaBridge.isConnected`,
+        // y eso es lo que se expone aquí.
+        val daemonOk = runCatching { OmegaEngineBridge.isConnected }.getOrDefault(false)
+        // T4/T5/510: la línea base local y la medición del candidato
+        // se recomputan en cada refresh con los historiales vivos
+        // (listas de ≤ 3; aritmética pura, sin red).
+        val (localBaseline, candidate) = synchronized(segmentLock) {
+            buildLocalBaseline(stableSegments.toList()) to
+                candidateSummary(candidateSegments.toList())
+        }
         _state.value = State(
             status = status,
             enabled = enabled,
@@ -1861,7 +2497,24 @@ object OrganismController {
             auditPaused = auditPaused,
             auditDivergentChecks = auditDivergentChecks,
             lastAuditAtMs = lastAuditAtMs,
-            lastAuditPauseAtMs = lastAuditPauseAtMs
+            lastAuditPauseAtMs = lastAuditPauseAtMs,
+            // T3/510: salud del daemon + última evidencia de «sonando»
+            // (solo la cambia captureSoundingEvidence vía enqueueChunk).
+            daemonOk = daemonOk,
+            lastSoundingEvidence = lastSoundingEvidence,
+            // T9/510: último piggyback (solo lo cambia
+            // onPiggybackProfileVersion).
+            lastPiggybackVersion = lastPiggybackVersion,
+            lastPiggybackAtMs = lastPiggybackAtMs,
+            // T4/T5/510: línea base local + medición del candidato
+            // (foto viva de los historiales; null/0 = aún sin medir).
+            localBaselineRmsDb = localBaseline?.rmsDb,
+            localBaselineCoherence = localBaseline?.coherence,
+            localBaselineSessions = localBaseline?.sessions ?: 0,
+            candidateSessionsMeasured = candidate?.sessions ?: 0,
+            candidateMeanRmsDb = candidate?.meanRmsDb,
+            lastLocalRollbackReason = lastLocalRollbackReason,
+            lastLocalRollbackAtMs = lastLocalRollbackAtMs
         )
     }
 
@@ -2229,6 +2882,173 @@ object OrganismController {
     fun shouldResumeAudit(paused: Boolean, cleanStreak: Int): Boolean =
         paused && cleanStreak >= AUDIT_CLEAN_CHECKS_TO_RESUME
 
+    // ── T4/T5/510 — verificación local de la VUELTA (decisiones puras) ──
+
+    /**
+     * T4/T5 — ¿este `abState` es de candidato en medición? Solo
+     * `candidate` / `ab_running` cuentan como candidato; todo lo
+     * demás (`none`, `stable`, `promoted`, `rolled_back`) suena con
+     * contenido estable y cuenta para la línea base local.
+     */
+    fun isCandidateAbState(abState: String): Boolean =
+        abState == "candidate" || abState == "ab_running"
+
+    /**
+     * T4/T5 — medición de UNA sesión completa bajo un perfil: un
+     * segmento de una `sessionId` bajo una clase (estable o
+     * candidato). Una sesión que cruza una aplicación se parte en
+     * dos segmentos (uno por clase): cada uno cuenta como una sesión
+     * de su clase, igual que el contador de sesiones de T6 cuenta el
+     * cambio de `sessionId`. Solo cuentan las sesiones COMPLETADAS
+     * (el segmento abierto se finaliza al cambiar de sesión o de
+     * clase); el parcial al detener el controlador se pierde, como
+     * el contador de T6.
+     */
+    data class LocalSessionMeasurement(
+        val sessionId: String,
+        val appliedVersion: Long,
+        val abState: String,
+        val chunks: Int,
+        val meanRmsDb: Float,
+        val meanCoherence: Float,
+        val meanErrorDb: FloatArray,
+        val levelMaxDbfs: Float
+    )
+
+    /** T4 — línea base local: media de las 3 últimas sesiones estables. */
+    data class LocalBaseline(
+        val rmsDb: Float,
+        val coherence: Float,
+        val meanErrorDb: FloatArray,
+        val sessions: Int
+    )
+
+    /** T4/T5 — resumen de la medición del candidato vigente (últimas 3 sesiones). */
+    data class CandidateSummary(
+        val version: Long,
+        val sessions: Int,
+        val meanRmsDb: Float,
+        val meanErrorDb: FloatArray,
+        val levelMaxDbfs: Float
+    )
+
+    /** T4 — veredicto puro de la promoción local (testeable en JVM). */
+    data class LocalPromotionVerdict(
+        val promote: Boolean,
+        val reason: String,
+        val improvement: Float,
+        val newResonanceBand: Int?,
+        val clipped: Boolean
+    )
+
+    /**
+     * T4/T5 — mejora relativa del candidato sobre la referencia:
+     * (base − cand) / base. Negativa si el candidato es PEOR que la
+     * base. base ≤ 0 = sin referencia válida (0, nunca negativo: una
+     * mejora sobre una base inválida no existe).
+     */
+    fun improvementFraction(baselineRmsDb: Float, candidateRmsDb: Float): Float =
+        if (baselineRmsDb > 0f) (baselineRmsDb - candidateRmsDb) / baselineRmsDb else 0f
+
+    /**
+     * T4 — ¿apareció una resonancia NUEVA? Primera banda (índice 0..23)
+     * con error ≥ `thresholdDb` en el candidato mientras en la línea
+     * base estaba por debajo; null = ninguna. Puro, testeable en JVM.
+     */
+    fun findNewResonanceBand(
+        baselineErrDb: FloatArray,
+        candidateErrDb: FloatArray,
+        thresholdDb: Float = NEW_RESONANCE_THRESHOLD_DB
+    ): Int? {
+        val n = minOf(baselineErrDb.size, candidateErrDb.size)
+        for (b in 0 until n) {
+            if (candidateErrDb[b] >= thresholdDb && baselineErrDb[b] < thresholdDb) return b
+        }
+        return null
+    }
+
+    /**
+     * T4 — construye la línea base local con las últimas
+     * [LOCAL_BASELINE_SESSIONS_REQUIRED] sesiones estables. null =
+     * aún no hay base (menos de 3 sesiones estables medidas con esta
+     * release): T4 no promueve sin ella. La coherencia se promedia
+     * igual que el RMS, pero NO es puerta (no hay umbral dado: solo
+     * se registra y se muestra).
+     */
+    fun buildLocalBaseline(segments: List<LocalSessionMeasurement>): LocalBaseline? {
+        if (segments.size < LOCAL_BASELINE_SESSIONS_REQUIRED) return null
+        val last = segments.takeLast(LOCAL_BASELINE_SESSIONS_REQUIRED)
+        val rms = last.sumOf { it.meanRmsDb.toDouble() }.toFloat() / last.size
+        val coh = last.sumOf { it.meanCoherence.toDouble() }.toFloat() / last.size
+        val err = FloatArray(SessionAggregator.BANDS) { b ->
+            last.sumOf { it.meanErrorDb.getOrElse(b) { 0f }.toDouble() }.toFloat() / last.size
+        }
+        return LocalBaseline(rmsDb = rms, coherence = coh, meanErrorDb = err, sessions = last.size)
+    }
+
+    /**
+     * T4/T5 — resume la medición del candidato vigente (solo
+     * segmentos de la última versión; los de una versión anterior no
+     * cuentan). null = el candidato aún no tiene ninguna sesión
+     * completada medida. El RMS es la media de los RMS por sesión
+     * (no de los chunks: cada sesión pesa lo mismo, mida lo que mida).
+     */
+    fun candidateSummary(segments: List<LocalSessionMeasurement>): CandidateSummary? {
+        if (segments.isEmpty()) return null
+        val version = segments.last().appliedVersion
+        val mine = segments.filter { it.appliedVersion == version }
+            .takeLast(LOCAL_BASELINE_SESSIONS_REQUIRED)
+        if (mine.isEmpty()) return null
+        val rms = mine.sumOf { it.meanRmsDb.toDouble() }.toFloat() / mine.size
+        val err = FloatArray(SessionAggregator.BANDS) { b ->
+            mine.sumOf { it.meanErrorDb.getOrElse(b) { 0f }.toDouble() }.toFloat() / mine.size
+        }
+        return CandidateSummary(
+            version = version,
+            sessions = mine.size,
+            meanRmsDb = rms,
+            meanErrorDb = err,
+            levelMaxDbfs = mine.maxOf { it.levelMaxDbfs }
+        )
+    }
+
+    /**
+     * T4 — veredicto puro de la promoción local (testeable en JVM).
+     * Promueve solo si TODO pasa: mejora ≥ 20% sobre la base local,
+     * sin resonancia nueva y sin clipping (`levelMaxDbfs ≥ 0` =
+     * fondo de escala). El motivo es el PRIMER fallo en ese orden
+     * (`""` = promueve). La coherencia de la base NO es puerta: se
+     * registra, no se gatea (no hay umbral dado).
+     */
+    fun evaluateLocalPromotion(baseline: LocalBaseline, candidate: CandidateSummary): LocalPromotionVerdict {
+        val improvement = improvementFraction(baseline.rmsDb, candidate.meanRmsDb)
+        val resonance = findNewResonanceBand(baseline.meanErrorDb, candidate.meanErrorDb)
+        val clipped = candidate.levelMaxDbfs >= 0f
+        val reason = when {
+            improvement < IMPROVEMENT_REQUIRED_FRACTION -> "insufficient_improvement"
+            resonance != null -> "new_resonance_band_${resonance + 1}"
+            clipped -> "clipping"
+            else -> ""
+        }
+        return LocalPromotionVerdict(
+            promote = reason.isEmpty(),
+            reason = reason,
+            improvement = improvement,
+            newResonanceBand = resonance,
+            clipped = clipped
+        )
+    }
+
+    /**
+     * T5 — ¿el candidato NO mejoró lo suficiente? true = rollback
+     * local. La referencia es la línea base local cuando existe y el
+     * dato fijo de la fase ([FIXED_BASELINE_RMS_DB]) cuando aún no:
+     * T5 mide mejora, no promoción, así que puede juzgar con el dato
+     * fijo; T4 NUNCA usa el fijo (fail-closed).
+     */
+    fun shouldRollbackForNoImprovement(candidateRmsDb: Float, referenceRmsDb: Float): Boolean =
+        improvementFraction(referenceRmsDb, candidateRmsDb) < IMPROVEMENT_REQUIRED_FRACTION
+
     /**
      * Decisión pura del sondeo (testeable en JVM): ¿toca pedir el perfil
      * vigente? El interruptor maestro en OFF apaga también el sondeo
@@ -2357,6 +3177,16 @@ object OrganismController {
                     Log.i(TAG, "sondeo: v${current.version} ${current.status}/${current.abState} no se aplica (aplicada v$previousVersion)")
                     return
                 }
+                // T4/510 — verificación local de la promoción: el
+                // servidor dice `promoted`, pero el teléfono solo
+                // promueve lo que midió en local (mejora ≥ 20%, sin
+                // resonancia nueva, sin clipping, con línea base
+                // local). Si no pasa, verifyPromotionLocally YA hizo
+                // el rollback local y aquí se para (fail-closed).
+                if (current.status == "promoted" && !verifyPromotionLocally(ctx, current)) {
+                    refreshState()
+                    return
+                }
                 // T6(b) — cuarentena de versión: una versión que hizo
                 // rollback queda vetada 24 h aunque el servidor la
                 // vuelva a publicar como `candidate`. El veto se
@@ -2426,14 +3256,15 @@ object OrganismController {
         current: ProfileFetcher.Result.Current,
         rolledBack: Boolean,
         promoteToStable: Boolean,
-        previousVersion: Long
+        previousVersion: Long,
+        rollbackReason: String? = null
     ): Boolean {
         if (!applySingleFlight.tryAcquire()) {
             Log.w(TAG, "S13: otra aplicación en curso; se rechaza la v${current.version} (se reintenta en el próximo sondeo)")
             return false
         }
         try {
-            return applyServerProfileLocked(ctx, current, rolledBack, promoteToStable, previousVersion)
+            return applyServerProfileLocked(ctx, current, rolledBack, promoteToStable, previousVersion, rollbackReason)
         } finally {
             applySingleFlight.release()
         }
@@ -2444,7 +3275,8 @@ object OrganismController {
         current: ProfileFetcher.Result.Current,
         rolledBack: Boolean,
         promoteToStable: Boolean,
-        previousVersion: Long
+        previousVersion: Long,
+        rollbackReason: String? = null
     ): Boolean {
         val applier = profileApplier ?: return false
         val result = applier.applyAndCommit(
@@ -2498,7 +3330,7 @@ object OrganismController {
                 } else {
                     clearAbTimer()
                 }
-                confirmApplied(applied, previousVersion)
+                confirmApplied(applied, previousVersion, rollbackReason = rollbackReason)
                 refreshState()
                 Log.i(TAG, "perfil v${current.version} ${current.status} aplicado y confirmado (abState=$abState)")
                 true
@@ -2681,13 +3513,22 @@ object OrganismController {
      * ya está registrado localmente y la telemetría T2 lo atribuye.
      * PENDIENTE: el endpoint aún no existe en el servidor (ver
      * [ProfileFetcher]); hasta entonces esto confirma contra un 404.
+     * T3/510: el cuerpo lleva la evidencia de «sonando» del momento
+     * de confirmar. T4/T5/510: `rollbackReason` (null = confirmación
+     * normal) es el motivo LOCAL del rollback que se confirma.
      */
-    private fun confirmApplied(applied: OrganismPayload.AppliedProfile, previousVersion: Long) {
+    private fun confirmApplied(
+        applied: OrganismPayload.AppliedProfile,
+        previousVersion: Long,
+        rollbackReason: String? = null
+    ) {
         val fetcher = profileFetcher ?: return
         val body = OrganismPayload.appliedConfirmation(
             applied = applied,
             previousVersion = previousVersion,
-            engineVersion = com.ivanna.omega.BuildConfig.VERSION_NAME
+            engineVersion = com.ivanna.omega.BuildConfig.VERSION_NAME,
+            sounding = captureSoundingEvidence(),
+            rollbackReason = rollbackReason
         )
         when (runCatching { fetcher.confirmApplied(body) }.getOrNull()) {
             ProfileFetcher.ConfirmOutcome.Confirmed ->

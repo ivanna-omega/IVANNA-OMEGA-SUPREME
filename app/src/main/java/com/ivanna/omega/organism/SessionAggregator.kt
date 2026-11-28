@@ -24,6 +24,43 @@ import kotlin.math.sqrt
  * Frames inválidos (valid=0, silencio ≤ −70 dBFS, no finitos) NO entran
  * en las estadísticas, pero SÍ cuentan en framesTotal (para saber cuánto
  * se midió de verdad).
+ *
+ * S15/510 — P0/D10 COMO COVARIABLES (campos OPCIONALES, null = no
+ * disponible; el payload sigue siendo retrocompatible):
+ *   * `d10HamiltonianAction`: acción hamiltoniana MEDIDA del último
+ *     bloque arbitrado por el D10 (CORONA). En C++ vive SOLO en
+ *     `FusedChain::totalConservationCertificate()`
+ *     (app/src/main/cpp/fused/fused_chain.cpp:910-917 — la cita
+ *     `fused_chain.cpp:693-700` de la especificación es de otra
+ *     revisión: en este worktree 693-700 son `resetTOmega` /
+ *     `compileTOmega`, sin hamiltoniano): `cert.tenthDimensionAction
+ *     = d10Engine_.telemetry().hamiltonianAction`, solo si el D10
+ *     está habilitado y ya arbitró (`d10TelemetryValid_`; si no,
+ *     `hasTenthDimension=false` y la acción queda sin estimar, nunca
+ *     inventada). NINGÚN lector Kotlin/JNI lo expone: el único JNI de
+ *     conservación es `nativeGetConservationStatusJson`
+ *     (FusedControlsBridge), que devuelve solo {active, appliedGain,
+ *     amount, energyCap, phaseCoherence, inertia} — sin campo D10.
+ *     Falta (trabajo del motor/JNI, fuera de este frente): un JNI que
+ *     exponga el certificado o `d10Engine_.telemetry()
+ *     .hamiltonianAction`.
+ *   * `p0TrimDbEffective`: trim tonal EFECTIVO (`tonal.trimDb`, dB)
+ *     vigente al emitir el chunk. P0 en sí es una REFERENCIA
+ *     CONGELADA, no telemetría viva
+ *     (`p0_reference_values.hpp`: ganancia neta L −6.059 / R −6.266
+ *     dB, `kNetGainDbL/R`); el trim efectivo es el `trimDb` de los
+ *     controles efectivos que `safeSetFusedControls` empuja al nativo
+ *     (`tonalTrimDb = c.tonal.trimDb`). Tampoco hay lector Kotlin:
+ *     `FusedControlsBridge` solo expone `safeGetFusedThdDb`,
+ *     `safeGetConservationStatusJson` y `safeGetAntiDolbyTelemetry`
+ *     (ningún getter de controles efectivos / trim). Falta (motor/
+ *     JNI): un `nativeGetFusedControls` o getter del trim efectivo.
+ *   * Hasta que existan esos lectores, [telemetryProvider] es null y
+ *     ambos campos quedan null: `OrganismPayload` los OMITE del
+ *     JSON (no emite nulls), así que el servidor no ve el cambio.
+ *     El proveedor es el único punto de enganche: cuando el motor
+ *     exponga un lector, una línea lo cablea aquí sin tocar el
+ *     esquema del chunk. No se toca el árbitro ni el kernel D10.
  */
 class SessionAggregator(
     val sessionId: String = UUID.randomUUID().toString(),
@@ -80,7 +117,22 @@ class SessionAggregator(
         val referenceLevelMeanDbfs: Float,
         /** Frames válidos de la ventana con referencia fresca (conteo, no fracción) (S1/510). */
         val framesReferenceFresh: Int,
-        val engineVersion: String
+        val engineVersion: String,
+        /**
+         * S15/510 — acción hamiltoniana D10 medida del último bloque
+         * arbitrado (ver KDoc de la clase). null = D10 no arbitró o sin
+         * lector (el caso hoy: no hay JNI que la exponga). Opcional:
+         * los chunks viejos y los tests que no la pasan siguen siendo
+         * válidos y el payload la omite cuando es null.
+         */
+        val d10HamiltonianAction: Double? = null,
+        /**
+         * S15/510 — trim tonal efectivo (`tonal.trimDb`, dB) vigente
+         * al emitir el chunk. null = sin lector (el caso hoy: ningún
+         * getter Kotlin expone los controles efectivos). Opcional,
+         * igual que [d10HamiltonianAction].
+         */
+        val p0TrimDbEffective: Float? = null
     ) {
         /** Media de coherencia de todas las bandas [0..1]. */
         val meanCoherence: Float get() = coherenceMean.average().toFloat()
@@ -102,6 +154,29 @@ class SessionAggregator(
 
     @Volatile
     var onChunk: ((SessionChunk) -> Unit)? = null
+
+    /**
+     * S15/510 — telemetría D10/P0 de UN chunk (ver KDoc de la clase).
+     * `hamiltonianAction` null = el D10 no arbitró ningún bloque;
+     * `trimDbEffective` null = no se pudo leer el trim vigente.
+     */
+    data class D10Telemetry(
+        val hamiltonianAction: Double?,
+        val trimDbEffective: Float?
+    )
+
+    /**
+     * S15/510 — proveedor de la telemetría D10/P0 del motor. Null =
+     * sin lector (el caso hoy: no existe ningún JNI que exponga
+     * `hamiltonianAction` ni el trim efectivo — ver KDoc de la clase).
+     * Es `var` para que el futuro lector del motor se cablee aquí sin
+     * tocar el agregador ni el esquema del chunk, igual que
+     * `OrganismController.xrunCounterReader`. Se lee UNA vez por chunk
+     * emitido (en [emitLocked]), con runCatching: un proveedor que
+     * falla deja los campos en null, nunca tumba la agregación.
+     */
+    @Volatile
+    var telemetryProvider: (() -> D10Telemetry?)? = null
 
     private val lock = Any()
     private var chunkId = 0
@@ -205,6 +280,9 @@ class SessionAggregator(
             sqrt(variance)
         }
         val cohMean = FloatArray(BANDS) { (cohSum[it] / n).coerceIn(0f, 1f) }
+        // S15/510: covariables D10/P0 del chunk (null si no hay lector:
+        // el proveedor es el único enganche y hoy es null).
+        val d10 = runCatching { telemetryProvider?.invoke() }.getOrNull()
         val chunk = SessionChunk(
             sessionId = sessionId,
             chunkId = chunkId++,
@@ -225,7 +303,9 @@ class SessionAggregator(
             referenceFreshFrac = if (windowValid > 0) framesReferenceFresh.toFloat() / windowValid else 0f,
             referenceLevelMeanDbfs = if (windowValid > 0) referenceLevelSum / n else -120f,
             framesReferenceFresh = framesReferenceFresh,
-            engineVersion = engineVersion
+            engineVersion = engineVersion,
+            d10HamiltonianAction = d10?.hamiltonianAction,
+            p0TrimDbEffective = d10?.trimDbEffective
         )
         emittedChunks++
         windowStartUs = -1L

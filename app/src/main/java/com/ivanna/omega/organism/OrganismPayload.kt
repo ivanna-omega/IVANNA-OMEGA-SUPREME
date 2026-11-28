@@ -79,6 +79,28 @@ object OrganismPayload {
         val hash: String = ""
     )
 
+    /**
+     * T3/510 — evidencia de «sonando, no solo instalado» (Fase 6).
+     * La construye `OrganismController.captureSoundingEvidence()` con
+     * lecturas vivas en el momento de confirmar / del primer chunk
+     * tras aplicar; todo campo es OPCIONAL (null = no se pudo leer en
+     * ese momento) y solo se emite lo no-null. `effectBeaconFrames`
+     * es el contador del beacon de Ruta B (`DSPBridge.
+     * effectBeaconFrames()`: crece solo si el efecto procesa audio en
+     * audioserver); `snapshotsAccepted` es el contador del consumidor
+     * de snapshots; `framesValid` es el del chunk; `daemonOk` es la
+     * salud del puente al daemon (`OmegaEngineBridge.isConnected`).
+     * Con `daemonOk=false` y beacon creciendo, el perfil suena por
+     * Ruta A; con `daemonOk=true` y beacon quieto, está aplicado pero
+     * no suena por Ruta B — la distinción que pide T3.
+     */
+    data class SoundingEvidence(
+        val effectBeaconFrames: Long? = null,
+        val snapshotsAccepted: Long? = null,
+        val framesValid: Int? = null,
+        val daemonOk: Boolean? = null
+    )
+
     private val erbCenters: FloatArray by lazy { SessionAggregator.erbCenterHz() }
 
     /** audioFeatures en el schema que normalizeAudioFeatures acepta. */
@@ -108,6 +130,10 @@ object OrganismPayload {
      * valores neutros (`factory` / 0 / `none` / `""`): el chunk sigue
      * siendo válido y el servidor lo atribuye a fábrica, sin inferir
      * la versión por correlación temporal con el `POST applied`.
+     *
+     * T3/510: `sounding` solo se pasa en el PRIMER chunk tras aplicar
+     * un perfil (lo decide `OrganismController.enqueueChunk`): es la
+     * evidencia de que suena, no un campo por chunk.
      */
     fun sessionBody(
         chunk: SessionAggregator.SessionChunk,
@@ -115,7 +141,8 @@ object OrganismPayload {
         artist: String = DEFAULT_ARTIST,
         room: String = DEFAULT_ROOM,
         equipment: String = DEFAULT_EQUIPMENT,
-        applied: AppliedProfile = AppliedProfile()
+        applied: AppliedProfile = AppliedProfile(),
+        sounding: SoundingEvidence? = null
     ): JsonObject {
         val body = JsonObject()
         body.addProperty("song", song.take(140).ifBlank { DEFAULT_SONG })
@@ -153,6 +180,15 @@ object OrganismPayload {
         telemetry.addProperty("appliedProfileVersion", applied.version)
         telemetry.addProperty("abState", applied.abState)
         telemetry.addProperty("appliedProfileHash", applied.hash)
+        // S15/510 — covariables D10/P0 del chunk (solo si el motor las
+        // expuso; hoy son null y se omiten — el esquema no cambia).
+        chunk.d10HamiltonianAction?.let { telemetry.addProperty("d10HamiltonianAction", it) }
+        chunk.p0TrimDbEffective?.let { telemetry.addProperty("p0TrimDbEffective", it.toDouble()) }
+        // T3/510 — evidencia de «sonando» (solo el primer chunk tras
+        // aplicar; los demás chunks no llevan estos campos).
+        sounding?.effectBeaconFrames?.let { telemetry.addProperty("effectBeaconFrames", it) }
+        sounding?.snapshotsAccepted?.let { telemetry.addProperty("snapshotsAccepted", it) }
+        sounding?.daemonOk?.let { telemetry.addProperty("daemonOk", it) }
         body.add("telemetry", telemetry)
         return body
     }
@@ -168,12 +204,25 @@ object OrganismPayload {
      * (T1, Fase 2): quien lo envía construye el cuerpo con esta función a
      * partir del `AppliedProfile` que devuelve
      * `OrganismController.recordAppliedProfile`.
+     *
+     * T3/510 — `sounding` (opcional): evidencia de «sonando, no solo
+     * instalado» en el momento de confirmar (beacon, snapshots,
+     * framesValid del último chunk, daemonOk). Solo se emiten los
+     * campos no-null.
+     *
+     * T4/T5/510 — `rollbackReason` (opcional): motivo LOCAL del
+     * rollback que confirma este POST (`t4_...` / `t5_...`; null =
+     * confirmación normal, no un rollback). Solo se emite si no es
+     * null ni vacío. El servidor debe ignorar los campos nuevos si
+     * no los conoce (igual que T2).
      */
     fun appliedConfirmation(
         applied: AppliedProfile,
         previousVersion: Long,
         engineVersion: String,
-        appliedAtMs: Long = System.currentTimeMillis()
+        appliedAtMs: Long = System.currentTimeMillis(),
+        sounding: SoundingEvidence? = null,
+        rollbackReason: String? = null
     ): JsonObject {
         val body = JsonObject()
         body.addProperty("profileId", applied.id)
@@ -182,6 +231,13 @@ object OrganismPayload {
         body.addProperty("engineVersion", engineVersion)
         body.addProperty("previousVersion", previousVersion)
         body.addProperty("profileHash", applied.hash)
+        // T3/510 — evidencia de que suena (solo campos medidos).
+        sounding?.effectBeaconFrames?.let { body.addProperty("effectBeaconFrames", it) }
+        sounding?.snapshotsAccepted?.let { body.addProperty("snapshotsAccepted", it) }
+        sounding?.framesValid?.let { body.addProperty("framesValid", it) }
+        sounding?.daemonOk?.let { body.addProperty("daemonOk", it) }
+        // T4/T5/510 — motivo local del rollback (si lo es).
+        if (!rollbackReason.isNullOrBlank()) body.addProperty("rollbackReason", rollbackReason)
         return body
     }
 }
