@@ -3354,6 +3354,23 @@ if(IVANNA_SAN_FLAGS)
 endif()
 gtest_discover_tests(test_tronidos_layer_step)
 
+# ── S12/510 — fundido de aplicación por hop (slew) ───────────────────────
+# setControlsRamped(): la aplicación de un perfil interpola EQ/trim/
+# compresor/operadores en N hops de 128 muestras (≤0.5 dB por hop en
+# AUTO); longitud 0 = comportamiento anterior (sin fundido).
+add_executable(test_param_ramp_s12
+  test_param_ramp_s12.cpp
+  ${FUSED_CHAIN_SOURCES}
+)
+target_include_directories(test_param_ramp_s12 PRIVATE .. ../include ../neuromorphic ../dsp host_stubs)
+target_compile_options(test_param_ramp_s12 PRIVATE -Wall -Wextra)
+target_link_libraries(test_param_ramp_s12 PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_param_ramp_s12 PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_param_ramp_s12 PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_param_ramp_s12)
+
 # ── Piso double de la cadena enganchada (labor grande, v2.5.486) ─────────
 # THD+N ≤ −200 dB con la cadena enganchada pero lineal a 1 kHz (ver
 # test_double_floor.cpp) + coste por hop (128 muestras = 2667 µs).

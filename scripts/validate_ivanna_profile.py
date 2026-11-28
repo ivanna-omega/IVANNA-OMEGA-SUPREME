@@ -204,9 +204,21 @@ def validate(data, path="$", live=False):
     if not isinstance(data, dict):
         err(path, "la raíz debe ser un objeto")
         return
-    check_keys(data, ["format", "format_version", "track", "artist",
-                      "source", "duration_s", "fingerprint", "engine",
-                      "derivation"], path)
+    root_keys = ["format", "format_version", "track", "artist",
+                 "source", "duration_s", "fingerprint", "engine",
+                 "derivation"]
+    if live:
+        # S9 (Fase 3): marca opcional solo-medición A/B; el validador
+        # espejo debe admitirla igual que ProfileApplier.kt (si viene
+        # y no es booleana, es error; sin ella el perfil es candidato
+        # normal y la guarda de coherencia del teléfono lo rechaza).
+        check_keys(data, root_keys, path,
+                   allowed=root_keys + ["ab_measurement_only"])
+        if ("ab_measurement_only" in data
+                and not isinstance(data["ab_measurement_only"], bool)):
+            err("$.ab_measurement_only", "debe ser boolean")
+    else:
+        check_keys(data, root_keys, path)
     if data.get("format") != "IVANNA OMEGA":
         err("$.format", "debe ser exactamente 'IVANNA OMEGA'")
     if data.get("format_version") != "1.0":

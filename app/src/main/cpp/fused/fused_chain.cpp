@@ -61,6 +61,10 @@ void FusedChain::prepare(double sampleRate) noexcept {
 void FusedChain::setControls(const FusedControls& c) noexcept {
     FusedControls nc = c;
     nc.clamp();
+    // S12/510: un push explícito nuevo supersede cualquier rampa en curso
+    // (gana el último: el motor termina en el objetivo más reciente, nunca
+    // queda a medias en valores intermedios).
+    cancelParamRamp();
     // ── TRONIDOS 493 — fundido de modo (2026-11-22) ─────────────────────
     // Un cambio de modo o de enganche de TΩ no se aplica de golpe: aplicar
     // SPEAKERS con la FIFO de TΩ vacía dejaba 2 bloques de 0 exacto, y
@@ -115,6 +119,214 @@ void FusedChain::distributeControls() noexcept {
     dynamics_.setControls(userControls_.dynamics);
 }
 
+// ── S12/510 — FUNDIDO DE APLICACIÓN POR HOP (SLEW) ───────────────────────
+// Interpolación lineal de UN campo continuo entre extremos clampados.
+// t ∈ [0, 1]; con t == 1 el resultado es EXACTAMENTE `b` (sin deriva).
+static float lerpParam(float a, float b, double t) noexcept {
+    if (t >= 1.0) return b;
+    if (t <= 0.0) return a;
+    return static_cast<float>(static_cast<double>(a) +
+                              (static_cast<double>(b) - static_cast<double>(a)) * t);
+}
+
+// Interpola TODOS los campos continuos de FusedControls; los discretos
+// (modo, curva, presets, bools) se copian de `from` y cambian con el snap
+// final a `to` (nunca a medias). El clamp() final aplica por paso las
+// mismas puertas fail-closed que setControls (puerta HRTF, MANUAL→
+// adaptation 0): la rampa nunca deja la cadena en un estado que un push
+// directo no pudiera dejar.
+static FusedControls lerpControls(const FusedControls& from,
+                                  const FusedControls& to, double t) noexcept {
+    FusedControls out = from;
+    out.spatial.amount = lerpParam(from.spatial.amount, to.spatial.amount, t);
+    out.spatial.azimuthDeg = lerpParam(from.spatial.azimuthDeg, to.spatial.azimuthDeg, t);
+    out.spatial.distanceM = lerpParam(from.spatial.distanceM, to.spatial.distanceM, t);
+    out.spatial.width = lerpParam(from.spatial.width, to.spatial.width, t);
+    out.spatial.wfsSpread = lerpParam(from.spatial.wfsSpread, to.spatial.wfsSpread, t);
+    out.spatial.hrtfWet = lerpParam(from.spatial.hrtfWet, to.spatial.hrtfWet, t);
+    out.spatial.upmixImmersivity =
+        lerpParam(from.spatial.upmixImmersivity, to.spatial.upmixImmersivity, t);
+    out.spatial.parallaxAmount =
+        lerpParam(from.spatial.parallaxAmount, to.spatial.parallaxAmount, t);
+    out.field.amount = lerpParam(from.field.amount, to.field.amount, t);
+    out.field.phiAmount = lerpParam(from.field.phiAmount, to.field.phiAmount, t);
+    out.field.pumping = lerpParam(from.field.pumping, to.field.pumping, t);
+    out.field.coherence = lerpParam(from.field.coherence, to.field.coherence, t);
+    out.field.harmonics = lerpParam(from.field.harmonics, to.field.harmonics, t);
+    out.field.gamma = lerpParam(from.field.gamma, to.field.gamma, t);
+    out.field.warmth = lerpParam(from.field.warmth, to.field.warmth, t);
+    out.field.dynamics = lerpParam(from.field.dynamics, to.field.dynamics, t);
+    out.field.roomRt60 = lerpParam(from.field.roomRt60, to.field.roomRt60, t);
+    out.field.omniAmount = lerpParam(from.field.omniAmount, to.field.omniAmount, t);
+    out.field.diffuse = lerpParam(from.field.diffuse, to.field.diffuse, t);
+    out.listenerRoom.rt60Sec = lerpParam(from.listenerRoom.rt60Sec, to.listenerRoom.rt60Sec, t);
+    out.listenerRoom.roomSizeM =
+        lerpParam(from.listenerRoom.roomSizeM, to.listenerRoom.roomSizeM, t);
+    out.listenerRoom.roomWet = lerpParam(from.listenerRoom.roomWet, to.listenerRoom.roomWet, t);
+    for (int i = 0; i < 10; ++i) {
+        out.listenerRoom.roomCorrDb[i] =
+            lerpParam(from.listenerRoom.roomCorrDb[i], to.listenerRoom.roomCorrDb[i], t);
+    }
+    out.transducer.correction =
+        lerpParam(from.transducer.correction, to.transducer.correction, t);
+    out.transducer.temporalAmount =
+        lerpParam(from.transducer.temporalAmount, to.transducer.temporalAmount, t);
+    out.tonal.trimDb = lerpParam(from.tonal.trimDb, to.tonal.trimDb, t);
+    out.tonal.lowDb = lerpParam(from.tonal.lowDb, to.tonal.lowDb, t);
+    out.tonal.midDb = lerpParam(from.tonal.midDb, to.tonal.midDb, t);
+    out.tonal.highDb = lerpParam(from.tonal.highDb, to.tonal.highDb, t);
+    out.tonal.presenceDb = lerpParam(from.tonal.presenceDb, to.tonal.presenceDb, t);
+    out.tonal.amount = lerpParam(from.tonal.amount, to.tonal.amount, t);
+    out.dynamics.punch = lerpParam(from.dynamics.punch, to.dynamics.punch, t);
+    out.dynamics.width = lerpParam(from.dynamics.width, to.dynamics.width, t);
+    out.dynamics.safety = lerpParam(from.dynamics.safety, to.dynamics.safety, t);
+    out.dynamics.compThresholdDb =
+        lerpParam(from.dynamics.compThresholdDb, to.dynamics.compThresholdDb, t);
+    out.dynamics.compRatio = lerpParam(from.dynamics.compRatio, to.dynamics.compRatio, t);
+    out.dynamics.exciter = lerpParam(from.dynamics.exciter, to.dynamics.exciter, t);
+    out.dynamics.voice = lerpParam(from.dynamics.voice, to.dynamics.voice, t);
+    out.dynamics.upmixImmersivity =
+        lerpParam(from.dynamics.upmixImmersivity, to.dynamics.upmixImmersivity, t);
+    out.brain.adaptation = lerpParam(from.brain.adaptation, to.brain.adaptation, t);
+    out.conservation.amount =
+        lerpParam(from.conservation.amount, to.conservation.amount, t);
+    out.conservation.energyCap =
+        lerpParam(from.conservation.energyCap, to.conservation.energyCap, t);
+    out.conservation.phaseCoherence =
+        lerpParam(from.conservation.phaseCoherence, to.conservation.phaseCoherence, t);
+    out.conservation.inertia =
+        lerpParam(from.conservation.inertia, to.conservation.inertia, t);
+    out.clamp();
+    return out;
+}
+
+int FusedChain::rampHopsFor(const FusedControls& from, const FusedControls& to) noexcept {
+    // Regla conservadora §S12: ≤0.5 dB por hop sobre los parámetros en dB.
+    float maxDbDelta = 0.0f;
+    const float dbDeltas[] = {
+        std::fabs(to.tonal.trimDb - from.tonal.trimDb),
+        std::fabs(to.tonal.lowDb - from.tonal.lowDb),
+        std::fabs(to.tonal.midDb - from.tonal.midDb),
+        std::fabs(to.tonal.highDb - from.tonal.highDb),
+        std::fabs(to.tonal.presenceDb - from.tonal.presenceDb),
+        std::fabs(to.dynamics.compThresholdDb - from.dynamics.compThresholdDb),
+    };
+    for (float d : dbDeltas) maxDbDelta = std::max(maxDbDelta, d);
+    for (int i = 0; i < 10; ++i) {
+        maxDbDelta = std::max(
+            maxDbDelta,
+            std::fabs(to.listenerRoom.roomCorrDb[i] - from.listenerRoom.roomCorrDb[i]));
+    }
+    if (maxDbDelta > 0.0f) {
+        const int hops = static_cast<int>(
+            std::ceil(static_cast<double>(maxDbDelta) / kParamRampMaxDbPerHop));
+        return std::clamp(hops, 1, kParamRampMaxHops);
+    }
+    // Sin cambio en dB: si algo continuo cambió, el precedente Volterra
+    // (~18 ms); si nada cambió, no hace falta rampa.
+    FusedControls probe = lerpControls(from, to, 1.0);
+    const bool anyChange =
+        probe.spatial.amount != from.spatial.amount ||
+        probe.spatial.azimuthDeg != from.spatial.azimuthDeg ||
+        probe.spatial.distanceM != from.spatial.distanceM ||
+        probe.spatial.width != from.spatial.width ||
+        probe.spatial.wfsSpread != from.spatial.wfsSpread ||
+        probe.spatial.hrtfWet != from.spatial.hrtfWet ||
+        probe.spatial.upmixImmersivity != from.spatial.upmixImmersivity ||
+        probe.spatial.parallaxAmount != from.spatial.parallaxAmount ||
+        probe.field.amount != from.field.amount ||
+        probe.field.phiAmount != from.field.phiAmount ||
+        probe.field.pumping != from.field.pumping ||
+        probe.field.coherence != from.field.coherence ||
+        probe.field.harmonics != from.field.harmonics ||
+        probe.field.gamma != from.field.gamma ||
+        probe.field.warmth != from.field.warmth ||
+        probe.field.dynamics != from.field.dynamics ||
+        probe.field.roomRt60 != from.field.roomRt60 ||
+        probe.field.omniAmount != from.field.omniAmount ||
+        probe.field.diffuse != from.field.diffuse ||
+        probe.listenerRoom.rt60Sec != from.listenerRoom.rt60Sec ||
+        probe.listenerRoom.roomSizeM != from.listenerRoom.roomSizeM ||
+        probe.listenerRoom.roomWet != from.listenerRoom.roomWet ||
+        probe.transducer.correction != from.transducer.correction ||
+        probe.transducer.temporalAmount != from.transducer.temporalAmount ||
+        probe.tonal.amount != from.tonal.amount ||
+        probe.dynamics.punch != from.dynamics.punch ||
+        probe.dynamics.width != from.dynamics.width ||
+        probe.dynamics.safety != from.dynamics.safety ||
+        probe.dynamics.compRatio != from.dynamics.compRatio ||
+        probe.dynamics.exciter != from.dynamics.exciter ||
+        probe.dynamics.voice != from.dynamics.voice ||
+        probe.dynamics.upmixImmersivity != from.dynamics.upmixImmersivity ||
+        probe.brain.adaptation != from.brain.adaptation ||
+        probe.conservation.amount != from.conservation.amount ||
+        probe.conservation.energyCap != from.conservation.energyCap ||
+        probe.conservation.phaseCoherence != from.conservation.phaseCoherence ||
+        probe.conservation.inertia != from.conservation.inertia;
+    // Los campos discretos (modo, curva, presets, bools) cambian con el
+    // snap final; si SOLO cambió uno de ellos, la rampa no tiene nada que
+    // interpolar — se aplica de inmediato (hops 0).
+    return anyChange ? kParamRampDefaultHops : 0;
+}
+
+void FusedChain::setControlsRamped(const FusedControls& target, int hops) noexcept {
+    FusedControls nc = target;
+    nc.clamp();
+    // Longitud 0 (o negativa) = comportamiento anterior exacto: aplicación
+    // inmediata, sin fundido. Es el camino de sliders / re-push.
+    if (hops <= 0) {
+        setControls(nc);
+        return;
+    }
+    // Un cambio de modo o de enganche de TΩ NO se rampea: lo cubre el
+    // fundido de modo existente (misma condición que setControls).
+    const bool oldTOmega = tOmegaActive();
+    const OmegaOutputMode oldMode = userControls_.spatial.mode;
+    const bool newTOmega = volumetricEnabled_.load(std::memory_order_relaxed) &&
+                           !nc.isNeutral() &&
+                           ivanna::omega_output_is_speakers_like(nc.spatial.mode);
+    const bool eitherEngaged = !nc.isNeutral() || !userControls_.isNeutral();
+    if ((oldTOmega != newTOmega || oldMode != nc.spatial.mode) && eitherEngaged) {
+        setControls(nc);
+        return;
+    }
+    // Nunca apilar una rampa sobre un fundido de modo en curso: el
+    // pendiente del fundido reescribe userControls_ en ganancia 0 y la
+    // rampa quedaría con `from`/`to` obsoletos.
+    if (modeFadePhase_ != ModeFadePhase::DONE) {
+        setControls(nc);
+        return;
+    }
+    // Re-base: `from` es el valor interpolado VIGENTE (si había una rampa
+    // en curso, la nueva es monótona desde donde el motor está de verdad).
+    paramRampFrom_ = userControls_;
+    paramRampTo_ = nc;
+    paramRampTotalHops_ = std::clamp(hops, 1, kParamRampMaxHops);
+    paramRampHopsDone_ = 0;
+    paramRampHopPos_ = 0;
+}
+
+void FusedChain::cancelParamRamp() noexcept {
+    paramRampTotalHops_ = 0;
+    paramRampHopsDone_ = 0;
+    paramRampHopPos_ = 0;
+}
+
+void FusedChain::advanceParamRampHop() noexcept {
+    if (paramRampTotalHops_ <= 0) return;
+    ++paramRampHopsDone_;
+    if (paramRampHopsDone_ >= paramRampTotalHops_) {
+        // Snap final EXACTO al objetivo (incluye los campos discretos):
+        // sin deriva float, sin quedar a medias.
+        userControls_ = paramRampTo_;
+        cancelParamRamp();
+        return;
+    }
+    const double t = static_cast<double>(paramRampHopsDone_) /
+                     static_cast<double>(paramRampTotalHops_);
+    userControls_ = lerpControls(paramRampFrom_, paramRampTo_, t);
+}
+
 void FusedChain::setNeutral() noexcept {
     userControls_.setNeutral();
     setControls(userControls_);
@@ -164,6 +376,7 @@ void FusedChain::reset() noexcept {
     modeFadePhase_ = ModeFadePhase::DONE;
     modeFadeGain_ = 1.0;
     modeFadePendingValid_ = false;
+    cancelParamRamp();  // S12/510: sin rampa pendiente tras reset()
     d10DisableFadePending_ = false;  // 6.4: sin fundido de D10 pendiente
     d10EnabledSeen_ = d10Engine_.isEnabled();  // 6.4: re-sincronizar
     opWet_[0] = brain_.isNeutral() ? 0.0 : 1.0;
@@ -316,6 +529,10 @@ void FusedChain::applyModeFadePending() noexcept {
         modeFadePhase_ = ModeFadePhase::IN;
         return;
     }
+    // S12/510: el pendiente reescribe userControls_ en ganancia 0; una
+    // rampa en curso quedaría con `from`/`to` obsoletos (nunca a medias:
+    // el motor termina en el pendiente, no en un intermedio de rampa).
+    cancelParamRamp();
     userControls_ = modeFadePending_;
     modeFadePendingValid_ = false;
     distributeControls();
@@ -1056,7 +1273,22 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
             fadeRemain = static_cast<int>(std::ceil(remain));
             if (fadeRemain < 1) fadeRemain = 1;
         }
-        const int chunk = std::min({remaining, kFusedMaxBlockFrames, fadeRemain});
+        int chunk = std::min({remaining, kFusedMaxBlockFrames, fadeRemain});
+        // ── S12/510 — fundido de aplicación por hop (slew) ─────────────
+        // Mientras la rampa está activa, el chunk se parte en fronteras de
+        // hop (128 muestras): cada sub-chunk corre con UN paso de la
+        // interpolación, y el paso se aplica ANTES de que nada lea los
+        // controles de este sub-chunk (apex/TΩ/puertas/pushEffectiveControls).
+        // Sin rampa, chunk queda como antes (coste cero, sin cambio de
+        // comportamiento). El primer hop usa t = 1/N y el hop N usa el
+        // objetivo exacto (snap final en advanceParamRampHop).
+        if (paramRampTotalHops_ > 0) {
+            // max(1, …): defensa del invariante hopPos_ ∈ [0,127] — un
+            // chunk de 0 muestras colgaría el bucle (remaining no avanza).
+            chunk = std::min(chunk,
+                             std::max(1, kParamRampHopSamples - paramRampHopPos_));
+            if (paramRampHopPos_ == 0) advanceParamRampHop();
+        }
         double* l = left + offset;
         double* r = right + offset;
 
@@ -1459,6 +1691,14 @@ void FusedChain::process(double* left, double* right, int frames) noexcept {
                 holosReseedDone_ = false;
                 field_.clearHolosReseedRequest();
             }
+        }
+
+        // S12/510: avance de la posición dentro del hop vigente (solo
+        // mientras la rampa sigue activa; al completarse en el avance de
+        // arriba, hopPos_ ya está a 0 y no hay nada que acumular).
+        if (paramRampTotalHops_ > 0) {
+            paramRampHopPos_ += chunk;
+            if (paramRampHopPos_ >= kParamRampHopSamples) paramRampHopPos_ = 0;
         }
 
         offset += chunk;

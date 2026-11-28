@@ -58,6 +58,9 @@ class ProfileApplierTest {
         assertTrue(result.profile.liveSession)
         assertEquals(0.0, result.profile.meanCoherence, 1e-9)
         assertEquals(10.46, result.profile.spectralErrorRmsDb, 1e-9)
+        // S9: la v1.1 es el primer candidato de medición del A/B
+        // (coherencia 0.0); pasa la guarda solo por la marca.
+        assertTrue(result.profile.abMeasurementOnly)
     }
 
     @Test
@@ -359,6 +362,83 @@ class ProfileApplierTest {
         assertTrue(applier.checkPendingRollback() is ProfileApplier.RollbackCheck.None)
     }
 
+    // ------------------------------------------------------------------
+    // S9: guarda de coherencia antes de aplicar EQ.
+    // ------------------------------------------------------------------
+
+    /** Quita la marca de solo-medición de un cuerpo (la v1.1 la trae). */
+    private fun withoutMeasurementOnly(body: String): String =
+        body.replace("\"ab_measurement_only\":true,", "")
+
+    private fun withCoherence(body: String, coherence: Double): String =
+        body.replace("\"mean_coherence\":0.0", "\"mean_coherence\":$coherence")
+
+    @Test
+    fun `coherencia 0 sin marca se rechaza por coherencia`() {
+        val body = withoutMeasurementOnly(V11_JSON)
+        val reasons = invalidReasons(ProfileApplier.validate(body, version = 2L, appliedVersion = 1L))
+        assertTrue("motivos: $reasons", reasons.any { it.contains("mean_coherence") && it.contains("coherencia media") })
+    }
+
+    @Test
+    fun `coherencia 0 sin marca va a cuarentena por el camino existente`() {
+        val body = withoutMeasurementOnly(V11_JSON)
+        val result = applier.apply(body, version = 2L, appliedVersion = 1L)
+        assertTrue("se esperaba Rejected, fue $result", result is ProfileApplier.ApplyResult.Rejected)
+        val rejected = result as ProfileApplier.ApplyResult.Rejected
+        assertTrue(rejected.quarantineFile.isFile)
+        assertTrue(rejected.quarantineFile.readText().contains("\"mean_coherence\":0.0"))
+        val status = applier.readQuarantineStatus()
+        assertTrue(status != null)
+        assertEquals(2L, status!!.version)
+        assertTrue(status.reasons.any { it.contains("coherencia media") })
+    }
+
+    @Test
+    fun `coherencia 0 con marca solo-medicion pasa la guarda`() {
+        // La v1.1 trae la marca: es el primer candidato de medición del A/B.
+        val result = ProfileApplier.validate(V11_JSON, version = 2L, appliedVersion = 1L)
+        assertTrue("con ab_measurement_only debe validar, fue $result", result is ProfileApplier.ValidationResult.Valid)
+        assertTrue((result as ProfileApplier.ValidationResult.Valid).profile.abMeasurementOnly)
+    }
+
+    @Test
+    fun `coherencia 0-25 sin marca pasa`() {
+        val body = withCoherence(withoutMeasurementOnly(V11_JSON), 0.25)
+        val result = ProfileApplier.validate(body, version = 2L, appliedVersion = 1L)
+        assertTrue("coherencia 0.25 debe validar, fue $result", result is ProfileApplier.ValidationResult.Valid)
+        assertFalse((result as ProfileApplier.ValidationResult.Valid).profile.abMeasurementOnly)
+    }
+
+    @Test
+    fun `coherencia 0-20 sin marca pasa (umbral inclusivo)`() {
+        val body = withCoherence(withoutMeasurementOnly(V11_JSON), 0.20)
+        val result = ProfileApplier.validate(body, version = 2L, appliedVersion = 1L)
+        assertTrue("coherencia 0.20 debe validar (no es < 0.20), fue $result", result is ProfileApplier.ValidationResult.Valid)
+    }
+
+    @Test
+    fun `coherencia 0-19 sin marca se rechaza`() {
+        val body = withCoherence(withoutMeasurementOnly(V11_JSON), 0.19)
+        val reasons = invalidReasons(ProfileApplier.validate(body, version = 2L, appliedVersion = 1L))
+        assertTrue("motivos: $reasons", reasons.any { it.contains("mean_coherence") && it.contains("0.19") })
+    }
+
+    @Test
+    fun `coherencia 0-19 con marca pasa como solo-medicion`() {
+        val body = withCoherence(V11_JSON, 0.19)
+        val result = ProfileApplier.validate(body, version = 2L, appliedVersion = 1L)
+        assertTrue("con marca debe validar, fue $result", result is ProfileApplier.ValidationResult.Valid)
+        assertTrue((result as ProfileApplier.ValidationResult.Valid).profile.abMeasurementOnly)
+    }
+
+    @Test
+    fun `ab_measurement_only no booleano se rechaza`() {
+        val body = V11_JSON.replace("\"ab_measurement_only\":true", "\"ab_measurement_only\":\"si\"")
+        val reasons = invalidReasons(ProfileApplier.validate(body, version = 2L, appliedVersion = 1L))
+        assertTrue("motivos: $reasons", reasons.any { it.contains("ab_measurement_only") && it.contains("boolean") })
+    }
+
     @Test
     fun `sha256Hex es estable y distingue cuerpos`() {
         val h1 = ProfileApplier.sha256Hex(V11_JSON)
@@ -533,7 +613,16 @@ class ProfileApplierTest {
     }
 
     companion object {
-        /** v1.1 candidata, verbatim del archivo entregado (sin modificar). */
-        private const val V11_JSON = """{"artist":"desconocido","derivation":{"compressor":"Sin cambio propuesto en la v1.1. Se heredan los valores del perfil vivo v1.0 (threshold -12.0 dB, ratio 2.0, attack 10.0 ms, release 120.0 ms).","eq":"Corrección v1.1 propuesta (Muse IA, 2026-11-28 04:00, 84 sesiones): subgraves +1, graves -3, medios-graves -2, medios +4, presencia +9, brillo +9 dB. Mapeo a los 4 slots del motor v1.0 con clamp ±2 dB: low_60_120 -2.0 (propuesto -3, residual -1.0), mid_500_1k +2.0 (propuesto +4, residual +2.0), high_2k_4k +2.0 (brillo, propuesto +9, residual +7.0), presence_4k_8k +2.0 (presencia, propuesto +9, residual +7.0). Sin slot en el motor (quedan aquí, no se aplican): subgraves +1.0 y medios-graves -2.0. Neto de los 4 slots +4.0 dB; trim -4.0 dB lo compensa para ganancia neta 0.0 dB (Regla de Oro Matched-LUFS). El residual (+7 dB en presencia/brillo) no lo puede aplicar el motor v1.0 en un solo perfil: se cierra por evoluciones sucesivas validadas por A/B o por una ampliación del esquema.","loudness":"Sin medición LUFS en sesión en vivo (micrófono ERB, no FLAC): no hay loudness_lufs_integrated, peak ni crest medidos. La ganancia neta es 0.0 dB por construcción (trim -4.0 dB compensa el neto +4.0 dB de los slots EQ). Los campos de medición de archivo (loudness, peak, crest, espectro por banda, estéreo) se rellenan desde el perfil v1.0 del servidor al aplicar.","note":"CANDIDATO v1.1, NO APLICADO. Pendiente de validación A/B automática: 3 sesiones idénticas vs v1.0, mejora ERB mínima 20% sin perder coherencia, rollback automático si empeora. Operadores sin cambios (Orbe 0.53, Holos 0.34, Neuro 0.35, SalaViva 0.30; SalaViva sin slot en el engine v1.0, se guarda como nota). Coherencia media 0%: el A/B corre con la guarda de coherencia (ver especificación de refactorización). Fingerprint ERB (no FLAC): solo se incluye el dato verificado (ERB-3 209 Hz, +9.86 dB); la tabla completa de 24 bandas vive en el servidor. duration_s 0.0 = sesión en vivo continua sin duración de pista única. artist 'desconocido' = las sesiones no traen artista.","structural_split":"Sin medición HPSS en sesión en vivo (micrófono ERB, no FLAC). Se heredan los valores del compilador de sesión en vivo (transitorio 0.0, tonal 1.0)."},"duration_s":0.0,"engine":{"compressor":{"attack_ms":10.0,"ratio":2.0,"release_ms":120.0,"threshold_db":-12.0},"eq_bands_db":{"high_2k_4k":2.0,"low_60_120":-2.0,"mid_500_1k":2.0,"presence_4k_8k":2.0},"exciter_amount":0.3,"holos_amount":0.34,"net_gain_db":0.0,"orbe_amount":0.53,"orbe_distance_m":0.35,"phi_amount":0.35,"structural_split":{"tonal_amount":1.0,"tonal_energy_ratio":1.0,"transient_amount":0.55,"transient_energy_ratio":0.0},"trim_db":-4.0,"volterra_enabled":true,"volterra_mix":0.55},"fingerprint":{"detected_issues":["Resonancia ERB-3 209 Hz: +9.86 dB ERB","Caída de -7 a -24 dB entre 1.4 kHz y 14.7 kHz (déficit en medios-altos/agudos)","Exceso en graves/medios-graves","Coherencia media ERB 0%: posible cancelación de fase o filtro peine (sala 4.0x7.0 m, techo 3.0 m, posible pared a ~2.0 m)","Fidelidad 30/100; confianza del Gemelo 10%"],"erb_bands_measured":{"erb3_209hz":{"coherence":0.0,"error_db":9.86}},"mean_coherence":0.0,"spectral_error_rms_db":10.46},"format":"IVANNA OMEGA","format_version":"1.0","source":"MuseLink omega-1795857152818-9lec (microfono ERB, 177 sesiones, 2026-11-28 04:09 CST) — CANDIDATO v1.1, NO APLICADO","track":"Sesión en vivo IVANNA"}"""
+        /**
+         * v1.1 candidata, verbatim del archivo entregado salvo la marca
+         * S9 `ab_measurement_only: true` (raíz): la v1.1 es el primer
+         * candidato de medición del A/B y su coherencia media es 0.0,
+         * así que sin la marca la guarda S9 la rechazaría. El archivo
+         * v1.1 entregado por el servidor (pre-S9) NO trae la marca:
+         * el analizador debe emitirla al re-emitir la v1.1 (y el
+         * validador Python espejo debe admitirla en la raíz), o la
+         * v1.1 real será rechazada por coherencia en el teléfono.
+         */
+        private const val V11_JSON = """{"ab_measurement_only":true,"artist":"desconocido","derivation":{"compressor":"Sin cambio propuesto en la v1.1. Se heredan los valores del perfil vivo v1.0 (threshold -12.0 dB, ratio 2.0, attack 10.0 ms, release 120.0 ms).","eq":"Corrección v1.1 propuesta (Muse IA, 2026-11-28 04:00, 84 sesiones): subgraves +1, graves -3, medios-graves -2, medios +4, presencia +9, brillo +9 dB. Mapeo a los 4 slots del motor v1.0 con clamp ±2 dB: low_60_120 -2.0 (propuesto -3, residual -1.0), mid_500_1k +2.0 (propuesto +4, residual +2.0), high_2k_4k +2.0 (brillo, propuesto +9, residual +7.0), presence_4k_8k +2.0 (presencia, propuesto +9, residual +7.0). Sin slot en el motor (quedan aquí, no se aplican): subgraves +1.0 y medios-graves -2.0. Neto de los 4 slots +4.0 dB; trim -4.0 dB lo compensa para ganancia neta 0.0 dB (Regla de Oro Matched-LUFS). El residual (+7 dB en presencia/brillo) no lo puede aplicar el motor v1.0 en un solo perfil: se cierra por evoluciones sucesivas validadas por A/B o por una ampliación del esquema.","loudness":"Sin medición LUFS en sesión en vivo (micrófono ERB, no FLAC): no hay loudness_lufs_integrated, peak ni crest medidos. La ganancia neta es 0.0 dB por construcción (trim -4.0 dB compensa el neto +4.0 dB de los slots EQ). Los campos de medición de archivo (loudness, peak, crest, espectro por banda, estéreo) se rellenan desde el perfil v1.0 del servidor al aplicar.","note":"CANDIDATO v1.1, NO APLICADO. Pendiente de validación A/B automática: 3 sesiones idénticas vs v1.0, mejora ERB mínima 20% sin perder coherencia, rollback automático si empeora. Operadores sin cambios (Orbe 0.53, Holos 0.34, Neuro 0.35, SalaViva 0.30; SalaViva sin slot en el engine v1.0, se guarda como nota). Coherencia media 0%: el A/B corre con la guarda de coherencia (ver especificación de refactorización). Fingerprint ERB (no FLAC): solo se incluye el dato verificado (ERB-3 209 Hz, +9.86 dB); la tabla completa de 24 bandas vive en el servidor. duration_s 0.0 = sesión en vivo continua sin duración de pista única. artist 'desconocido' = las sesiones no traen artista.","structural_split":"Sin medición HPSS en sesión en vivo (micrófono ERB, no FLAC). Se heredan los valores del compilador de sesión en vivo (transitorio 0.0, tonal 1.0)."},"duration_s":0.0,"engine":{"compressor":{"attack_ms":10.0,"ratio":2.0,"release_ms":120.0,"threshold_db":-12.0},"eq_bands_db":{"high_2k_4k":2.0,"low_60_120":-2.0,"mid_500_1k":2.0,"presence_4k_8k":2.0},"exciter_amount":0.3,"holos_amount":0.34,"net_gain_db":0.0,"orbe_amount":0.53,"orbe_distance_m":0.35,"phi_amount":0.35,"structural_split":{"tonal_amount":1.0,"tonal_energy_ratio":1.0,"transient_amount":0.55,"transient_energy_ratio":0.0},"trim_db":-4.0,"volterra_enabled":true,"volterra_mix":0.55},"fingerprint":{"detected_issues":["Resonancia ERB-3 209 Hz: +9.86 dB ERB","Caída de -7 a -24 dB entre 1.4 kHz y 14.7 kHz (déficit en medios-altos/agudos)","Exceso en graves/medios-graves","Coherencia media ERB 0%: posible cancelación de fase o filtro peine (sala 4.0x7.0 m, techo 3.0 m, posible pared a ~2.0 m)","Fidelidad 30/100; confianza del Gemelo 10%"],"erb_bands_measured":{"erb3_209hz":{"coherence":0.0,"error_db":9.86}},"mean_coherence":0.0,"spectral_error_rms_db":10.46},"format":"IVANNA OMEGA","format_version":"1.0","source":"MuseLink omega-1795857152818-9lec (microfono ERB, 177 sesiones, 2026-11-28 04:09 CST) — CANDIDATO v1.1, NO APLICADO","track":"Sesión en vivo IVANNA"}"""
     }
 }

@@ -447,6 +447,18 @@ static void omniProcessRouteA(float* l, float* r, int n) noexcept {
 // solo actualiza los campos que los atomics gobiernan (el modo de salida y
 // los campos sin atomic conservan su valor). Hilo de audio, solo loads.
 static void syncFusedControlsRouteA() noexcept {
+    // S12/510 — GUARDA DE RAMPA: mientras una rampa de aplicación está
+    // activa, el sync NO re-empuja controles. El sync reconstruye `c`
+    // desde controls() (valor interpolado vigente) y sobrescribe los
+    // campos con atomic con el objetivo: un setControls() ahí aplicaría
+    // el objetivo de golpe (mataría la rampa) y corrompería los campos
+    // SIN atomic (trim, compresor…) tomando valores intermedios como
+    // objetivo. La rampa ya lleva el objetivo en paramRampTo_ y el push
+    // rampado espeja los atomics igual que el inmediato; al completarse
+    // (≤32 hops, ~85 ms) el sync siguiente ve el estado asentado y el
+    // setControls es no-op. Un cambio de slider durante la rampa espera
+    // como mucho ese tiempo: imperceptible y seguro.
+    if (g_fusedChainRouteA.paramRampActive()) return;
     using ivanna::fused::FusedControls;
     FusedControls c = g_fusedChainRouteA.controls();
     c.spatial.amount = g_orbe_amount.load(std::memory_order_relaxed);
@@ -3451,6 +3463,163 @@ Java_com_ivanna_omega_audio_FusedControlsBridge_nativeSetFusedControls(
     // con el RT60 de HOLOS para que ambas salas suenen idénticas). Sin
     // esto rirLoaded() era false y el stage RIR de SALA VIVA era bypass
     // permanente. No-op si ese RT60 ya está cargado (una comparación).
+    g_fusedChainRouteA.listenerRoom().synthesizeMasterStudioBrir(c.field.roomRt60);
+    // Espejo a los atomics (lo que el sync por bloque lee): sin esto el
+    // sync reescribiría los campos mapeados con los valores viejos.
+    g_orbe_amount.store(c.spatial.amount, std::memory_order_relaxed);
+    g_orbe_distance_m.store(c.spatial.distanceM, std::memory_order_relaxed);
+    g_orbe_head_tracking.store(c.spatial.headTracking, std::memory_order_relaxed);
+    g_wfs_enabled.store(c.spatial.wfsSpread > 0.0f, std::memory_order_relaxed);
+    g_wfs_spread.store(c.spatial.wfsSpread, std::memory_order_relaxed);
+    g_hrtf_wet_dry.store(c.spatial.hrtfWet, std::memory_order_relaxed);
+    g_hyper_xtc.store(c.spatial.xtcEnabled, std::memory_order_relaxed);
+    g_holos_amount.store(c.field.amount, std::memory_order_relaxed);
+    g_hyper_amount.store(c.field.phiAmount, std::memory_order_relaxed);
+    g_hyper_preset.store(c.field.phiPreset, std::memory_order_relaxed);
+    g_holos_harmonics.store(c.field.harmonics, std::memory_order_relaxed);
+    g_holos_warmth.store(c.field.warmth, std::memory_order_relaxed);
+    g_holos_dynamics.store(c.field.dynamics, std::memory_order_relaxed);
+    g_holos_gamma.store(c.field.gamma, std::memory_order_relaxed);
+    g_holos_room_rt60.store(c.field.roomRt60, std::memory_order_relaxed);
+    // Unificación 2.5.509 (paso 5): espejo de los dos campos nuevos; sin
+    // esto el sync por bloque los reescribiría con los valores viejos.
+    g_omni_amount.store(c.field.omniAmount, std::memory_order_relaxed);
+    g_holos_diffuse.store(c.field.diffuse, std::memory_order_relaxed);
+    g_holos_eq_low.store(c.tonal.lowDb, std::memory_order_relaxed);
+    g_holos_eq_mid.store(c.tonal.midDb, std::memory_order_relaxed);
+    g_holos_eq_high.store(c.tonal.highDb, std::memory_order_relaxed);
+    // S3/510: espejo de los dos campos nuevos; sin esto el sync por
+    // bloque los reescribiría con los valores viejos (la presencia) o
+    // la corrección medida se perdería en el siguiente push (roomCorr).
+    g_holos_eq_presence.store(c.tonal.presenceDb, std::memory_order_relaxed);
+    for (int i = 0; i < 10; ++i)
+        g_room_corr_db[i].store(c.listenerRoom.roomCorrDb[i], std::memory_order_relaxed);
+}
+
+// ── S12/510 — FUNDIDO DE APLICACIÓN POR HOP (SLEW) ───────────────────────
+// nativeSetFusedControlsRamped: MISMA firma que nativeSetFusedControls (61
+// parámetros, mismo orden) + `rampHops` al final. La aplica el Organismo
+// (ProfileApplier, Dispatchers.IO) al aplicar un perfil descargado, en
+// lugar del push inmediato: la cadena interpola EQ/trim/compresor/
+// operadores desde el valor vigente hasta el objetivo sin escalón audible.
+//   rampHops < 0 → AUTO: FusedChain::rampHopsFor (≤0.5 dB por hop; la
+//     v1.1 pide 8 hops, ~21 ms @ 48 kHz).
+//   rampHops == 0 → inmediato, idéntico a nativeSetFusedControls.
+//   rampHops > 0 → ese número de hops (acotado a 32 en la cadena).
+// El espejo a los atomics es IDÉNTICO al del push inmediato: sin él, el
+// sync por bloque reescribiría los campos mapeados con los valores viejos
+// al terminar la rampa. El desempaquetado se duplica deliberadamente (no
+// se refactoriza la función viva): la entrada inmediata queda byte a byte
+// intacta y esta entrada solo existe cuando Kotlin la declara.
+// DECLARACIÓN KOTLIN PENDIENTE (agente de cableado — NO en este cambio):
+//   @JvmStatic external fun nativeSetFusedControlsRamped(
+//       <los mismos 61 parámetros en el mismo orden>, rampHops: Int)
+// en FusedControlsBridge, llamada desde el camino de aplicación de
+// perfiles con rampHops = -1 (auto). Sin esa declaración esta entrada es
+// código muerto sin llamador (no afecta al comportamiento).
+JNIEXPORT void JNICALL
+Java_com_ivanna_omega_audio_FusedControlsBridge_nativeSetFusedControlsRamped(
+    JNIEnv* /*env*/, jobject /*thiz*/,
+    jfloat spatialAmount, jfloat spatialAzimuthDeg, jfloat spatialDistanceM,
+    jfloat spatialWidth, jint spatialMode, jfloat spatialWfsSpread,
+    jfloat spatialHrtfWet, jboolean spatialHeadTracking, jboolean spatialXtc,
+    jboolean spatialUpmix, jfloat spatialImmersivity,
+    jfloat fieldAmount, jfloat fieldPhiAmount, jint fieldPhiPreset,
+    jfloat fieldPumping, jfloat fieldCoherence, jfloat fieldHarmonics,
+    jfloat fieldGamma, jfloat fieldWarmth, jfloat fieldDynamics,
+    jfloat fieldRt60,
+    jfloat roomRt60, jfloat roomSizeM, jfloat roomWet, jint roomHearingProfile,
+    jfloat transCorrection, jfloat transTemporal, jboolean transEmf,
+    jint tonalCurve, jfloat tonalTrimDb, jfloat tonalLowDb, jfloat tonalMidDb,
+    jfloat tonalHighDb, jboolean tonalLoudness,
+    jfloat dynPunch, jfloat dynWidth, jfloat dynSafety, jfloat dynThrDb,
+    jfloat dynRatio, jfloat dynExciter, jfloat dynVoice, jfloat dynUpmix,
+    jint brainMode, jfloat brainAdaptation,
+    jfloat consvAmount, jfloat consvEnergyCap, jfloat consvPhaseCoherence,
+    jfloat consvInertia,
+    jfloat fieldOmniAmount, jfloat fieldDiffuse,
+    // S3/510: presencia 4-8 kHz + corrección de sala cut-only (10 bandas).
+    // Al final para no mover los 50 parámetros existentes.
+    jfloat tonalPresenceDb,
+    jfloat roomCorrDb0, jfloat roomCorrDb1, jfloat roomCorrDb2,
+    jfloat roomCorrDb3, jfloat roomCorrDb4, jfloat roomCorrDb5,
+    jfloat roomCorrDb6, jfloat roomCorrDb7, jfloat roomCorrDb8,
+    jfloat roomCorrDb9,
+    jint rampHops) {
+    using ivanna::fused::FusedControls;
+    FusedControls c = g_fusedChainRouteA.controls();
+    c.spatial.amount = spatialAmount;
+    c.spatial.azimuthDeg = spatialAzimuthDeg;
+    c.spatial.distanceM = spatialDistanceM;
+    c.spatial.width = spatialWidth;
+    c.spatial.mode = (spatialMode == 1) ? ivanna::OmegaOutputMode::SPEAKERS
+                                        : ivanna::OmegaOutputMode::HEADPHONES;
+    c.spatial.wfsSpread = spatialWfsSpread;
+    c.spatial.hrtfWet = spatialHrtfWet;
+    c.spatial.headTracking = (spatialHeadTracking == JNI_TRUE);
+    c.spatial.xtcEnabled = (spatialXtc == JNI_TRUE);
+    c.spatial.upmixEnabled = (spatialUpmix == JNI_TRUE);
+    c.spatial.upmixImmersivity = spatialImmersivity;
+    c.field.amount = fieldAmount;
+    c.field.phiAmount = fieldPhiAmount;
+    c.field.phiPreset = fieldPhiPreset;
+    c.field.pumping = fieldPumping;
+    c.field.coherence = fieldCoherence;
+    c.field.harmonics = fieldHarmonics;
+    c.field.gamma = fieldGamma;
+    c.field.warmth = fieldWarmth;
+    c.field.dynamics = fieldDynamics;
+    c.field.roomRt60 = fieldRt60;
+    // Unificación 2.5.509 (paso 5): OmniField y diffuse tienen slot propio
+    // (antes OmniField seguía el amount de HOLOS y diffuse era fijo 0.85).
+    c.field.omniAmount = fieldOmniAmount;
+    c.field.diffuse = fieldDiffuse;
+    c.listenerRoom.rt60Sec = roomRt60;
+    c.listenerRoom.roomSizeM = roomSizeM;
+    c.listenerRoom.roomWet = roomWet;
+    c.listenerRoom.hearingProfile = roomHearingProfile;
+    // S3/510 — corrección de sala cut-only (10 bandas): por fin con slot
+    // en la firma fusionada. El clamp (-12..0) lo hace c.clamp() abajo.
+    {
+        const jfloat roomCorrIn[10] = {roomCorrDb0, roomCorrDb1, roomCorrDb2,
+            roomCorrDb3, roomCorrDb4, roomCorrDb5, roomCorrDb6, roomCorrDb7,
+            roomCorrDb8, roomCorrDb9};
+        for (int i = 0; i < 10; ++i)
+            c.listenerRoom.roomCorrDb[i] = roomCorrIn[i];
+    }
+    c.transducer.correction = transCorrection;
+    c.transducer.temporalAmount = transTemporal;
+    c.transducer.emfEnabled = (transEmf == JNI_TRUE);
+    c.tonal.curve = tonalCurve;
+    c.tonal.trimDb = tonalTrimDb;
+    c.tonal.lowDb = tonalLowDb;
+    c.tonal.midDb = tonalMidDb;
+    c.tonal.highDb = tonalHighDb;
+    c.tonal.presenceDb = tonalPresenceDb;  // S3/510.
+    c.tonal.loudnessComp = (tonalLoudness == JNI_TRUE);
+    c.dynamics.punch = dynPunch;
+    c.dynamics.width = dynWidth;
+    c.dynamics.safety = dynSafety;
+    c.dynamics.compThresholdDb = dynThrDb;
+    c.dynamics.compRatio = dynRatio;
+    c.dynamics.exciter = dynExciter;
+    c.dynamics.voice = dynVoice;
+    c.dynamics.upmixImmersivity = dynUpmix;
+    c.brain.mode = brainMode;
+    c.brain.adaptation = brainAdaptation;
+    // 8. Conservación perceptual (árbitro de campo, 2026-11-21).
+    c.conservation.amount = consvAmount;
+    c.conservation.energyCap = consvEnergyCap;
+    c.conservation.phaseCoherence = consvPhaseCoherence;
+    c.conservation.inertia = consvInertia;
+    c.clamp();
+    // S12/510: AUTO (rampHops < 0) = regla ≤0.5 dB/hop desde el valor
+    // vigente; 0 = inmediato (setControlsRamped delega en setControls).
+    const int hops = (rampHops < 0)
+        ? ivanna::fused::FusedChain::rampHopsFor(g_fusedChainRouteA.controls(), c)
+        : static_cast<int>(rampHops);
+    g_fusedChainRouteA.setControlsRamped(c, hops);
+    // FALLO 5 (SALA VIVA, Ruta A): igual que el push inmediato.
     g_fusedChainRouteA.listenerRoom().synthesizeMasterStudioBrir(c.field.roomRt60);
     // Espejo a los atomics (lo que el sync por bloque lee): sin esto el
     // sync reescribiría los campos mapeados con los valores viejos.

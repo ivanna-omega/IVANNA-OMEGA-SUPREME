@@ -5,6 +5,7 @@ import android.media.AudioManager
 import android.os.SystemClock
 import android.util.Log
 import com.ivanna.omega.audio.IvannaAudioProfile
+import com.ivanna.omega.audio.OmegaMetrics
 import com.ivanna.omega.audio.ProfilesLoader
 import com.ivanna.omega.audio.RealAcousticSensor
 import com.ivanna.omega.core.ParameterStore
@@ -91,6 +92,203 @@ object OrganismController {
     const val PROFILE_STATUS_ROLLED_BACK = "rolled_back"
     const val PROFILE_STATUS_QUARANTINED = "quarantined"
 
+    // ── S13/510 — presupuesto por hop y contador de xruns ────────────────
+    //
+    // 1 hop = 128 muestras @ 48 kHz = 2.6667 ms. Una aplicación automática
+    // que tarde más de 1 hop en el hilo que la ejecuta, o que coincida con
+    // un xrun/dropout, marca el perfil «aplicado con defecto» y la puerta
+    // A/B lo trata como fallo (rollback), no como dato — ver
+    // [evaluateApplyDefect] y el enganche T4 en [recordApplyMeasurement].
+    // La medición es solo telemetría: ningún trabajo nuevo en el hilo de
+    // audio (el apply corre en Dispatchers.IO, ver (c) abajo) y ningún
+    // recálculo por hop (los coeficientes EQ se fijan una vez al aplicar,
+    // verificado en código vivo — nota (d) al final de este bloque).
+    //
+    // (a) CONTADOR DE XRUNS — DISCREPANCIA HONESTA (código vivo manda):
+    // el contador del motor SÍ existe en nativo — `IvannaFusionState.
+    // xrun_count` (app/src/main/cpp/include/ivanna_fusion_state.h:152,
+    // músculo → cerebro, lo escribe el HAL stage) — pero NO hay ningún
+    // lector Kotlin/JNI que lo exponga a la app: ningún `.kt` lee el
+    // snapshot del daemon ni `xrun_count` (grep: 0 hits). Cablear ese
+    // lector es trabajo del motor/JNI, no de S13, así que NO se crea aquí
+    // (la especificación lo prohíbe expresamente) y queda como pendiente
+    // del motor. Lo que SÍ se puede leer hoy desde la app es el contador
+    // de underruns del AudioTrack propio, publicado en
+    // `OmegaMetrics.shared.value.underrunCount` (IvannaBridgePlayer lo
+    // refresca a ~1 Hz; la captura publica los suyos por la misma vía).
+    // Es un contador DISTINTO del xrun_count del daemon (underruns del
+    // reproductor/captura de la app, no del motor), y su refresco a ~1 Hz
+    // hace gruesa la detección de coincidencia: un delta > 0 entre el
+    // antes y el después de la aplicación es evidencia suficiente de un
+    // dropout alrededor de la aplicación, pero un delta == 0 NO prueba
+    // que no hubo xrun (el refresco puede no haber caído aún en la
+    // ventana de ~ms). Por eso la fuente queda registrada en el estado
+    // (`lastApplyXrunSource`): cuando el motor exponga `xrun_count`, el
+    // lector se cambia por él sin tocar la guarda.
+    // (b) GUARDA: [evaluateApplyDefect] (pura, testeable en JVM).
+    // (c) LA APLICACIÓN NUNCA CORRE EN EL HILO DE AUDIO NI EN LA UI:
+    // el camino automático de T1 (pollJob en `scope` =
+    // CoroutineScope(Dispatchers.IO + SupervisorJob()) →
+    // pollProfileOnce → applyServerProfile → applyAndCommit → install →
+    // onApplyProfile → ProfileManagerBridge.applyProfile → applyToDsp →
+    // pushToNative) es síncrono en el hilo del pollJob: ni
+    // ProfileManagerBridge ni ProfileManager cambian de dispatcher
+    // (grep: 0 `withContext`/`launch`/`Dispatchers` en ambos) y el
+    // puente se invoca síncrono desde el callback `install`. La vía
+    // MANUAL desde la UI (MainActivity:544,663,672) sigue corriendo en el
+    // hilo que la llama (Main): es acción del usuario, no aplicación
+    // automática — fuera del alcance de S13. Single-flight: el sondeo ya
+    // se serializaba con `profilePollMutex`, pero eso serializa SONDEOS,
+    // no aplicaciones; S13 añade [ApplySingleFlight] dedicado alrededor
+    // de [applyServerProfile]: la segunda aplicación concurrente se
+    // RECHAZA (tryLock, fail-closed) y se reintenta en el próximo sondeo
+    // — no espera, para no bloquear el ciclo de sondeo.
+    // (d) SIN RECÁLCULO POR HOP — VERIFICADO EN CÓDIGO VIVO, SIN DEFECTO:
+    // `FusedTonal.setControls` → `applyControls()` → `RoomCorrectionEq.
+    // setTarget(gains)` calcula las 10 ganancias UNA vez por aplicación;
+    // `FusedChain.process()` sí llama a `tonal_.setControls(eff.tonal)`
+    // en cada bloque, pero `setTarget` solo copia 10 floats con clamp
+    // (sin diseñar biquads). Los coeficientes biquad se rediseñan
+    // (`eq_.setBand`) solo dentro de `RoomCorrectionEq.process()` y solo
+    // mientras `cur_` está en slew hacia `tgt_` (≤0.25 dB/bloque,
+    // `kSlewDbPerBlock`), y se detiene al converger. No hay recálculo por
+    // hop a causa del perfil: la publicación es por intercambio de
+    // parámetros (`setControls` con los controles efectivos) y el slew
+    // acotado es el diseño existente (S12), no un defecto. Nada que
+    // corregir en S13.
+    /** Presupuesto de 1 hop en µs (128 muestras @ 48 kHz = 2.6667 ms). */
+    const val APPLY_HOP_BUDGET_US = 2_667L
+
+    /** Fuente del contador muestreado alrededor de la aplicación. */
+    const val XRUN_SOURCE_NONE = "none"
+    /** AudioTrack.underrunCount vía OmegaMetrics (refresco ~1 Hz). */
+    const val XRUN_SOURCE_AUDIOTRACK = "audiotrack_underrun"
+    /**
+     * xrun_count del daemon (IvannaFusionState): SIN lector Kotlin/JNI
+     * — pendiente del motor (ver nota (a) arriba). No usar hasta que
+     * exista el lector.
+     */
+    const val XRUN_SOURCE_DAEMON = "daemon_xrun_count"
+
+    /** Motivos de `lastApplyDefectReason` ("" = sin defecto). */
+    const val APPLY_DEFECT_NONE = ""
+    const val APPLY_DEFECT_OVER_BUDGET = "over_budget"
+    const val APPLY_DEFECT_XRUN = "xrun"
+    const val APPLY_DEFECT_OVER_BUDGET_AND_XRUN = "over_budget+xrun"
+    /** El intento no llegó a aplicar (install false / read-back fallido). */
+    const val APPLY_DEFECT_NOT_APPLIED = "not_applied"
+
+    /**
+     * S13 — veredicto puro de la guarda de aplicación (testeable en JVM).
+     * `defective` solo si el perfil QUEDÓ aplicado ([applied] true) y
+     * además tardó más de 1 hop o coincidió con un xrun. Un intento que
+     * no aplicó no es «aplicado con defecto»: ya lo cubre el camino
+     * NotCommitted (diario PENDING, reintento en el próximo sondeo).
+     */
+    data class ApplyDefectVerdict(
+        val defective: Boolean,
+        val overBudget: Boolean,
+        val xrunCoincided: Boolean,
+        val reason: String
+    )
+
+    /** Medición de UNA aplicación automática (la registra [recordApplyMeasurement]). */
+    data class ApplyMeasurement(
+        val version: Long,
+        val durationUs: Long,
+        val xrunsBefore: Int?,
+        val xrunsAfter: Int?,
+        val xrunSource: String,
+        val applied: Boolean,
+        val atMs: Long
+    )
+
+    /**
+     * S13 — guarda pura (testeable en JVM): ¿la aplicación quedó
+     * «aplicada con defecto»? `xrunDelta` null = sin contador observable
+     * (la pata de xrun no dispara; la de presupuesto sí).
+     */
+    fun evaluateApplyDefect(
+        durationUs: Long,
+        xrunDelta: Int?,
+        applied: Boolean
+    ): ApplyDefectVerdict {
+        if (!applied) {
+            return ApplyDefectVerdict(
+                defective = false,
+                overBudget = false,
+                xrunCoincided = false,
+                reason = APPLY_DEFECT_NOT_APPLIED
+            )
+        }
+        val overBudget = durationUs > APPLY_HOP_BUDGET_US
+        val xrunCoincided = (xrunDelta ?: 0) > 0
+        val reason = when {
+            overBudget && xrunCoincided -> APPLY_DEFECT_OVER_BUDGET_AND_XRUN
+            overBudget -> APPLY_DEFECT_OVER_BUDGET
+            xrunCoincided -> APPLY_DEFECT_XRUN
+            else -> APPLY_DEFECT_NONE
+        }
+        return ApplyDefectVerdict(
+            defective = overBudget || xrunCoincided,
+            overBudget = overBudget,
+            xrunCoincided = xrunCoincided,
+            reason = reason
+        )
+    }
+
+    /**
+     * S13 — delta del contador entre el antes y el después de aplicar.
+     * null si no hay contador observable. Un delta negativo es un reset
+     * del contador (el AudioTrack se recrea y `underrunCount` vuelve a 0):
+     * se clampa a 0, no es un dropout.
+     */
+    fun xrunDelta(before: Int?, after: Int?): Int? {
+        if (before == null || after == null) return null
+        return (after - before).coerceAtLeast(0)
+    }
+
+    /**
+     * S13 — transición pura del [State] con una medición de aplicación
+     * (testeable en JVM). El veredicto pertenece a [ApplyMeasurement.
+     * version]: T4/Fase 3 debe comprobar que coincide con
+     * `appliedProfileVersion` antes de usar `lastApplyDefective` (un
+     * veredicto de una versión anterior no condena a la vigente).
+     */
+    fun applyMeasurementToState(state: State, m: ApplyMeasurement): State {
+        val delta = xrunDelta(m.xrunsBefore, m.xrunsAfter)
+        val verdict = evaluateApplyDefect(m.durationUs, delta, m.applied)
+        return state.copy(
+            lastApplyVersion = m.version,
+            lastApplyDurationUs = m.durationUs,
+            lastApplyAtMs = m.atMs,
+            lastApplyXrunsBefore = m.xrunsBefore,
+            lastApplyXrunsAfter = m.xrunsAfter,
+            lastApplyXrunDelta = delta,
+            lastApplyXrunSource = m.xrunSource,
+            lastApplyOverBudget = verdict.overBudget,
+            lastApplyDefective = verdict.defective,
+            lastApplyDefectReason = verdict.reason
+        )
+    }
+
+    /**
+     * S13 — single-flight de aplicación (dos aplicaciones concurrentes
+     * prohibidas). tryLock = la segunda se RECHAZA, no espera (el
+     * reintento llega en el próximo sondeo). Solo el poseedor libera.
+     * Puro JVM: [Mutex.tryLock]/[Mutex.unlock] no suspenden.
+     */
+    class ApplySingleFlight {
+        private val mutex = Mutex()
+        /** true si esta llamada obtuvo el turno; false si otra aplicación está en curso. */
+        fun tryAcquire(): Boolean = mutex.tryLock()
+        /** Libera el turno; sin efecto si nadie lo tiene. */
+        fun release() {
+            if (mutex.isLocked) mutex.unlock()
+        }
+        val isLocked: Boolean get() = mutex.isLocked
+    }
+
     enum class Status {
         OFF, CAPTURING, QUEUED, OFFLINE, ERROR, NO_TOKEN, TOKEN_INVALID
     }
@@ -129,7 +327,35 @@ object OrganismController {
          * camino de la VUELTA). No duplica `appliedProfileVersion`
          * (T2): es el estado, no la versión.
          */
-        val appliedProfileStatus: String = PROFILE_STATUS_NONE
+        val appliedProfileStatus: String = PROFILE_STATUS_NONE,
+        // ── S13/510 — telemetría de la última aplicación automática ──
+        /** Versión a la que pertenece esta medición (null = aún no hay ninguna). */
+        val lastApplyVersion: Long? = null,
+        /** Tiempo de `applyProfile` + `pushToNative()` en µs (Dispatchers.IO). Null = aún no hay medición. */
+        val lastApplyDurationUs: Long? = null,
+        /** Cuándo se midió (System.currentTimeMillis). 0 = aún no hay medición. */
+        val lastApplyAtMs: Long = 0L,
+        /** Contador de dropouts antes / después de aplicar (null = sin contador observable). */
+        val lastApplyXrunsBefore: Int? = null,
+        val lastApplyXrunsAfter: Int? = null,
+        /** Delta after − before (null = sin contador; 0 = sin dropout observado). */
+        val lastApplyXrunDelta: Int? = null,
+        /** Qué contador se muestreó: [XRUN_SOURCE_AUDIOTRACK] hoy; [XRUN_SOURCE_DAEMON] cuando el motor lo exponga. */
+        val lastApplyXrunSource: String = XRUN_SOURCE_NONE,
+        /** true si la aplicación tardó más de 1 hop (2.667 ms). */
+        val lastApplyOverBudget: Boolean = false,
+        /**
+         * S13 — «aplicado con defecto»: la aplicación tardó más de 1 hop
+         * o coincidió con un xrun. ENGANCHE T4/Fase 3: la puerta A/B lee
+         * este flag (junto a [lastApplyVersion] == `appliedProfileVersion`
+         * y [lastApplyDefectReason]) y trata ese perfil como FALLO
+         * (rollback), no como dato. S13 solo marca; T4 implementa el
+         * tratamiento (la confirmación `POST /profile/applied` vive en
+         * OrganismPayload, fuera de S13).
+         */
+        val lastApplyDefective: Boolean = false,
+        /** Motivo del defecto: "" | "over_budget" | "xrun" | "over_budget+xrun" | "not_applied". */
+        val lastApplyDefectReason: String = APPLY_DEFECT_NONE
     )
 
     private val _state = MutableStateFlow(State())
@@ -170,6 +396,23 @@ object OrganismController {
     private var profileApplier: ProfileApplier? = null
     private var pollJob: Job? = null
     private val profilePollMutex = Mutex()
+
+    /** S13 — single-flight de aplicación (dos aplicaciones concurrentes prohibidas; la segunda se rechaza). */
+    private val applySingleFlight = ApplySingleFlight()
+
+    /**
+     * S13 — lector del contador de dropouts observable desde la app.
+     * Por defecto lee `OmegaMetrics.shared.value.underrunCount`
+     * (AudioTrack.underrunCount del bridge/captura, refresco ~1 Hz;
+     * null si no se puede leer). Es `var` para que los tests y el
+     * futuro lector del daemon (`IvannaFusionState.xrun_count`, pendiente
+     * del motor) lo sustituyan sin tocar la guarda. La fuente muestreada
+     * queda en `State.lastApplyXrunSource`.
+     */
+    @Volatile
+    var xrunCounterReader: (() -> Int?)? = {
+        runCatching { OmegaMetrics.shared.value.underrunCount }.getOrNull()
+    }
 
     /** Último sondeo de perfil que ARRANCÓ (el due-check de flushOnce lo lee). */
     @Volatile
@@ -429,6 +672,38 @@ object OrganismController {
             )
         }
 
+    /**
+     * S13 — registra la medición de una aplicación automática en el
+     * [State] (vía la transición pura [applyMeasurementToState]) y
+     * devuelve el veredicto de la guarda. Lo llama el camino de
+     * aplicación de T1 ([installValidatedProfile]) tras cada intento de
+     * `applyProfile` + `pushToNative()`, aplicado o no. Si el veredicto
+     * es defectuoso, el perfil queda marcado «aplicado con defecto» y
+     * la puerta A/B lo trata como fallo: ENGANCHE T4/Fase 3 — leer
+     * `state.lastApplyDefective` con `lastApplyVersion ==
+     * appliedProfileVersion` (ver KDoc de `State.lastApplyDefective`).
+     * No hace rollback aquí: el rollback lo decide la puerta A/B (T4).
+     */
+    @Synchronized
+    fun recordApplyMeasurement(m: ApplyMeasurement): ApplyDefectVerdict {
+        _state.value = applyMeasurementToState(_state.value, m)
+        // El veredicto devuelto es el mismo que quedó en el State (sin
+        // recalcular: se deriva de los campos recién escritos).
+        val s = _state.value
+        val verdict = ApplyDefectVerdict(
+            defective = s.lastApplyDefective,
+            overBudget = s.lastApplyOverBudget,
+            xrunCoincided = (s.lastApplyXrunDelta ?: 0) > 0,
+            reason = s.lastApplyDefectReason
+        )
+        if (verdict.defective) {
+            Log.w(TAG, "S13: perfil v${m.version} aplicado con defecto (${verdict.reason}; ${m.durationUs} µs, xrunDelta=${s.lastApplyXrunDelta}); la puerta A/B debe tratarlo como fallo")
+        } else {
+            Log.i(TAG, "S13: aplicación v${m.version} medida: ${m.durationUs} µs (presupuesto 1 hop = $APPLY_HOP_BUDGET_US µs), xruns ${m.xrunsBefore}→${m.xrunsAfter} (${m.xrunSource})")
+        }
+        return verdict
+    }
+
     @Volatile
     private var lastFlushOutcome: OrganismSender.Outcome? = null
     @Volatile
@@ -585,7 +860,19 @@ object OrganismController {
             appliedProfileHash = _state.value.appliedProfileHash,
             // T1/510: el estado del perfil aplicado se conserva igual
             // (solo lo cambia el camino de la VUELTA).
-            appliedProfileStatus = _state.value.appliedProfileStatus
+            appliedProfileStatus = _state.value.appliedProfileStatus,
+            // S13/510: la telemetría de la última aplicación se conserva
+            // igual (solo la cambia recordApplyMeasurement).
+            lastApplyVersion = _state.value.lastApplyVersion,
+            lastApplyDurationUs = _state.value.lastApplyDurationUs,
+            lastApplyAtMs = _state.value.lastApplyAtMs,
+            lastApplyXrunsBefore = _state.value.lastApplyXrunsBefore,
+            lastApplyXrunsAfter = _state.value.lastApplyXrunsAfter,
+            lastApplyXrunDelta = _state.value.lastApplyXrunDelta,
+            lastApplyXrunSource = _state.value.lastApplyXrunSource,
+            lastApplyOverBudget = _state.value.lastApplyOverBudget,
+            lastApplyDefective = _state.value.lastApplyDefective,
+            lastApplyDefectReason = _state.value.lastApplyDefectReason
         )
     }
 
@@ -722,8 +1009,31 @@ object OrganismController {
      * Aplica un perfil del servidor por la vía completa: validar (C2) →
      * instalar con diario (C8) → confirmar por read-back → registrar →
      * confirmar al servidor. Devuelve true solo si quedó commiteado.
+     *
+     * S13 (c): single-flight — si otra aplicación está en curso, este
+     * intento se RECHAZA (no espera) y se reintenta en el próximo
+     * sondeo. El `profilePollMutex` de [pollProfileOnce] ya serializa
+     * sondeos, pero este mutex serializa APLICACIONES como tales.
      */
     private fun applyServerProfile(
+        ctx: Context,
+        current: ProfileFetcher.Result.Current,
+        rolledBack: Boolean,
+        promoteToStable: Boolean,
+        previousVersion: Long
+    ): Boolean {
+        if (!applySingleFlight.tryAcquire()) {
+            Log.w(TAG, "S13: otra aplicación en curso; se rechaza la v${current.version} (se reintenta en el próximo sondeo)")
+            return false
+        }
+        try {
+            return applyServerProfileLocked(ctx, current, rolledBack, promoteToStable, previousVersion)
+        } finally {
+            applySingleFlight.release()
+        }
+    }
+
+    private fun applyServerProfileLocked(
         ctx: Context,
         current: ProfileFetcher.Result.Current,
         rolledBack: Boolean,
@@ -831,7 +1141,32 @@ object OrganismController {
                 lastModified = java.time.LocalDate.now().toString()
             )
         )
-        return runCatching { apply(ivanna) }.getOrDefault(false)
+        // S13 (a): telemetría mínima de la aplicación — tiempo de
+        // `applyProfile` + `pushToNative()` (el puente es síncrono y
+        // corre en el hilo del pollJob, Dispatchers.IO; ver nota (c) en
+        // las constantes S13) y contador de dropouts antes/después.
+        // System.nanoTime() es monótono y puro JVM. La traducción y el
+        // saveOverride() de arriba NO se miden: la especificación pide
+        // applyProfile + pushToNative, no la instalación en disco.
+        // El veredicto de defecto solo marca si el perfil QUEDÓ aplicado
+        // (`applied` true); un intento fallido queda como "not_applied".
+        val xrunsBefore = runCatching { xrunCounterReader?.invoke() }.getOrNull()
+        val startNs = System.nanoTime()
+        val applied = runCatching { apply(ivanna) }.getOrDefault(false)
+        val durationUs = (System.nanoTime() - startNs) / 1_000L
+        val xrunsAfter = runCatching { xrunCounterReader?.invoke() }.getOrNull()
+        recordApplyMeasurement(
+            ApplyMeasurement(
+                version = current.version,
+                durationUs = durationUs,
+                xrunsBefore = xrunsBefore,
+                xrunsAfter = xrunsAfter,
+                xrunSource = if (xrunsBefore == null && xrunsAfter == null) XRUN_SOURCE_NONE else XRUN_SOURCE_AUDIOTRACK,
+                applied = applied,
+                atMs = System.currentTimeMillis()
+            )
+        )
+        return applied
     }
 
     /**

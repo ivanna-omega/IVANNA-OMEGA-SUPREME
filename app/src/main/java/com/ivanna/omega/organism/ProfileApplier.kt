@@ -45,6 +45,16 @@ import java.io.File
  * COMMITTED tras la lectura de vuelta del perfil aplicado; al arrancar,
  * `OrganismController.start()` restaura el estable verificado si el
  * diario quedó PENDING (máximo 1 intento por arranque).
+ *
+ * S9 (release 510): guarda de coherencia antes de aplicar EQ. Con
+ * coherencia media < 0.20 la tabla ERB puede ser artefacto de fase
+ * (filtro peine), no error tonal; aplicar +2 dB sobre un nulo de peine
+ * es corregir un fantasma. Un candidato con `mean_coherence < 0.20`
+ * se rechaza (a cuarentena por el camino ya existente) salvo marca
+ * explícita `ab_measurement_only: true` en la raíz del perfil: ese
+ * candidato es solo medición para el A/B, no promoción, y la
+ * validación lo indica en [ValidatedProfile.abMeasurementOnly] para
+ * que T1/OrganismController lo sepan y no lo traten como promoción.
  */
 class ProfileApplier(
     private val dir: File,
@@ -462,6 +472,20 @@ class ProfileApplier(
         /** (g) Salto máximo de un operador entre versiones: 0.2. */
         const val MAX_OPERATOR_STEP = 0.2
 
+        /**
+         * (S9) Umbral de la guarda de coherencia (§S9 de
+         * `evolucion-magistral-autonomia-completa.md`): un candidato
+         * con `mean_coherence < 0.20` se rechaza salvo marca explícita
+         * `ab_measurement_only`. Justificación: con coherencia media
+         * 0% la tabla ERB puede ser artefacto de fase (filtro peine),
+         * no error tonal; aplicar +2 dB sobre un nulo de peine es
+         * corregir un fantasma. El 0.20 es el umbral de la
+         * especificación (la guarda del analizador usa el mismo 0.20
+         * por banda: solo emite correcciones en bandas con coherencia
+         * por banda > 0.20).
+         */
+        const val MIN_MEAN_COHERENCE = 0.20
+
         /** Nombre del último perfil bueno (destino del rollback; T1 lo gestiona). */
         const val STABLE_FILE_NAME = "muselink-profile-stable.ivanna.json"
 
@@ -672,7 +696,16 @@ data class ValidatedProfile(
     val volterraMix: Double,
     val compressor: CompressorParams,
     val structuralSplitTransientAmount: Double,
-    val structuralSplitTonalAmount: Double
+    val structuralSplitTonalAmount: Double,
+    /**
+     * S9: true solo si el perfil trae `ab_measurement_only: true`
+     * (campo explícito en la raíz, nunca inferido). El candidato es
+     * solo medición para el A/B: pasó la guarda de coherencia por la
+     * marca, no porque su coherencia sea suficiente. T1 /
+     * OrganismController deben tratarlo como medición, no como
+     * promoción a estable.
+     */
+    val abMeasurementOnly: Boolean = false
 )
 
 /**
@@ -716,9 +749,23 @@ private class ProfileValidator(
 
         // (b) Forma estricta de la raíz.
         checkKeys(
-            data, ROOT_KEYS, ROOT_KEYS, "\$",
+            data, ROOT_KEYS, ROOT_ALLOWED_KEYS, "\$",
             "claves obligatorias del schema v1.0"
         )
+        // (S9) Marca explícita de solo-medición del A/B (opcional, en
+        // la raíz; nunca inferida de nada). Solo un booleano true
+        // exime de la guarda de coherencia; cualquier otro tipo es
+        // error. El analizador la emite para los candidatos que son
+        // solo medición del A/B (la v1.1 es el primero).
+        var abMeasurementOnly = false
+        val abEl = data.get("ab_measurement_only")
+        if (abEl != null) {
+            if (!abEl.isJsonPrimitive || !abEl.asJsonPrimitive.isBoolean) {
+                err("\$.ab_measurement_only", "debe ser boolean")
+            } else {
+                abMeasurementOnly = abEl.asBoolean
+            }
+        }
         if (data.get("format")?.takeIf { it.isJsonPrimitive }?.asString != ProfileApplier.FORMAT) {
             err("\$.format", "debe ser exactamente '${ProfileApplier.FORMAT}'")
         }
@@ -754,6 +801,22 @@ private class ProfileValidator(
             erbBands = checkErbBands(f)
             checkDetectedIssues(f)
             checkFileFingerprintFields(f)
+        }
+
+        // (S9) Guarda de coherencia: con coherencia media < 0.20 la
+        // tabla ERB puede ser artefacto de fase (filtro peine), no
+        // error tonal; aplicar +2 dB sobre un nulo de peine es
+        // corregir un fantasma. Solo un candidato marcado
+        // explícitamente ab_measurement_only (medición para el A/B,
+        // no promoción) pasa la guarda. El rechazo va a cuarentena
+        // por el camino ya existente ([apply]/[applyAndCommit]).
+        if (meanCoherence != null && meanCoherence < ProfileApplier.MIN_MEAN_COHERENCE && !abMeasurementOnly) {
+            err(
+                "\$.fingerprint.mean_coherence",
+                "coherencia media $meanCoherence < ${ProfileApplier.MIN_MEAN_COHERENCE}: la tabla ERB puede ser " +
+                    "artefacto de fase (filtro peine), no error tonal; candidato rechazado salvo " +
+                    "marca explícita ab_measurement_only (solo-medición A/B)"
+            )
         }
 
         // (b)(c) Engine: claves exactas + rangos del esquema.
@@ -868,7 +931,8 @@ private class ProfileValidator(
                 volterraMix = volterraMix!!,
                 compressor = compressor!!,
                 structuralSplitTransientAmount = splitTransientAmount!!,
-                structuralSplitTonalAmount = splitTonalAmount!!
+                structuralSplitTonalAmount = splitTonalAmount!!,
+                abMeasurementOnly = abMeasurementOnly
             )
         )
     }
@@ -1127,6 +1191,14 @@ private class ProfileValidator(
             "format", "format_version", "track", "artist", "source",
             "duration_s", "fingerprint", "engine", "derivation"
         )
+
+        /**
+         * Raíz permitida: las obligatorias + la marca S9 opcional
+         * `ab_measurement_only` (solo-medición A/B). La marca NO es
+         * obligatoria: un candidato de promoción sin ella simplemente
+         * pasa por la guarda de coherencia sin exención.
+         */
+        private val ROOT_ALLOWED_KEYS = ROOT_KEYS + "ab_measurement_only"
         private val ENGINE_KEYS = setOf(
             "orbe_amount", "orbe_distance_m", "holos_amount", "phi_amount",
             "volterra_enabled", "volterra_mix", "eq_bands_db", "compressor",
