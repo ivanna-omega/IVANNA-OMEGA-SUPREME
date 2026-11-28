@@ -219,6 +219,10 @@ def main() -> int:
         # corren en paralelo y la suma inflaria el tiempo ~4x (1498 s en
         # vez de ~380 s). Si no hay wall en el JUnit, se usa la suma.
         duration = wall_max if wall_max else total_time
+        # El job Ledger de la CI no compila (solo baja artefactos): build/
+        # no existe ahi. Crear el padre o write_text levanta FileNotFoundError
+        # y el paso muere (reproducido en local 2026-11-28).
+        Path(args.merged_summary).parent.mkdir(parents=True, exist_ok=True)
         Path(args.merged_summary).write_text(
             f"{pct}% tests passed, {len(failed)} tests failed out of {total}\n"
             f"Total Test time (real) = {duration:.2f} sec\n",
