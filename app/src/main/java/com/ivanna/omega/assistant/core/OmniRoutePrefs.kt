@@ -53,6 +53,69 @@ object OmniRoutePrefs {
     /** Modelo/combo por defecto del gateway. */
     const val DEFAULT_MODEL = "ivanna-free"
 
+    /**
+     * Descubrimiento de la URL viva del gateway (v2.5.509, auto-enlace).
+     *
+     * La dirección pública del túnel rota cada pocos minutos y NO puede
+     * ir en el APK (v2.5.471: la dirección del gateway del dueño no va
+     * hardcodeada, ni como default, ni en comentarios) ni pedirse al
+     * usuario en cada rotación — ese era el fallo que obligaba a copiar
+     * URL y key a mano y a reintentar sin éxito. El vigilante del túnel
+     * publica la URL vigente en `omniroute.json` (rama `omniroute-url`
+     * del repo, archivo público, sin PRs porque no es main); la app la
+     * lee al arrancar y la guarda como URL vigente. Si el descubrimiento
+     * falla (sin red, archivo caído), se usa la URL guardada. Aquí solo
+     * vive el puntero público; la dirección del túnel NUNCA va en el APK.
+     */
+    const val DISCOVERY_URL =
+        "https://raw.githubusercontent.com/ivanna-omega/IVANNA-OMEGA-SUPREME/omniroute-url/omniroute.json"
+
+    /**
+     * Normaliza una URL de gateway: quita espacios y barra final y exige
+     * el sufijo `/v1` (lo añade si falta). Acepta https siempre, y http
+     * solo para localhost (pruebas locales del gateway). Null si no es
+     * una URL de gateway válida. Función pura (sin Context) para poder
+     * testearla sin Android.
+     */
+    fun normalizeGatewayUrl(url: String): String? {
+        val clean = url.trim().trimEnd('/')
+        if (clean.isEmpty()) return null
+        val lower = clean.lowercase()
+        val afterScheme = when {
+            lower.startsWith("https://") -> clean.substring("https://".length)
+            lower.startsWith("http://localhost") ||
+                lower.startsWith("http://127.0.0.1") -> clean.substring("http://".length)
+            else -> return null
+        }
+        val host = afterScheme.substringBefore('/').substringBefore(':')
+        if (host.isBlank()) return null
+        if (host != "localhost" && !host.contains('.')) return null
+        return if (clean.endsWith("/v1")) clean else "$clean/v1"
+    }
+
+    /**
+     * Parsea el archivo de descubrimiento `{"omniroute_url": "https://.../v1"}`.
+     * Null si el JSON no trae una URL de gateway válida. Función pura.
+     */
+    fun parseDiscoveredBaseUrl(json: String): String? = runCatching {
+        val raw = org.json.JSONObject(json).optString("omniroute_url").orEmpty()
+        normalizeGatewayUrl(raw)
+    }.getOrNull()
+
+    /**
+     * true si la URL apunta al túnel público (localhost.run). Solo esas
+     * URLs las puede sustituir el descubrimiento: una URL propia del
+     * usuario (su propio gateway) se respeta siempre. Función pura.
+     */
+    fun isTunnelUrl(url: String): Boolean {
+        val host = url.trim().lowercase()
+            .removePrefix("http://")
+            .removePrefix("https://")
+            .substringBefore('/')
+            .substringBefore(':')
+        return host.endsWith(".app.lhr.life")
+    }
+
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 

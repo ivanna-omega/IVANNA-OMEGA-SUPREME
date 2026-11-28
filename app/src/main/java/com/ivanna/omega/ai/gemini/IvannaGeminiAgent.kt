@@ -115,7 +115,12 @@ class IvannaGeminiAgent(
     private val omniRouteOrchestrator by lazy {
         OmniRouteOrchestrator(
             configProvider = { resolveOmniRouteConfig() },
-            scope = scope
+            scope = scope,
+            // Auto-enlace (v2.5.509): la URL descubierta se persiste para
+            // que la guardada no se quede rancia entre arranques.
+            onDiscoveredBaseUrl = { url ->
+                com.ivanna.omega.assistant.core.OmniRoutePrefs.setBaseUrl(appContext, url)
+            }
         )
     }
 

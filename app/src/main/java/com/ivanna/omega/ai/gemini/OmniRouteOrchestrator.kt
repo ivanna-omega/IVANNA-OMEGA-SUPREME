@@ -50,7 +50,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 class OmniRouteOrchestrator(
     private val configProvider: () -> OmniRouteConfig,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
-    httpClient: OkHttpClient? = null
+    httpClient: OkHttpClient? = null,
+    /**
+     * Se llama cuando el descubrimiento publica una URL vigente distinta
+     * de la guardada (v2.5.509, auto-enlace): el llamador la persiste
+     * (OmniRoutePrefs.setBaseUrl) para que la guardada no se quede
+     * rancia entre arranques. No-op por defecto (tests).
+     */
+    private val onDiscoveredBaseUrl: (String) -> Unit = {}
 ) {
     companion object {
         private const val TAG = "OmniRouteOrchestrator"
@@ -63,6 +70,8 @@ class OmniRouteOrchestrator(
         private const val REQUEST_TIMEOUT_MS = 15_000L
         private const val STREAM_TIMEOUT_MS = 30_000L
         private const val MAX_OUTPUT_TOKENS_CEILING = 8192
+        private const val DISCOVERY_TIMEOUT_MS = 3_000L
+        private const val DISCOVERY_CACHE_TTL_MS = 600_000L // 10 min
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
@@ -166,6 +175,19 @@ class OmniRouteOrchestrator(
         }
 
         /**
+         * true si un código de respuesta del health check (GET /v1/models)
+         * prueba que el gateway está vivo y alcanzable. 200 = vivo con
+         * key válida. 401 = vivo SIN key (o con key rechazada): el gateway
+         * respondió, así que la ruta existe; la key es opcional para el
+         * chat ivanna-free, así que un 401 NO es un fallo y NO abre el
+         * circuito (antes, 3 health checks 401 seguidos lo abrían y Ami
+         * dejaba de intentar el gateway para siempre). Cualquier otro
+         * código (502 túnel caído, 5xx, 404) = no vivo.
+         */
+        fun isAliveResponseCode(code: Int): Boolean =
+            code == 401 || code in 200..299
+
+        /**
          * Transición pura del circuit breaker (testeable sin red).
          * Éxito: cierra el circuito y resetea fallos. Fallo: acumula; a
          * partir de MAX_CONSECUTIVE_FAILURES abre el circuito.
@@ -252,6 +274,12 @@ class OmniRouteOrchestrator(
 
     @Volatile private var lastRealActivityAt = System.currentTimeMillis()
 
+    // Caché en memoria de la URL descubierta (v2.5.509, auto-enlace):
+    // el archivo de descubrimiento se lee como mucho una vez cada
+    // 10 min por proceso; entre medias manda la caché.
+    @Volatile private var discoveredBaseUrl: String? = null
+    @Volatile private var discoveredAtMs: Long = 0
+
     /** Llamar en cada consulta real del usuario (igual que GeminiOrchestrator). */
     fun notifyRealActivity() { lastRealActivityAt = System.currentTimeMillis() }
 
@@ -265,12 +293,57 @@ class OmniRouteOrchestrator(
         }
     }
 
-    private fun resolveConfig(): OmniRouteConfig {
+    /**
+     * Lee la URL viva del gateway del archivo de descubrimiento
+     * (OmniRoutePrefs.DISCOVERY_URL), con caché en memoria de 10 min y
+     * timeout de 3 s. Null si no hay red, el archivo no responde o no
+     * trae una URL válida — el llamador usa entonces la URL guardada.
+     * Nunca lanza: cualquier fallo es un null silencioso (con log).
+     */
+    private suspend fun fetchDiscoveredBaseUrl(): String? {
+        val now = System.currentTimeMillis()
+        val cached = discoveredBaseUrl
+        if (cached != null && now - discoveredAtMs < DISCOVERY_CACHE_TTL_MS) return cached
+        val found = runCatching {
+            withTimeout(DISCOVERY_TIMEOUT_MS) {
+                val request = Request.Builder().url(OmniRoutePrefs.DISCOVERY_URL).get().build()
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        OmniRoutePrefs.parseDiscoveredBaseUrl(response.body?.string().orEmpty())
+                    } else {
+                        null
+                    }
+                }
+            }
+        }.onFailure { Log.w(TAG, "Descubrimiento OmniRoute falló: ${it.message}") }.getOrNull()
+        if (found != null) {
+            discoveredBaseUrl = found
+            discoveredAtMs = now
+        }
+        return found
+    }
+
+    private suspend fun resolveConfig(): OmniRouteConfig {
         val raw = configProvider()
+        var baseUrl = raw.baseUrl.trim().trimEnd('/')
+        // Auto-enlace (v2.5.509): la URL del túnel rota cada pocos
+        // minutos y la guardada se queda rancia. El descubrimiento
+        // publica la vigente; si hay una y difiere de la guardada,
+        // manda ella — pero solo si la guardada es del túnel o está
+        // vacía: una URL propia del usuario (su propio gateway) se
+        // respeta siempre. La descubierta se persiste (vía
+        // onDiscoveredBaseUrl) para que la guardada no se quede rancia
+        // entre arranques.
+        val discovered = fetchDiscoveredBaseUrl()
+        if (discovered != null && discovered != baseUrl &&
+            (baseUrl.isBlank() || OmniRoutePrefs.isTunnelUrl(baseUrl))) {
+            baseUrl = discovered
+            runCatching { onDiscoveredBaseUrl(discovered) }
+        }
         // Sin URL no hay fallback: DEFAULT_BASE_URL es "" (v2.5.471) y un
         // gateway sin configurar NO se intenta (ver guards abajo).
         return raw.copy(
-            baseUrl = raw.baseUrl.trim().trimEnd('/'),
+            baseUrl = baseUrl,
             model = raw.model.trim().ifBlank { OmniRoutePrefs.DEFAULT_MODEL }
         )
     }
@@ -367,6 +440,15 @@ class OmniRouteOrchestrator(
             .build()
         client.newCall(request).execute().use { response ->
             val rawBody = response.body?.string().orEmpty()
+            if (response.code == 401 && config.apiKey.isNotBlank()) {
+                // La key guardada fue rechazada: el chat ivanna-free no
+                // la exige — reintentar una sola vez sin key en vez de
+                // fallar (la key guardada NO se borra).
+                Log.i(TAG, "OmniRoute 401 con key, reintentando sin key")
+                return postChatCompletion(
+                    config.copy(apiKey = ""), model, systemInstruction, prompt, profile, stream
+                )
+            }
             if (!response.isSuccessful) {
                 throw IOException(explainError(parseError(response.code, rawBody)))
             }
@@ -404,6 +486,13 @@ class OmniRouteOrchestrator(
         if (!response.isSuccessful) {
             val rawBody = response.body?.string().orEmpty()
             runCatching { response.close() }
+            if (response.code == 401 && config.apiKey.isNotBlank()) {
+                // Igual que en postChatCompletion: reintentar sin key.
+                Log.i(TAG, "OmniRoute stream 401 con key, reintentando sin key")
+                return@flow streamChatCompletion(
+                    config.copy(apiKey = ""), model, systemInstruction, prompt, profile
+                ).collect { emit(it) }
+            }
             throw IOException(explainError(parseError(response.code, rawBody)))
         }
         val buffered = response.body?.charStream()?.let { java.io.BufferedReader(it) }
@@ -451,7 +540,10 @@ class OmniRouteOrchestrator(
         }
 
         // Health check ligero: GET /v1/models (no gasta tokens ni llama a
-        // ningún LLM). 200 = el gateway responde.
+        // ningún LLM). 200 = el gateway responde. 401 TAMBIÉN es vivo: el
+        // gateway respondió sin key (la key es opcional para el chat
+        // ivanna-free) — solo errores de red / 5xx / 502 (túnel caído)
+        // cuentan como fallo y abren el circuito.
         val start = System.currentTimeMillis()
         val result = runCatching {
             withTimeout(HEALTH_CHECK_TIMEOUT_MS) {
@@ -461,7 +553,7 @@ class OmniRouteOrchestrator(
                     .apply { if (config.apiKey.isNotBlank()) header("Authorization", "Bearer ${config.apiKey}") }
                     .build()
                 client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+                    if (!isAliveResponseCode(response.code)) throw IOException("HTTP ${response.code}")
                     response.body?.string()
                 }
             }
