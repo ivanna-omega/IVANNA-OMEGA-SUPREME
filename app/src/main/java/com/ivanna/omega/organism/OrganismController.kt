@@ -1,6 +1,7 @@
 package com.ivanna.omega.organism
 
 import android.content.Context
+import android.media.AudioManager
 import android.os.SystemClock
 import android.util.Log
 import com.ivanna.omega.audio.RealAcousticSensor
@@ -23,7 +24,9 @@ import java.io.File
  *   1. Al arrancar (PersistedStateRestorer), si el interruptor maestro
  *      está ON, arranca el consumidor de snapshots + el agregador + el
  *      vaciado de la cola. La conexión se establece sola; la captura y
- *      el envío arrancan solos cuando suena música (frames válidos).
+ *      el envío arrancan solos cuando suena música (beacon de Ruta B
+ *      avanzando o AudioManager.isMusicActive() — la Ruta A ya no decide:
+ *      su 0 µs/hop atoraba el Organismo aunque sonara música).
  *   2. Si algo falla, la app sigue sonando igual y lo reintenta sola
  *      (cola durable + backoff). El audio NUNCA depende del envío.
  *   3. UN interruptor maestro ("Organismo automático: ON/OFF") apaga
@@ -148,7 +151,18 @@ object OrganismController {
         // pasa frames; no encola directo (si no, el chunk final de
         // close() se perdería y las ventanas se duplicarían).
         agg.onChunk = { chunk -> enqueueChunk(chunk, q) }
-        val cons = SensorSnapshotConsumer(agg, onChunk = {})
+        val cons = SensorSnapshotConsumer(
+            agg,
+            onChunk = {},
+            // Respaldo del sistema para "hay música": AudioManager lo sabe
+            // aunque la Ruta A marque 0 µs/hop. Se evalúa en cada llamada,
+            // nunca se cachea; sin AudioManager vale false (fail-closed).
+            audioManagerMusicActive = {
+                runCatching {
+                    (ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)?.isMusicActive
+                }.getOrDefault(false) == true
+            }
+        )
         consumer = cons
         scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         RealAcousticSensor.start(ctx)

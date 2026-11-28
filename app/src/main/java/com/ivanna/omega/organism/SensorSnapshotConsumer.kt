@@ -4,6 +4,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.ivanna.omega.audio.RealAcousticSensor
 import com.ivanna.omega.core.IvannaNativeLib
+import com.ivanna.omega.dsp.DSPBridge
 
 /**
  * SensorSnapshotConsumer — consumidor DEDICADO del canal lateral (v2.5.506).
@@ -26,7 +27,13 @@ import com.ivanna.omega.core.IvannaNativeLib
 class SensorSnapshotConsumer(
     private val aggregator: SessionAggregator,
     private val onChunk: (SessionAggregator.SessionChunk) -> Unit,
-    private val pollMs: Long = 40L
+    private val pollMs: Long = 40L,
+    /**
+     * Respaldo del sistema para "hay música": AudioManager.isMusicActive().
+     * Lo inyecta OrganismController (tiene el Context); null = sin respaldo.
+     * Se evalúa en cada llamada a isMusicActive(), nunca se cachea.
+     */
+    private val audioManagerMusicActive: (() -> Boolean)? = null
 ) {
     companion object {
         private const val TAG = "SensorSnapshotConsumer"
@@ -38,16 +45,20 @@ class SensorSnapshotConsumer(
         private set
 
     @Volatile
-    var lastValidFrameAtMs: Long = 0L
-        private set
-
-    @Volatile
     var snapshotsAccepted: Long = 0L
         private set
 
     @Volatile
     var snapshotsRejected: Long = 0L
         private set
+
+    /**
+     * Línea base del beacon de Ruta B para detectar crecimiento entre
+     * llamadas a isMusicActive(). -1 = sin línea base (primer ciclo o
+     * beacon no disponible): no se puede probar crecimiento (fail-closed).
+     */
+    @Volatile
+    private var lastBeaconFrames: Long = -1L
 
     @Volatile
     private var thread: Thread? = null
@@ -72,7 +83,6 @@ class SensorSnapshotConsumer(
                                 )
                             }
                             if (ok) snapshotsAccepted++ else snapshotsRejected++
-                            if (frame[73] >= 0.5f) lastValidFrameAtMs = SystemClock.uptimeMillis()
                             aggregator.addFrame(frame, tsUs, idx)?.let { chunk ->
                                 onChunk(chunk)
                             }
@@ -100,7 +110,26 @@ class SensorSnapshotConsumer(
         thread = null
     }
 
-    /** ¿Hay música sonando? Frame válido en los últimos 2 s. */
-    fun isMusicActive(nowMs: Long = SystemClock.uptimeMillis()): Boolean =
-        nowMs - lastValidFrameAtMs <= 2000L
+    /**
+     * ¿Hay música sonando? La Ruta A ya NO decide: su medida (0 µs/hop)
+     * se atora aunque suene música, así que su frame válido no es señal
+     * fiable. Deciden, en OR:
+     *   1. El beacon de Ruta B AVANZA frames (el efecto procesa en
+     *      audioserver = hay música fluyendo por Ruta B). Se compara con
+     *      la línea base de la llamada anterior; sin línea base (-1) o
+     *      con beacon no disponible (-1) no se puede probar crecimiento
+     *      (fail-closed) y se pasa al respaldo.
+     *   2. AudioManager.isMusicActive() (respaldo del sistema, inyectado
+     *      por OrganismController; null = sin respaldo).
+     * nowMs se conserva por compatibilidad de firma; la decisión ya no
+     * depende del tiempo desde el último frame válido de Ruta A.
+     */
+    fun isMusicActive(nowMs: Long = SystemClock.uptimeMillis()): Boolean {
+        val frames = runCatching { DSPBridge.effectBeaconFrames() }.getOrDefault(-1L)
+        val beaconGrowing = frames > 0 && lastBeaconFrames >= 0 && frames > lastBeaconFrames
+        if (frames >= 0) lastBeaconFrames = frames
+        if (beaconGrowing) return true
+        if (audioManagerMusicActive?.invoke() == true) return true
+        return false
+    }
 }
