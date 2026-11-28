@@ -25,6 +25,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.ivanna.omega.organism.OrganismController
+import com.ivanna.omega.organism.OrganismPayload
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -138,6 +139,41 @@ fun OrganismCard(
                 if (state.lastSensorStallAtMs > 0L) {
                     Text(
                         "Último stall: ${format401Date(state.lastSensorStallAtMs)} (frameIndex parado con música; mic re-anclado).",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            // C24/510 — cuarentena versionada: el conteo y el último
+            // error ya no son solo un número en el estado. Solo se
+            // muestra cuando hay algo que ver; el error dice por qué
+            // murió el chunk (sin el cuerpo). La cuarentena se borra a
+            // los 7 días por retención, no por este texto.
+            if (state.quarantined > 0) {
+                Text(
+                    "En cuarentena: ${state.quarantined} chunk(s) (4xx no reintentable o max-intentos).",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                state.lastQuarantineError?.let { err ->
+                    Text(
+                        "Último error de cuarentena: $err",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            // C24/510 — payload obsoleto: el servidor cambió el esquema
+            // y la cola vieja se descartó explícitamente (no se dejó
+            // pudrir 7 días). Sin actualización de la app el teléfono
+            // seguirá enviando la versión vieja: los chunks nuevos
+            // caerán igual en el próximo sondeo.
+            if (state.payloadObsolete) {
+                Text(
+                    "Payload obsoleto: el servidor exige v${state.minSupportedPayloadVersion} y este teléfono envía v${OrganismPayload.PAYLOAD_VERSION}; ${state.obsoleteChunksDiscarded} chunk(s) descartados explícitamente.",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                if (state.lastPayloadDiscardAtMs > 0L) {
+                    Text(
+                        "Último descarte por obsolescencia: ${format401Date(state.lastPayloadDiscardAtMs)}.",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }

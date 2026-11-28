@@ -82,6 +82,19 @@ import java.io.File
  *      del consumidor vive en el State (snapshotsAccepted/Rejected,
  *      sensorStalls, lastSensorStallAtMs) y la tarjeta la muestra
  *      cuando hay algo que ver (rechazos o stalls).
+ *   9. CUARENTENA VERSIONADA (C24/510): el payload lleva versión
+ *      (`telemetry.payloadVersion`, ver [OrganismPayload.
+ *      PAYLOAD_VERSION]) y el sobre del GET de perfil puede anunciar
+ *      `minSupportedPayloadVersion`. Si el servidor exige más que lo
+ *      que envía este teléfono, la cola vieja se descarta
+ *      EXPLÍCITAMENTE (con registro en el Log y en el State) en vez de
+ *      pudrirse 7 días en cuarentena: un cambio de esquema del
+ *      servidor ya no tira sesiones en silencio. El State expone
+ *      además cuántos chunks hay en cuarentena y el último error
+ *      (antes solo había un conteo total de cola). La señal del
+ *      servidor vive en el endpoint de Muselink, no en este repo: hasta
+ *      que la anuncie, `minSupportedPayloadVersion` es null y nada
+ *      cambia (el descarte solo corre con señal explícita).
  *
  * ESTADO (el indicador de la UI):
  *   Capturando / En cola / Sin conexión / Error recuperable, más los
@@ -431,7 +444,42 @@ object OrganismController {
          */
         val sensorStalls: Long = 0L,
         /** Fecha (epoch ms) del último stall; 0 = ninguno. */
-        val lastSensorStallAtMs: Long = 0L
+        val lastSensorStallAtMs: Long = 0L,
+        // ── C24/510 — cuarentena versionada ──
+        /**
+         * Chunks en QUARANTINED (4xx no reintentable o max-intentos).
+         * Antes el estado solo mostraba el conteo total de la cola:
+         * una cuarentena que crece en silencio era invisible.
+         */
+        val quarantined: Int = 0,
+        /**
+         * `lastError` del chunk en cuarentena más reciente (ver
+         * [OrganismQueue.lastQuarantinedError]). null = nada en
+         * cuarentena. Es el motivo visible, sin el cuerpo del chunk.
+         */
+        val lastQuarantineError: String? = null,
+        /**
+         * Mínima versión de payload que el servidor acepta, según el
+         * último sobre del GET de perfil. null = el servidor aún no
+         * anuncia ninguna (nada que descartar).
+         */
+        val minSupportedPayloadVersion: Long? = null,
+        /**
+         * true si el servidor exige un payload más nuevo que el que
+         * envía este teléfono ([OrganismPayload.PAYLOAD_VERSION]).
+         * Se actualiza en cada sondeo con la señal fresca (un sobre
+         * sin señal lo limpia: el servidor la anuncia en cada GET).
+         */
+        val payloadObsolete: Boolean = false,
+        /**
+         * Chunks obsoletos descartados explícitamente por C24 en este
+         * proceso (acumulado). 0 = aún no hubo descarte por
+         * obsolescencia (el prune de retención de 7 días no cuenta
+         * aquí: ese borra por edad, no por esquema).
+         */
+        val obsoleteChunksDiscarded: Int = 0,
+        /** Fecha (epoch ms) del último descarte por obsolescencia; 0 = ninguno. */
+        val lastPayloadDiscardAtMs: Long = 0L
     )
 
     private val _state = MutableStateFlow(State())
@@ -985,6 +1033,15 @@ object OrganismController {
     @Volatile
     var tokenDiagnostics: OrganismTokenDiagnostics? = null
 
+    // ── C24/510 — cuarentena versionada ──────────────────────────────
+    /** Chunks obsoletos descartados explícitamente en este proceso (acumulado; ver State). */
+    @Volatile
+    private var obsoleteChunksDiscarded: Int = 0
+
+    /** Fecha (epoch ms) del último descarte por payload obsoleto; 0 = ninguno. */
+    @Volatile
+    private var lastPayloadDiscardAtMs: Long = 0L
+
     /**
      * C21 — veredicto puro de la re-validación de un token recién
      * pegado (testeable en JVM). El GET barato de versión es el mismo
@@ -999,7 +1056,9 @@ object OrganismController {
     fun classifyTokenValidation(result: ProfileFetcher.Result?): TokenValidation =
         when (result) {
             is ProfileFetcher.Result.Current,
-            ProfileFetcher.Result.NotModified,
+            // C24/510: NotModified dejó de ser `data object` (lleva la
+            // señal minSupportedPayloadVersion), así que va con `is`.
+            is ProfileFetcher.Result.NotModified,
             is ProfileFetcher.Result.Quarantine -> TokenValidation.VALID
             ProfileFetcher.Result.TokenInvalid -> TokenValidation.INVALID
             else -> TokenValidation.UNKNOWN
@@ -1135,7 +1194,10 @@ object OrganismController {
     private fun refreshState() {
         val ctx = appContext
         val enabled = ctx?.let { isEnabled(it) } ?: true
-        val queued = queue?.counts()?.values?.sum() ?: 0
+        // C24/510: los conteos se leen UNA vez (la cola lee el disco):
+        // el total para `queued` y el de cuarentena para el State.
+        val counts = queue?.counts()
+        val queued = counts?.values?.sum() ?: 0
         val music = consumer?.isMusicActive() ?: false
         val status = deriveStatus(
             enabled = enabled,
@@ -1196,7 +1258,23 @@ object OrganismController {
             snapshotsAccepted = consumer?.snapshotsAccepted ?: _state.value.snapshotsAccepted,
             snapshotsRejected = consumer?.snapshotsRejected ?: _state.value.snapshotsRejected,
             sensorStalls = consumer?.stalls ?: _state.value.sensorStalls,
-            lastSensorStallAtMs = consumer?.lastStallAtMs ?: _state.value.lastSensorStallAtMs
+            lastSensorStallAtMs = consumer?.lastStallAtMs ?: _state.value.lastSensorStallAtMs,
+            // C24/510: la cuarentena se lee de la cola viva; sin cola
+            // (controlador detenido) se conserva el último valor
+            // conocido. El error es el del chunk en cuarentena más
+            // reciente; con la cola vacía de cuarentena vuelve a null
+            // (no se conserva un error de chunks ya borrados).
+            quarantined = counts?.getValue(OrganismQueue.State.QUARANTINED) ?: _state.value.quarantined,
+            lastQuarantineError = queue?.lastQuarantinedError()
+                ?: if (queue == null) _state.value.lastQuarantineError else null,
+            // C24/510: la señal del servidor solo la cambia el sondeo
+            // (handlePayloadVersionSignal); aquí se conserva. El
+            // acumulado de descartes vive en los vars volátiles, como
+            // sentTotal/last401AtMs.
+            minSupportedPayloadVersion = _state.value.minSupportedPayloadVersion,
+            payloadObsolete = _state.value.payloadObsolete,
+            obsoleteChunksDiscarded = obsoleteChunksDiscarded,
+            lastPayloadDiscardAtMs = lastPayloadDiscardAtMs
         )
     }
 
@@ -1205,6 +1283,48 @@ object OrganismController {
     // Todo en Dispatchers.IO (el pollJob y maybePollProfile corren ahí);
     // aplicar solo vía el puente registrado por MainActivity (H5). El
     // audio nunca se toca desde aquí: el puente es la única vía al DSP.
+
+    /**
+     * C24/510 — decisión pura (testeable en JVM): ¿el payload de este
+     * teléfono quedó obsoleto? Solo si el servidor anunció un mínimo
+     * mayor que [OrganismPayload.PAYLOAD_VERSION]. Sin señal (null) no
+     * hay obsolescencia: el descarte explícito solo corre con señal
+     * del servidor, nunca por suposición.
+     */
+    fun isPayloadObsolete(minSupportedPayloadVersion: Long?): Boolean =
+        minSupportedPayloadVersion != null && minSupportedPayloadVersion > OrganismPayload.PAYLOAD_VERSION
+
+    /**
+     * C24/510 — procesa la señal `minSupportedPayloadVersion` del
+     * sobre del GET (la traen [ProfileFetcher.Result.Current] y
+     * [ProfileFetcher.Result.NotModified]). Registra la señal en el
+     * State (siempre, con la fresca: un sobre sin señal la limpia) y,
+     * si el payload quedó obsoleto, descarta EXPLÍCITAMENTE la cola
+     * vieja ([OrganismQueue.discardPayloadOlderThan]) con registro en
+     * el Log y en el State (acumulado + fecha). Un chunk en SENDING no
+     * se toca (su outcome lo reescribe y el próximo sondeo lo
+     * reevalúa); un chunk nuevo encolado DESPUÉS del descarte también
+     * es obsoleto (misma versión) y cae en el próximo sondeo — o antes
+     * en cuarentena por su 4xx, que el sondeo siguiente también
+     * descarta. No toca el perfil aplicado ni el audio.
+     */
+    private fun handlePayloadVersionSignal(minSupported: Long?) {
+        _state.value = _state.value.copy(
+            minSupportedPayloadVersion = minSupported,
+            payloadObsolete = isPayloadObsolete(minSupported)
+        )
+        if (!isPayloadObsolete(minSupported)) return
+        val q = queue ?: return
+        val discarded = q.discardPayloadOlderThan(minSupported!!)
+        if (discarded > 0) {
+            obsoleteChunksDiscarded += discarded
+            lastPayloadDiscardAtMs = System.currentTimeMillis()
+            Log.w(TAG, "C24: el servidor exige payload >= v$minSupported y este teléfono envía v${OrganismPayload.PAYLOAD_VERSION}: $discarded chunk(s) obsoletos descartados explícitamente (no se dejan pudrir 7 días en cuarentena)")
+        } else {
+            Log.i(TAG, "C24: el servidor exige payload >= v$minSupported (este teléfono envía v${OrganismPayload.PAYLOAD_VERSION}); cola sin chunks obsoletos que descartar")
+        }
+        refreshState()
+    }
 
     /**
      * Decisión pura del sondeo (testeable en JVM): ¿toca pedir el perfil
@@ -1297,7 +1417,11 @@ object OrganismController {
                     Log.i(TAG, "sondeo de perfil: reintentable (red/429/5xx); próximo ciclo")
                 is ProfileFetcher.Result.Quarantine ->
                     Log.i(TAG, "sondeo de perfil: ${res.reason}; se conserva el último bueno")
-                is ProfileFetcher.Result.NotModified -> { /* versión igual: nada que hacer */ }
+                is ProfileFetcher.Result.NotModified ->
+                    // C24/510: versión igual, pero el sobre puede traer
+                    // la señal de payload mínimo (el servidor puede
+                    // subirla sin publicar un perfil nuevo).
+                    handlePayloadVersionSignal(res.minSupportedPayloadVersion)
                 is ProfileFetcher.Result.Current -> handleCurrent(ctx, res)
             }
             retryPendingConfirmation()
@@ -1307,6 +1431,10 @@ object OrganismController {
     }
 
     private fun handleCurrent(ctx: Context, current: ProfileFetcher.Result.Current) {
+        // C24/510: la señal de payload mínimo se procesa ANTES de
+        // decidir sobre el perfil (el descarte de la cola vieja no
+        // depende de que el perfil nuevo se aplique o no).
+        handlePayloadVersionSignal(current.minSupportedPayloadVersion)
         val previousVersion = _state.value.appliedProfileVersion
         when (current.status) {
             "rolled_back" -> handleRollback(ctx, current, previousVersion)

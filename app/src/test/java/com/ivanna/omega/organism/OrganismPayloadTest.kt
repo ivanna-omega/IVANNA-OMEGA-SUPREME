@@ -1,5 +1,6 @@
 package com.ivanna.omega.organism
 
+import com.google.gson.JsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -147,5 +148,39 @@ class OrganismPayloadTest {
         assertEquals(2L, body.get("previousVersion").asLong)
         assertEquals("2.5.510", body.get("engineVersion").asString)
         assertTrue(body.get("appliedAt").asString.startsWith("2026-11-"))
+    }
+
+    // C24/510 — versión del esquema del payload.
+
+    @Test
+    fun `telemetry lleva payloadVersion igual a PAYLOAD_VERSION`() {
+        val telemetry = OrganismPayload.sessionBody(chunk())
+            .getAsJsonObject("telemetry")
+        assertEquals(OrganismPayload.PAYLOAD_VERSION, telemetry.get("payloadVersion").asInt)
+        // El body que se encola lleva la misma versión que lee el descarte.
+        assertEquals(
+            OrganismPayload.PAYLOAD_VERSION,
+            OrganismPayload.payloadVersionOf(OrganismPayload.sessionBody(chunk()))
+        )
+    }
+
+    @Test
+    fun `payloadVersionOf lee la version y 0 si falta o es invalida`() {
+        val withVersion = JsonObject().apply {
+            add("telemetry", JsonObject().apply { addProperty("payloadVersion", 3) })
+        }
+        assertEquals(3, OrganismPayload.payloadVersionOf(withVersion))
+        // Sin telemetry o sin campo: chunk de antes de C24 = versión 0.
+        assertEquals(0, OrganismPayload.payloadVersionOf(JsonObject()))
+        assertEquals(0, OrganismPayload.payloadVersionOf(JsonObject().apply {
+            add("telemetry", JsonObject())
+        }))
+        // Campo no numérico o negativo: 0, no excepción.
+        assertEquals(0, OrganismPayload.payloadVersionOf(JsonObject().apply {
+            add("telemetry", JsonObject().apply { addProperty("payloadVersion", "nueva") })
+        }))
+        assertEquals(0, OrganismPayload.payloadVersionOf(JsonObject().apply {
+            add("telemetry", JsonObject().apply { addProperty("payloadVersion", -2) })
+        }))
     }
 }

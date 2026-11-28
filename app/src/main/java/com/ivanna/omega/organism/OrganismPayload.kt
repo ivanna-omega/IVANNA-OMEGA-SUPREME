@@ -41,6 +41,32 @@ object OrganismPayload {
     const val DEFAULT_AB_STATE = "none"
 
     /**
+     * C24/510 — versión del esquema del POST /session (campo
+     * `payloadVersion` en `telemetry`). El servidor puede anunciar
+     * `minSupportedPayloadVersion` en el sobre del GET de perfil (ver
+     * [ProfileFetcher]): si es mayor que esta, la cola vieja se
+     * descarta explícitamente ([OrganismQueue.discardPayloadOlderThan])
+     * en vez de pudrirse 7 días en cuarentena. Subir aquí SOLO cuando
+     * cambie el esquema del POST (y el servidor lo anuncie primero).
+     */
+    const val PAYLOAD_VERSION = 1
+
+    /**
+     * C24/510 — versión de payload de un cuerpo encolado (para el
+     * descarte por obsolescencia). 0 = sin versionar (chunk de antes
+     * de C24) o campo inválido: un chunk sin versión nunca puede
+     * probar que el servidor lo acepte, así que cuenta como el más
+     * viejo. Puro JVM.
+     */
+    fun payloadVersionOf(body: JsonObject): Int {
+        return runCatching {
+            val telemetry = body.getAsJsonObject("telemetry") ?: return 0
+            val v = telemetry.get("payloadVersion") ?: return 0
+            v.asInt.coerceAtLeast(0)
+        }.getOrDefault(0)
+    }
+
+    /**
      * T2/510 — perfil aplicado que sonó en este chunk. Lo mantiene
      * `OrganismController` tras cada aplicación (`recordAppliedProfile`)
      * y lo lee `enqueueChunk` para etiquetar cada chunk; `OrganismPayload`
@@ -114,6 +140,11 @@ object OrganismPayload {
         telemetry.addProperty("framesReferenceFresh", chunk.framesReferenceFresh)
         telemetry.addProperty("referenceLevelMeanDbfs", chunk.referenceLevelMeanDbfs.toDouble())
         telemetry.addProperty("engineVersion", chunk.engineVersion)
+        // C24/510 — versión del esquema del payload. El servidor la lee
+        // para rechazar (4xx → cuarentena) lo que ya no acepta, y anuncia
+        // su mínimo en el sobre del GET de perfil para el descarte
+        // explícito (sin esperar a que el prune de 7 días lo borre).
+        telemetry.addProperty("payloadVersion", PAYLOAD_VERSION)
         // T2/510 — atribución A/B: con qué perfil sonó este chunk.
         // Campos nuevos; el servidor debe ignorarlos si no los conoce
         // (pendiente de verificar: si los rechaza con 4xx, los chunks

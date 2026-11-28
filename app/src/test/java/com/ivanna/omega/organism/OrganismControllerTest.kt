@@ -1,6 +1,9 @@
 package com.ivanna.omega.organism
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -301,7 +304,9 @@ class OrganismControllerTest {
         )
         assertEquals(
             OrganismController.TokenValidation.VALID,
-            OrganismController.classifyTokenValidation(ProfileFetcher.Result.NotModified)
+            // C24/510: NotModified es data class (lleva la señal
+            // minSupportedPayloadVersion); el default es null.
+            OrganismController.classifyTokenValidation(ProfileFetcher.Result.NotModified())
         )
     }
 
@@ -335,6 +340,41 @@ class OrganismControllerTest {
         assertEquals(
             OrganismController.TokenValidation.UNKNOWN,
             OrganismController.classifyTokenValidation(null)
+        )
+    }
+
+    // C24/510 — cuarentena versionada.
+
+    @Test
+    fun `State por defecto no lleva cuarentena ni payload obsoleto`() {
+        val state = OrganismController.State()
+        assertEquals(0, state.quarantined)
+        assertNull(state.lastQuarantineError)
+        assertNull(state.minSupportedPayloadVersion)
+        assertFalse(state.payloadObsolete)
+        assertEquals(0, state.obsoleteChunksDiscarded)
+        assertEquals(0L, state.lastPayloadDiscardAtMs)
+    }
+
+    @Test
+    fun `payload obsoleto solo si el servidor exige mas que PAYLOAD_VERSION`() {
+        assertFalse(OrganismController.isPayloadObsolete(null))
+        assertFalse(OrganismController.isPayloadObsolete(1L))
+        assertFalse(
+            OrganismController.isPayloadObsolete(OrganismPayload.PAYLOAD_VERSION.toLong())
+        )
+        assertTrue(
+            OrganismController.isPayloadObsolete(OrganismPayload.PAYLOAD_VERSION.toLong() + 1)
+        )
+    }
+
+    @Test
+    fun `NotModified con senal tambien valida el token pegado`() {
+        assertEquals(
+            OrganismController.TokenValidation.VALID,
+            OrganismController.classifyTokenValidation(
+                ProfileFetcher.Result.NotModified(minSupportedPayloadVersion = 2L)
+            )
         )
     }
 }

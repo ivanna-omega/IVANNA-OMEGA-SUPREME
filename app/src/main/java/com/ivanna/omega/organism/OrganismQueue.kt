@@ -30,6 +30,18 @@ import java.io.File
  * tarjeta del organismo). Los JSON viven en filesDir (privado de la
  * app, sin cifrar en reposo — se documenta, no se esconde).
  *
+ * CUARENTENA VERSIONADA (C24/510): cada chunk lleva su versión de
+ * payload en el body (`telemetry.payloadVersion`, ver
+ * [OrganismPayload.PAYLOAD_VERSION]; 0 = sin versionar, anterior a
+ * C24). Cuando el servidor anuncia `minSupportedPayloadVersion` mayor
+ * que la del teléfono, [discardPayloadOlderThan] borra EXPLÍCITAMENTE
+ * (con registro en el controlador) los chunks viejos en vez de
+ * dejarlos pudrirse 7 días en cuarentena: un cambio de esquema del
+ * servidor ya no tira sesiones en silencio. La cuarentena en sí no
+ * cambia: [markQuarantined] estampa además cuándo entró el chunk
+ * ([Item.quarantinedAtMs]) para que [lastQuarantinedError] devuelva
+ * el error del más reciente, no de uno cualquiera.
+ *
  * DEGRADACIÓN POR ESPACIO: si la cola supera el tope, primero se
  * descartan los chunks RETRY más viejos y solo después los PENDING más
  * viejos. El AUDIO nunca se toca: sin espacio, se degrada el envío,
@@ -68,7 +80,13 @@ class OrganismQueue(
         val body: JsonObject,
         val lastError: String? = null,
         /** Creación (ms epoch). 0 = desconocido (archivo viejo). */
-        val createdAtMs: Long = 0L
+        val createdAtMs: Long = 0L,
+        /**
+         * C24/510 — cuándo entró en QUARANTINED (ms epoch). 0 = nunca
+         * estuvo en cuarentena o archivo de antes de C24 (entonces manda
+         * [createdAtMs] como aproximación en [lastQuarantinedError]).
+         */
+        val quarantinedAtMs: Long = 0L
     ) {
         /** Clave de idempotencia: el mismo chunk nunca se encola dos veces. */
         val key: String get() = "${sessionId}_$chunkId"
@@ -158,10 +176,49 @@ class OrganismQueue(
 
     /** Fallo no reintentable (4xx salvo 429, payload inválido): cuarentena. */
     @Synchronized
-    fun markQuarantined(item: Item, error: String?): Item {
-        val next = item.copy(state = State.QUARANTINED, lastError = error)
+    fun markQuarantined(item: Item, error: String?, nowMs: Long = System.currentTimeMillis()): Item {
+        // C24/510: se estampa cuándo entró en cuarentena; el estado
+        // expone el lastError del chunk en cuarentena MÁS RECIENTE.
+        val next = item.copy(state = State.QUARANTINED, lastError = error, quarantinedAtMs = nowMs)
         writeItem(next)
         return next
+    }
+
+    /**
+     * C24/510 — `lastError` del chunk en cuarentena más reciente
+     * (por [Item.quarantinedAtMs]; sin estampa —archivo de antes de
+     * C24— manda `createdAtMs`). null si no hay nada en cuarentena.
+     * Es lo que el estado expone como `lastQuarantineError`.
+     */
+    @Synchronized
+    fun lastQuarantinedError(): String? =
+        listAll().filter { it.state == State.QUARANTINED }
+            .maxByOrNull { if (it.quarantinedAtMs > 0L) it.quarantinedAtMs else it.createdAtMs }
+            ?.lastError
+
+    /**
+     * C24/510 — descarte EXPLÍCITO por payload obsoleto (lo llama el
+     * controlador cuando el servidor anuncia `minSupportedPayloadVersion`
+     * mayor que [OrganismPayload.PAYLOAD_VERSION]). Borra los chunks
+     * cuya versión de payload ([OrganismPayload.payloadVersionOf]; 0 =
+     * sin versionar) es menor que [minSupportedVersion], en CUALQUIER
+     * estado salvo SENDING: un chunk en vuelo no se toca (su outcome lo
+     * reescribe al terminar y el próximo sondeo lo reevalúa). Devuelve
+     * cuántos se descartaron. El registro (qué versión exigía el
+     * servidor, cuántos cayeron) lo hace el llamador: aquí solo se
+     * borra. No es el prune de retención: este descarte es por esquema,
+     * no por edad, y no espera 7 días.
+     */
+    @Synchronized
+    fun discardPayloadOlderThan(minSupportedVersion: Long): Int {
+        var discarded = 0
+        for (item in listAll()) {
+            if (item.state == State.SENDING) continue
+            if (OrganismPayload.payloadVersionOf(item.body) < minSupportedVersion) {
+                if (findFile(item.key)?.delete() == true) discarded++
+            }
+        }
+        return discarded
     }
 
     @Synchronized
@@ -275,14 +332,16 @@ class OrganismQueue(
         val nextAttemptAtMs: Long = 0L,
         val bodyJson: String = "{}",
         val lastError: String? = null,
-        val createdAtMs: Long = 0L
+        val createdAtMs: Long = 0L,
+        /** C24/510 — ver [Item.quarantinedAtMs]; 0 en archivos viejos. */
+        val quarantinedAtMs: Long = 0L
     ) {
         fun toItem(): Item {
             val body = Gson().fromJson(bodyJson, JsonObject::class.java) ?: JsonObject()
             return Item(
                 sessionId, chunkId,
                 runCatching { State.valueOf(state) }.getOrDefault(State.PENDING),
-                attempts, nextAttemptAtMs, body, lastError, createdAtMs
+                attempts, nextAttemptAtMs, body, lastError, createdAtMs, quarantinedAtMs
             )
         }
 
@@ -291,7 +350,7 @@ class OrganismQueue(
                 return StoredItem(
                     item.sessionId, item.chunkId, item.state.name, item.attempts,
                     item.nextAttemptAtMs, Gson().toJson(item.body),
-                    item.lastError, item.createdAtMs
+                    item.lastError, item.createdAtMs, item.quarantinedAtMs
                 )
             }
         }

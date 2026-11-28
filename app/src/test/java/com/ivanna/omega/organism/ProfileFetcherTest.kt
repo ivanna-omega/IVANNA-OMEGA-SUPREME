@@ -8,6 +8,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -74,9 +75,13 @@ class ProfileFetcherTest {
         version: Long,
         status: String,
         abState: String,
-        profileId: String = "omega-1795857152818-9lec"
-    ): String =
-        """{"profileId":"$profileId","version":$version,"status":"$status","abState":"$abState","compiledAt":"2026-11-28T10:03:03Z","sessionsCount":177,"profile":{"format":"IVANNA OMEGA","track":"Sesión en vivo IVANNA"}}"""
+        profileId: String = "omega-1795857152818-9lec",
+        // C24/510: señal opcional del servidor (null = no la anuncia).
+        minSupportedPayloadVersion: Long? = null
+    ): String {
+        val minSupported = minSupportedPayloadVersion?.let { ",\"minSupportedPayloadVersion\":$it" } ?: ""
+        return """{"profileId":"$profileId","version":$version,"status":"$status","abState":"$abState"$minSupported,"compiledAt":"2026-11-28T10:03:03Z","sessionsCount":177,"profile":{"format":"IVANNA OMEGA","track":"Sesión en vivo IVANNA"}}"""
+    }
 
     private fun fetcher(
         token: String? = "test-token-1234567890",
@@ -224,6 +229,46 @@ class ProfileFetcherTest {
     fun `JSON roto es Quarantine`() {
         nextCode = 200
         nextBody = "{no-json"
+        assertTrue(fetcher().fetch(appliedVersion = 2L) is ProfileFetcher.Result.Quarantine)
+    }
+
+    // C24/510 — señal minSupportedPayloadVersion del servidor.
+
+    @Test
+    fun `Current lleva minSupportedPayloadVersion cuando el servidor la anuncia`() {
+        nextCode = 200
+        nextBody = envelope(version = 3L, status = "stable", abState = "promoted", minSupportedPayloadVersion = 2L)
+        val result = fetcher().fetch(appliedVersion = 2L)
+        assertTrue("se esperaba Current, fue $result", result is ProfileFetcher.Result.Current)
+        assertEquals(2L, (result as ProfileFetcher.Result.Current).minSupportedPayloadVersion)
+    }
+
+    @Test
+    fun `sin senal minSupportedPayloadVersion es null en Current y NotModified`() {
+        nextCode = 200
+        val current = fetcher().fetch(appliedVersion = 2L)
+        assertTrue(current is ProfileFetcher.Result.Current)
+        assertNull((current as ProfileFetcher.Result.Current).minSupportedPayloadVersion)
+        val notModified = fetcher().fetch(appliedVersion = 3L)
+        assertTrue("se esperaba NotModified, fue $notModified", notModified is ProfileFetcher.Result.NotModified)
+        assertNull((notModified as ProfileFetcher.Result.NotModified).minSupportedPayloadVersion)
+    }
+
+    @Test
+    fun `NotModified tambien lleva la senal del servidor`() {
+        nextCode = 200
+        nextBody = envelope(version = 3L, status = "stable", abState = "promoted", minSupportedPayloadVersion = 2L)
+        val result = fetcher().fetch(appliedVersion = 3L)
+        assertTrue("se esperaba NotModified, fue $result", result is ProfileFetcher.Result.NotModified)
+        assertEquals(2L, (result as ProfileFetcher.Result.NotModified).minSupportedPayloadVersion)
+    }
+
+    @Test
+    fun `minSupportedPayloadVersion no numerica o menor de 1 es Quarantine`() {
+        nextCode = 200
+        nextBody = """{"profileId":"omega-1","version":3,"status":"stable","abState":"promoted","minSupportedPayloadVersion":"dos","profile":{"format":"IVANNA OMEGA"}}"""
+        assertTrue(fetcher().fetch(appliedVersion = 2L) is ProfileFetcher.Result.Quarantine)
+        nextBody = envelope(version = 3L, status = "stable", abState = "promoted", minSupportedPayloadVersion = 0L)
         assertTrue(fetcher().fetch(appliedVersion = 2L) is ProfileFetcher.Result.Quarantine)
     }
 

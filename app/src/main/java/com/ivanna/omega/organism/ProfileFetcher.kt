@@ -25,6 +25,12 @@ import okhttp3.Response
  * en 401, QUARANTINE en 400/403/404/422 (404 = «aún no hay perfil
  * compilado», no es un error: el teléfono sigue con el último bueno).
  *
+ * C24/510 — el sobre del GET puede traer además
+ * `minSupportedPayloadVersion` (opcional): la versión mínima de
+ * payload que el servidor acepta. Va en [Result.Current] y en
+ * [Result.NotModified] (el servidor puede subir su mínimo sin publicar
+ * un perfil nuevo); el controlador descarta la cola vieja con ella.
+ *
  * PUNTO DE ENGANCHE (C3, Fase 2 — verificación de firma Ed25519): en
  * [fetch], tras parsear el sobre y ANTES de devolver [Result.Current],
  * irá la verificación de la firma del sobre contra la clave pública del
@@ -81,17 +87,31 @@ class ProfileFetcher(
          * campo `profile` del sobre): es lo que recibe
          * [ProfileApplier.validate]. La versión vive en el sobre, no
          * dentro del `.ivanna.json`.
+         *
+         * C24/510 — [minSupportedPayloadVersion] es la señal del
+         * servidor: la versión mínima de payload (`telemetry.
+         * payloadVersion`) que acepta. null = el servidor aún no la
+         * anuncia (comportamiento previo: nada que descartar).
          */
         data class Current(
             val profileId: String,
             val version: Long,
             val status: String,
             val abState: String,
-            val profileBody: String
+            val profileBody: String,
+            val minSupportedPayloadVersion: Long? = null
         ) : Result()
 
-        /** La versión del servidor es la misma que la aplicada: nada que hacer. */
-        data object NotModified : Result()
+        /**
+         * La versión del servidor es la misma que la aplicada: nada que
+         * hacer. C24/510 — lleva igualmente la señal
+         * [minSupportedPayloadVersion]: el servidor puede subir su
+         * mínimo sin publicar un perfil nuevo, y el teléfono debe
+         * enterarse en este sondeo (no solo cuando llegue un Current).
+         */
+        data class NotModified(
+            val minSupportedPayloadVersion: Long? = null
+        ) : Result()
 
         /** Red caída, timeout, 429, 5xx: reintentable en el próximo sondeo. */
         data object Retry : Result()
@@ -264,17 +284,38 @@ class ProfileFetcher(
         if (profileEl == null || !profileEl.isJsonObject) {
             return Result.Quarantine("GET current: falta profile (objeto .ivanna.json)")
         }
+        // C24/510 — señal OPCIONAL del servidor: versión mínima de
+        // payload que acepta. Ausente = aún no la anuncia (null). Si
+        // viene, debe ser un número >= 1: un valor inválido es sobre
+        // malformado (fail-closed, igual que version < 1) y va a
+        // cuarentena, no se ignora en silencio.
+        val minSupportedPayloadVersion: Long? = when (val minEl = data.get("minSupportedPayloadVersion")) {
+            null -> null
+            else -> {
+                if (!minEl.isJsonPrimitive || !minEl.asJsonPrimitive.isNumber) {
+                    return Result.Quarantine("GET current: minSupportedPayloadVersion debe ser un número")
+                }
+                val minV = minEl.asDouble
+                if (!minV.isFinite() || minV < 1.0) {
+                    return Result.Quarantine("GET current: minSupportedPayloadVersion $minV debe ser >= 1")
+                }
+                minV.toLong()
+            }
+        }
         // PUNTO DE ENGANCHE (C3, Fase 2 — verificación de firma Ed25519):
         // aquí se verificará la firma del sobre (campo `signature`,
         // clave pública del servidor) ANTES de devolver Current. Hoy el
         // sobre no trae firma y la verificación no existe (ver cabecera).
-        if (appliedVersion != null && version == appliedVersion) return Result.NotModified
+        if (appliedVersion != null && version == appliedVersion) {
+            return Result.NotModified(minSupportedPayloadVersion)
+        }
         return Result.Current(
             profileId = profileId,
             version = version,
             status = status,
             abState = abState,
-            profileBody = profileEl.toString()
+            profileBody = profileEl.toString(),
+            minSupportedPayloadVersion = minSupportedPayloadVersion
         )
     }
 }
