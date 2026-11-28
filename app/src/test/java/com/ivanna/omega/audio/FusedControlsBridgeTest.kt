@@ -15,7 +15,14 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 
+// Robolectric: el test de outputMode usa PerceptualStatePayload.build*,
+// que construye org.json.JSONObject — stub en el android.jar de los unit
+// tests sin Robolectric (el put no guarda nada y getDouble devuelve 0.0).
+// Mismo patrón que RouteBDoctorTest y PerceptualStateDedupJsonTest.
+@RunWith(RobolectricTestRunner::class)
 class FusedControlsBridgeTest {
 
     private fun distinctiveControls(): FusedControls = FusedControls(

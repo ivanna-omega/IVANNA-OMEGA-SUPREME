@@ -100,10 +100,15 @@ class FactoryProfileTest {
     @Test fun storedPrefsWinOverProfile() {
         val store = ParameterStore(context)
         // Valores vivos de Esse: se respetan, no los pisa el perfil.
-        store.setHolosParams(0.359f, 0.35f, 1.0f, 3.0f, 0.5f, 0.298f, 0.5f, 1.0f, 1.0f, 1.0f, 0.34f, true, 24)
+        // Armónicos 0.001f (no el 0.298f vivo): el modelo fusionado
+        // recorta harmonics a [0, 0.002] (kHolosHarmonicsMaxValidated,
+        // ATREVIDA 502), así que 0.298f NO sobrevive al round-trip
+        // fusionado (vuelve 0.002f). 0.001f sigue siendo distinto del
+        // default del perfil (0.002f), así que prueba que la pref gana.
+        store.setHolosParams(0.359f, 0.35f, 1.0f, 3.0f, 0.5f, 0.001f, 0.5f, 1.0f, 1.0f, 1.0f, 0.34f, true, 24)
         store.setHolosEq(7.8f, -8.1f, -8.6f, 0f, 5.2f, 1000f)
         assertEquals(0.359f, store.loadFusedControls().field.amount, 0f)
-        assertEquals(0.298f, store.getHolosHarmonics(), 0f)
+        assertEquals(0.001f, store.getHolosHarmonics(), 0f)
         assertEquals(7.8f, store.getHolosEqLow(), 0f)
         assertEquals(-8.1f, store.getHolosEqMid(), 0f)
     }

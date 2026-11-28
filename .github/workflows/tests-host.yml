@@ -63,7 +63,10 @@ jobs:
   ctest:
     name: ${{ matrix.san == 'asan' && 'CTest (ASan+UBSan)' || 'CTest' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30 min (era 20): el enlace ASan+UBSan de test_acoustic_harness
+    # supera los 20 min y el job se cancelaba a mitad del enlace (509),
+    # sin fallo de test. El CTest plano tarda ~1 min.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
