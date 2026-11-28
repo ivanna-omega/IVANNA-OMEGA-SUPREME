@@ -1,6 +1,11 @@
 package com.ivanna.omega.organism
 
 import com.google.gson.JsonParser
+import com.ivanna.omega.audio.IvannaAntiDolbyParams
+import com.ivanna.omega.audio.IvannaAudioEngineParams
+import com.ivanna.omega.audio.IvannaAudioProfile
+import com.ivanna.omega.audio.IvannaNeuromorphicParams
+import com.ivanna.omega.audio.IvannaRouteParams
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -360,6 +365,171 @@ class ProfileApplierTest {
         assertEquals(64, h1.length)
         assertEquals(h1, ProfileApplier.sha256Hex(V11_JSON))
         assertTrue(h1 != ProfileApplier.sha256Hex("$V11_JSON "))
+    }
+
+    // T1/510 — traducción ValidatedProfile → IvannaAudioProfile.
+
+    private fun baseProfile(): IvannaAudioProfile = IvannaAudioProfile(
+        id = "rock_70s",
+        name = "Rock 70s",
+        description = "base",
+        category = "rock",
+        priority = 1,
+        audioEngine = IvannaAudioEngineParams(gain = 0.5f, exciterAmount = 0.3f, eqGain = 0.0f, widthAmount = 1.0f),
+        antiDolby = IvannaAntiDolbyParams(speechThreshold = 0.33f, bassThreshold = 0.33f, eqBoost2k4k = 0.0f, widenerMultiplier = 1.0f),
+        neuromorphic = IvannaNeuromorphicParams(harmonicGain = 0.3f, lateralInhibition = 0.5f, ohcCompression = 0.4f, masterGainDb = 0.0f),
+        route = IvannaRouteParams(bassBoostDb = 0.0f, dialogBoostDb = 0.0f, widenerMult = 1.0f),
+        tags = listOf("rock"),
+        recommendedFor = "test"
+    )
+
+    @Test
+    fun `traduccion escribe el EQ en ambos destinos con el mismo valor sin dividir entre 2`() {
+        val validated = valid().profile
+        val ivanna = ProfileApplier.translate(validated, status = "stable", profileId = "omega-1795857152818-9lec", base = baseProfile())
+        // v1.1: low -2.0, mid/high/presence +2.0. El mismo valor en el
+        // destino legacy (audioEngine) y en el fusionado (tonal): NO es
+        // la mitad en cada uno (eso sería -1.0/+1.0).
+        assertEquals(-2.0f, ivanna.audioEngine.eqLowDb!!)
+        assertEquals(-2.0f, ivanna.tonal.lowDb!!)
+        assertEquals(2.0f, ivanna.audioEngine.eqMidDb!!)
+        assertEquals(2.0f, ivanna.tonal.midDb!!)
+        assertEquals(2.0f, ivanna.audioEngine.eqHighDb!!)
+        assertEquals(2.0f, ivanna.tonal.highDb!!)
+        assertEquals(2.0f, ivanna.audioEngine.eqPresenceDb!!)
+        assertEquals(2.0f, ivanna.tonal.presenceDb!!)
+        assertEquals(ivanna.audioEngine.eqLowDb, ivanna.tonal.lowDb)
+        assertEquals(ivanna.audioEngine.eqMidDb, ivanna.tonal.midDb)
+        assertEquals(ivanna.audioEngine.eqHighDb, ivanna.tonal.highDb)
+        assertEquals(ivanna.audioEngine.eqPresenceDb, ivanna.tonal.presenceDb)
+    }
+
+    @Test
+    fun `traduccion fija muselink-live la sala de Esse y hereda lo no cubierto`() {
+        val validated = valid().profile
+        val base = baseProfile()
+        val ivanna = ProfileApplier.translate(validated, status = "stable", profileId = "omega-1795857152818-9lec", base = base)
+        assertEquals(ProfileApplier.LIVE_PROFILE_ID, ivanna.id)
+        assertTrue(ivanna.name.contains("Sesión en vivo IVANNA"))
+        assertTrue(ivanna.name.contains("v2"))
+        assertTrue(ivanna.description.contains("omega-1795857152818-9lec"))
+        assertEquals("Sesión en vivo IVANNA", ivanna.referenceTrack)
+        assertEquals(0.0f, ivanna.targetLufsDeltaDb)
+        // Sala fija de la VUELTA (4.0x7.0 m, escucha 3 m).
+        assertEquals(0.34f, ivanna.sala.rt60Sec)
+        assertEquals(7.0f, ivanna.sala.roomSizeM)
+        assertEquals(0.22f, ivanna.sala.roomWet)
+        // Operadores y compresor del perfil.
+        assertEquals(0.53f, ivanna.spatial.orbeAmount)
+        assertEquals(0.35f, ivanna.spatial.orbeDistanceM)
+        assertEquals(0.34f, ivanna.field.holosAmount)
+        assertEquals(0.35f, ivanna.field.phiAmount)
+        assertEquals(0.3f, ivanna.audioEngine.exciterAmount)
+        assertEquals(-4.0f, ivanna.tonal.trimDb!!)
+        assertEquals(-12.0f, ivanna.dynamics.compThresholdDb!!)
+        assertEquals(2.0f, ivanna.dynamics.compRatio!!)
+        assertEquals(1.0f, ivanna.volterra.correction) // volterra_enabled=true → on
+        // Herencia de la base: nada inventado.
+        assertEquals(0.5f, ivanna.audioEngine.gain)
+        assertEquals(1.0f, ivanna.audioEngine.widthAmount)
+        assertEquals(0.33f, ivanna.antiDolby.speechThreshold)
+        assertEquals(0.3f, ivanna.neuromorphic.harmonicGain)
+        assertEquals(0.0f, ivanna.route.bassBoostDb)
+    }
+
+    @Test
+    fun `volterra apagado traduce correction a 0`() {
+        val body = V11_JSON.replace("\"volterra_enabled\":true", "\"volterra_enabled\":false")
+        val result = ProfileApplier.validate(body, version = 2L, appliedVersion = 1L)
+        assertTrue("debe validar, motivos: ${(result as? ProfileApplier.ValidationResult.Invalid)?.reasons}", result is ProfileApplier.ValidationResult.Valid)
+        val ivanna = ProfileApplier.translate(
+            (result as ProfileApplier.ValidationResult.Valid).profile,
+            status = "stable", profileId = "omega-1", base = baseProfile()
+        )
+        assertEquals(0.0f, ivanna.volterra.correction)
+    }
+
+    @Test
+    fun `traduccion sin profileId omite el id de la descripcion (rollback)`() {
+        val validated = valid().profile
+        val ivanna = ProfileApplier.translate(validated, status = "rolled_back", profileId = null, base = baseProfile())
+        assertEquals(ProfileApplier.LIVE_PROFILE_ID, ivanna.id)
+        assertFalse(ivanna.description.contains("omega-"))
+        assertTrue(ivanna.description.contains("rolled_back"))
+    }
+
+    // T1/510 — diario: el candidato commitea sin promover el estable.
+
+    @Test
+    fun `applyAndCommit de candidato no promueve el estable pero registra el diario`() {
+        val result = applier.applyAndCommit(
+            V11_JSON, version = 2L, appliedVersion = 1L,
+            profileId = "omega-1795857152818-9lec",
+            promoteToStable = false,
+            install = ::installOk,
+            readAppliedProfileId = { ProfileApplier.LIVE_PROFILE_ID }
+        )
+        assertTrue("se esperaba Committed, fue $result", result is ProfileApplier.CommitResult.Committed)
+        assertFalse("el candidato no es estable", File(dir, ProfileApplier.STABLE_FILE_NAME).exists())
+        assertEquals(null, applier.readStableBody())
+        val journal = applier.readJournal()!!
+        assertEquals(2L, journal.version)
+        assertEquals(ProfileApplier.JournalState.COMMITTED, journal.estado)
+        assertEquals("omega-1795857152818-9lec", journal.profileId)
+        assertEquals(null, journal.stableVersion)
+    }
+
+    @Test
+    fun `applyAndCommit estable promueve y registra stableVersion en el diario`() {
+        val result = applier.applyAndCommit(
+            V11_JSON, version = 2L, appliedVersion = 1L,
+            profileId = "omega-1795857152818-9lec",
+            install = ::installOk,
+            readAppliedProfileId = { ProfileApplier.LIVE_PROFILE_ID }
+        )
+        assertTrue("se esperaba Committed, fue $result", result is ProfileApplier.CommitResult.Committed)
+        assertEquals(V11_JSON, applier.readStableBody())
+        val journal = applier.readJournal()!!
+        assertEquals(2L, journal.version)
+        assertEquals("omega-1795857152818-9lec", journal.profileId)
+        assertEquals(2L, journal.stableVersion)
+    }
+
+    @Test
+    fun `candidato tras estable conserva la stableVersion anterior en el diario`() {
+        applier.applyAndCommit(
+            V11_JSON, version = 2L, appliedVersion = 1L,
+            profileId = "omega-1",
+            install = ::installOk,
+            readAppliedProfileId = { ProfileApplier.LIVE_PROFILE_ID }
+        )
+        val v3 = V11_JSON.replace("\"orbe_amount\":0.53", "\"orbe_amount\":0.7")
+        val result = applier.applyAndCommit(
+            v3, version = 3L, appliedVersion = 2L,
+            profileId = "omega-1",
+            promoteToStable = false,
+            install = ::installOk,
+            readAppliedProfileId = { ProfileApplier.LIVE_PROFILE_ID }
+        )
+        assertTrue("se esperaba Committed, fue $result", result is ProfileApplier.CommitResult.Committed)
+        // El estable sigue siendo la v2 (no la candidata v3).
+        assertEquals(V11_JSON, applier.readStableBody())
+        assertEquals(2L, applier.readJournal()!!.stableVersion)
+        assertEquals(3L, applier.readJournal()!!.version)
+    }
+
+    @Test
+    fun `diario viejo sin profileId ni stableVersion se lee con defaults`() {
+        applier.writeJournal(
+            ProfileApplier.ApplyJournal(1L, ProfileApplier.sha256Hex(V11_JSON), ProfileApplier.JournalState.COMMITTED, 0L)
+        )
+        // Reescribir sin los campos nuevos, como lo haría el código C8.
+        File(dir, ProfileApplier.JOURNAL_FILE_NAME).writeText(
+            """{"version":1,"hashSha256":"${ProfileApplier.sha256Hex(V11_JSON)}","estado":"COMMITTED","atMs":0}"""
+        )
+        val journal = applier.readJournal()!!
+        assertEquals("", journal.profileId)
+        assertEquals(null, journal.stableVersion)
     }
 
     companion object {

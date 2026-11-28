@@ -6,6 +6,7 @@ import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.google.gson.JsonSyntaxException
+import com.ivanna.omega.audio.IvannaAudioProfile
 import java.io.File
 
 /**
@@ -175,12 +176,23 @@ class ProfileApplier(
     /** Estado del diario de aplicación (visible; lo lee OrganismController al arrancar). */
     enum class JournalState { PENDING, COMMITTED, ROLLED_BACK }
 
-    /** Una entrada del diario `muselink-apply-journal.json`. */
+    /**
+     * Una entrada del diario `muselink-apply-journal.json`.
+     * T1/510: [profileId] es el id omega del perfil instalado (lo usa el
+     * rollback para registrar a qué perfil se vuelve; "" en diarios
+     * escritos antes de T1) y [stableVersion] es la versión del archivo
+     * estable vigente (el diario de la instalación NO es la versión del
+     * estable: un candidato commiteado deja el diario en su versión pero
+     * el estable sigue siendo la versión bendecida anterior; sin este
+     * campo el rollback no sabría a qué versión volver).
+     */
     data class ApplyJournal(
         val version: Long,
         val hashSha256: String,
         val estado: JournalState,
-        val atMs: Long
+        val atMs: Long,
+        val profileId: String = "",
+        val stableVersion: Long? = null
     )
 
     sealed class CommitResult {
@@ -232,6 +244,15 @@ class ProfileApplier(
      *      COMMITTED y se promueve el estable (archivo + SHA-256).
      *      Cualquier otro valor (o null) deja el diario PENDING para que
      *      el próximo arranque restaure el estable.
+     *
+     * T1/510: [profileId] es el id omega del sobre (queda en el diario
+     * para el rollback) y [promoteToStable] decide si este commit
+     * promueve el archivo estable. Un candidato (`candidate` /
+     * `ab_running`) se commitea SIN promover: el estable sigue siendo la
+     * versión bendecida anterior, que es el destino del rollback si el
+     * servidor marca `rolled_back`. Un estable o un rollback restaurado
+     * sí promueven. El diario registra en ambos casos la versión del
+     * estable vigente en [ApplyJournal.stableVersion].
      */
     fun applyAndCommit(
         body: String,
@@ -239,6 +260,8 @@ class ProfileApplier(
         appliedVersion: Long?,
         rolledBack: Boolean = false,
         previous: ValidatedProfile? = null,
+        profileId: String = "",
+        promoteToStable: Boolean = true,
         install: (ValidatedProfile) -> Boolean,
         readAppliedProfileId: () -> String?
     ): CommitResult {
@@ -249,7 +272,7 @@ class ProfileApplier(
                 return CommitResult.Rejected(result, file)
             }
         }
-        installCandidate(body, version)
+        installCandidate(body, version, profileId)
         if (!install(validated)) {
             return CommitResult.NotCommitted(validated, "install() devolvió false; diario queda PENDING")
         }
@@ -260,8 +283,20 @@ class ProfileApplier(
                 "read-back: perfil aplicado '$appliedId', se esperaba '$LIVE_PROFILE_ID'; diario queda PENDING"
             )
         }
-        promoteStable(body, version)
-        writeJournal(ApplyJournal(version, sha256Hex(body), JournalState.COMMITTED, clockMs()))
+        val prevStableVersion = readJournal()?.stableVersion
+        if (promoteToStable) {
+            promoteStable(body, version)
+        }
+        writeJournal(
+            ApplyJournal(
+                version,
+                sha256Hex(body),
+                JournalState.COMMITTED,
+                clockMs(),
+                profileId,
+                stableVersion = if (promoteToStable) version else prevStableVersion
+            )
+        )
         pruneCandidates(keepVersion = null)
         return CommitResult.Committed(validated)
     }
@@ -269,12 +304,15 @@ class ProfileApplier(
     /**
      * Escribe el candidato con tmp+rename y el diario en PENDING con el
      * SHA-256 del cuerpo. Conserva solo estable + este candidato + diario.
+     * El diario PENDING conserva la versión del estable vigente (si la
+     * había): el candidato aún no es estable.
      */
-    fun installCandidate(body: String, version: Long): File {
+    fun installCandidate(body: String, version: Long, profileId: String = ""): File {
         dir.mkdirs()
         val file = File(dir, candidateFileName(version))
         writeAtomic(file, body)
-        writeJournal(ApplyJournal(version, sha256Hex(body), JournalState.PENDING, clockMs()))
+        val prevStableVersion = readJournal()?.stableVersion
+        writeJournal(ApplyJournal(version, sha256Hex(body), JournalState.PENDING, clockMs(), profileId, prevStableVersion))
         pruneCandidates(keepVersion = version)
         return file
     }
@@ -289,7 +327,11 @@ class ProfileApplier(
                 version = obj.get("version").asLong,
                 hashSha256 = obj.get("hashSha256").asString,
                 estado = JournalState.valueOf(obj.get("estado").asString),
-                atMs = obj.get("atMs").asLong
+                atMs = obj.get("atMs").asLong,
+                // T1/510: tolerante con diarios escritos antes de T1 (sin
+                // estos campos): profileId "" y stableVersion null.
+                profileId = obj.get("profileId")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString ?: "",
+                stableVersion = obj.get("stableVersion")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }?.asLong
             )
         }.getOrNull()
     }
@@ -301,6 +343,8 @@ class ProfileApplier(
             addProperty("hashSha256", journal.hashSha256)
             addProperty("estado", journal.estado.name)
             addProperty("atMs", journal.atMs)
+            addProperty("profileId", journal.profileId)
+            journal.stableVersion?.let { addProperty("stableVersion", it) }
         }
         writeAtomic(File(dir, JOURNAL_FILE_NAME), gson.toJson(obj))
     }
@@ -429,6 +473,121 @@ class ProfileApplier(
 
         /** Id del perfil vivo en el motor; el read-back debe devolver exactamente este valor. */
         const val LIVE_PROFILE_ID = "muselink-live"
+
+        /**
+         * Sala de escucha de Esse (verificado 2026-11-21): 4.0 m de ancho
+         * × 7.0 m de largo, escucha a 3 m. La VUELTA §3.2 fija estos tres
+         * valores para todo perfil descargado (el `.ivanna.json` no trae
+         * sala: SalaViva no tiene slot en el engine v1.0).
+         */
+        const val SALA_RT60_SEC = 0.34f
+        const val SALA_ROOM_SIZE_M = 7.0f
+        const val SALA_ROOM_WET = 0.22f
+
+        /**
+         * T1/510 — traducción del [ValidatedProfile] al esquema interno
+         * [IvannaAudioProfile] (VUELTA §3.2 paso 2). Pura y testeable en
+         * JVM: no toca disco, DSP ni Android.
+         *
+         * MAPEO DUAL VERIFICADO (ver `510-prep/T1-double-eq-verification.md`):
+         * el EQ se escribe en AMBOS destinos con el MISMO valor, sin
+         * dividir entre 2: `audioEngine.eqXDb` (EQ legacy, suena en rutas
+         * legacy / `nativeProcessBlock`) y `tonal.xDb` (EQ fusionado
+         * ARMONÍA, suena en las rutas fusionadas vivas). `pushToNative()`
+         * y el tonal fusionado alimentan dos EQs distintos detrás de
+         * ramas mutuamente excluyentes; escribir en un solo destino
+         * dejaría al EQ mudo en la otra ruta. La presencia se escribe en
+         * ambos destinos aunque hoy se pierda en las rutas fusionadas
+         * (sin slot JNI hasta S3 — el slot ya existe en la ola 1).
+         *
+         * HERENCIA: lo que el `.ivanna.json` no cubre (`audioEngine.gain`,
+         * `widthAmount`, `antiDolby`, `neuromorphic`, `route`, resto de
+         * `spatial`/`field`/`volterra`/`sala`/`tonal`/`dynamics`/`brain`/
+         * `output`) se hereda de [base] (el perfil que se reemplaza);
+         * nunca se inventa. [base] lo resuelve el controlador (muselink-live
+         * vigente, o el perfil aplicado, o el primero de la lista).
+         *
+         * HUECOS DOCUMENTADOS (no se inventan):
+         * - `volterra_mix` (0.55) no tiene slot en el esquema interno: se
+         *   conserva en el `.ivanna.json` y no se aplica.
+         *   `volterra.correction` es solo on/off (1.0 si `volterra_enabled`,
+         *   0.0 si no), igual que `TransducerControls.correction`
+         *   («cantidad de corrección 0..1»). Nota: `IvannaOmegaFile`
+         *   mapea el mix como correction; la VUELTA especifica on/off y
+         *   manda la especificación aquí.
+         * - `structural_split` no tiene operador en el DSP (diseño aparte);
+         *   se valida pero no se traduce.
+         * - `profileId` null (solo en el camino de rollback, cuando el
+         *   diario no lo registró) omite el id de la descripción; el
+         *   resto del mapeo no cambia.
+         */
+        fun translate(
+            validated: ValidatedProfile,
+            status: String,
+            profileId: String?,
+            base: IvannaAudioProfile
+        ): IvannaAudioProfile {
+            // 1. Calcular UNA vez por banda, mismo valor para ambos destinos.
+            val low = validated.eqBandsDb.low60_120.toFloat()
+            val mid = validated.eqBandsDb.mid500_1k.toFloat()
+            val high = validated.eqBandsDb.high2k_4k.toFloat()
+            val presence = validated.eqBandsDb.presence4k_8k.toFloat()
+            val description = if (profileId.isNullOrBlank()) {
+                "MuseLink · ${validated.source} · $status"
+            } else {
+                "MuseLink · ${validated.source} · $status · $profileId"
+            }
+            return base.copy(
+                id = LIVE_PROFILE_ID,
+                name = "${validated.track} (v${validated.version})",
+                description = description,
+                category = "muselink",
+                priority = base.priority,
+                audioEngine = base.audioEngine.copy(
+                    exciterAmount = validated.exciterAmount.toFloat(),
+                    // Mapeo dual: mismo valor en el destino legacy…
+                    eqLowDb = low,
+                    eqMidDb = mid,
+                    eqHighDb = high,
+                    eqPresenceDb = presence
+                    // gain / eqGain / widthAmount / bypass: heredados de base.
+                ),
+                spatial = base.spatial.copy(
+                    orbeAmount = validated.orbeAmount.toFloat(),
+                    orbeDistanceM = validated.orbeDistanceM.toFloat()
+                ),
+                field = base.field.copy(
+                    holosAmount = validated.holosAmount.toFloat(),
+                    phiAmount = validated.phiAmount.toFloat()
+                ),
+                volterra = base.volterra.copy(
+                    correction = if (validated.volterraEnabled) 1.0f else 0.0f
+                ),
+                sala = base.sala.copy(
+                    rt60Sec = SALA_RT60_SEC,
+                    roomSizeM = SALA_ROOM_SIZE_M,
+                    roomWet = SALA_ROOM_WET
+                ),
+                tonal = base.tonal.copy(
+                    trimDb = validated.trimDb.toFloat(),
+                    // …y en el destino fusionado (mismo valor, sin /2).
+                    lowDb = low,
+                    midDb = mid,
+                    highDb = high,
+                    presenceDb = presence
+                ),
+                dynamics = base.dynamics.copy(
+                    compThresholdDb = validated.compressor.thresholdDb.toFloat(),
+                    compRatio = validated.compressor.ratio.toFloat()
+                ),
+                tags = listOf("muselink-live", status),
+                referenceTrack = validated.track,
+                targetLufsDeltaDb = validated.netGainDb.toFloat()
+                // antiDolby / neuromorphic / route / brain / output /
+                // resto de spatial/field/volterra/sala/tonal/dynamics:
+                // heredados de base (copy los conserva).
+            )
+        }
 
         /** SHA-256 hex (minúsculas) del cuerpo; usado por diario y sidecar del estable. */
         fun sha256Hex(text: String): String {

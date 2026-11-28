@@ -133,9 +133,10 @@ object OrganismPayload {
      * perfil aplicado, para que el servidor correlacione versión
      * aplicada ↔ ERB medido sin depender solo de la versión).
      * `appliedAt` en ISO-8601 UTC, igual que `compiledAt` del GET.
-     * PUNTO DE ENGANCHE — el POST aún no existe (lo crea T1 en Fase 2):
-     * quien lo envíe construye el cuerpo con esta función a partir del
-     * `AppliedProfile` que devuelve `OrganismController.recordAppliedProfile`.
+     * PUNTO DE ENGANCHE — el POST existe en `ProfileFetcher.confirmApplied()`
+     * (T1, Fase 2): quien lo envía construye el cuerpo con esta función a
+     * partir del `AppliedProfile` que devuelve
+     * `OrganismController.recordAppliedProfile`.
      */
     fun appliedConfirmation(
         applied: AppliedProfile,

@@ -176,4 +176,109 @@ class OrganismControllerTest {
         assertEquals(true, OrganismController.shouldAttemptRollback(false, missing))
         assertEquals(false, OrganismController.shouldAttemptRollback(true, missing))
     }
+
+    // T1/510 — decisiones puras del sondeo de perfil (la VUELTA).
+
+    @Test
+    fun `State por defecto lleva appliedProfileStatus none`() {
+        assertEquals("none", OrganismController.State().appliedProfileStatus)
+    }
+
+    @Test
+    fun `recordAppliedProfile con profileStatus actualiza appliedProfileStatus`() {
+        try {
+            OrganismController.recordAppliedProfile(
+                profileId = "omega-1795857152818-9lec",
+                version = 3L,
+                abState = "ab_running",
+                profileHash = "sha256:abc123",
+                profileStatus = "ab_running"
+            )
+            assertEquals("ab_running", OrganismController.state.value.appliedProfileStatus)
+            assertEquals(3L, OrganismController.state.value.appliedProfileVersion)
+        } finally {
+            OrganismController.recordAppliedProfile("factory", 0L, "none", "", "none")
+        }
+    }
+
+    @Test
+    fun `interruptor maestro en OFF apaga tambien el sondeo`() {
+        assertEquals(
+            false,
+            OrganismController.shouldPollProfile(
+                enabled = false, hasToken = true,
+                nowMs = now, lastCheckMs = 0L
+            )
+        )
+    }
+
+    @Test
+    fun `sin token no se sondea aunque toque`() {
+        assertEquals(
+            false,
+            OrganismController.shouldPollProfile(
+                enabled = true, hasToken = false,
+                nowMs = now, lastCheckMs = 0L
+            )
+        )
+    }
+
+    @Test
+    fun `sondeo toca a los 30 min y no antes`() {
+        val interval = OrganismController.PROFILE_POLL_INTERVAL_MS
+        assertEquals(
+            true,
+            OrganismController.shouldPollProfile(
+                enabled = true, hasToken = true,
+                nowMs = now, lastCheckMs = now - interval
+            )
+        )
+        assertEquals(
+            false,
+            OrganismController.shouldPollProfile(
+                enabled = true, hasToken = true,
+                nowMs = now, lastCheckMs = now - interval + 1000L
+            )
+        )
+    }
+
+    @Test
+    fun `stable mas nuevo se aplica`() {
+        assertEquals(true, OrganismController.shouldApplyServerVersion("stable", "none", 3L, 2L))
+        assertEquals(true, OrganismController.shouldApplyServerVersion("promoted", "promoted", 3L, 2L))
+    }
+
+    @Test
+    fun `version igual o mas vieja no se aplica`() {
+        assertEquals(false, OrganismController.shouldApplyServerVersion("stable", "none", 2L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("stable", "none", 1L, 2L))
+    }
+
+    @Test
+    fun `candidate solo se aplica con abState que permite probar`() {
+        assertEquals(true, OrganismController.shouldApplyServerVersion("candidate", "candidate", 3L, 2L))
+        assertEquals(true, OrganismController.shouldApplyServerVersion("ab_running", "ab_running", 3L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("candidate", "none", 3L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("candidate", "promoted", 3L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("candidate", "rolled_back", 3L, 2L))
+    }
+
+    @Test
+    fun `rolled_back no se aplica por la via normal (lo gestiona el rollback)`() {
+        assertEquals(false, OrganismController.shouldApplyServerVersion("rolled_back", "rolled_back", 3L, 2L))
+        assertEquals(false, OrganismController.shouldApplyServerVersion("rolled_back", "rolled_back", 1L, 2L))
+    }
+
+    @Test
+    fun `status desconocido no se aplica (fail-closed)`() {
+        assertEquals(false, OrganismController.shouldApplyServerVersion("experimental", "none", 3L, 2L))
+    }
+
+    @Test
+    fun `rollback solo restaura un estable estrictamente anterior`() {
+        assertEquals(true, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = 3L))
+        assertEquals(false, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = 4L))
+        assertEquals(false, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = 5L))
+        assertEquals(false, OrganismController.shouldRestoreStable(appliedVersion = 4L, stableVersion = null))
+    }
 }
