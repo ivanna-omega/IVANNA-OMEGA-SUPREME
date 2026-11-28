@@ -161,6 +161,26 @@
             android:exported="false"
             android:foregroundServiceType="microphone"/>
 
+        <!-- T8/510 — WorkManager del Organismo: el Initializer
+             (OrganismWorkSchedulerInitializer) programa en cada arranque
+             el trabajo periódico `organism-flush` (15 min, con red) que
+             vacía la cola y comprueba la versión del perfil con la app
+             cerrada. La entrada es el <meta-data> con valor
+             "androidx.startup" bajo el InitializationProvider (merge con
+             el que ya declara la librería WorkManager); sin ella el
+             Initializer existe pero nunca se ejecuta. El Initializer no
+             arranca el controlador ni envía nada: solo encola el trabajo
+             (KEEP, idempotente). -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="com.ivanna.omega.organism.OrganismWorkSchedulerInitializer"
+                android:value="androidx.startup" />
+        </provider>
+
         <!-- FIX: Receptor de sesiones de audio globales (Global Effect Manager) -->
         <!-- Permite capturar el broadcast de Android cuando cualquier app abre audio -->
         <receiver
