@@ -81,7 +81,11 @@ class OrganismSenderTest {
             hosts = hosts,
             nowMs = { 1000L },
             jitter = { 0.0 },
-            logger = NoOpOrganismLogger()
+            logger = NoOpOrganismLogger(),
+            // C9/510: los tests usan el servidor local 127.0.0.1:8080, fuera
+            // de la allowlist de hosts de producción; la allowlist queda
+            // siempre activa en producción (OrganismController usa el default).
+            enforceAllowlist = false
         )
     }
 
@@ -137,7 +141,8 @@ class OrganismSenderTest {
                     InMemoryTokenStore("test-token-1234567890"), queue,
                     client = fakeClient(),
                     hosts = listOf(localHost()), nowMs = { 1000L }, jitter = { 0.0 },
-                    logger = NoOpOrganismLogger()
+                    logger = NoOpOrganismLogger(),
+                    enforceAllowlist = false  // C9/510: servidor local de test
                 )
                 val body = JsonObject().apply { addProperty("song", "x") }
                 queue.enqueue("s1", 0, body)

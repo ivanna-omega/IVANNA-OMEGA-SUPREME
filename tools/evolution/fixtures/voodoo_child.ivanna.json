@@ -1,0 +1,67 @@
+{
+  "format": "IVANNA OMEGA",
+  "format_version": "1.0",
+  "track": "Voodoo Child (Slight Return)",
+  "artist": "Jimi Hendrix",
+  "source": "voodoo_child_ivanna_omega_6_1fes.flac (48 kHz / 24-bit, estereo)",
+  "duration_s": 313.07,
+  "fingerprint": {
+    "loudness_lufs_integrated": -10.75,
+    "loudness_rms_dbfs": -14.39,
+    "peak_dbfs": -1.1,
+    "crest_db": 13.29,
+    "spectrum_db_rel": {
+      "sub": -16.93,
+      "low_60_120": -11.14,
+      "lowmid": -5.13,
+      "mid_500_1k": -5.55,
+      "highmid": -8.79,
+      "high_2k_4k": -9.33,
+      "presence_4k_8k": -12.74,
+      "air": -27.99,
+      "ultra": -36.94
+    },
+    "transient_energy_ratio": 0.177,
+    "tonal_energy_ratio": 0.823,
+    "stereo_correlation": 0.518,
+    "stereo_width_side_mid": 0.564,
+    "sample_rate_hz": 48000,
+    "channels": 2
+  },
+  "engine": {
+    "orbe_amount": 1.0,
+    "orbe_distance_m": 0.35,
+    "holos_amount": 0.5,
+    "phi_amount": 0.5,
+    "volterra_enabled": true,
+    "volterra_mix": 0.55,
+    "eq_bands_db": {
+      "low_60_120": 0.51,
+      "mid_500_1k": -1.45,
+      "high_2k_4k": -0.12,
+      "presence_4k_8k": 1.07
+    },
+    "compressor": {
+      "threshold_db": -8.4,
+      "ratio": 2.0,
+      "attack_ms": 10.0,
+      "release_ms": 120.0
+    },
+    "exciter_amount": 0.3,
+    "trim_db": 0.0,
+    "net_gain_db": 0.0,
+    "structural_split": {
+      "transient_amount": 0.46,
+      "tonal_amount": 1.0,
+      "transient_energy_ratio": 0.177,
+      "tonal_energy_ratio": 0.823
+    }
+  },
+  "derivation": {
+    "eq": "Correccion suave hacia plano sobre las 4 bandas con slot (-0.35 x desviacion de la media -9.69 dB, clamp +-2 dB). Net 0.0 dB por construccion.",
+    "compressor": "Threshold RMS+6 dB = -8.4 dB, ratio 2.0 (crest 13.3 dB: rola dinamica, solo toca picos).",
+    "structural_split": "HPSS (mediana tiempo/frecuencia, STFT 2048): transitorio 0.177, tonal 0.823.",
+    "loudness": "BS.1770 K-weighting + gating absoluto -70 y relativo -10 LU: -10.75 LUFS.",
+    "note": "Constantes del engine (orbe/holos/phi/volterra/exciter) son los valores por defecto de IVANNA; solo EQ, compresor y split se derivan de la medicion."
+  }
+}
