@@ -347,6 +347,8 @@ fun IvannaControlPanel(
     onOrganismClearQueue: () -> Unit = {},
     // C21/510: diagnóstico de un toque del token (desde la tarjeta).
     onOrganismDiagnoseToken: () -> Unit = {},
+    // C22/510: borrado explícito del perfil estable (maestro en OFF).
+    onOrganismDeleteStableProfile: () -> Unit = {},
     initialPunchAmount: Float = 0f,
     initialCrossfeed: Float = 0f,
     // ORBE — Binaural Esférico de Campo Cercano (v2.5.363). ACTIVO por defecto en v2.5.369 (amount 1.0).
@@ -1028,7 +1030,8 @@ fun IvannaControlPanel(
             onToggle = onOrganismToggle,
             onSaveToken = onOrganismSaveToken,
             onClearQueue = onOrganismClearQueue,
-            onDiagnoseToken = onOrganismDiagnoseToken
+            onDiagnoseToken = onOrganismDiagnoseToken,
+            onDeleteStableProfile = onOrganismDeleteStableProfile
         )
 
         // ── v2.5.483 · FÍSICA NUEVA v3 ─────────────────────────────────────

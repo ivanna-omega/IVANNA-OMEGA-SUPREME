@@ -45,10 +45,18 @@ import java.io.File
  *      un flush y cancelar el scope acto seguido era una carrera: el
  *      envío final no estaba garantizado. El diferido sí lo está (la
  *      cola es durable y el arranque reanuda el vaciado).
- *   5. RETENCIÓN Y BORRADO (defecto #9): la cola vive 7 días como
- *      máximo y el usuario puede borrarla entera desde la tarjeta
- *      (clearQueue). Los JSON están en filesDir (privado de la app,
- *      sin cifrar en reposo).
+ *   5. RETENCIÓN Y BORRADO (defecto #9; C22/510 para perfiles): la
+ *      cola vive 7 días como máximo y el usuario puede borrarla entera
+ *      desde la tarjeta (clearQueue). Borrar la cola borra TAMBIÉN los
+ *      candidatos de perfil no estables (`muselink-profile-<n>.ivanna.json`),
+ *      pero NUNCA el estable: el último perfil bueno solo se borra con
+ *      borrado explícito ([deleteStableProfile]) y con el interruptor
+ *      maestro en OFF, para que «borrar» nunca deje el teléfono sin
+ *      perfil bueno. En disco solo viven estable + candidato vigente +
+ *      diario (el resto se poda al instalar/promover). Los JSON de
+ *      perfil no contienen secretos (el token nunca va en ellos), así
+ *      que filesDir privado sin cifrar en reposo es aceptable,
+ *      documentado igual que la cola.
  *   6. FOREGROUND SERVICE (v2.5.510, fix del «nada» de la 509): sin
  *      servicio en primer plano, al salir de la app Android congela
  *      el proceso y silencia el mic, así que el organismo no captura
@@ -654,9 +662,46 @@ object OrganismController {
         appContext?.let { OrganismForegroundService.stop(it) }
     }
 
-    /** Borra toda la cola local (defecto #9). Devuelve cuántos se borraron. */
+    /**
+     * Borra toda la cola local (defecto #9). C22/510: borra TAMBIÉN los
+     * candidatos de perfil no estables (`muselink-profile-<n>.ivanna.json`);
+     * el estable, su sidecar, el diario y la cuarentena se conservan, así
+     * que «borrar» nunca deja el teléfono sin perfil bueno. El estable
+     * solo se borra con [deleteStableProfile] (maestro en OFF + explícito).
+     * Funciona aunque el controlador esté detenido (sin cola ni applier
+     * vivos): usa un [ProfileApplier] desechable sobre filesDir. Devuelve
+     * cuántos chunks de cola se borraron (los candidatos van al Log).
+     */
     fun clearQueue(): Int {
         val deleted = queue?.clearAll() ?: 0
+        val candidatesDeleted = profileApplier?.deleteCandidates()
+            ?: appContext?.let { ProfileApplier(it.filesDir).deleteCandidates() }
+            ?: 0
+        if (candidatesDeleted > 0) {
+            Log.i(TAG, "C22: clearQueue borró $candidatesDeleted candidato(s) no estables (el estable se conserva)")
+        }
+        refreshState()
+        return deleted
+    }
+
+    /**
+     * C22/510 — borrado EXPLÍCITO del perfil estable (archivo + sidecar
+     * `.sha256` + diario). Solo con el interruptor maestro en OFF: con el
+     * organismo encendido se rechaza (fail-closed; sin contexto no se puede
+     * verificar el interruptor y también se rechaza). Sin estable que
+     * borrar devuelve false. La versión aplicada en memoria no se toca
+     * (solo vive en memoria y vuelve a neutros tras reiniciar); tras
+     * reiniciar, el sondeo vuelve a descargar el perfil vigente porque
+     * ya no hay versión aplicada que comparar.
+     */
+    fun deleteStableProfile(): Boolean {
+        val ctx = appContext ?: return false
+        if (isEnabled(ctx)) {
+            Log.w(TAG, "C22: borrar el estable exige el interruptor maestro en OFF")
+            return false
+        }
+        val deleted = ProfileApplier(ctx.filesDir).deleteStable()
+        if (deleted) Log.i(TAG, "C22: perfil estable borrado (archivo + sidecar + diario)")
         refreshState()
         return deleted
     }

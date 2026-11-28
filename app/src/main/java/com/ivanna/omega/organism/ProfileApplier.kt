@@ -55,6 +55,17 @@ import java.io.File
  * candidato es solo medición para el A/B, no promoción, y la
  * validación lo indica en [ValidatedProfile.abMeasurementOnly] para
  * que T1/OrganismController lo sepan y no lo traten como promoción.
+ *
+ * C22 (release 510): retención de perfiles descargados. En disco solo
+ * viven estable + candidato vigente + diario ([pruneCandidates] los
+ * impone en cada instalación/promoción); [deleteCandidates] borra los
+ * candidatos no estables cuando el usuario borra la cola desde la
+ * tarjeta, y [deleteStable] es el borrado explícito del último perfil
+ * bueno (solo con el interruptor maestro en OFF, lo exige
+ * `OrganismController.deleteStableProfile()`). Los JSON de perfil NO
+ * contienen secretos (el token nunca va en ellos), así que `filesDir`
+ * privado sin cifrar en reposo es aceptable, documentado igual que la
+ * cola ([OrganismQueue]).
  */
 class ProfileApplier(
     private val dir: File,
@@ -445,6 +456,50 @@ class ProfileApplier(
             val tmp = File(dir, "$name.tmp")
             if (tmp.isFile) tmp.delete()
         }
+    }
+
+    /**
+     * C22/510 — borrado de candidatos desde la tarjeta del Organismo
+     * ([OrganismController.clearQueue]): borra TODOS los candidatos
+     * versionados (`muselink-profile-<n>.ivanna.json`) y sus `.tmp`
+     * huérfanos. El estable, su sidecar `.sha256`, el diario y la
+     * cuarentena NO se tocan: «borrar» nunca deja el teléfono sin
+     * perfil bueno. Devuelve cuántos archivos de candidato se borraron.
+     * El diario PENDING que apunte a un candidato borrado sigue siendo
+     * válido: al arrancar, el rollback restaura el estable verificado
+     * como candidato de esa versión ([restoreStableCandidate]).
+     */
+    fun deleteCandidates(): Int {
+        var deleted = 0
+        val files = dir.listFiles() ?: return 0
+        for (f in files) {
+            if (CANDIDATE_FILE_REGEX.matchEntire(f.name) == null) continue
+            if (f.delete()) deleted++
+            val tmp = File(dir, "${f.name}.tmp")
+            if (tmp.isFile) tmp.delete()
+        }
+        return deleted
+    }
+
+    /**
+     * C22/510 — borrado EXPLÍCITO del perfil estable. Borra el estable,
+     * su sidecar `.sha256` y el diario (su `stableVersion` quedaría
+     * colgando sin estable al que apuntar). Los candidatos NO se tocan:
+     * los borra `clearQueue` / los poda la próxima instalación. Solo lo
+     * llama `OrganismController.deleteStableProfile()`, que exige el
+     * interruptor maestro en OFF. Devuelve true solo si había un estable
+     * y se borró; false si no había nada que borrar.
+     */
+    fun deleteStable(): Boolean {
+        val stable = File(dir, STABLE_FILE_NAME)
+        if (!stable.isFile) return false
+        stable.delete()
+        File(dir, STABLE_HASH_FILE_NAME).delete()
+        File(dir, JOURNAL_FILE_NAME).delete()
+        File(dir, "$STABLE_FILE_NAME.tmp").delete()
+        File(dir, "$STABLE_HASH_FILE_NAME.tmp").delete()
+        File(dir, "$JOURNAL_FILE_NAME.tmp").delete()
+        return true
     }
 
     private fun writeAtomic(dest: File, text: String) {

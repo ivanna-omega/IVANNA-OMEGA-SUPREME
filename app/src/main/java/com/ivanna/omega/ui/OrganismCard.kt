@@ -52,6 +52,9 @@ fun OrganismCard(
     onSaveToken: (String) -> Boolean,
     onClearQueue: () -> Unit = {},
     onDiagnoseToken: () -> Unit = {},
+    // C22/510: borrado explícito del perfil estable. Solo se muestra con
+    // el interruptor maestro en OFF; el controlador lo rechaza si está ON.
+    onDeleteStableProfile: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var tokenDraft by remember { mutableStateOf("") }
@@ -103,6 +106,18 @@ fun OrganismCard(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Button(onClick = onClearQueue) { Text("Borrar cola local") }
+            }
+            // C22/510: el estable (último perfil bueno) solo se borra con
+            // borrado explícito y el organismo apagado; borrar la cola no
+            // lo toca. Sin este botón no habría forma de borrarlo.
+            if (!state.enabled) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    "Borrar la cola conserva el último perfil bueno. Para borrarlo también:",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Button(onClick = onDeleteStableProfile) { Text("Borrar perfil estable") }
             }
             if (state.micReanchors > 0) {
                 Text(

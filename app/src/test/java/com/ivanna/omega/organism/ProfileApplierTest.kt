@@ -345,6 +345,50 @@ class ProfileApplierTest {
     }
 
     @Test
+    fun `C22 borrar candidatos no toca estable ni diario ni cuarentena`() {
+        assertTrue(applier.promoteStable(V11_JSON, 1L))
+        applier.installCandidate(V11_JSON, 2L)
+        // Candidatos acumulados (p. ej. de versiones viejas o de un corte
+        // antes del prune): se escriben directo para simular el montón.
+        File(dir, ProfileApplier.candidateFileName(3L)).writeText(V11_JSON)
+        File(dir, ProfileApplier.candidateFileName(4L)).writeText(V11_JSON)
+        File(dir, "${ProfileApplier.candidateFileName(4L)}.tmp").writeText("{basura")
+        val quarantined = applier.quarantine(V11_JSON, 9L, listOf("motivo de prueba"))
+        assertEquals("deben borrarse los 3 candidatos (2, 3 y 4)", 3, applier.deleteCandidates())
+        val names = dir.listFiles()!!.map { it.name }.toSet()
+        assertFalse(names.contains(ProfileApplier.candidateFileName(2L)))
+        assertFalse(names.contains(ProfileApplier.candidateFileName(3L)))
+        assertFalse(names.contains(ProfileApplier.candidateFileName(4L)))
+        assertFalse(names.contains("${ProfileApplier.candidateFileName(4L)}.tmp"))
+        assertTrue(names.contains(ProfileApplier.STABLE_FILE_NAME))
+        assertTrue(names.contains(ProfileApplier.STABLE_HASH_FILE_NAME))
+        assertTrue(names.contains(ProfileApplier.JOURNAL_FILE_NAME))
+        assertTrue(names.contains(quarantined.name))
+        assertTrue(names.contains(ProfileApplier.QUARANTINE_STATUS_FILE_NAME))
+        assertEquals("el estable sigue verificando", V11_JSON, applier.readStableBody())
+    }
+
+    @Test
+    fun `C22 borrar estable borra estable mas sidecar mas diario y conserva candidatos`() {
+        assertTrue(applier.promoteStable(V11_JSON, 1L))
+        applier.installCandidate(V11_JSON, 2L)
+        assertTrue(applier.deleteStable())
+        val names = dir.listFiles()!!.map { it.name }.toSet()
+        assertFalse(names.contains(ProfileApplier.STABLE_FILE_NAME))
+        assertFalse(names.contains(ProfileApplier.STABLE_HASH_FILE_NAME))
+        assertFalse(names.contains(ProfileApplier.JOURNAL_FILE_NAME))
+        assertTrue("el candidato no se toca (lo borra clearQueue o el prune)", names.contains(ProfileApplier.candidateFileName(2L)))
+        assertFalse("sin estable ya no hay nada que borrar", applier.deleteStable())
+    }
+
+    @Test
+    fun `C22 borrar estable sin estable devuelve false`() {
+        assertFalse(applier.deleteStable())
+        applier.installCandidate(V11_JSON, 2L)
+        assertFalse(applier.deleteStable())
+    }
+
+    @Test
     fun `corte simulado tmp huerfano no reemplaza al candidato`() {
         applier.installCandidate(V11_JSON, 2L)
         File(dir, "${ProfileApplier.candidateFileName(2L)}.tmp").writeText("{basura")
