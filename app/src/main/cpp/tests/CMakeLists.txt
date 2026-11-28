@@ -3370,6 +3370,29 @@ if(IVANNA_SAN_FLAGS)
 endif()
 gtest_discover_tests(test_double_floor)
 
+# ── HARNESS ACÚSTICO OFFLINE (2026-11-27, plan ajustado) ───────────────────
+# Laboratorio offline: reproduce con números la degradación al subir HOLOS +
+# hiperoperador (field.amount 1.0 / phi 1.0 / harmonics 0.002) sobre 5
+# estímulos (tono 1 kHz, barrido log 20 Hz–20 kHz, ruido rosa, impulso,
+# música sintética). Mide clipping, True Peak BS.1770, THD+N, tono
+# emergente, crest factor, balance L/R, fase intercanal y CPU por hop
+# (128 muestras = 2667 µs). Umbrales en el .cpp, justificados con líneas
+# base medidas del proyecto. Registro con el patrón de test_double_floor
+# (add_executable + ${FUSED_CHAIN_SOURCES}): ivanna_add_test NO vale aquí
+# porque FusedChain no está en ivanna_dsp_under_test.
+add_executable(test_acoustic_harness
+  test_acoustic_harness.cpp
+  ${FUSED_CHAIN_SOURCES}
+)
+target_include_directories(test_acoustic_harness PRIVATE .. ../include ../neuromorphic ../dsp host_stubs)
+target_compile_options(test_acoustic_harness PRIVATE -Wall -Wextra)
+target_link_libraries(test_acoustic_harness PRIVATE GTest::gtest_main ivanna_dsp_under_test Threads::Threads m)
+if(IVANNA_SAN_FLAGS)
+  target_compile_options(test_acoustic_harness PRIVATE ${IVANNA_SAN_FLAGS})
+  target_link_options(test_acoustic_harness PRIVATE ${IVANNA_SAN_FLAGS})
+endif()
+gtest_discover_tests(test_acoustic_harness)
+
 # ── CORONA D10: 5 tests (2026-11-25) ──────────────────────────────────────
 # TΩ-2 LTI (bandas laterales ±375 Hz), neutro bit-exacto con D10 ON,
 # Matched-LUFS con los 7 operadores, protección térmica de bobina y

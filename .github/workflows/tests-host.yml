@@ -117,7 +117,7 @@ jobs:
           bash scripts/run_ctest.sh | tee /tmp/ctest_run.log
           python3 scripts/check_docs_claims.py --generate-from-log /tmp/ctest_run.log
 
-      - name: Fase 0 — Herramientas de verdad (0.1–0.5 + cppcheck + gitleaks)
+      - name: Fase 0 — Herramientas de verdad (0.1–0.5 + cppcheck + header_wiring)
         if: matrix.san == ''
         run: |
           set -euo pipefail
