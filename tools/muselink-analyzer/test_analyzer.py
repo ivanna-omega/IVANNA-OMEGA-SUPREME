@@ -22,7 +22,9 @@ from analyzer import (
     COHERENCE_GUARD,
     COMB_FIT_D_MAX_M,
     COMB_FIT_D_MIN_M,
+    COMB_IMPROVEMENT_MIN,
     CUMULATIVE_EXCURSION_CAP_DB,
+    D10_P0_TOLERANCE_DB,
     DEFAULT_MAX_SESSIONS_PER_HOUR,
     ERB_CENTER_HZ,
     EQ_CLAMP_DB,
@@ -32,14 +34,19 @@ from analyzer import (
     OUTLIER_CONFIRM_SESSIONS,
     OUTLIER_DEVIATION_DB,
     REGIONS,
+    S10_RESIDUAL_FREEZE_DB,
     TARGET_RMS_DB,
     check_cumulative_excursion,
+    check_d10_p0_covariates,
+    check_playing_evidence,
     check_promotion_brake,
     check_replay,
+    check_residual_freeze,
     check_token_rate,
     classify_session_outlier,
     coherence_guard,
     compile_candidate,
+    count_playing_chunks,
     detect_resonances,
     emit_ladder,
     evaluate_ab,
@@ -426,9 +433,23 @@ class TestCompileCandidatePipeline(unittest.TestCase):
         # S9 blocks every correction for auto-application.
         self.assertEqual(out["coherence_guard"]["mode"], "none")
         self.assertIsNone(out["split"]["v1_1a"])
-        # The S5 ladder still plans the climb from the clamped slots.
+        # S10 freezes brillo/presencia (residual +7 dB) at coherence
+        # 0%: EVO-003 is the next required step, pending the S1
+        # reference fix. (transicion/aire also trigger — unslotted,
+        # so they freeze no slot.)
+        self.assertEqual(out["s10"]["frozen_regions"],
+                         ["transicion", "brillo", "presencia", "aire"])
+        self.assertEqual(out["s10"]["frozen_slots"],
+                         ["high_2k_4k", "presence_4k_8k"])
+        self.assertTrue(out["s10"]["evo003_required"])
+        self.assertTrue(out["s10"]["evo003_pending_reference_fix"])
+        # The S5 ladder plans only the UNFROZEN climb (low -3, mid +4):
+        # one rung; brillo/presencia stay at their clamped +2 dB.
+        self.assertEqual(len(out["ladder"]), 1)
         self.assertEqual(out["ladder"][0]["version"], "v1.2")
-        self.assertEqual(out["ladder"][-1]["version"], "v1.5")
+        self.assertEqual(out["ladder"][0]["eq_bands_db"], {
+            "low_60_120": -3.0, "mid_500_1k": 4.0,
+            "high_2k_4k": 2.0, "presence_4k_8k": 2.0})
 
     def test_pipeline_with_good_coherence_emits_v1_1a(self):
         out = compile_candidate(
@@ -920,6 +941,404 @@ class TestT6CompileCandidate(unittest.TestCase):
         self.assertFalse(t6["halt_needs_human"])
         self.assertIsNone(t6["first_breaching_rung"])
         self.assertEqual(t6["excursion"]["max_excursion_db"], 1.5)
+
+
+class TestS10ResidualFreeze(unittest.TestCase):
+    """S10: residual > 4 dB -> diagnose before climbing further.
+
+    The triggering case is the v1.1 data itself: residual +7 dB in
+    presencia/brillo with coherence 0%."""
+
+    def test_v1_1_plus7_residual_with_zero_coherence_freezes(self):
+        corr = regional_correction(V1_1_ERROR_DB)
+        result = check_residual_freeze(corr, mean_coherence=0.0)
+        self.assertIn("brillo", result["frozen_regions"])
+        self.assertIn("presencia", result["frozen_regions"])
+        self.assertEqual(result["frozen_slots"],
+                         ["high_2k_4k", "presence_4k_8k"])
+        self.assertTrue(result["evo003_required"])
+        # Coherence 0% is instrumentation (S1), so the residual cannot
+        # be trusted as a room deficit: the EVO-003 firing itself stays
+        # pending the S1 reference fix.
+        self.assertTrue(result["evo003_pending_reference_fix"])
+        self.assertFalse(result["released"])
+
+    def test_unslotted_regions_trigger_the_diagnostic_but_freeze_no_slot(self):
+        # transicion (+7 dB) and aire (+12 dB) also exceed 4 dB; they
+        # trigger EVO-003, but there is no EQ step to freeze there.
+        corr = regional_correction(V1_1_ERROR_DB)
+        result = check_residual_freeze(corr, mean_coherence=0.0)
+        self.assertIn("transicion", result["triggered_regions"])
+        self.assertIn("aire", result["triggered_regions"])
+        self.assertEqual(result["frozen_slots"],
+                         ["high_2k_4k", "presence_4k_8k"])
+
+    def test_residual_exactly_4db_does_not_trigger(self):
+        # "Supera 4 dB" is strictly greater: brillo error -6 dB gives
+        # proposed +6, applied +2, residual exactly +4.0.
+        error = [0.0] * 24
+        for i in range(12, 16):  # ERB-13..16 brillo
+            error[i] = -6.0
+        result = check_residual_freeze(regional_correction(error),
+                                       mean_coherence=0.0)
+        self.assertEqual(result["triggered_regions"], [])
+        self.assertFalse(result["evo003_required"])
+
+    def test_residual_just_above_4db_triggers(self):
+        error = [0.0] * 24
+        for i in range(12, 16):  # ERB-13..16 brillo
+            error[i] = -6.5  # proposed +6.5, applied +2, residual +4.5
+        result = check_residual_freeze(regional_correction(error),
+                                       mean_coherence=0.0)
+        self.assertEqual(result["frozen_regions"], ["brillo"])
+        self.assertEqual(result["frozen_slots"], ["high_2k_4k"])
+        self.assertTrue(result["evo003_required"])
+
+    def test_small_residuals_do_not_trigger(self):
+        result = check_residual_freeze(regional_correction([-1.5] * 24),
+                                       mean_coherence=0.0)
+        self.assertEqual(result["triggered_regions"], [])
+        self.assertFalse(result["evo003_required"])
+
+    def test_good_coherence_releases_the_freeze(self):
+        # "Hasta que la coherencia suba": mean coherence >= 0.20 (the
+        # S9 guard, reused as "coherence has risen") means the table
+        # can be trusted and the residual is a real deficit.
+        corr = regional_correction(V1_1_ERROR_DB)
+        result = check_residual_freeze(corr, mean_coherence=0.9)
+        self.assertEqual(result["triggered_regions"],
+                         ["transicion", "brillo", "presencia", "aire"])
+        self.assertEqual(result["frozen_regions"], [])
+        self.assertTrue(result["released"])
+        self.assertFalse(result["evo003_required"])
+
+    def test_deficit_confirmed_releases_even_at_zero_coherence(self):
+        # The EVO-003 measurement confirmed the deficit: the freeze is
+        # released even though coherence is still 0%.
+        corr = regional_correction(V1_1_ERROR_DB)
+        result = check_residual_freeze(corr, mean_coherence=0.0,
+                                       deficit_confirmed=True)
+        self.assertTrue(result["released"])
+        self.assertEqual(result["frozen_regions"], [])
+        self.assertFalse(result["evo003_required"])
+        self.assertFalse(result["evo003_pending_reference_fix"])
+
+    def test_compile_candidate_freezes_the_ladder_at_zero_coherence(self):
+        out = compile_candidate(
+            V1_1_ERROR_DB, [0.0] * 24, 0.0,
+            erb_std_db=None, level_max_dbfs=-6.0)
+        self.assertTrue(out["s10"]["evo003_required"])
+        # No ladder rung climbs brillo/presencia past +2 dB.
+        for rung in out["ladder"]:
+            self.assertEqual(rung["eq_bands_db"]["high_2k_4k"], 2.0)
+            self.assertEqual(rung["eq_bands_db"]["presence_4k_8k"], 2.0)
+        self.assertTrue(any("S10 freeze" in n
+                            for n in out["split"]["notes"]))
+
+    def test_compile_candidate_climbs_when_the_freeze_is_released(self):
+        # Good coherence releases the freeze: the v1.1 ladder climbs
+        # to v1.5 again (and T6 still caps it at v1.3 — see TestT6).
+        out = compile_candidate(
+            V1_1_ERROR_DB, [0.9] * 24, 0.9,
+            erb_std_db=[0.3] * 24, level_max_dbfs=-6.0)
+        self.assertTrue(out["s10"]["released"])
+        self.assertEqual(out["ladder"][-1]["version"], "v1.5")
+        out = compile_candidate(
+            V1_1_ERROR_DB, [0.0] * 24, 0.0,
+            erb_std_db=None, level_max_dbfs=-6.0, deficit_confirmed=True)
+        self.assertTrue(out["s10"]["released"])
+        self.assertEqual(out["ladder"][-1]["version"], "v1.5")
+
+
+class TestS15D10P0Covariates(unittest.TestCase):
+    """S15: P0/D10 as A/B covariates, not decoration.
+
+    The telemetry fields are optional (retrocompatible): the A/B must
+    not require what the phone does not send yet. When they arrive on
+    both sides, a move outside +/-0.5 dB makes the A/B inconclusive
+    even if the RMS improves."""
+
+    def _sessions(self, d10=None, p0=None, trim=None):
+        sessions = []
+        for _ in range(3):
+            s = _session(5.23, [e * 0.5 for e in V1_1_ERROR_DB])
+            if d10 is not None:
+                s["d10_action"] = d10
+            if p0 is not None:
+                s["p0_db"] = p0
+            if trim is not None:
+                s["trim_db_effective"] = trim
+            sessions.append(s)
+        return sessions
+
+    def _base(self, d10=1.0, p0=-6.0, trim=-4.0):
+        return self._sessions(d10=d10, p0=p0, trim=trim)
+
+    def test_telemetry_fields_are_accepted_when_present(self):
+        chunk = {
+            "error_mean_db": list(V1_1_ERROR_DB),
+            "d10_action": 1.5,
+            "p0_db": -6.2,
+            "trim_db_effective": -4.0,
+        }
+        self.assertTrue(validate_chunk(chunk)["ok"])
+
+    def test_nonfinite_d10_or_p0_is_rejected(self):
+        chunk = {"error_mean_db": list(V1_1_ERROR_DB),
+                 "d10_action": float("nan")}
+        self.assertFalse(validate_chunk(chunk)["ok"])
+        chunk = {"error_mean_db": list(V1_1_ERROR_DB),
+                 "p0_db": float("inf")}
+        self.assertFalse(validate_chunk(chunk)["ok"])
+
+    def test_covariates_within_tolerance_are_ok(self):
+        result = check_d10_p0_covariates(self._base(),
+                                         self._sessions(d10=1.2, p0=-6.3,
+                                                        trim=-4.1))
+        self.assertEqual(result["status"], "ok")
+        self.assertAlmostEqual(result["d10_action_delta_db"], 0.2)
+        self.assertAlmostEqual(result["p0_db_delta_db"], -0.3)
+
+    def test_exactly_at_tolerance_is_ok(self):
+        result = check_d10_p0_covariates(self._base(),
+                                         self._sessions(d10=1.5, p0=-6.5))
+        self.assertEqual(result["status"], "ok")
+        self.assertAlmostEqual(result["d10_action_delta_db"], 0.5)
+        self.assertAlmostEqual(result["p0_db_delta_db"], -0.5)
+
+    def test_d10_move_beyond_tolerance_is_inconclusive(self):
+        result = check_d10_p0_covariates(self._base(),
+                                         self._sessions(d10=1.8, p0=-6.0))
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertAlmostEqual(result["d10_action_delta_db"], 0.8)
+        self.assertIn("D10 action", result["reason"])
+
+    def test_p0_move_beyond_tolerance_is_inconclusive(self):
+        result = check_d10_p0_covariates(self._base(),
+                                         self._sessions(d10=1.0, p0=-6.7))
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertAlmostEqual(result["p0_db_delta_db"], -0.7)
+        self.assertIn("P0", result["reason"])
+
+    def test_trim_move_does_not_gate_but_is_reported(self):
+        # The spec fixes no tolerance for the trim: a -2 dB trim move
+        # is reported, not gating.
+        result = check_d10_p0_covariates(self._base(),
+                                         self._sessions(d10=1.0, p0=-6.0,
+                                                        trim=-6.0))
+        self.assertEqual(result["status"], "ok")
+        self.assertAlmostEqual(result["trim_db_effective_delta_db"], -2.0)
+
+    def test_missing_telemetry_is_unchecked_not_blocking(self):
+        result = check_d10_p0_covariates(self._sessions(),
+                                         self._sessions())
+        self.assertEqual(result["status"], "unchecked")
+        self.assertIsNone(result["d10_action_delta_db"])
+        self.assertIn("SKIPPED", result["reason"])
+
+    def test_telemetry_on_one_side_only_is_unchecked(self):
+        result = check_d10_p0_covariates(self._base(), self._sessions())
+        self.assertEqual(result["status"], "unchecked")
+
+    def test_zero_d10_mean_is_a_value_not_an_absence(self):
+        # A genuine mean of 0.0 must not collapse to "absent".
+        result = check_d10_p0_covariates(self._sessions(d10=0.0, p0=-6.0),
+                                         self._sessions(d10=0.8, p0=-6.0))
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertAlmostEqual(result["d10_action_delta_db"], 0.8)
+
+    def test_tolerance_is_a_parameter_not_a_buried_constant(self):
+        result = check_d10_p0_covariates(self._base(),
+                                         self._sessions(d10=1.8, p0=-6.0),
+                                         tolerance_db=1.0)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["tolerance_db"], 1.0)
+        self.assertEqual(D10_P0_TOLERANCE_DB, 0.5)
+
+    def test_ab_with_d10_move_is_inconclusive_despite_rms_improvement(self):
+        base = [dict(_session(BASELINE_RMS_DB, V1_1_ERROR_DB),
+                     d10_action=1.0, p0_db=-6.0) for _ in range(3)]
+        cand = self._sessions(d10=1.8, p0=-6.0)
+        result = evaluate_ab(base, cand)
+        self.assertEqual(result["verdict"], "inconclusive")
+        self.assertTrue(result["gates"]["erb_improvement"]["passed"])
+        self.assertFalse(result["gates"]["d10_p0_covariates"]["passed"])
+
+    def test_ab_with_p0_move_is_inconclusive(self):
+        base = [dict(_session(BASELINE_RMS_DB, V1_1_ERROR_DB),
+                     d10_action=1.0, p0_db=-6.0) for _ in range(3)]
+        cand = self._sessions(d10=1.0, p0=-6.7)
+        result = evaluate_ab(base, cand)
+        self.assertEqual(result["verdict"], "inconclusive")
+        self.assertFalse(result["gates"]["d10_p0_covariates"]["passed"])
+
+    def test_ab_within_tolerance_promotes(self):
+        base = [dict(_session(BASELINE_RMS_DB, V1_1_ERROR_DB),
+                     d10_action=1.0, p0_db=-6.0) for _ in range(3)]
+        cand = self._sessions(d10=1.2, p0=-6.3)
+        result = evaluate_ab(base, cand)
+        self.assertEqual(result["verdict"], "promote")
+
+    def test_ab_without_telemetry_promotes_as_before(self):
+        base = [_session(BASELINE_RMS_DB, V1_1_ERROR_DB) for _ in range(3)]
+        cand = self._sessions()
+        result = evaluate_ab(base, cand)
+        self.assertEqual(result["verdict"], "promote")
+        self.assertTrue(result["gates"]["d10_p0_covariates"]["passed"])
+        self.assertIn("SKIPPED",
+                      result["gates"]["d10_p0_covariates"]["detail"])
+
+    def test_rollback_outranks_inconclusive(self):
+        # Candidate fails on its merits (no RMS improvement) AND moves
+        # D10: the verdict is rollback, not inconclusive.
+        base = [dict(_session(BASELINE_RMS_DB, V1_1_ERROR_DB),
+                     d10_action=1.0, p0_db=-6.0) for _ in range(3)]
+        cand = [dict(_session(BASELINE_RMS_DB, V1_1_ERROR_DB),
+                     d10_action=1.8, p0_db=-6.0) for _ in range(3)]
+        result = evaluate_ab(base, cand)
+        self.assertEqual(result["verdict"], "rollback")
+        self.assertFalse(result["gates"]["erb_improvement"]["passed"])
+
+
+class TestT3PlayingEvidence(unittest.TestCase):
+    """T3: confirmation "sounding, not just installed".
+
+    The server only starts counting the 3 test sessions when it sees
+    evidence that it sounds: beacon advancing + valid frames with the
+    candidate. Without evidence a chunk does not count — it is neither
+    a success nor a failure."""
+
+    def _evidence(self, beacon=150, snapshots=3, frames=True, daemon=True):
+        return {
+            "effect_beacon_frames": beacon,
+            "snapshots_accepted": snapshots,
+            "frames_valid": frames,
+            "daemon_ok": daemon,
+        }
+
+    def test_full_evidence_with_advancing_beacon_counts(self):
+        result = check_playing_evidence(self._evidence(), 100)
+        self.assertTrue(result["counts"])
+        self.assertEqual(result["status"], "counts")
+        self.assertTrue(all(result["checks"].values()))
+
+    def test_first_beacon_observation_does_not_count(self):
+        # No previous value: advance cannot be established yet.
+        result = check_playing_evidence(self._evidence(), None)
+        self.assertFalse(result["counts"])
+        self.assertEqual(result["status"], "not_counted")
+        self.assertIn("first beacon observation", result["reason"])
+
+    def test_stalled_beacon_does_not_count(self):
+        result = check_playing_evidence(self._evidence(beacon=150), 150)
+        self.assertFalse(result["counts"])
+        self.assertFalse(result["checks"]["beacon_advancing"])
+        self.assertIn("NOT advancing", result["reason"])
+        result = check_playing_evidence(self._evidence(beacon=90), 100)
+        self.assertFalse(result["counts"])
+
+    def test_daemon_down_does_not_count(self):
+        result = check_playing_evidence(self._evidence(daemon=False), 100)
+        self.assertFalse(result["counts"])
+        self.assertFalse(result["checks"]["daemon_ok"])
+        self.assertIn("daemon", result["reason"])
+
+    def test_daemon_ok_missing_does_not_count(self):
+        evidence = self._evidence()
+        del evidence["daemon_ok"]
+        result = check_playing_evidence(evidence, 100)
+        self.assertFalse(result["counts"])
+        self.assertIn("daemon_ok missing", result["reason"])
+
+    def test_no_valid_frames_does_not_count(self):
+        result = check_playing_evidence(self._evidence(frames=False), 100)
+        self.assertFalse(result["counts"])
+        self.assertFalse(result["checks"]["frames_valid"])
+        result = check_playing_evidence(self._evidence(frames=0), 100)
+        self.assertFalse(result["counts"])
+
+    def test_frames_valid_as_a_count_works(self):
+        result = check_playing_evidence(self._evidence(frames=12), 100)
+        self.assertTrue(result["counts"])
+        self.assertTrue(result["checks"]["frames_valid"])
+
+    def test_no_snapshots_accepted_does_not_count(self):
+        result = check_playing_evidence(self._evidence(snapshots=0), 100)
+        self.assertFalse(result["counts"])
+        self.assertFalse(result["checks"]["snapshots_accepted"])
+        evidence = self._evidence()
+        del evidence["snapshots_accepted"]
+        result = check_playing_evidence(evidence, 100)
+        self.assertFalse(result["counts"])
+
+    def test_no_evidence_at_all_does_not_count(self):
+        result = check_playing_evidence({}, None)
+        self.assertFalse(result["counts"])
+        self.assertEqual(result["status"], "not_counted")
+        # Not counted is neither success nor failure.
+        self.assertIn("NOT count", result["reason"])
+        self.assertIn("neither success nor failure", result["reason"])
+
+    def test_non_dict_evidence_does_not_count(self):
+        self.assertFalse(check_playing_evidence(None, 100)["counts"])
+
+    def test_count_playing_chunks_threads_the_beacon(self):
+        evidences = [
+            self._evidence(beacon=100),  # first: advance not established
+            self._evidence(beacon=150),  # counts
+            self._evidence(beacon=150),  # stalled: does not count
+            self._evidence(beacon=200),  # counts
+        ]
+        result = count_playing_chunks(evidences)
+        self.assertEqual(result["counted"], 2)
+        self.assertEqual(result["not_counted"], 2)
+        self.assertEqual(result["last_beacon_frames"], 200)
+        self.assertEqual(len(result["decisions"]), 4)
+
+    def test_count_playing_chunks_with_a_previous_beacon(self):
+        result = count_playing_chunks([self._evidence(beacon=150)],
+                                      previous_beacon_frames=100)
+        self.assertEqual(result["counted"], 1)
+        self.assertEqual(result["last_beacon_frames"], 150)
+
+    def test_count_playing_chunks_empty_list(self):
+        result = count_playing_chunks([])
+        self.assertEqual(result["counted"], 0)
+        self.assertEqual(result["not_counted"], 0)
+        self.assertIsNone(result["last_beacon_frames"])
+
+
+class TestS2S16Verification(unittest.TestCase):
+    """Fase 6 verification, empirical on the CURRENT data (nothing
+    invented): S1 says coherence 0% is instrumentation; S2 must say
+    whether the deficit is a room comb or a response. With the current
+    data it cannot — and that is exactly why S16 (the physical
+    EVO-003 measurement) does NOT trigger."""
+
+    def test_s2_with_current_data_is_indeterminate(self):
+        result = fit_comb_vs_response(V1_1_ERROR_DB, None)
+        self.assertEqual(result["verdict"], "indeterminate")
+        self.assertIn("erb_std_db_missing", result["reason"])
+        self.assertIsNone(result["std_contrast_db"])
+        # The fit itself ran and does not favour a comb either:
+        # measured improvement 9.0%, far below the 25% comb bar.
+        self.assertLess(result["improvement"], COMB_IMPROVEMENT_MIN)
+        self.assertGreater(result["improvement"], 0.0)
+        self.assertIsNotNone(result["distance_m"])
+
+    def test_s1_plus_s2_do_not_point_to_the_room_so_s16_does_not_trigger(self):
+        with open(V1_1_PATH, encoding="utf-8") as fh:
+            profile = json.load(fh)
+        # S1 premise: coherence 0% in the live profile (instrumentation,
+        # not room data — the Organism path does not feed the reference).
+        self.assertAlmostEqual(profile["fingerprint"]["mean_coherence"], 0.0)
+        # S2 premise: indeterminate without erbStdDb.
+        result = fit_comb_vs_response(V1_1_ERROR_DB, None)
+        self.assertEqual(result["verdict"], "indeterminate")
+        # Conclusion (documented in README §S2/S16, not a function):
+        # neither S1 nor S2 points to the room, so S16's physical
+        # EVO-003 measurement does NOT trigger. The next step is the S1
+        # reference fix + erbStdDb in the payload, not a position probe.
 
 
 if __name__ == "__main__":

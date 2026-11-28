@@ -25,6 +25,13 @@ Public API (all pure functions):
   * S8  -- :func:`evaluate_ab`
   * S5  -- :func:`emit_ladder`
   * S9  -- :func:`coherence_guard`
+  * S10 -- :func:`check_residual_freeze` (residual > 4 dB freezes EQ
+    steps in the region and marks EVO-003 as the next required step)
+  * S15 -- :func:`check_d10_p0_covariates` (D10 action / P0 as A/B
+    covariates; an out-of-tolerance move makes the A/B inconclusive)
+  * T3  -- :func:`check_playing_evidence`, :func:`count_playing_chunks`
+    (a chunk only counts toward the A/B when there is evidence that
+    it is actually sounding)
   * T7  -- :func:`validate_chunk`, :func:`check_token_rate`,
     :func:`check_replay`, :func:`classify_session_outlier`,
     :func:`quarantine_update`, :func:`log_rejection`,
@@ -93,6 +100,10 @@ __all__ = [
     # README §T6)
     "CUMULATIVE_EXCURSION_CAP_DB",
     "MAX_PROMOTIONS_PER_DAY",
+    # S10 — residual freeze (see README §S10)
+    "S10_RESIDUAL_FREEZE_DB",
+    # S15 — D10/P0 covariates (see README §S15)
+    "D10_P0_TOLERANCE_DB",
     # §2.3 helpers
     "region_error",
     "region_rms",
@@ -106,6 +117,13 @@ __all__ = [
     "emit_ladder",
     "coherence_guard",
     "compile_candidate",
+    # S10 — residual freeze
+    "check_residual_freeze",
+    # S15 — D10/P0 covariates
+    "check_d10_p0_covariates",
+    # T3 — "sounding, not just installed" counting
+    "check_playing_evidence",
+    "count_playing_chunks",
     # T7 — anti-poisoning, before aggregation
     "validate_chunk",
     "check_token_rate",
@@ -334,6 +352,40 @@ MAX_PROMOTIONS_PER_DAY = 1
 
 
 # ---------------------------------------------------------------------------
+# S10 — residual > 4 dB: diagnose before climbing further
+# (evolucion-magistral-autonomia-completa.md S10).
+#
+# The trigger is the spec's own number: a regional residual above 4 dB
+# ("supera 4 dB", strictly greater; exactly 4.0 dB does not trigger).
+# The release conditions are the spec's own words — "hasta que la
+# coherencia suba o la medición confirme el déficit" — with one
+# modelling choice made explicit: "coherence has risen" is read as
+# mean_coherence >= COHERENCE_GUARD (0.20), the same guard S9 already
+# uses for "this table can be trusted". That threshold reuse is a
+# choice, not a measured value; the spec fixes no number for it. The
+# other release is explicit evidence: ``deficit_confirmed=True``,
+# i.e. the EVO-003 physical measurement confirmed the deficit.
+# ---------------------------------------------------------------------------
+
+S10_RESIDUAL_FREEZE_DB = 4.0
+
+
+# ---------------------------------------------------------------------------
+# S15 — P0/D10 as A/B covariates, not decoration
+# (evolucion-magistral-autonomia-completa.md S15).
+#
+# Tolerance from the spec: if the candidate moves the D10 action or
+# the P0 outside +/-0.5 dB, the A/B is "no concluyente" even if the
+# RMS improves. The spec itself says the tolerance is "a fijar con la
+# primera medición", so 0.5 dB is the spec's value taken as the
+# explicit default until the first measurement confirms or changes it
+# — a named constant, not a measured fact.
+# ---------------------------------------------------------------------------
+
+D10_P0_TOLERANCE_DB = 0.5
+
+
+# ---------------------------------------------------------------------------
 # Small numeric helpers (stdlib only)
 # ---------------------------------------------------------------------------
 
@@ -436,6 +488,119 @@ def regional_correction(error_mean_db):
         "residual_db": residual_db,
         "unslotted_db": unslotted_db,
         "trim_db": trim_db,
+    }
+
+
+# ---------------------------------------------------------------------------
+# S10 — residual > 4 dB: diagnose before climbing further (Rol 5 P7)
+# ---------------------------------------------------------------------------
+
+def check_residual_freeze(regional, mean_coherence=None,
+                          deficit_confirmed=False):
+    """S10: a regional residual above 4 dB smells of a measurement
+    problem (mic position, room comb), not of a real +9 dB deficit.
+    Closing it with blind ladder steps assumes linearity with no
+    evidence, so the rule FREEZES the EQ steps in that region and
+    marks EVO-003 (physical measurement: distance to walls / test by
+    position) as the next required step.
+
+    ``regional`` is the dict returned by :func:`regional_correction`
+    (only its ``residual_db`` is read). ``mean_coherence`` is the
+    compiled profile's mean coherence when the server knows it (None
+    when it does not). ``deficit_confirmed`` is True only when the
+    EVO-003 physical measurement already confirmed the deficit.
+
+    Freeze rule (spec): a region freezes when |residual| >
+    S10_RESIDUAL_FREEZE_DB (4.0 dB, strictly greater). Regions without
+    a motor slot (transición, aire, ...) have no EQ step to freeze,
+    but they still trigger the diagnostic: their residual is
+    uncorrected error, and it is reported in ``triggered_regions``.
+    ``frozen_slots`` lists only the motor slots that lose their steps.
+
+    Release rule (spec: "hasta que la coherencia suba o la medición
+    confirme el déficit"): the freeze is released when
+    ``deficit_confirmed`` is True, or when ``mean_coherence`` >=
+    COHERENCE_GUARD (0.20 — the S9 guard, reused here as "coherence
+    has risen"; see the constants block). A released freeze still
+    reports the regions that triggered, in ``triggered_regions``, so
+    the diagnostic signal is not lost; ``frozen_regions`` is empty.
+
+    ``evo003_required`` is True when a region triggered and the freeze
+    was NOT released: EVO-003 is the next required step. With
+    coherence below the guard the residual cannot be trusted as a room
+    deficit (S1: coherence 0% is instrumentation — the Organism path
+    does not feed the reference), so
+    ``evo003_pending_reference_fix`` is True in exactly that case:
+    the EVO-003 firing itself stays pending the S1 reference fix,
+    because a position probe would measure the instrument, not the
+    room (see README §S10 and §S2/S16).
+
+    Returns ``{"triggered_regions": [...], "frozen_regions": [...],
+    "frozen_slots": [...], "evo003_required": bool,
+    "evo003_pending_reference_fix": bool, "released": bool,
+    "release_reason": str, "residual_db": {...}, "reason": str}``.
+    Region lists are sorted by the REGIONS order; slot lists are
+    sorted alphabetically.
+    """
+    residual_db = dict(regional["residual_db"])
+    triggered = [name for name in REGIONS
+                 if abs(residual_db.get(name, 0.0)) > S10_RESIDUAL_FREEZE_DB + 1e-9]
+
+    released = False
+    release_reason = ""
+    if not triggered:
+        release_reason = "no region exceeds the %.1f dB residual freeze threshold" % S10_RESIDUAL_FREEZE_DB
+    elif deficit_confirmed:
+        released = True
+        release_reason = ("EVO-003 physical measurement already confirmed "
+                          "the deficit; freeze released")
+    elif mean_coherence is not None and mean_coherence >= COHERENCE_GUARD:
+        released = True
+        release_reason = ("mean coherence %.3f >= %.2f (S9 guard): the "
+                          "table can be trusted, the residual is a real "
+                          "deficit, freeze released"
+                          % (mean_coherence, COHERENCE_GUARD))
+
+    frozen_regions = [] if released else list(triggered)
+    slot_for_region = {region: slot for slot, region in SLOT_REGION.items()}
+    frozen_slots = sorted({slot_for_region[name] for name in frozen_regions
+                           if name in slot_for_region})
+    evo003_required = bool(triggered) and not released
+    pending_reference_fix = bool(
+        evo003_required and mean_coherence is not None
+        and mean_coherence < COHERENCE_GUARD)
+
+    if not triggered:
+        reason = ("S10: no freeze — largest |residual| %.2f dB in %s "
+                  "(threshold > %.1f dB)"
+                  % (max([abs(v) for v in residual_db.values()] or [0.0]),
+                     max(residual_db, key=lambda k: abs(residual_db[k]),
+                         default="—"),
+                     S10_RESIDUAL_FREEZE_DB))
+    elif released:
+        reason = ("S10: residual > %.1f dB in %s, but the freeze is "
+                  "RELEASED — %s"
+                  % (S10_RESIDUAL_FREEZE_DB, triggered, release_reason))
+    else:
+        reason = ("S10: residual > %.1f dB in %s — EQ steps FROZEN in "
+                  "those regions (slots %s); EVO-003 is the next required "
+                  "step%s"
+                  % (S10_RESIDUAL_FREEZE_DB, frozen_regions,
+                     frozen_slots or "none (unslotted regions only)",
+                     "; firing pending the S1 reference fix (mean "
+                     "coherence %.3f < %.2f, residual not trustworthy as "
+                     "a room deficit)" % (mean_coherence, COHERENCE_GUARD)
+                     if pending_reference_fix else ""))
+    return {
+        "triggered_regions": triggered,
+        "frozen_regions": frozen_regions,
+        "frozen_slots": frozen_slots,
+        "evo003_required": evo003_required,
+        "evo003_pending_reference_fix": pending_reference_fix,
+        "released": released,
+        "release_reason": release_reason,
+        "residual_db": residual_db,
+        "reason": reason,
     }
 
 
@@ -779,6 +944,15 @@ def _session_mean(sessions, field):
     return _mean([s[field] for s in sessions if field in s and s[field] is not None])
 
 
+def _session_mean_or_none(sessions, field):
+    """Mean of a field across sessions, or None when no session carries
+    it. Unlike ``_session_mean(...) or None``, a genuine mean of 0.0
+    stays 0.0 instead of collapsing to None (a D10 action of 0.0 is a
+    real value, not an absence)."""
+    values = [s[field] for s in sessions if field in s and s[field] is not None]
+    return _mean(values) if values else None
+
+
 def _aggregate_sessions(sessions):
     """Aggregate 3 sessions (base or candidate) into one summary.
 
@@ -802,6 +976,110 @@ def _aggregate_sessions(sessions):
         "crest_db": _session_mean(sessions, "crest_db") or None,
         "crest_min_db": min([s["crest_db"] for s in sessions if s.get("crest_db") is not None], default=None),
         "lufs": _session_mean(sessions, "lufs") or None,
+        # S15 covariates (None when the telemetry is absent: the A/B
+        # must not require what the phone does not send yet).
+        "d10_action": _session_mean_or_none(sessions, "d10_action"),
+        "p0_db": _session_mean_or_none(sessions, "p0_db"),
+        "trim_db_effective": _session_mean_or_none(sessions, "trim_db_effective"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# S15 — P0/D10 as A/B covariates (Rol 2 P9)
+# ---------------------------------------------------------------------------
+
+def check_d10_p0_covariates(base_sessions, candidate_sessions,
+                            tolerance_db=D10_P0_TOLERANCE_DB):
+    """S15: the A/B must not mistake "the field changed" for "the EQ
+    improved". P0 measures -6.065/-6.274 dB (ALL7 -14.18 dB) without
+    trim; the v1.1 ``trim_db = -4.0`` is nominal from the file, not
+    measured loudness; the D10 arbiter is legacy as gain (telemetry
+    only) and the LTI D10 kernel is still engaged. So the D10 action
+    and the P0 ride along as covariates of the A/B.
+
+    Each session may carry ``d10_action``, ``p0_db`` and
+    ``trim_db_effective`` (all optional, retrocompatible: sessions
+    without them are not rejected — see :func:`validate_chunk`).
+
+    Rule (spec): if the candidate moves the D10 action or the P0
+    outside +/-``tolerance_db`` (0.5 dB), the A/B is "no concluyente"
+    even if the RMS improves. ``trim_db_effective`` is REPORTED (its
+    delta is in the result) but does NOT gate: the spec fixes no
+    tolerance for the trim, and inventing one would be inventing a
+    metric. Do not touch the arbiter or the kernel: this is telemetry
+    + a rule, nothing else.
+
+    The comparison is on the per-side means of the covariate fields
+    only, so the function also works on session dicts that carry just
+    the covariates (it does not need the full A/B session shape).
+
+    Returns ``{"status": "ok" | "inconclusive" | "unchecked",
+    "d10_action_delta_db": float | None,
+    "p0_db_delta_db": float | None,
+    "trim_db_effective_delta_db": float | None, "tolerance_db": float,
+    "reason": str}``. ``unchecked`` means the telemetry is absent on
+    at least one side (or on both): the covariate cannot be checked,
+    so it does not block anything — the A/B proceeds without it and
+    the skip is recorded in the reason. A genuine mean of 0.0 is a
+    value, not an absence (see ``_session_mean_or_none``).
+    """
+    def _delta(field):
+        b = _session_mean_or_none(base_sessions, field)
+        c = _session_mean_or_none(candidate_sessions, field)
+        if b is None or c is None:
+            return None
+        return c - b
+
+    d10_delta = _delta("d10_action")
+    p0_delta = _delta("p0_db")
+    trim_delta = _delta("trim_db_effective")
+
+    missing = [label for label, delta in
+               (("d10_action", d10_delta), ("p0_db", p0_delta))
+               if delta is None]
+    if missing:
+        return {
+            "status": "unchecked",
+            "d10_action_delta_db": d10_delta,
+            "p0_db_delta_db": p0_delta,
+            "trim_db_effective_delta_db": trim_delta,
+            "tolerance_db": tolerance_db,
+            "reason": ("S15 covariate check SKIPPED: %s telemetry absent "
+                       "on at least one side (SessionChunk carries no "
+                       "D10/P0 fields yet); the A/B proceeds without this "
+                       "covariate" % ", ".join(missing)),
+        }
+
+    out = []
+    if abs(d10_delta) > tolerance_db + 1e-9:
+        out.append("D10 action moved %+.2f dB (tolerance +/-%.1f dB)"
+                   % (d10_delta, tolerance_db))
+    if abs(p0_delta) > tolerance_db + 1e-9:
+        out.append("P0 moved %+.2f dB (tolerance +/-%.1f dB)"
+                   % (p0_delta, tolerance_db))
+    if out:
+        return {
+            "status": "inconclusive",
+            "d10_action_delta_db": d10_delta,
+            "p0_db_delta_db": p0_delta,
+            "trim_db_effective_delta_db": trim_delta,
+            "tolerance_db": tolerance_db,
+            "reason": ("S15: " + "; ".join(out) + " — the candidate moved "
+                       "something other than the EQ; the A/B is NOT "
+                       "CONCLUSIVE even if the RMS improved"),
+        }
+    return {
+        "status": "ok",
+        "d10_action_delta_db": d10_delta,
+        "p0_db_delta_db": p0_delta,
+        "trim_db_effective_delta_db": trim_delta,
+        "tolerance_db": tolerance_db,
+        "reason": ("S15: D10 action %+.2f dB, P0 %+.2f dB (tolerance "
+                   "+/-%.1f dB); trim_db_effective %s — covariates "
+                   "inside tolerance"
+                   % (d10_delta, p0_delta, tolerance_db,
+                      ("%+.2f dB" % trim_delta)
+                      if trim_delta is not None else "absent")),
     }
 
 
@@ -812,7 +1090,10 @@ def evaluate_ab(base_sessions, candidate_sessions):
       ``spectral_error_rms_db`` (float), ``error_mean_db`` (24 floats),
       ``mean_coherence`` (float), ``level_max_dbfs`` (float, worst chunk),
       ``level_mean_dbfs`` (float); optional ``crest_db`` (float) and
-      ``lufs`` (float, when that telemetry exists).
+      ``lufs`` (float, when that telemetry exists); optional S15
+      covariates ``d10_action``, ``p0_db`` and ``trim_db_effective``
+      (floats, when that telemetry exists — retrocompatible: absent
+      means the S15 gate is skipped, not failed).
 
     Gates (all must pass for promotion; any failure -> rollback):
       §4-1  ERB improvement >= 20%: (rms_base - rms_cand)/rms_base.
@@ -831,10 +1112,20 @@ def evaluate_ab(base_sessions, candidate_sessions):
       S8(c) Loudness matching: |levelMean_cand - levelMean_base| <= 3 dB;
             when lufs exists on both sides, |lufs_cand - lufs_base|
             <= 1 dB.
+      S15  D10/P0 covariates: when the telemetry exists on both sides,
+            the candidate must not move the D10 action or the P0 by
+            more than +/-0.5 dB. A move outside tolerance makes the
+            verdict "inconclusive" (NOT a rollback: the candidate did
+            not fail on its merits, the comparison itself is
+            invalidated — something other than the EQ changed). When
+            the telemetry is absent the gate is skipped + noted and
+            the verdict is unaffected. A candidate that fails any
+            §4/S8 gate is still a "rollback" even if it also moved
+            D10/P0: failing on the merits outranks inconclusive.
 
-    Returns ``{"verdict": "promote" | "rollback", "gates": {...},
-    "base": <summary>, "candidate": <summary>}``. Each gate entry is
-    ``{"passed": bool, "detail": str}``.
+    Returns ``{"verdict": "promote" | "rollback" | "inconclusive",
+    "gates": {...}, "base": <summary>, "candidate": <summary>}``. Each
+    gate entry is ``{"passed": bool, "detail": str}``.
     """
     base = _aggregate_sessions(base_sessions)
     cand = _aggregate_sessions(candidate_sessions)
@@ -939,7 +1230,23 @@ def evaluate_ab(base_sessions, candidate_sessions):
         "detail": loud_detail,
     }
 
-    verdict = "promote" if all(g["passed"] for g in gates.values()) else "rollback"
+    # S15: D10/P0 covariates. A move outside tolerance invalidates the
+    # comparison (verdict "inconclusive"), it does not fail the
+    # candidate. Absent telemetry skips the gate without blocking.
+    covariates = check_d10_p0_covariates(base_sessions, candidate_sessions)
+    gates["d10_p0_covariates"] = {
+        "passed": covariates["status"] != "inconclusive",
+        "detail": covariates["reason"],
+    }
+
+    s8_failed = not all(g["passed"] for name, g in gates.items()
+                        if name != "d10_p0_covariates")
+    if s8_failed:
+        verdict = "rollback"
+    elif covariates["status"] == "inconclusive":
+        verdict = "inconclusive"
+    else:
+        verdict = "promote"
     return {"verdict": verdict, "gates": gates, "base": base, "candidate": cand}
 
 
@@ -1165,7 +1472,8 @@ def validate_chunk(chunk):
     present, like S8 treats optional telemetry: ``magnitude_db`` (24),
     ``coherence`` (24, per-band), ``mean_coherence``, ``level_max_dbfs``,
     ``level_mean_dbfs``, ``spectral_error_rms_db``, ``erb_std_db`` (24),
-    ``crest_db``, ``lufs``.
+    ``crest_db``, ``lufs`` — and the S15 D10/P0 telemetry fields
+    ``d10_action``, ``p0_db`` and ``trim_db_effective``.
 
     A value is rejected when it is not a finite number (NaN/inf from a
     corrupt or truncated payload) or outside its physical range: error
@@ -1173,7 +1481,10 @@ def validate_chunk(chunk):
     dBFS, RMS 0..40 dB, erbStdDb 0..40 dB, crest 0..60 dB, LUFS
     -70..0 dB. All bounds are the CHUNK_* constants; the dBFS/coherence
     ones follow from the definitions, the rest are proposals (see the
-    constants block and README §T7).
+    constants block and README §T7). The S15 fields carry NO range
+    bound: no scale or physical range for the D10 action or the P0 is
+    fixed in any spec, so they are checked only for finiteness —
+    inventing a range for them would be inventing a metric.
 
     Returns ``{"ok": bool, "reasons": [str]}``; every reason names the
     field, the band when it applies, and the offending value.
@@ -1209,6 +1520,14 @@ def validate_chunk(chunk):
             ("lufs", CHUNK_LUFS_MIN_DB, CHUNK_LUFS_MAX_DB)):
         if field in chunk and chunk[field] is not None:
             if not _check_scalar(field, chunk[field], low, high, reasons):
+                ok = False
+    # S15 telemetry: finite-number check only, no range bound (see the
+    # docstring: no scale/range for D10 action or P0 is fixed anywhere).
+    for field in ("d10_action", "p0_db", "trim_db_effective"):
+        if field in chunk and chunk[field] is not None:
+            if not _is_finite_number(chunk[field]):
+                reasons.append("%s: not a finite number (%r)"
+                               % (field, chunk[field]))
                 ok = False
     return {"ok": ok, "reasons": reasons}
 
@@ -1666,6 +1985,164 @@ def gate_promotion(candidate_slots_db, promotions_today,
 
 
 # ---------------------------------------------------------------------------
+# T3 — confirmation "sounding, not just installed" (Rol 1 P4)
+# (evolucion-magistral-autonomia-completa.md T3).
+#
+# The spec's POST /api/v1/muse/ivanna/profile/applied only says
+# "installed". A profile installed with the daemon down, no music, or
+# the sensor stopped would generate 3 "empty" sessions that the
+# server could read as a failure of the candidate (or as a success
+# through silence). So the server only starts counting the 3 test
+# sessions when it sees evidence that it is sounding: the effect
+# beacon advancing + valid frames with the candidate. The phone side
+# (T3's Android half: exposing daemonOk in OrganismController.State
+# and sending the evidence in the confirmation / first chunk) is not
+# in this module; this is the server-side counting rule.
+#
+# Evidence fields (all optional in the incoming chunk — a chunk
+# without them simply carries no evidence and does not count):
+#   * ``effect_beacon_frames`` (int): the DSP effect beacon frame
+#     counter, read via DSPBridge.effectBeaconFrames(). It must be
+#     ADVANCING — strictly greater than the previous observation the
+#     server saw for this candidate. A first observation, with no
+#     previous value to compare against, cannot establish advance yet
+#     and does not count: the server must keep the previous value and
+#     wait for the next chunk.
+#   * ``snapshots_accepted`` (int): snapshots the sensor consumer
+#     accepted (SensorSnapshotConsumer.snapshotsAccepted). Must be > 0.
+#   * ``frames_valid`` (bool, or int count): framesValid of the chunk.
+#     A bool must be True; an int must be > 0.
+#   * ``daemon_ok`` (bool): daemon health from the reconnection loop.
+#     Must be True — it is what distinguishes "applied without a
+#     daemon" from "applied and sounding".
+# A chunk without evidence does NOT count: it is neither a success
+# nor a failure, it simply does not advance the A/B count. This
+# module never defines session boundaries — the server owns them; it
+# feeds ordered chunk evidences here and counts sessions from the
+# chunks that count.
+# ---------------------------------------------------------------------------
+
+def check_playing_evidence(evidence, previous_beacon_frames=None):
+    """T3: decide whether ONE chunk counts toward the A/B.
+
+    ``evidence`` is the chunk's evidence dict (any subset of the four
+    fields above; missing fields are missing evidence). ``previous_beacon_frames``
+    is the effect-beacon value the server saw on the previous chunk
+    for this candidate (None on the first observation).
+
+    Returns ``{"counts": bool, "status": "counts" | "not_counted",
+    "checks": {"daemon_ok": bool, "frames_valid": bool,
+    "snapshots_accepted": bool, "beacon_advancing": bool},
+    "reason": str}``. ``counts`` is True only when all four checks
+    pass. ``reason`` names every failing check, so the server can tell
+    "no music" from "daemon down" from "beacon stalled".
+    """
+    if not isinstance(evidence, dict):
+        evidence = {}
+
+    checks = {}
+    failures = []
+
+    daemon_ok = evidence.get("daemon_ok")
+    checks["daemon_ok"] = daemon_ok is True
+    if daemon_ok is None:
+        failures.append("daemon_ok missing (cannot tell 'applied without "
+                        "a daemon' from 'applied and sounding')")
+    elif daemon_ok is not True:
+        failures.append("daemon_ok is False (daemon down)")
+
+    frames_valid = evidence.get("frames_valid")
+    if isinstance(frames_valid, bool):
+        checks["frames_valid"] = frames_valid
+    elif isinstance(frames_valid, (int, float)) and not isinstance(frames_valid, bool):
+        checks["frames_valid"] = frames_valid > 0
+    else:
+        checks["frames_valid"] = False
+    if frames_valid is None:
+        failures.append("frames_valid missing (no valid-frame evidence)")
+    elif not checks["frames_valid"]:
+        failures.append("frames_valid is %r (no valid frames)" % (frames_valid,))
+
+    snapshots = evidence.get("snapshots_accepted")
+    checks["snapshots_accepted"] = (
+        isinstance(snapshots, (int, float))
+        and not isinstance(snapshots, bool) and snapshots > 0)
+    if snapshots is None:
+        failures.append("snapshots_accepted missing (no consumer evidence)")
+    elif not checks["snapshots_accepted"]:
+        failures.append("snapshots_accepted is %r (consumer accepted nothing)"
+                        % (snapshots,))
+
+    beacon = evidence.get("effect_beacon_frames")
+    if (isinstance(beacon, (int, float)) and not isinstance(beacon, bool)
+            and isinstance(previous_beacon_frames, (int, float))
+            and not isinstance(previous_beacon_frames, bool)):
+        checks["beacon_advancing"] = beacon > previous_beacon_frames
+    else:
+        checks["beacon_advancing"] = False
+    if beacon is None:
+        failures.append("effect_beacon_frames missing (no beacon evidence)")
+    elif previous_beacon_frames is None:
+        failures.append("first beacon observation (%r): advance not yet "
+                        "established, wait for the next chunk" % (beacon,))
+    elif not checks["beacon_advancing"]:
+        failures.append("effect beacon NOT advancing (%r -> %r)"
+                        % (previous_beacon_frames, beacon))
+
+    counts = all(checks.values())
+    if counts:
+        reason = ("T3: chunk counts toward the A/B — daemon ok, "
+                  "frames valid, snapshots accepted, effect beacon "
+                  "advancing (%r -> %r)"
+                  % (previous_beacon_frames, beacon))
+    else:
+        reason = ("T3: chunk does NOT count toward the A/B (neither "
+                  "success nor failure): " + "; ".join(failures))
+    return {
+        "counts": counts,
+        "status": "counts" if counts else "not_counted",
+        "checks": checks,
+        "reason": reason,
+    }
+
+
+def count_playing_chunks(evidences, previous_beacon_frames=None):
+    """T3, sequential helper: thread the beacon state across an
+    ordered list of chunk evidences (oldest first) and count how many
+    chunks carry sounding evidence.
+
+    ``evidences`` is a list of evidence dicts (see
+    :func:`check_playing_evidence`); ``previous_beacon_frames`` is the
+    beacon value before the first chunk in the list (None when the
+    server has never seen one for this candidate). After each chunk,
+    the last seen beacon value becomes the previous for the next one
+    (a chunk without a beacon value leaves it unchanged).
+
+    Returns ``{"counted": int, "not_counted": int,
+    "decisions": [per-chunk check_playing_evidence results],
+    "last_beacon_frames": int | None}``. The server counts its 3 A/B
+    sessions from the counted chunks; this function does not define
+    what a session is.
+    """
+    decisions = []
+    last_beacon = previous_beacon_frames
+    for evidence in evidences:
+        decision = check_playing_evidence(evidence or {}, last_beacon)
+        decisions.append(decision)
+        beacon = (evidence or {}).get("effect_beacon_frames")
+        if (isinstance(beacon, (int, float))
+                and not isinstance(beacon, bool)):
+            last_beacon = beacon
+    counted = sum(1 for d in decisions if d["counts"])
+    return {
+        "counted": counted,
+        "not_counted": len(decisions) - counted,
+        "decisions": decisions,
+        "last_beacon_frames": last_beacon,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Pipeline: §2.3 regional correction + S9 guard + S6 split (+ S5 ladder)
 # ---------------------------------------------------------------------------
 
@@ -1673,7 +2150,7 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
                       erb_std_db=None, level_max_dbfs=-6.0,
                       exciter_amount=0.3, v1_1a_promoted=False,
                       room_corr_available=False, base_version="v1.1",
-                      ab_measurement_only=False):
+                      ab_measurement_only=False, deficit_confirmed=False):
     """Full deterministic pipeline for one compiled profile table.
 
     1. §2.3 regional correction (deadband, clamp +/-2 dB, trim, residual).
@@ -1683,6 +2160,13 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
        regional correction (a region's correction is applied to its bands
        only where the guard allows it; a region with no allowed band
        keeps its correction as documented residual).
+    3b. S10 residual freeze: regions whose |residual| > 4 dB have their
+       EQ steps FROZEN (their slots leave the split and their ladder
+       targets stay at the currently applied value — the ladder does
+       not climb there) and EVO-003 is marked as the next required
+       step, unless the freeze is released (mean coherence >= 0.20 or
+       ``deficit_confirmed`` — the EVO-003 measurement confirmed the
+       deficit). See :func:`check_residual_freeze`.
     4. S6 split into v1.1a (cut-only) / v1.1b (boost, gated on
        ``v1_1a_promoted``), each headroom pre-checked.
     5. S5 ladder for the remaining positive residual (rungs after the
@@ -1699,11 +2183,13 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
 
     ``coherence_mean_db`` is the 24-band per-band coherence list.
     Returns a dict with keys ``regional``, ``s2``, ``coherence_guard``,
-    ``split``, ``ladder`` and ``t6``. Pure function; the server decides whether
+    ``s10``, ``split``, ``ladder`` and ``t6``. Pure function; the server decides whether
     to publish the returned candidates.
     """
     regional = regional_correction(error_mean_db)
     s2 = fit_comb_vs_response(error_mean_db, erb_std_db)
+    s10 = check_residual_freeze(regional, mean_coherence,
+                                deficit_confirmed=deficit_confirmed)
 
     # Per-band corrections implied by the regional correction: each band
     # inherits its region's proposed correction.
@@ -1722,7 +2208,9 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
     # a partially blocked region keeps its slot value (the guard is
     # per-band, the slot is per-region -- the partial case is documented
     # in the notes, not silently applied band by band, because the motor
-    # has no per-band slot).
+    # has no per-band slot). A slot whose region is FROZEN by S10
+    # (|residual| > 4 dB) contributes nothing either: no EQ step is
+    # proposed in a frozen region until EVO-003 clears it.
     slot_for_region = {region: slot for slot, region in SLOT_REGION.items()}
     blocked_regions = set()
     for region_name, band_range in REGIONS.items():
@@ -1733,10 +2221,11 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
         allowed_bands = [b for b in bands if b in guard["allowed"]]
         if bands and not allowed_bands:
             blocked_regions.add(region_name)
+    frozen_regions = set(s10["frozen_regions"])
     proposed_slots = {}
     for slot in EQ_SLOTS:
         region = SLOT_REGION[slot]
-        if region in blocked_regions:
+        if region in blocked_regions or region in frozen_regions:
             continue
         proposed_slots[slot] = regional["proposed_db"][region]
     # ERB-3 roomCorr cut: the medios-graves proposed correction, if any.
@@ -1759,6 +2248,18 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
             "residual, not in any candidate"
             % (sorted(blocked_regions), COHERENCE_GUARD)
         )
+    if s10["frozen_regions"]:
+        split["notes"].append(
+            "S10 freeze: region(s) %s have |residual| > %.1f dB; their "
+            "EQ steps are FROZEN (slots %s propose nothing) — EVO-003 "
+            "is the next required step%s"
+            % (s10["frozen_regions"], S10_RESIDUAL_FREEZE_DB,
+               s10["frozen_slots"] or "none (unslotted regions only)",
+               "; firing pending the S1 reference fix (mean coherence "
+               "%.3f < %.2f, residual not trustworthy as a room deficit)"
+               % (mean_coherence, COHERENCE_GUARD)
+               if s10["evo003_pending_reference_fix"] else "")
+        )
     if guard["mode"] == "partial":
         split["notes"].append(
             "S9 guard is PARTIAL: some bands blocked; slot values are "
@@ -1769,9 +2270,16 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
         )
 
     # S5 ladder: from the currently applied (clamped) slots toward the
-    # full proposed targets.
-    target_slots = {slot: regional["proposed_db"][SLOT_REGION[slot]]
-                    for slot in EQ_SLOTS}
+    # full proposed targets. A frozen region's target stays at the
+    # currently applied value: the ladder does not climb where S10
+    # froze the steps.
+    target_slots = {}
+    for slot in EQ_SLOTS:
+        region = SLOT_REGION[slot]
+        if region in frozen_regions:
+            target_slots[slot] = regional["applied_db"][slot]
+        else:
+            target_slots[slot] = regional["proposed_db"][region]
     ladder = emit_ladder(regional["applied_db"], target_slots,
                          base_version=base_version)
 
@@ -1813,6 +2321,7 @@ def compile_candidate(error_mean_db, coherence_mean_db, mean_coherence,
         "regional": regional,
         "s2": s2,
         "coherence_guard": guard,
+        "s10": s10,
         "split": split,
         "ladder": ladder,
         "t6": t6,

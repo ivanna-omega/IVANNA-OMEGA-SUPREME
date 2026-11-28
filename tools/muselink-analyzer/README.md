@@ -19,7 +19,10 @@ constant in `analyzer.py`, taken from the specifications, never invented.
 - `refactorizacion-muselink-autonoma.md` §2.3 (deterministic analyzer),
   §4 (A/B machine, the 5 original promotion gates), §6 (v1.1 candidate).
 - `evolucion-magistral-autonomia-completa.md` §§S2, S5 (via B), S6, S8,
-  S9 (server side), **T6 (excursion cap + promotion brake)**,
+  S9 (server side), **S10 (residual freeze + EVO-003)**, **S15 (P0/D10
+  covariates)**, **S16 (EVO-003 probe — verification only, does not
+  trigger)**, **T3 ("sounding, not just installed" counting)**,
+  **T6 (excursion cap + promotion brake)**,
   **T7 (anti-poisoning, before aggregation)**.
 - Baseline fixed by the specs: spectral error RMS **10.46 dB** (v1.1
   profile), promotion target **≤ 8.37 dB** (0.8 × 10.46).
@@ -29,7 +32,7 @@ constant in `analyzer.py`, taken from the specifications, never invented.
 | File | What it is |
 |---|---|
 | `analyzer.py` | The rules. Pure functions + documented constants. |
-| `test_analyzer.py` | `unittest` suite (stdlib only, 85 tests). Run `python3 -m unittest test_analyzer -v` from this directory, or `python3 -m unittest discover -s tools/muselink-analyzer` from the repo root. |
+| `test_analyzer.py` | `unittest` suite (stdlib only, 125 tests). Run `python3 -m unittest test_analyzer -v` from this directory, or `python3 -m unittest discover -s tools/muselink-analyzer` from the repo root. |
 | `README.md` | This file. |
 
 ## Inputs / outputs
@@ -43,8 +46,9 @@ band centres are fixed: 82 … 14693 Hz (`ERB_CENTER_HZ`, verified against
 
 The main entry point is `compile_candidate(...)`, which runs the whole
 pipeline and returns a dict with `regional` (§2.3), `s2` (S2 fit),
-`coherence_guard` (S9), `split` (S6) and `ladder` (S5). Each rule is
-also callable on its own; the server is free to call them separately.
+`coherence_guard` (S9), `s10` (S10 freeze), `split` (S6) and `ladder`
+(S5), plus `t6` (T6 excursion verdict on the planned climb). Each rule
+is also callable on its own; the server is free to call them separately.
 
 ## The rules
 
@@ -154,10 +158,12 @@ All gates must pass; any failure → `rollback`:
 | **S8(a) Region RMS** | no region worsens by **> 1 dB**, even if the global RMS improves. Groups: graves/medios-graves (ERB 1–6), medios (7–9), brillo (13–16), presencia (17–20), aire (21–24). Transition bands (10–12) belong to no S8 group and are covered only by the global gate. |
 | **S8(b) APEX not working harder** | crest must not fall **> 0.5 dB**, and the candidate's `levelMaxDbfs` must not sit pegged at −0.1 dBFS (within 0.05 dB) while the base did not |
 | **S8(c) Loudness matching** | `|levelMean_cand − levelMean_base| ≤ 3 dB` (§4 session-equivalence tolerance); when `lufs()` exists on both sides, `|LUFS_cand − LUFS_base| ≤ 1 dB` — a louder candidate is not a better candidate |
+| **S15 D10/P0 covariates** | when the telemetry exists on both sides, the candidate must not move the D10 action or the P0 by more than **±0.5 dB**. A move outside tolerance makes the verdict **`inconclusive`** — not a rollback: the candidate did not fail on its merits, the comparison itself is invalidated. When the telemetry is absent the gate is skipped + noted. A candidate that fails any §4/S8 gate is still a `rollback` even if it also moved D10/P0. See §S15 below. |
 
-`evaluate_ab` returns `{"verdict": "promote" | "rollback", "gates":
-{...}, "base": <summary>, "candidate": <summary>}` with a per-gate
-`passed` flag and a human-readable `detail` string.
+`evaluate_ab` returns `{"verdict": "promote" | "rollback" |
+"inconclusive", "gates": {...}, "base": <summary>, "candidate":
+<summary>}` with a per-gate `passed` flag and a human-readable
+`detail` string.
 
 ### S5 via B — Deterministic +2 dB ladder (`emit_ladder`)
 
@@ -192,12 +198,144 @@ With today's coherence (0%), the guard is active: the v1.1 candidate
 emits nothing for auto-application unless marked measurement-only, and
 EVO-003 runs in parallel to fix coherence itself.
 
-**Known interaction, out of scope here:** S10 says a regional residual
-> 4 dB should trigger EVO-003 first and freeze EQ steps in that region
-until coherence rises or a measurement confirms the deficit. This
-module plans the ladder (S5) but does not implement the S10 freeze —
-that is a separate proposal needing Esse's decision + a physical
-measurement.
+### S10 — Residual > 4 dB: diagnose before climbing further (`check_residual_freeze`)
+
+`check_residual_freeze(regional, mean_coherence=None,
+deficit_confirmed=False)` implements the S10 rule on the output of
+`regional_correction(...)`:
+
+- A region **freezes** when its |residual| is **strictly > 4 dB**
+  (`S10_RESIDUAL_FREEZE_DB`; exactly 4.0 dB does not trigger). Frozen
+  regions propose **no EQ step**: their slots leave the S6 split and
+  their ladder targets stay at the currently applied value, so the
+  ladder does not climb there. Regions without a motor slot
+  (transición, aire) have no step to freeze, but they still trigger
+  the diagnostic — their residual is uncorrected error.
+- A freeze **marks EVO-003 as the next required step**
+  (`evo003_required: True`): the physical measurement (distance to
+  walls / test by position) that decides whether the residual is a
+  real room deficit or a measurement artefact.
+- The freeze is **released** when the EVO-003 measurement confirms
+  the deficit (`deficit_confirmed=True`, passed to
+  `compile_candidate`), or when mean coherence rises to the S9 guard
+  (`≥ 0.20`, reused here as "coherence has risen" — a modelling
+  choice, not a measured value; the spec fixes no number for it).
+  A released freeze still reports the regions that triggered, so the
+  diagnostic signal is not lost.
+
+**The triggering case is the current data itself.** With the v1.1
+table at coherence 0%: residuals +7 dB in brillo/presencia (and +7 dB
+in transición, +12 dB in aire) freeze slots `high_2k_4k` /
+`presence_4k_8k`; the ladder plans only the unfrozen climb (one rung
+v1.2: low −3 dB, mid +4 dB). With coherence 0.9 the freeze releases
+and the ladder climbs to v1.5 again — where T6 still caps it at v1.3.
+So S10 and T6 interact in this order: S10 stops the climb first
+(diagnose), T6 stops it second (human limit).
+
+**EVO-003 firing stays pending the S1 reference fix.**
+`evo003_pending_reference_fix` is True exactly when EVO-003 is
+required and mean coherence is below the guard: with coherence 0% by
+instrumentation (S1 — the Organism path does not feed the reference),
+the residual cannot be trusted as a room deficit, and a position
+probe would measure the instrument, not the room. The analyzer marks
+EVO-003 as the next required step, but its firing (the physical
+measurement, S16) does **not** trigger until S1 is fixed — see
+§S2/S16 below. Do not run the probe to "confirm" a residual that the
+instrument itself produced.
+
+### S15 — P0/D10 as A/B covariates (`check_d10_p0_covariates`)
+
+`check_d10_p0_covariates(base_sessions, candidate_sessions,
+tolerance_db=0.5)` keeps the A/B from mistaking "the field changed"
+for "the EQ improved". P0 measures −6.065/−6.274 dB (ALL7 −14.18 dB)
+without trim; the v1.1 `trim_db = −4.0` is nominal from the file, not
+measured loudness; the D10 arbiter is legacy as gain (telemetry only)
+and the LTI D10 kernel is still engaged.
+
+- The analyzer **accepts** the optional chunk/session fields
+  `d10_action`, `p0_db`, `trim_db_effective` when they arrive
+  (`validate_chunk` checks them for finiteness only — no range is
+  fixed for the D10 action or the P0 in any spec, so no range is
+  invented) and **does not require them** when they do not arrive
+  (retrocompatible: sessions without them are not rejected, and the
+  covariate gate is skipped + noted).
+- **Rule:** if the candidate moves the D10 action or the P0 outside
+  **±0.5 dB** (`D10_P0_TOLERANCE_DB` — the spec's value, "a fijar con
+  la primera medición", taken as the explicit default until the first
+  measurement confirms or changes it), the A/B verdict is
+  **`inconclusive`** even if the RMS improves. See the S8 table above
+  for how `inconclusive` ranks against `rollback`.
+- `trim_db_effective` is **reported, not gating**: its delta rides in
+  the result, but the spec fixes no tolerance for the trim, and
+  inventing one would be inventing a metric.
+- Nothing here touches the arbiter or the kernel: telemetry + a rule,
+  nothing else.
+
+**Status today (verified in this worktree): the telemetry does not
+arrive yet.** No D10/P0 field exists in `SessionChunk` /
+`OrganismPayload` (`app/src/main/java/com/ivanna/omega/organism/`,
+grep at Fase 6). Until the phone sends it, the S15 gate is
+`unchecked` on every A/B and the verdict is unaffected — the rule is
+in place for the day the fields land, not a claim that they do.
+
+### T3 — "Sounding, not just installed" (`check_playing_evidence`, `count_playing_chunks`)
+
+The spec's `POST /api/v1/muse/ivanna/profile/applied` only says
+"installed". A profile installed with the daemon down, no music, or
+the sensor stopped would generate 3 "empty" sessions that the server
+could read as a failure of the candidate (or as a success through
+silence). The server-side counting rule:
+
+`check_playing_evidence(evidence, previous_beacon_frames=None)`
+decides whether **one chunk counts** toward the A/B. It counts only
+when **all four** evidence checks pass:
+
+| Check | Rule |
+|---|---|
+| `daemon_ok` | must be `True` — it is what distinguishes "applied without a daemon" from "applied and sounding". Missing or `False` → does not count. |
+| `frames_valid` | must be `True` (bool) or `> 0` (int count). Missing, `False` or `0` → does not count. |
+| `snapshots_accepted` | must be `> 0` (snapshots the sensor consumer accepted). Missing or `0` → does not count. |
+| `beacon advancing` | `effect_beacon_frames` must be **strictly greater** than the previous observation for this candidate. A first observation, with no previous value, cannot establish advance yet and does not count — the server keeps the previous value and waits for the next chunk. |
+
+A chunk without evidence **does not count: it is neither a success
+nor a failure**, it simply does not advance the A/B count.
+`count_playing_chunks(evidences, previous_beacon_frames=None)` threads
+the beacon state across an ordered list of chunk evidences and returns
+how many counted (`counted` / `not_counted`, per-chunk decisions,
+`last_beacon_frames`). This module never defines session boundaries —
+the server owns them; it feeds ordered chunk evidences here and counts
+its 3 A/B sessions from the chunks that count. The phone-side half of
+T3 (exposing `daemonOk` in `OrganismController.State` and sending the
+evidence in the confirmation / first chunk) is not in this module; the
+pieces already exist on the phone (`framesValid` is in telemetry,
+`snapshotsAccepted` in the consumer state, the beacon via
+`DSPBridge.effectBeaconFrames()`).
+
+### S2/S16 — What S2 concludes with the current data (measured, Fase 6)
+
+Verified by running `fit_comb_vs_response` on the v1.1 table
+(`regional` residuals above) with the data the server actually has:
+
+| Fact | Value (measured) |
+|---|---|
+| `erbStdDb` in the compiled server profile | **missing** — the phone computes it (`SessionAggregator.kt:68,214`) but `OrganismPayload.kt:92-93` sends only `magnitudeDb`, `errorDb`, `coherence` per band (verified in this worktree, HEAD `d22885b`) |
+| S2 verdict | **`indeterminate`**, reason `erb_std_db_missing` — the rule refuses to guess |
+| Comb fit (published anyway) | distance `d = 3.11 m`, residual 1.42 dB vs smooth-only 1.56 dB, improvement **9.0%** — far below the 25% comb bar (`COMB_IMPROVEMENT_MIN`); the fit itself does not favour a comb |
+| `std_contrast_db` | `None` (no dispersion data to contrast) |
+| S1 premise (Fase 0 audit) | coherence 0% is **instrumentation**: the Organism path does not feed the reference, so `coherence = 0` in all 24 bands by design |
+
+**Conclusion, exact: S1 + S2 do NOT point to the room, so S16 (the
+physical EVO-003 measurement) does NOT trigger.** S1 says the 0% is
+not room data, and S2 cannot distinguish comb from response without
+`erbStdDb` — and even the fit it does run leans away from a comb
+(9.0% < 25%). The next step is the S1 reference fix + `erbStdDb` in
+the payload, not a position probe: a probe now would measure the
+instrument, not the room. If, after the fix, S2 returns `comb` (or
+coherence behaves like a room effect), S16 triggers then — the probe
+protocol (3 labelled positions, same track/level) is specified in
+evolucion-magistral-autonomia-completa.md §S16 and needs no change
+here. Pinned by `TestS2S16Verification`, so a future data change
+fails loudly instead of silently re-triggering the probe.
 
 ## How the server (AI Studio) adopts it
 
@@ -217,13 +355,28 @@ measurement.
 4. On each new compiled profile, call `compile_candidate(...)`; publish
    the returned v1.1a / v1.1b as `candidate` versions through the
    existing `GET /api/v1/muse/ivanna/profile/current` endpoint.
-5. On the 3 A/B sessions of a candidate, call `evaluate_ab(base_3,
-   candidate_3)`; publish `promoted` or `rolled_back` from its verdict.
-6. After a promotion, the next rung of `ladder` becomes the next
+   **Read the `s10` entry first:** if regions are frozen, do not
+   publish EQ steps for them — EVO-003 is the next required step, and
+   while `evo003_pending_reference_fix` is True its firing waits for
+   the S1 reference fix (see §S10 above).
+5. **T3 before counting:** on every chunk that arrives with a candidate
+   applied, call `check_playing_evidence(...)` (threading the previous
+   beacon value, or `count_playing_chunks(...)` over the ordered
+   chunks). Only counted chunks advance the A/B count; an uncounted
+   chunk is neither a success nor a failure. The 3 A/B sessions are
+   counted from counted chunks only.
+6. On the 3 counted A/B sessions of a candidate, call
+   `evaluate_ab(base_3, candidate_3)`; publish `promoted`,
+   `rolled_back`, or `inconclusive` from its verdict. `inconclusive`
+   (S15: the candidate moved D10/P0) means **repeat the A/B, do not
+   promote and do not roll back** — the comparison was invalidated.
+   The S15 gate only fires when the D10/P0 telemetry exists on both
+   sides; until then it is skipped + noted.
+7. After a promotion, the next rung of `ladder` becomes the next
    candidate (each rung gets its own A/B; a failed rung rolls back to
    the previous rung, never to v1.0 directly unless the whole climb is
    abandoned).
-7. **T6 before every promotion: call `gate_promotion(rung_slots,
+8. **T6 before every promotion: call `gate_promotion(rung_slots,
    promotions_today)`** (see §T6 below). A promotion the gate refuses
    is not published; an excursion breach (`halt_needs_human`) stops
    the cycle until Esse decides — do not publish that rung or any
@@ -342,12 +495,17 @@ change no one should make without him listening first.
 
 1. **`erbStdDb` per band of the compiled profile — MISSING.** The phone
    computes it (`SessionChunk.erbStdDb`, `SessionAggregator.kt:68,214`)
-   but `OrganismPayload.kt` (lines 60–68) sends only `magnitudeDb`,
-   `errorDb` and `coherence` per band — `erbStdDb` never reaches the
-   server. Until the payload and the compiler retain it, S2 returns
-   `indeterminate` with reason `erb_std_db_missing` (the fit still
-   publishes `d` and its residual; only the classification refuses to
-   guess). S2 is specified as pending on exactly this.
+   but `OrganismPayload.kt` (lines 92–93, verified in this worktree)
+   sends only `magnitudeDb`, `errorDb` and `coherence` per band —
+   `erbStdDb` never reaches the server. Until the payload and the
+   compiler retain it, S2 returns `indeterminate` with reason
+   `erb_std_db_missing` (the fit still publishes `d` and its residual;
+   only the classification refuses to guess). S2 is specified as
+   pending on exactly this. **Measured consequence (Fase 6):** with
+   the v1.1 table the fit gives `d = 3.11 m` and only 9.0% improvement
+   over the smooth model — below the 25% comb bar — so even the fit
+   leans away from a comb; S1+S2 do not point to the room and S16
+   does not trigger (see §S2/S16 above).
 2. **Full 24-band ERB table export.** The v1.1 profile documents only
    ERB-3 (+9.86 dB); the other 23 bands "live on the server". The
    analyzer needs the whole table; verify it is exportable from the
@@ -361,6 +519,22 @@ change no one should make without him listening first.
 5. **S3 (`roomCorrDb` JNI slot).** Until S3 lands, v1.1a cannot carry
    the ERB-3 cut and uses only `low_60_120`; the module reports this
    instead of pretending the cut is applied.
+6. **S15 telemetry (`d10_action`, `p0_db`, `trim_db_effective`) —
+   MISSING.** No D10/P0 field exists in `SessionChunk` /
+   `OrganismPayload` today (verified by grep in `organism/` at Fase 6).
+   The analyzer accepts the fields when they arrive and does not
+   require them until then; the S15 gate is `unchecked` on every A/B
+   meanwhile. Adding the fields is phone-side work (S15's "dato que
+   falta"); the server-side rule is already in place.
+7. **T3 phone-side wiring — PENDING.** The evidence pieces exist on
+   the phone (`framesValid` already in telemetry,
+   `snapshotsAccepted` in the consumer state, the beacon via
+   `DSPBridge.effectBeaconFrames()`), but `daemonOk` is not yet
+   exposed in `OrganismController.State` and the evidence is not yet
+   sent in the confirmation / first chunk after applying. Until that
+   lands, the server has no evidence to count from and every chunk is
+   `not_counted` — which is the safe default (no A/B runs on
+   silence), not a failure.
 
 ## Discrepancies noted
 
@@ -397,3 +571,29 @@ change no one should make without him listening first.
 - **S8(a) transition bands (ERB 10–12)** belong to no named S8 region
   group in the spec; they are covered only by the global RMS gate.
   This is documented in the code, not silently assigned to a group.
+- **S10 release threshold is a modelling choice, not a measured
+  value.** The spec says the freeze lifts "hasta que la coherencia
+  suba o la medición confirme el déficit" but fixes no number for
+  "suba". This module reads it as `mean_coherence >= COHERENCE_GUARD`
+  (0.20), reusing the S9 guard for "this table can be trusted", and
+  the other release is explicit evidence (`deficit_confirmed=True`
+  from the EVO-003 measurement). The trigger itself (residual
+  strictly > 4 dB) is the spec's own number. The interaction is
+  measured, not assumed: with the v1.1 table at coherence 0% the
+  freeze stops the ladder at one rung (v1.2, low −3 / mid +4); at
+  coherence 0.9 it releases and T6 caps the climb at v1.3.
+- **S15 tolerance (±0.5 dB) is the spec's value, pending the first
+  measurement.** The spec says it is "a fijar con la primera
+  medición"; 0.5 dB is taken as the explicit default until that
+  measurement confirms or changes it (`D10_P0_TOLERANCE_DB`, a
+  parameter of `check_d10_p0_covariates`). `trim_db_effective` is
+  reported but not gated — the spec fixes no trim tolerance — and the
+  S15 fields carry no range bound in `validate_chunk` (finiteness
+  only): no scale for the D10 action or the P0 is fixed anywhere, so
+  inventing a range would be inventing a metric.
+- **T3 first observation does not count.** "Beacon advancing" needs
+  two observations to establish; the first chunk after applying, with
+  no previous beacon value, is `not_counted` by design (it waits for
+  the next chunk). The server must persist the previous beacon value
+  per candidate. All four evidence fields are required for a chunk to
+  count — a missing field is missing evidence, not a pass.
